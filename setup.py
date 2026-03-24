@@ -17,7 +17,6 @@ setup(
         "click>=8.1.0",
     ],
     extras_require={
-        "nlp": ["spacy>=3.7.0"],
         "dev": ["pytest>=7.4.0", "pytest-asyncio>=0.21.0"],
     },
     entry_points={
