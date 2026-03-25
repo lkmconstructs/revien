@@ -1,6 +1,6 @@
 """
 Revien Deduplication — Prevents duplicate nodes from polluting the graph.
-Uses exact label match + fuzzy match (Levenshtein distance < 3).
+Uses exact label match + fuzzy match (Levenshtein distance + ratio-based similarity).
 """
 
 from typing import List, Optional, Tuple
@@ -67,11 +67,12 @@ class Deduplicator:
             candidate.label, node_type=candidate.node_type
         )
 
-    def _find_fuzzy_match(self, candidate: Node) -> Optional[Node]:
-        """Find a node within Levenshtein distance < 3 of the same type."""
+   def _find_fuzzy_match(self, candidate: Node) -> Optional[Node]:
+        """Find a similar node using Levenshtein distance and ratio matching."""
         matches = self.ops.find_nodes_by_label_fuzzy(
-            candidate.label, max_distance=3
+            candidate.label, max_distance=5, min_ratio=0.75
         )
+
         # Filter to same type
         for match in matches:
             if match.node_type == candidate.node_type:

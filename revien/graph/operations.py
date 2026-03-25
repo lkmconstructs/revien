@@ -26,19 +26,25 @@ class GraphOperations:
                 return node
         return None
 
-    def find_nodes_by_label_fuzzy(
-        self, label: str, max_distance: int = 3
+   def find_nodes_by_label_fuzzy(
+        self, label: str, max_distance: int = 5, min_ratio: float = 0.75
     ) -> List[Node]:
-        """Find nodes with labels within Levenshtein distance."""
+        """Find nodes with similar labels using both Levenshtein distance
+        and ratio-based matching. Ratio-based matching handles length
+        differences better (e.g., 'PostgreSQL' vs 'Postgres')."""
+        from difflib import SequenceMatcher
         nodes = self.store.list_nodes(limit=999999)
         matches = []
         for node in nodes:
-            dist = _levenshtein(node.label.lower(), label.lower())
-            if dist < max_distance:
+            label_lower = label.lower()
+            node_lower = node.label.lower()
+            dist = _levenshtein(node_lower, label_lower)
+            ratio = SequenceMatcher(None, node_lower, label_lower).ratio()
+            if dist < max_distance or ratio >= min_ratio:
                 matches.append(node)
         return matches
-
-    def connect_nodes(
+    
+       def connect_nodes(
         self,
         source_id: str,
         target_id: str,
