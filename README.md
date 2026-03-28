@@ -1,3 +1,7 @@
+![PyPI](https://img.shields.io/pypi/v/revien)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue)
+![Python](https://img.shields.io/pypi/pyversions/revien)
+
 # Revien
 
 **Memory that returns.**
@@ -18,13 +22,16 @@ That's it. Revien starts building persistent memory.
 
 Most AI tools still lose continuity between sessions. Most memory systems either forget too much, hide too much, or force developers to assemble the pipeline themselves.
 
-| Approach | Problem |
-|----------|---------|
-| **RAG / Vector DBs** | Requires GPU for embeddings. Developer builds the pipeline. |
-| **Platform memory** (Claude, ChatGPT) | Vendor-locked. Opaque. Non-portable. |
-| **LangChain Memory** | Compacts and summarizes. Irreversible information loss. |
-| **Mem0** | Optimized for lightweight memory, but not graph-native relational structure. |
-| **Context compaction** | Asks the LLM to decide what to forget. Burns tokens on housekeeping. |
+| Feature | Revien | LangChain Memory | Mem0 | Zep |
+|---------|--------|-----------------|------|-----|
+| Graph-based retrieval | ✅ | ❌ (linear/compaction) | ❌ | Partial |
+| Three-factor scoring | ✅ | ❌ | ❌ | ❌ |
+| OpenAI export ingestion | ✅ | ❌ | ❌ | ❌ |
+| LangChain drop-in | ✅ | N/A | ✅ | ✅ |
+| Ollama integration | ✅ | ❌ | ❌ | ❌ |
+| Claude Code integration | ✅ | ❌ | ❌ | ❌ |
+| Zero cloud dependency | ✅ | Partial | ❌ | ❌ |
+| File watcher auto-ingest | ✅ | ❌ | ❌ | ❌ |
 
 Revien takes a different approach: **store everything as a graph, compact nothing, retrieve surgically.**
 
@@ -67,7 +74,14 @@ Every time a node is retrieved, its access count increases. This boosts its freq
 ### Install
 
 ```bash
+# Core
 pip install revien
+
+# With LangChain support
+pip install revien[langchain]
+
+# With all adapters
+pip install revien[all]
 ```
 
 ### Start the daemon
@@ -124,15 +138,56 @@ for result in response.json()["results"]:
 
 ---
 
+## Integrations
+
+Revien integrates with popular AI platforms and frameworks. Migrate existing conversation history, drop in as a replacement memory backend, or bridge to local models — all without losing context.
+
+### OpenAI / ChatGPT
+
+Migrate conversation history into persistent graph-based AI memory. Export your ChatGPT conversations and transform them into a queryable knowledge graph:
+
+```bash
+revien ingest --source openai --file conversations.json --bulk
+```
+
+Conversations become queryable graph nodes with three-factor scoring. Instead of losing old conversations to context limits, they remain accessible and searchable. This is your ChatGPT memory alternative — a true OpenAI conversation persistence layer that doesn't forget.
+
+### LangChain
+
+Drop-in replacement for LangChain's memory backend. Use graph-based AI memory instead of compaction:
+
+```python
+from revien.adapters.langchain_adapter import RevienMemory
+memory = RevienMemory(graph_path="./my_graph")
+chain = ConversationChain(llm=llm, memory=memory)
+```
+
+No compaction, no summarization loss. LangChain memory replacement that retrieves what's relevant instead of what's recent. This LangChain memory replacement uses graph-based retrieval, ensuring your agent always has access to the full context it needs.
+
+### Ollama
+
+Zero-cloud persistent memory for local models. Run your own LLM with Revien's local AI memory engine:
+
+```bash
+revien chat --backend ollama --model llama3
+```
+
+Every conversation persists in your local graph. Full privacy, full memory, zero cloud dependency. Deploy Ollama persistent memory that remembers everything without surveillance. This is local AI memory that doesn't forget — no vendor lock-in, no cloud bills, just your models and your graph.
+
+---
+
 ## Adapters
 
-Revien connects to AI systems through adapters. Three ship with the package:
+Revien connects to AI systems through adapters. These ship with the package:
 
 | Adapter | What it does |
 |---------|-------------|
 | **Claude Code** | Reads Claude Code session logs (JSONL). Auto-syncs on schedule. |
 | **File Watcher** | Watches a directory for new/changed files. Ingests on change. |
 | **Generic API** | Connects to any REST endpoint returning conversation data. |
+| **OpenAI / ChatGPT** | Ingests ChatGPT conversation exports. Supports single and bulk formats. |
+| **LangChain** | Drop-in `BaseMemory` replacement. Graph-based retrieval instead of compaction. |
+| **Ollama** | Bridges Revien memory to local Ollama models. Zero cloud dependency. |
 
 ### Connect an adapter
 

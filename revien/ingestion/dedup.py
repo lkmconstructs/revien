@@ -67,7 +67,7 @@ class Deduplicator:
             candidate.label, node_type=candidate.node_type
         )
 
-   def _find_fuzzy_match(self, candidate: Node) -> Optional[Node]:
+    def _find_fuzzy_match(self, candidate: Node) -> Optional[Node]:
         """Find a similar node using Levenshtein distance and ratio matching."""
         matches = self.ops.find_nodes_by_label_fuzzy(
             candidate.label, max_distance=5, min_ratio=0.75

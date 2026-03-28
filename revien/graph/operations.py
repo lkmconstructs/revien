@@ -26,7 +26,7 @@ class GraphOperations:
                 return node
         return None
 
-   def find_nodes_by_label_fuzzy(
+    def find_nodes_by_label_fuzzy(
         self, label: str, max_distance: int = 5, min_ratio: float = 0.75
     ) -> List[Node]:
         """Find nodes with similar labels using both Levenshtein distance
@@ -43,8 +43,8 @@ class GraphOperations:
             if dist < max_distance or ratio >= min_ratio:
                 matches.append(node)
         return matches
-    
-       def connect_nodes(
+
+    def connect_nodes(
         self,
         source_id: str,
         target_id: str,

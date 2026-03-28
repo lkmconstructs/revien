@@ -18,6 +18,8 @@ setup(
     ],
     extras_require={
         "dev": ["pytest>=7.4.0", "pytest-asyncio>=0.21.0"],
+        "langchain": ["langchain-core>=0.1.0"],
+        "all": ["langchain-core>=0.1.0"],
     },
     entry_points={
         "console_scripts": [
