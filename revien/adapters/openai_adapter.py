@@ -155,8 +155,9 @@ class OpenAIAdapter:
 
             # Track conversation nodes for cross-conversation linking
             self._processed_conversations[conv_id] = True
+            source_id = f"openai:conversation:{conv_id}"
             conversation_nodes.extend(
-                self.store.list_nodes(source_id=conv_id, limit=9999)
+                self.store.list_nodes(source_id=source_id, limit=9999)
             )
 
         # Create cross-conversation edges where content similarity is high

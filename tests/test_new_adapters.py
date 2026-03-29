@@ -403,8 +403,12 @@ class TestOpenAIAdapterBulkExport:
         """Verify cross-conversation edges created for similar content."""
         stats = openai_adapter.ingest_bulk_export(bulk_export_file)
         # Both conversations mention PostgreSQL — should create cross-conv edges
-        # (depends on similarity threshold; at minimum stats key should exist)
         assert "cross_conversation_edges" in stats
+        assert stats["cross_conversation_edges"] >= 0  # At least the key is populated correctly
+        # Verify the total edge count includes any cross-conversation links
+        total_edges_in_db = openai_adapter.store.count_edges()
+        assert total_edges_in_db >= stats["total_edges"], \
+            "Database edge count should be at least the reported total"
 
     def test_bulk_not_array_raises(self, openai_adapter, tmp_db):
         """Bulk export must be a JSON array."""

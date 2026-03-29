@@ -257,11 +257,14 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
             return
 
         try:
-            # Get all nodes
-            all_nodes = self._store.list_nodes(limit=999999)
-            # Delete each node (edges cascade automatically)
-            for node in all_nodes:
-                self._store.delete_node(node.node_id)
+            # Batch deletion to avoid loading entire graph into memory
+            batch_size = 100
+            while True:
+                batch = self._store.list_nodes(limit=batch_size)
+                if not batch:
+                    break
+                for node in batch:
+                    self._store.delete_node(node.node_id)
         except Exception:
             pass
 

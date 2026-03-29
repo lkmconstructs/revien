@@ -15,10 +15,13 @@ Revien Ollama Adapter — Bridges Revien's graph memory to locally-running Ollam
 Injects relevant graph context into Ollama prompts automatically.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from revien.graph.schema import Node, NodeType
 from revien.graph.store import GraphStore
@@ -227,7 +230,6 @@ class OllamaAdapter:
 
             # Format time delta
             now = datetime.now(timezone.utc)
-            created_at = result.node_id  # This is stored in graph; we need the node
             node = self.store.get_node(result.node_id)
             if node:
                 time_delta = self._format_time_delta(node.created_at, now)
@@ -349,7 +351,7 @@ class OllamaAdapter:
             self.pipeline.ingest(input_data)
         except Exception as e:
             # Log but don't fail — ingestion errors shouldn't break the chat
-            print(f"Warning: failed to ingest exchange into graph: {e}")
+            logger.warning(f"Failed to ingest exchange into graph: {e}")
 
     def _format_time_delta(self, created_at: datetime, now: datetime) -> str:
         """
