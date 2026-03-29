@@ -1,12 +1,11 @@
-![PyPI](https://img.shields.io/pypi/v/revien)
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
-![Python](https://img.shields.io/pypi/pyversions/revien)
+
 
 # Revien
 
 **Memory that returns.**
 
-Revien is a graph-based memory engine for AI systems. It gives any AI tool — local models, Claude Code, API-based assistants, agent frameworks — persistent memory across sessions. No GPU required. No cloud account needed. Nothing is compacted away by default.
+Revien is a graph-based memory engine for AI systems. It gives any AI tool — local models, Claude Code, API-based assistants, agent frameworks — persistent memory across sessions, allowing cross-session AI context. No GPU required. No cloud account needed. Nothing is compacted away by default. 
 
 ```bash
 pip install revien
