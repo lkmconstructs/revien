@@ -1,12 +1,14 @@
 """
 Revien Graph Operations — Higher-level operations on the graph store.
 Convenience layer over raw CRUD.
+Confidence layer: confidence tagging, reinforcement, decay, propagation
+(2-hop bounded).
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .schema import Edge, EdgeType, Graph, Node, NodeType
+from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
 
 
@@ -15,6 +17,168 @@ class GraphOperations:
 
     def __init__(self, store: GraphStore):
         self.store = store
+
+    # ── Confidence Layer: Scoring, Decay, Reinforcement ───────
+
+    def _apply_decay(self, node: Node) -> Node:
+        """Apply lazy decay to INFERRED nodes not referenced recently.
+
+        Decay rate: -0.01 per week since last_referenced (or created_at).
+        Pinned nodes and non-INFERRED nodes are immune. Persists the new
+        confidence only when the change is meaningful (> 0.005).
+        """
+        if node.pinned or node.source_type != SourceType.INFERRED:
+            return node
+
+        now = datetime.now(timezone.utc)
+        reference_time = node.last_referenced or node.created_at
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=timezone.utc)
+        days_since = (now - reference_time).days
+        weeks_since = days_since / 7.0
+        decay_amount = weeks_since * 0.01
+
+        new_confidence = max(0.0, node.confidence - decay_amount)
+        if node.confidence - new_confidence > 0.005:
+            return self.store.update_node(
+                node.node_id,
+                confidence=new_confidence,
+                confidence_set_at=now,
+                source_context="lazy_decay",
+            ) or node
+        return node
+
+    def reinforce_node(self, node_id: str, construct_id: str = "") -> Optional[Node]:
+        """Reinforce a node's confidence after successful use.
+
+        Increment confidence by +0.05 (capped at 1.0). Update last_referenced
+        timestamp and audit fields.
+        """
+        node = self.store.get_node(node_id)
+        if node is None:
+            return None
+
+        now = datetime.now(timezone.utc)
+        new_confidence = min(1.0, node.confidence + 0.05)
+        return self.store.update_node(
+            node_id,
+            confidence=new_confidence,
+            confidence_set_at=now,
+            confidence_set_by=construct_id,
+            source_context="reinforced_after_use",
+            last_referenced=now,
+            metadata={**node.metadata, "_reinforced_by": construct_id},
+        )
+
+    def correct_node(
+        self, node_id: str, correction_context: str = "", construct_id: str = ""
+    ) -> Optional[Node]:
+        """Mark a node as CORRECTED due to conflicting information.
+
+        Set source_type to CORRECTED and confidence to 0.0.
+        """
+        node = self.store.get_node(node_id)
+        if node is None:
+            return None
+
+        now = datetime.now(timezone.utc)
+        return self.store.update_node(
+            node_id,
+            source_type=SourceType.CORRECTED,
+            confidence=0.0,
+            confidence_set_at=now,
+            confidence_set_by=construct_id,
+            source_context=correction_context,
+            metadata={
+                **node.metadata,
+                "_corrected_by": construct_id,
+                "_corrected_at": now.isoformat(),
+            },
+        )
+
+    def propagate_confidence(
+        self, source_node_id: str, max_hops: int = 2
+    ) -> Dict[str, float]:
+        """Propagate confidence from a source node to connected nodes.
+
+        Confidence decays per hop and is capped at 2 hops max (bounded
+        propagation). Returns dict of {node_id: new_confidence} for the nodes
+        whose confidence would be raised by propagation.
+        """
+        if max_hops > 2:
+            max_hops = 2
+
+        source = self.store.get_node(source_node_id)
+        if source is None:
+            return {}
+
+        updates: Dict[str, float] = {}
+        visited = {source_node_id}
+        frontier = [(source_node_id, source.confidence, 0)]  # (node_id, confidence, depth)
+
+        while frontier:
+            current_id, current_conf, depth = frontier.pop(0)
+            if depth >= max_hops:
+                continue
+
+            edges = self.store.get_edges_for_node(current_id)
+            for edge in edges:
+                neighbor_id = (
+                    edge.target_node_id
+                    if edge.source_node_id == current_id
+                    else edge.source_node_id
+                )
+
+                if neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)
+
+                # Propagated confidence decays by 0.1 per hop.
+                propagated = current_conf * (1.0 - (0.1 * (depth + 1)))
+                propagated = max(0.0, min(1.0, propagated))
+
+                neighbor = self.store.get_node(neighbor_id)
+                if neighbor and propagated > neighbor.confidence:
+                    updates[neighbor_id] = propagated
+                    frontier.append((neighbor_id, propagated, depth + 1))
+
+        # Apply updates (mark propagated; confidence raise tracked in updates dict).
+        for node_id in updates:
+            node = self.store.get_node(node_id)
+            if node is not None:
+                self.store.update_node(
+                    node_id,
+                    metadata={**node.metadata, "_propagated": True},
+                )
+
+        return updates
+
+    def retrieve_with_confidence(
+        self,
+        node_type: Optional[NodeType] = None,
+        source_id: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Tuple[List[Dict], List[float]]:
+        """Retrieve nodes with confidence scoring.
+
+        Applies lazy decay, then returns (nodes_as_dicts, confidence_scores)
+        sorted by confidence descending.
+        """
+        raw_nodes = self.store.list_nodes(
+            node_type=node_type, source_id=source_id, limit=limit, offset=offset
+        )
+
+        nodes_with_scores = []
+        for node in raw_nodes:
+            decayed_node = self._apply_decay(node)
+            score = decayed_node.confidence
+            nodes_with_scores.append((decayed_node.model_dump(), score))
+
+        nodes_with_scores.sort(key=lambda x: x[1], reverse=True)
+        nodes = [n for n, _ in nodes_with_scores]
+        scores = [s for _, s in nodes_with_scores]
+        return nodes, scores
 
     def find_node_by_label(
         self, label: str, node_type: Optional[NodeType] = None

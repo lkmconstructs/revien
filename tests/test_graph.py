@@ -122,7 +122,8 @@ class TestEdgeCreation:
         assert result.edge_type == EdgeType.CONTRADICTS
 
     def test_all_edge_types_covered(self):
-        assert len(EdgeType) == 6
+        # 6 core relationship types + CORRECTS (confidence-layer audit edge)
+        assert len(EdgeType) == 7
 
 
 # ── Update Operations ─────────────────────────────────────

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .schema import Edge, EdgeType, Graph, Node, NodeType
+from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 
 
 class GraphStore:
@@ -21,7 +21,14 @@ class GraphStore:
         self._ensure_db()
 
     def _ensure_db(self) -> None:
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist, with confidence-layer columns.
+
+        Fresh databases get the confidence columns directly in the CREATE TABLE
+        statements. Existing databases are upgraded by
+        ``_migrate_add_confidence_columns`` (see also
+        ``revien/graph/migrations/001_confidence_layer.py`` for a standalone
+        migration runner).
+        """
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
         conn.executescript("""
@@ -34,7 +41,14 @@ class GraphStore:
                 created_at TEXT NOT NULL,
                 last_accessed TEXT NOT NULL,
                 access_count INTEGER DEFAULT 0,
-                metadata TEXT DEFAULT '{}'
+                metadata TEXT DEFAULT '{}',
+                source_type TEXT DEFAULT 'inferred',
+                confidence REAL DEFAULT 0.5,
+                pinned INTEGER DEFAULT 0,
+                confidence_set_at TEXT,
+                confidence_set_by TEXT DEFAULT '',
+                source_context TEXT DEFAULT '',
+                last_referenced TEXT
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -45,6 +59,10 @@ class GraphStore:
                 weight REAL DEFAULT 0.5,
                 created_at TEXT NOT NULL,
                 metadata TEXT DEFAULT '{}',
+                confidence REAL DEFAULT 0.5,
+                confidence_set_at TEXT,
+                confidence_set_by TEXT DEFAULT '',
+                source_context TEXT DEFAULT '',
                 FOREIGN KEY (source_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE,
                 FOREIGN KEY (target_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
             );
@@ -55,9 +73,63 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
+            CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence);
+            CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence);
         """)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
+
+        # Upgrade pre-confidence databases in place (backwards compatibility).
+        self._migrate_add_confidence_columns(conn)
+
+    def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
+        """Add confidence-layer columns to existing nodes/edges tables.
+
+        No-op for fresh databases (columns already created above). For
+        databases created before the confidence layer, this ALTERs the tables
+        and lets the column defaults backfill old rows
+        (source_type='inferred', confidence=0.5, pinned=0).
+        """
+        try:
+            cursor = conn.execute("PRAGMA table_info(nodes)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            if "source_type" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN source_type TEXT DEFAULT 'inferred'")
+            if "confidence" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN confidence REAL DEFAULT 0.5")
+            if "pinned" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN pinned INTEGER DEFAULT 0")
+            if "confidence_set_at" not in columns:
+                conn.execute(f"ALTER TABLE nodes ADD COLUMN confidence_set_at TEXT DEFAULT '{now_iso}'")
+            if "confidence_set_by" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN confidence_set_by TEXT DEFAULT ''")
+            if "source_context" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN source_context TEXT DEFAULT ''")
+            if "last_referenced" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN last_referenced TEXT")
+
+            cursor = conn.execute("PRAGMA table_info(edges)")
+            edge_columns = {row[1] for row in cursor.fetchall()}
+
+            if "confidence" not in edge_columns:
+                conn.execute("ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 0.5")
+            if "confidence_set_at" not in edge_columns:
+                conn.execute(f"ALTER TABLE edges ADD COLUMN confidence_set_at TEXT DEFAULT '{now_iso}'")
+            if "confidence_set_by" not in edge_columns:
+                conn.execute("ALTER TABLE edges ADD COLUMN confidence_set_by TEXT DEFAULT ''")
+            if "source_context" not in edge_columns:
+                conn.execute("ALTER TABLE edges ADD COLUMN source_context TEXT DEFAULT ''")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence)")
+
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Column already exists or other migration issue — log but don't fail.
+            print(f"Migration note: {e}")
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -80,8 +152,10 @@ class GraphStore:
         conn.execute(
             """INSERT INTO nodes
                (node_id, node_type, label, content, source_id,
-                created_at, last_accessed, access_count, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, last_accessed, access_count, metadata,
+                source_type, confidence, pinned, confidence_set_at,
+                confidence_set_by, source_context, last_referenced)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -92,6 +166,13 @@ class GraphStore:
                 node.last_accessed.isoformat(),
                 node.access_count,
                 json.dumps(node.metadata),
+                node.source_type.value,
+                node.confidence,
+                1 if node.pinned else 0,
+                node.confidence_set_at.isoformat(),
+                node.confidence_set_by,
+                node.source_context,
+                node.last_referenced.isoformat() if node.last_referenced else None,
             ),
         )
         conn.commit()
@@ -113,11 +194,15 @@ class GraphStore:
             return None
 
         updates = {}
-        for field in ("label", "content", "source_id", "access_count", "metadata"):
+        allowed_fields = (
+            "label", "content", "source_id", "access_count", "metadata",
+            "last_accessed", "confidence", "pinned", "source_type",
+            "confidence_set_at", "confidence_set_by", "source_context",
+            "last_referenced",
+        )
+        for field in allowed_fields:
             if field in kwargs:
                 updates[field] = kwargs[field]
-        if "last_accessed" in kwargs:
-            updates["last_accessed"] = kwargs["last_accessed"]
 
         if not updates:
             return existing
@@ -125,12 +210,17 @@ class GraphStore:
         conn = self._get_conn()
         set_clauses = []
         values = []
+        datetime_fields = ("last_accessed", "confidence_set_at", "last_referenced")
         for key, val in updates.items():
             set_clauses.append(f"{key} = ?")
             if key == "metadata":
                 values.append(json.dumps(val))
-            elif key == "last_accessed":
+            elif key in datetime_fields:
                 values.append(val.isoformat() if isinstance(val, datetime) else val)
+            elif key == "source_type":
+                values.append(val.value if hasattr(val, "value") else val)
+            elif key == "pinned":
+                values.append(1 if val else 0)
             else:
                 values.append(val)
         values.append(node_id)
@@ -186,8 +276,9 @@ class GraphStore:
         conn.execute(
             """INSERT INTO edges
                (edge_id, edge_type, source_node_id, target_node_id,
-                weight, created_at, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                weight, created_at, metadata,
+                confidence, confidence_set_at, confidence_set_by, source_context)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 edge.edge_id,
                 edge.edge_type.value,
@@ -196,6 +287,10 @@ class GraphStore:
                 edge.weight,
                 edge.created_at.isoformat(),
                 json.dumps(edge.metadata),
+                edge.confidence,
+                edge.confidence_set_at.isoformat(),
+                edge.confidence_set_by,
+                edge.source_context,
             ),
         )
         conn.commit()
@@ -229,6 +324,17 @@ class GraphStore:
             else:
                 neighbors.add(e.source_node_id)
         return list(neighbors)
+
+    def update_edge_weight(self, edge_id: str, weight: float) -> bool:
+        """Update an edge's weight. Clamps to [0.0, 1.0]. Returns True if updated."""
+        weight = max(0.0, min(1.0, weight))
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE edges SET weight = ? WHERE edge_id = ?",
+            (weight, edge_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
     def delete_edge(self, edge_id: str) -> bool:
         conn = self._get_conn()
@@ -274,6 +380,14 @@ class GraphStore:
             last_accessed=datetime.fromisoformat(row[6]),
             access_count=row[7],
             metadata=json.loads(row[8]),
+            # Confidence Layer (columns 9+)
+            source_type=SourceType(row[9]) if len(row) > 9 and row[9] else SourceType.INFERRED,
+            confidence=float(row[10]) if len(row) > 10 and row[10] is not None else 0.5,
+            pinned=bool(row[11]) if len(row) > 11 else False,
+            confidence_set_at=datetime.fromisoformat(row[12]) if len(row) > 12 and row[12] else datetime.now(timezone.utc),
+            confidence_set_by=row[13] if len(row) > 13 and row[13] else "",
+            source_context=row[14] if len(row) > 14 and row[14] else "",
+            last_referenced=datetime.fromisoformat(row[15]) if len(row) > 15 and row[15] else None,
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:
@@ -285,4 +399,9 @@ class GraphStore:
             weight=row[4],
             created_at=datetime.fromisoformat(row[5]),
             metadata=json.loads(row[6]),
+            # Confidence Layer (columns 7+)
+            confidence=float(row[7]) if len(row) > 7 and row[7] is not None else 0.5,
+            confidence_set_at=datetime.fromisoformat(row[8]) if len(row) > 8 and row[8] else datetime.now(timezone.utc),
+            confidence_set_by=row[9] if len(row) > 9 and row[9] else "",
+            source_context=row[10] if len(row) > 10 and row[10] else "",
         )
