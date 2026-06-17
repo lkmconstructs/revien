@@ -510,11 +510,11 @@ class TestOpenAIAdapterThreeFactorScores:
 
         # Leg 3: recall now multiplies the base score by effective confidence.
         # This fixture's nodes are INFERRED with conversation timestamps from
-        # 2024 and no last_referenced, so leg-1 lazy decay drives their
-        # confidence toward 0 relative to "now" — that is correct decay
-        # behavior, not a scoring failure. This test verifies the three-factor
-        # scoring plumbing produces results, so query with min_score=0.0 to
-        # surface them regardless of the confidence post-factor.
+        # 2024 and no last_referenced, so leg-1 lazy decay demotes their
+        # confidence to the DECAY_FLOOR (demote-not-delete) relative to "now" —
+        # correct decay behavior, not a scoring failure. This test verifies the
+        # three-factor scoring plumbing produces results, so query with
+        # min_score=0.0 to surface them regardless of the confidence post-factor.
         response = engine.recall("PostgreSQL database migration", min_score=0.0)
         assert len(response.results) > 0, "Should find results for PostgreSQL query"
 

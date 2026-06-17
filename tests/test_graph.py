@@ -8,11 +8,11 @@ reimport. Verify graph integrity after reimport.
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
+from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 
@@ -31,6 +31,38 @@ def store():
 @pytest.fixture
 def ops(store):
     return GraphOperations(store)
+
+
+# ── Confidence decay: demote, don't delete ───────────────
+
+class TestDecayDemotesNotDeletes:
+    """Decay floors at DECAY_FLOOR (demote); only correction deletes (0.0)."""
+
+    def test_aged_inferred_floors_not_zero(self, store, ops):
+        old = datetime.now(timezone.utc) - timedelta(weeks=300)
+        n = Node(node_type=NodeType.FACT, label="ancient", content="x",
+                 source_type=SourceType.INFERRED, confidence=0.7,
+                 last_referenced=old)
+        store.add_node(n)
+        decayed = ops._apply_decay(n)
+        assert decayed.confidence == GraphOperations.DECAY_FLOOR
+        assert decayed.confidence > 0.0  # demoted, never deleted
+
+    def test_correction_still_deletes_to_zero(self, store, ops):
+        n = Node(node_type=NodeType.FACT, label="wrong", content="x",
+                 source_type=SourceType.INFERRED, confidence=0.8)
+        store.add_node(n)
+        ops.correct_node(n.node_id)
+        got = store.get_node(n.node_id)
+        assert got.confidence == 0.0  # explicit correction bypasses the floor
+
+    def test_fresh_inferred_not_raised(self, store, ops):
+        n = Node(node_type=NodeType.FACT, label="recent", content="x",
+                 source_type=SourceType.INFERRED, confidence=0.6,
+                 last_referenced=datetime.now(timezone.utc))
+        store.add_node(n)
+        decayed = ops._apply_decay(n)
+        assert decayed.confidence == 0.6  # no meaningful decay; floor never raises
 
 
 # ── Node Creation (every type) ────────────────────────────

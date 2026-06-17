@@ -15,6 +15,12 @@ from .store import GraphStore
 class GraphOperations:
     """High-level graph operations built on GraphStore."""
 
+    # Decay demotes but never deletes: INFERRED nodes decay toward this floor,
+    # never to zero. Only explicit correction (correct_node) sets confidence to
+    # 0.0. Aged memories stay retrievable but rank low — "store everything,
+    # compact nothing."
+    DECAY_FLOOR = 0.15
+
     def __init__(self, store: GraphStore):
         self.store = store
 
@@ -24,8 +30,10 @@ class GraphOperations:
         """Apply lazy decay to INFERRED nodes not referenced recently.
 
         Decay rate: -0.01 per week since last_referenced (or created_at).
-        Pinned nodes and non-INFERRED nodes are immune. Persists the new
-        confidence only when the change is meaningful (> 0.005).
+        Decay DEMOTES but never DELETES: confidence floors at DECAY_FLOOR, so
+        aged memories rank low but stay retrievable. Only explicit correction
+        (correct_node) drives confidence to 0.0. Pinned and non-INFERRED nodes
+        are immune. Persists only when the change is meaningful (> 0.005).
         """
         if node.pinned or node.source_type != SourceType.INFERRED:
             return node
@@ -38,7 +46,9 @@ class GraphOperations:
         weeks_since = days_since / 7.0
         decay_amount = weeks_since * 0.01
 
-        new_confidence = max(0.0, node.confidence - decay_amount)
+        # Demote, don't delete: floor at DECAY_FLOOR; min() guard never raises
+        # a node already sitting below the floor.
+        new_confidence = min(node.confidence, max(self.DECAY_FLOOR, node.confidence - decay_amount))
         if node.confidence - new_confidence > 0.005:
             return self.store.update_node(
                 node.node_id,
