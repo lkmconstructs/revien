@@ -11,6 +11,7 @@ from revien.graph.schema import Edge, EdgeType, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 from .extractor import ExtractionResult, RuleBasedExtractor
+from .extractor_llm import TextExtractor, build_extractor
 from .dedup import Deduplicator
 
 
@@ -44,10 +45,14 @@ class IngestionPipeline:
     4. Return summary of what happened
     """
 
-    def __init__(self, store: GraphStore):
+    def __init__(self, store: GraphStore, extractor: Optional[TextExtractor] = None):
         self.store = store
         self.ops = GraphOperations(store)
-        self.extractor = RuleBasedExtractor()
+        # LOCAL-FIRST: build the configured extractor (env REVIEN_EXTRACTOR,
+        # default "rule" = offline, zero-config). The RuleBasedExtractor is the
+        # mandatory fallback inside any LLM backend, so ingestion never crashes
+        # and never goes to the network unless explicitly opted in.
+        self.extractor: TextExtractor = extractor or build_extractor()
         self.dedup = Deduplicator(store, self.ops)
 
     def ingest(self, input_data: IngestionInput) -> IngestionOutput:
