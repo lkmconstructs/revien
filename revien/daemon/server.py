@@ -310,6 +310,46 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             message="Manual sync triggered. Adapters will process on next cycle.",
         )
 
+    # ── POST /v1/mark_used ─────────────────────────────
+
+    class MarkUsedRequest(BaseModel):
+        node_id: str
+        query: Optional[str] = None
+
+    @app.post("/v1/mark_used")
+    async def mark_used(request: MarkUsedRequest):
+        """
+        Mark a retrieved node as actually used.
+        Call this when the user references or acts on retrieved information.
+        Provides positive training signal AND reinforces connected edge weights.
+        """
+        node = store.get_node(request.node_id)
+        if node is None:
+            raise HTTPException(404, f"Node not found: {request.node_id}")
+        engine.mark_used(request.node_id, request.query)
+        return {"status": "marked", "node_id": request.node_id}
+
+    # ── GET /v1/training/stats ─────────────────────────
+
+    @app.get("/v1/training/stats")
+    async def training_stats():
+        """Get neural training statistics. Reports neural status even when the
+        opt-in `neural` extra (numpy/sklearn) is not installed."""
+        return engine.get_training_stats()
+
+    # ── POST /v1/training/run ──────────────────────────
+
+    @app.post("/v1/training/run")
+    async def run_training():
+        """Manually trigger neural training. No-ops (status 'skipped') when the
+        neural extra is absent or insufficient signals have accumulated."""
+        success = engine.force_train()
+        return {
+            "status": "success" if success else "skipped",
+            "message": "Training completed" if success else "Not enough data or training failed",
+            "stats": engine.get_training_stats(),
+        }
+
     return app
 
 

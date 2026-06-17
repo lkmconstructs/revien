@@ -23,10 +23,18 @@ setup(
         # Opt-in Leiden community-detection backend. Compiled deps — not
         # installed by default. Enable with: pip install revien[leiden]
         "leiden": ["leidenalg>=0.10.0", "python-igraph>=0.11.0"],
+        # Opt-in neural reranker (TF-IDF + LogisticRegression). Heavy but
+        # local — NOT installed by default. Enable with:
+        #   pip install revien[neural]
+        # When absent, recall() runs base scoring (three-factor + community +
+        # confidence) unchanged and the neural adjustment is silently skipped.
+        "neural": ["scikit-learn>=1.3.0", "numpy>=1.24.0"],
         "all": [
             "langchain-core>=0.1.0",
             "leidenalg>=0.10.0",
             "python-igraph>=0.11.0",
+            "scikit-learn>=1.3.0",
+            "numpy>=1.24.0",
         ],
     },
     entry_points={
