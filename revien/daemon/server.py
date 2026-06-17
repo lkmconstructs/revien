@@ -350,6 +350,43 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             "stats": engine.get_training_stats(),
         }
 
+    # ── POST /v1/nodes/{id}/reinforce ──────────────────
+
+    class ReinforceRequest(BaseModel):
+        construct_id: str = ""
+
+    @app.post("/v1/nodes/{node_id}/reinforce")
+    async def reinforce_node_endpoint(node_id: str, request: Optional[ReinforceRequest] = None):
+        """Reinforce a node's confidence (+0.05, cap 1.0) after successful use."""
+        req = request or ReinforceRequest()
+        updated = ops.reinforce_node(node_id, construct_id=req.construct_id)
+        if updated is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return {"status": "reinforced", "node_id": node_id, "confidence": updated.confidence}
+
+    # ── POST /v1/nodes/{id}/correct ────────────────────
+
+    class CorrectRequest(BaseModel):
+        correction_context: str = ""
+        construct_id: str = ""
+
+    @app.post("/v1/nodes/{node_id}/correct")
+    async def correct_node_endpoint(node_id: str, request: Optional[CorrectRequest] = None):
+        """Mark a node CORRECTED (source_type=CORRECTED, confidence=0.0). Explicit
+        removal from ranking — distinct from decay, which only demotes."""
+        req = request or CorrectRequest()
+        updated = ops.correct_node(
+            node_id, correction_context=req.correction_context, construct_id=req.construct_id
+        )
+        if updated is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return {
+            "status": "corrected",
+            "node_id": node_id,
+            "confidence": updated.confidence,
+            "source_type": updated.source_type.value,
+        }
+
     return app
 
 
