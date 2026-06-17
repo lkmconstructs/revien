@@ -11,6 +11,7 @@ setup(
         "pydantic>=2.0",
         "fastapi>=0.104.0",
         "uvicorn>=0.24.0",
+        "networkx>=3.0",
         "apscheduler>=3.10.0",
         "watchdog>=3.0.0",
         "httpx>=0.25.0",
@@ -19,7 +20,14 @@ setup(
     extras_require={
         "dev": ["pytest>=7.4.0", "pytest-asyncio>=0.21.0"],
         "langchain": ["langchain-core>=0.1.0"],
-        "all": ["langchain-core>=0.1.0"],
+        # Opt-in Leiden community-detection backend. Compiled deps — not
+        # installed by default. Enable with: pip install revien[leiden]
+        "leiden": ["leidenalg>=0.10.0", "python-igraph>=0.11.0"],
+        "all": [
+            "langchain-core>=0.1.0",
+            "leidenalg>=0.10.0",
+            "python-igraph>=0.11.0",
+        ],
     },
     entry_points={
         "console_scripts": [

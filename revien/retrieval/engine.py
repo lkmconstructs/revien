@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from revien.graph.schema import Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
+from revien.graph.clustering import CommunityDetector
 from revien.ingestion.extractor import RuleBasedExtractor
 from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer
 from .walker import GraphWalker
@@ -42,16 +43,21 @@ class RetrievalEngine:
     Full retrieval pipeline:
     1. Parse query to extract entities/topics
     2. Find anchor nodes in the graph
+    2b. Community-first routing — boost nodes in query-relevant communities
     3. Walk the graph from anchors
     4. Score all reachable nodes
     5. Rank and return top N
     """
+
+    # Community membership boost — nodes in the same community as anchors score higher
+    COMMUNITY_BOOST = 0.15
 
     def __init__(
         self,
         store: GraphStore,
         scoring_config: Optional[ScoringConfig] = None,
         max_depth: int = 3,
+        clustering: Optional[CommunityDetector] = None,
     ):
         self.store = store
         self.ops = GraphOperations(store)
@@ -59,6 +65,7 @@ class RetrievalEngine:
         self.scorer = ThreeFactorScorer(scoring_config)
         self.walker = GraphWalker(store, max_depth=max_depth)
         self.max_depth = max_depth
+        self.clustering = clustering
 
     def recall(
         self,
@@ -92,6 +99,13 @@ class RetrievalEngine:
         if not anchor_ids:
             anchor_ids = self._keyword_search(query)
 
+        # 2b. Community-first routing — identify which communities are relevant
+        relevant_communities: set = set()
+        if anchor_ids and self.clustering and self.clustering.is_clustered:
+            relevant_communities = set(
+                self.clustering.get_communities_for_anchors(anchor_ids)
+            )
+
         # 3. Walk graph from anchors
         if anchor_ids:
             node_distances = self.walker.walk(anchor_ids)
@@ -121,7 +135,16 @@ class RetrievalEngine:
                 now=now,
             )
 
-            if breakdown.composite < min_score:
+            # Community boost — nodes in same community as anchors get a boost
+            community_boost = 0.0
+            if relevant_communities and self.clustering:
+                node_community = self.clustering.get_community(node_id)
+                if node_community is not None and node_community in relevant_communities:
+                    community_boost = self.COMMUNITY_BOOST
+
+            final_score = breakdown.composite + community_boost
+
+            if final_score < min_score:
                 continue
 
             # Build path labels
@@ -137,11 +160,13 @@ class RetrievalEngine:
                 node_type=node.node_type.value,
                 label=node.label,
                 content=node.content,
-                score=breakdown.composite,
+                score=final_score,
                 score_breakdown={
                     "recency": breakdown.recency,
                     "frequency": breakdown.frequency,
                     "proximity": breakdown.proximity,
+                    "base_composite": breakdown.composite,
+                    "community_boost": community_boost,
                 },
                 path=path_labels,
             ))

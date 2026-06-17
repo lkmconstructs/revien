@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
+from revien.graph.clustering import CommunityDetector
 from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 
@@ -88,14 +89,20 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
     store = GraphStore(db_path=db_path)
     ops = GraphOperations(store)
     pipeline = IngestionPipeline(store)
-    engine = RetrievalEngine(store)
+    clustering = CommunityDetector(db_path=db_path)
+    engine = RetrievalEngine(store, clustering=clustering)
     start_time = time.time()
+
+    # Load existing community assignments (or run initial clustering)
+    if not clustering.load_from_db():
+        clustering.run()
 
     # Store references on app for access by daemon/scheduler
     app.state.store = store
     app.state.ops = ops
     app.state.pipeline = pipeline
     app.state.engine = engine
+    app.state.clustering = clustering
 
     # ── POST /v1/ingest ───────────────────────────────
 
@@ -117,6 +124,11 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             metadata=request.metadata,
         )
         result = pipeline.ingest(input_data)
+
+        # Notify clustering — recluster if threshold reached
+        if clustering.notify_ingest():
+            clustering.run()
+
         return IngestResponse(
             context_node_id=result.context_node_id,
             nodes_created=result.nodes_created,
@@ -243,6 +255,35 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             }
         except Exception as e:
             raise HTTPException(400, f"Invalid graph data: {str(e)}")
+
+    # ── POST /v1/cluster ─────────────────────────────
+
+    @app.post("/v1/cluster")
+    async def run_clustering():
+        """Trigger community detection on the graph. Returns community summary."""
+        communities = clustering.run()
+        return {
+            "status": "clustered",
+            "community_count": len(communities),
+            "communities": clustering.get_all_communities(),
+        }
+
+    # ── GET /v1/communities ──────────────────────────
+
+    @app.get("/v1/communities")
+    async def list_communities():
+        """List detected communities with centroids and sizes."""
+        if not clustering.is_clustered:
+            return {
+                "status": "unclustered",
+                "community_count": 0,
+                "communities": [],
+            }
+        return {
+            "status": "clustered",
+            "community_count": clustering.community_count,
+            "communities": clustering.get_all_communities(),
+        }
 
     # ── GET /v1/health ────────────────────────────────
 
