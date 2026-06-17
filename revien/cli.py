@@ -225,6 +225,42 @@ def ingest(content: str, source: str, db: Optional[str]):
 
 @main.command()
 @click.option("--db", default=None, help="Database path")
+def reindex(db: Optional[str]):
+    """Backfill semantic embeddings for existing nodes (opt-in semantic layer).
+
+    Requires the `semantic` extra: pip install revien[semantic]. Without it (or
+    with REVIEN_SEMANTIC=0) this reports the layer is disabled and does nothing.
+    """
+    from revien.graph.store import GraphStore
+    from revien.semantic.index import SemanticIndex
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        semantic = SemanticIndex(store)
+        if not semantic.is_enabled:
+            st = semantic.status()
+            click.echo("Semantic layer is disabled.")
+            click.echo(f"  extra installed (sqlite-vec): {st['sqlite_vec']}")
+            click.echo(f"  fastembed installed: {st['fastembed']}")
+            click.echo(f"  env gate (REVIEN_SEMANTIC): {st['env_gate']}")
+            click.echo("Install with: pip install revien[semantic]")
+            return
+        result = semantic.reindex_all()
+        click.echo(f"Reindexed {result.get('indexed', 0)} nodes "
+                   f"(status: {result.get('status')}).")
+    finally:
+        store.close()
+
+
+@main.command()
+@click.option("--db", default=None, help="Database path")
 def status(db: Optional[str]):
     """Show Revien status and graph statistics."""
     from revien.graph.store import GraphStore

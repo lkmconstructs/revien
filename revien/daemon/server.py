@@ -16,6 +16,7 @@ from revien.graph.operations import GraphOperations
 from revien.graph.clustering import CommunityDetector
 from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
+from revien.semantic.index import SemanticIndex
 
 
 # ── Request/Response Models ───────────────────────────────
@@ -88,9 +89,13 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
     # Shared state
     store = GraphStore(db_path=db_path)
     ops = GraphOperations(store)
-    pipeline = IngestionPipeline(store)
+    # One shared semantic index (opt-in). Self-disables without the `semantic`
+    # extra, so ingest/recall run the unchanged graph path. Sharing it means
+    # ingest-time embeddings and recall-time search hit the same vec0 table.
+    semantic = SemanticIndex(store)
+    pipeline = IngestionPipeline(store, semantic=semantic)
     clustering = CommunityDetector(db_path=db_path)
-    engine = RetrievalEngine(store, clustering=clustering)
+    engine = RetrievalEngine(store, clustering=clustering, semantic=semantic)
     start_time = time.time()
 
     # Load existing community assignments (or run initial clustering)
@@ -103,6 +108,7 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
     app.state.pipeline = pipeline
     app.state.engine = engine
     app.state.clustering = clustering
+    app.state.semantic = semantic
 
     # ── POST /v1/ingest ───────────────────────────────
 
@@ -386,6 +392,25 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             "confidence": updated.confidence,
             "source_type": updated.source_type.value,
         }
+
+    # ── POST /v1/reindex ───────────────────────────────
+    # Backfill embeddings for existing nodes (opt-in semantic layer). When the
+    # `semantic` extra is absent or REVIEN_SEMANTIC=0, this reports status
+    # "disabled" and does nothing — graph retrieval is unaffected either way.
+    @app.post("/v1/reindex")
+    async def reindex():
+        """Embed all existing content nodes into the semantic vector index.
+
+        No-op (status 'disabled') when the opt-in `semantic` extra is not
+        installed or REVIEN_SEMANTIC=0.
+        """
+        return semantic.reindex_all()
+
+    # ── GET /v1/semantic/status ────────────────────────
+    @app.get("/v1/semantic/status")
+    async def semantic_status():
+        """Report whether the opt-in semantic/vector layer is active and why."""
+        return semantic.status()
 
     return app
 

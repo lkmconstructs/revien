@@ -13,6 +13,9 @@ from revien.graph.operations import GraphOperations
 from .extractor import ExtractionResult, RuleBasedExtractor
 from .extractor_llm import TextExtractor, build_extractor
 from .dedup import Deduplicator
+# Semantic indexing is opt-in (pip install revien[semantic]). SemanticIndex
+# self-disables when the extra is absent, so ingest() is unchanged without it.
+from revien.semantic.index import SemanticIndex
 
 
 @dataclass
@@ -45,7 +48,12 @@ class IngestionPipeline:
     4. Return summary of what happened
     """
 
-    def __init__(self, store: GraphStore, extractor: Optional[TextExtractor] = None):
+    def __init__(
+        self,
+        store: GraphStore,
+        extractor: Optional[TextExtractor] = None,
+        semantic: Optional[SemanticIndex] = None,
+    ):
         self.store = store
         self.ops = GraphOperations(store)
         # LOCAL-FIRST: build the configured extractor (env REVIEN_EXTRACTOR,
@@ -54,6 +62,11 @@ class IngestionPipeline:
         # and never goes to the network unless explicitly opted in.
         self.extractor: TextExtractor = extractor or build_extractor()
         self.dedup = Deduplicator(store, self.ops)
+        # Opt-in semantic indexing. Self-disables without the `semantic` extra;
+        # when enabled, newly-created nodes are embedded at ingest time so the
+        # hybrid recall path can find them. Failures inside the index never
+        # propagate (it self-disables), so ingest is robust either way.
+        self.semantic = semantic if semantic is not None else SemanticIndex(store)
 
     def ingest(self, input_data: IngestionInput) -> IngestionOutput:
         """
@@ -70,6 +83,8 @@ class IngestionPipeline:
         id_map = {}  # old_id -> actual_id (may differ if deduplicated)
         nodes_created = 0
         nodes_deduped = 0
+        # Track newly-created, non-context nodes for opt-in semantic indexing.
+        newly_created: List[tuple] = []  # (node_id, label, content)
 
         for candidate_node in extraction.nodes:
             old_id = candidate_node.node_id
@@ -77,6 +92,10 @@ class IngestionPipeline:
             id_map[old_id] = actual_node.node_id
             if is_new:
                 nodes_created += 1
+                if actual_node.node_type != NodeType.CONTEXT:
+                    newly_created.append(
+                        (actual_node.node_id, actual_node.label, actual_node.content)
+                    )
             else:
                 nodes_deduped += 1
 
@@ -102,6 +121,13 @@ class IngestionPipeline:
             )
             self.store.add_edge(new_edge)
             edges_created += 1
+
+        # 3b. Semantic indexing (opt-in). Embed the newly-created content nodes
+        # so keyword-less queries can retrieve them. No-op when the layer is
+        # disabled; index_nodes self-disables on any failure rather than
+        # breaking ingestion.
+        if self.semantic.is_enabled and newly_created:
+            self.semantic.index_nodes(newly_created)
 
         # 4. Get context node ID from mapping
         context_id = id_map.get(

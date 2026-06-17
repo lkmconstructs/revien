@@ -30,6 +30,10 @@ from revien.ingestion.extractor import RuleBasedExtractor
 # are missing; TrainingLoop is pure sqlite3 stdlib).
 from revien.neural.scorer_model import NeuralScorer
 from revien.neural.training import TrainingLoop
+# Semantic/vector layer is opt-in (pip install revien[semantic]). SemanticIndex
+# imports cleanly without the extra and self-disables (is_enabled False), so
+# recall() runs the unchanged graph path when it is absent or REVIEN_SEMANTIC=0.
+from revien.semantic.index import SemanticIndex
 from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer
 from .walker import GraphWalker
 
@@ -71,6 +75,22 @@ class RetrievalEngine:
     # Community membership boost — nodes in the same community as anchors score higher
     COMMUNITY_BOOST = 0.15
 
+    # Semantic blend — when the opt-in semantic layer surfaces a node, add a
+    # bounded bonus proportional to how far the node's similarity exceeds a
+    # floor. Mirrors COMMUNITY_BOOST in magnitude so it nudges ranking without
+    # dominating the three-factor base.
+    SEMANTIC_BOOST = 0.15
+    # How many nearest neighbours to consider at recall time.
+    SEMANTIC_TOP_K = 10
+    # Similarity floor. Embedding models (e.g. bge-small) score almost every
+    # node as mildly related to almost any query, which would flatten ranking
+    # if every neighbour became an equal-weight anchor. We only treat a node as
+    # a semantic anchor / give it a boost when its similarity clears this floor,
+    # and the boost is scaled by (sim - floor) so weak matches contribute ~0.
+    # This keeps keyword queries unchanged-or-better while still letting a
+    # keyword-less query reach a genuinely-close node.
+    SEMANTIC_SIM_FLOOR = 0.55
+
     def __init__(
         self,
         store: GraphStore,
@@ -79,6 +99,7 @@ class RetrievalEngine:
         clustering: Optional[CommunityDetector] = None,
         model_dir: Optional[str] = None,
         training_db: Optional[str] = None,
+        semantic: Optional[SemanticIndex] = None,
     ):
         self.store = store
         self.ops = GraphOperations(store)
@@ -93,6 +114,11 @@ class RetrievalEngine:
         # is a pass-through, so recall() degrades to base scoring.
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
+
+        # Semantic/vector layer (opt-in). Constructs cleanly even without the
+        # `semantic` extra: SemanticIndex.is_enabled stays False and all of its
+        # methods no-op, so recall() degrades to the exact graph-only path.
+        self.semantic = semantic if semantic is not None else SemanticIndex(store)
 
     def recall(
         self,
@@ -125,6 +151,24 @@ class RetrievalEngine:
         # 2. If no anchors found, try keyword search across all nodes
         if not anchor_ids:
             anchor_ids = self._keyword_search(query)
+
+        # 2a. Hybrid semantic anchors (opt-in). When the semantic layer is
+        # enabled, embed the query, pull the nearest stored nodes, and UNION
+        # them into the anchor set. This is what lets a keyword-less query
+        # (no entity/keyword overlap with any node) still find relevant nodes.
+        # When the layer is disabled, semantic_sims is empty and the anchor set
+        # is byte-for-byte what it was before this leg.
+        semantic_sims: Dict[str, float] = {}
+        if self.semantic.is_enabled:
+            for node_id, sim in self.semantic.search(query, top_k=self.SEMANTIC_TOP_K):
+                # Only nodes that clear the floor act as semantic anchors. This
+                # is what lets a keyword-less query reach a genuinely-close node
+                # without near-uniform mild similarity reshuffling keyword hits.
+                if sim < self.SEMANTIC_SIM_FLOOR:
+                    continue
+                semantic_sims[node_id] = sim
+                if node_id not in anchor_ids:
+                    anchor_ids.append(node_id)
 
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
@@ -177,11 +221,27 @@ class RetrievalEngine:
                 if node_community is not None and node_community in relevant_communities:
                     community_boost = self.COMMUNITY_BOOST
 
+            # Semantic boost (opt-in). When the semantic layer surfaced this
+            # node for the query, add a bounded similarity-weighted bonus.
+            # semantic_sims is empty whenever the layer is disabled, so this
+            # branch never runs and the score expression below is unchanged.
+            semantic_boost = 0.0
+            if semantic_sims:
+                sim = semantic_sims.get(node_id)
+                if sim is not None:
+                    # Scale by how far similarity clears the floor, normalized so
+                    # a perfect match (sim==1) yields the full SEMANTIC_BOOST and
+                    # a just-at-floor match yields ~0. Floor-gated above, so sim
+                    # here is always >= SEMANTIC_SIM_FLOOR.
+                    span = max(1e-6, 1.0 - self.SEMANTIC_SIM_FLOOR)
+                    norm = (sim - self.SEMANTIC_SIM_FLOOR) / span
+                    semantic_boost = self.SEMANTIC_BOOST * norm
+
             # Layer 1 (leg 1): confidence multiplier as a post-factor.
             # Lazy decay for INFERRED nodes is applied here, reusing leg-1's
             # GraphOperations._apply_decay helper (no duplicated decay logic).
             effective_confidence = self._effective_confidence(node, now)
-            final_score = (base_score + community_boost) * effective_confidence
+            final_score = (base_score + community_boost + semantic_boost) * effective_confidence
 
             if final_score < min_score:
                 continue
@@ -194,21 +254,27 @@ class RetrievalEngine:
                 if pnode:
                     path_labels.append(pnode.label)
 
+            score_breakdown = {
+                "recency": breakdown.recency,
+                "frequency": breakdown.frequency,
+                "proximity": breakdown.proximity,
+                "base_composite": breakdown.composite,
+                "community_boost": community_boost,
+                "effective_confidence": effective_confidence,
+                "neural_adjusted": self.neural_scorer.is_neural,
+            }
+            # Only surface the semantic component when the opt-in layer is
+            # enabled, so the disabled-path breakdown is byte-for-byte unchanged.
+            if self.semantic.is_enabled:
+                score_breakdown["semantic_boost"] = semantic_boost
+
             scored_results.append(RetrievalResult(
                 node_id=node.node_id,
                 node_type=node.node_type.value,
                 label=node.label,
                 content=node.content,
                 score=final_score,
-                score_breakdown={
-                    "recency": breakdown.recency,
-                    "frequency": breakdown.frequency,
-                    "proximity": breakdown.proximity,
-                    "base_composite": breakdown.composite,
-                    "community_boost": community_boost,
-                    "effective_confidence": effective_confidence,
-                    "neural_adjusted": self.neural_scorer.is_neural,
-                },
+                score_breakdown=score_breakdown,
                 path=path_labels,
             ))
 
