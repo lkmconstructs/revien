@@ -55,6 +55,7 @@ class GraphOperations:
                 confidence=new_confidence,
                 confidence_set_at=now,
                 source_context="lazy_decay",
+                _audit_op="decay",
             ) or node
         return node
 
@@ -78,6 +79,8 @@ class GraphOperations:
             source_context="reinforced_after_use",
             last_referenced=now,
             metadata={**node.metadata, "_reinforced_by": construct_id},
+            _audit_op="reinforce",
+            _audit_actor=construct_id,
         )
 
     def correct_node(
@@ -104,7 +107,106 @@ class GraphOperations:
                 "_corrected_by": construct_id,
                 "_corrected_at": now.isoformat(),
             },
+            _audit_op="correct",
+            _audit_actor=construct_id,
         )
+
+    def invalidate_node(
+        self, node_id: str, reason: str = "", construct_id: str = ""
+    ) -> Optional[Node]:
+        """Soft-invalidate a node: mark it stale without deleting anything.
+
+        Sets ``invalidated_at`` to now and writes an audit entry. This is for
+        correction / archive / supersession — the node's content is RETAINED and
+        the row is never removed. Invalidated nodes are excluded from default
+        recall but remain fully inspectable and recoverable. This is NOT deletion
+        and NOT right-to-forget (that is leg 6b). Idempotent: re-invalidating an
+        already-invalid node leaves the original timestamp untouched.
+        """
+        node = self.store.get_node(node_id)
+        if node is None:
+            return None
+        if node.invalidated_at is not None:
+            # Already stale — don't overwrite the original timestamp.
+            return node
+
+        now = datetime.now(timezone.utc)
+        return self.store.update_node(
+            node_id,
+            invalidated_at=now,
+            metadata={
+                **node.metadata,
+                "_invalidated_by": construct_id,
+                "_invalidated_reason": reason,
+                "_invalidated_at": now.isoformat(),
+            },
+            _audit_op="invalidate",
+            _audit_actor=construct_id,
+        )
+
+    def get_lineage(self, node_id: str, max_depth: int = 10) -> Dict:
+        """Trace a node's derivation chain via DERIVED_FROM edges.
+
+        Walks DERIVED_FROM edges in the source→ancestor direction (a node is
+        ``DERIVED_FROM`` its source, so we follow edges where this node is the
+        SOURCE node to reach its ancestors). Bounded depth and cycle-safe.
+
+        Returns:
+            {
+              "node_id": <id>,
+              "ancestors": [ {node summary, "depth": n}, ... ],  # nearest first
+              "truncated": bool,  # True if max_depth stopped the walk
+            }
+        """
+        root = self.store.get_node(node_id)
+        if root is None:
+            return {"node_id": node_id, "ancestors": [], "truncated": False}
+
+        ancestors: List[Dict] = []
+        visited = {node_id}
+        truncated = False
+        # BFS over DERIVED_FROM edges, current node as edge SOURCE -> ancestor.
+        frontier = [(node_id, 0)]
+        while frontier:
+            current_id, depth = frontier.pop(0)
+            if depth >= max_depth:
+                # Stop expanding; flag truncation only if more would follow.
+                edges = self.store.get_edges_for_node(current_id)
+                if any(
+                    e.edge_type == EdgeType.DERIVED_FROM
+                    and e.source_node_id == current_id
+                    and e.target_node_id not in visited
+                    for e in edges
+                ):
+                    truncated = True
+                continue
+
+            for edge in self.store.get_edges_for_node(current_id):
+                if edge.edge_type != EdgeType.DERIVED_FROM:
+                    continue
+                # current is DERIVED_FROM its source -> ancestor is the target.
+                if edge.source_node_id != current_id:
+                    continue
+                ancestor_id = edge.target_node_id
+                if ancestor_id in visited:
+                    continue
+                visited.add(ancestor_id)
+                ancestor = self.store.get_node(ancestor_id)
+                if ancestor is None:
+                    continue
+                ancestors.append({
+                    "node_id": ancestor.node_id,
+                    "node_type": ancestor.node_type.value,
+                    "label": ancestor.label,
+                    "depth": depth + 1,
+                    "invalidated_at": (
+                        ancestor.invalidated_at.isoformat()
+                        if ancestor.invalidated_at else None
+                    ),
+                })
+                frontier.append((ancestor_id, depth + 1))
+
+        return {"node_id": node_id, "ancestors": ancestors, "truncated": truncated}
 
     def propagate_confidence(
         self, source_node_id: str, max_hops: int = 2
@@ -239,10 +341,14 @@ class GraphOperations:
         node = self.store.get_node(node_id)
         if node is None:
             return None
+        # Bookkeeping bump (access_count / last_accessed). Audit of access is
+        # owned by the engine's mark_used hook (op="access"); suppress the
+        # generic "update" entry here to avoid flooding the trail on every recall.
         return self.store.update_node(
             node_id,
             access_count=node.access_count + 1,
             last_accessed=datetime.now(timezone.utc),
+            _audit_op=None,
         )
 
     def get_node_with_edges(self, node_id: str) -> Optional[Dict]:

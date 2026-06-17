@@ -126,6 +126,7 @@ class RetrievalEngine:
         top_n: int = 5,
         min_score: float = 0.01,
         now: Optional[datetime] = None,
+        include_invalidated: bool = False,
     ) -> RetrievalResponse:
         """
         Query the memory graph and return ranked results.
@@ -135,6 +136,12 @@ class RetrievalEngine:
             top_n: Maximum results to return (default 5, max 20)
             min_score: Minimum composite score threshold
             now: Current time for recency scoring (defaults to UTC now)
+            include_invalidated: When False (default), soft-invalidated nodes
+                (invalidated_at set) are excluded from results. Set True to
+                surface them. Provenance is non-destructive — invalidated nodes
+                are retained and recoverable, just hidden from default recall.
+                When no node is invalidated this flag changes nothing, so recall
+                is byte-identical to the pre-6a behavior.
 
         Returns:
             RetrievalResponse with ranked nodes and timing data
@@ -196,6 +203,11 @@ class RetrievalEngine:
 
             # Skip context nodes from results (they're structural, not content)
             if node.node_type == NodeType.CONTEXT:
+                continue
+
+            # Provenance (leg 6a): exclude soft-invalidated nodes by default.
+            # No-op when nothing is invalidated, so recall stays byte-identical.
+            if node.invalidated_at is not None and not include_invalidated:
                 continue
 
             # Three-factor base score (recency + frequency + proximity)
@@ -411,6 +423,15 @@ class RetrievalEngine:
 
         # 2. Touch the node (bump access count + last_accessed)
         self.ops.touch_node(node_id)
+
+        # 2b. Provenance hook (leg 6a): record the access in the audit trail.
+        # touch_node suppresses its own generic "update"; this is the single
+        # "access" entry. Defensive — never breaks the underlying op.
+        accessed = self.store.get_node(node_id)
+        if accessed is not None:
+            self.store._record_node_audit(
+                node_id, "access", after_node=accessed,
+            )
 
         # 3. Reinforce edges connected to this node (retrieval-driven learning)
         REINFORCEMENT_DELTA = 0.05  # Small boost per usage

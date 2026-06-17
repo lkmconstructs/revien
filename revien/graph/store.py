@@ -48,7 +48,8 @@ class GraphStore:
                 confidence_set_at TEXT,
                 confidence_set_by TEXT DEFAULT '',
                 source_context TEXT DEFAULT '',
-                last_referenced TEXT
+                last_referenced TEXT,
+                invalidated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -67,6 +68,20 @@ class GraphStore:
                 FOREIGN KEY (target_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
             );
 
+            -- Provenance Layer (leg 6a): append-only audit trail. Never updated,
+            -- never deleted. before_json/after_json capture node state snapshots
+            -- around each recorded op. No FK to nodes(node_id) on purpose — the
+            -- trail must survive even if a node row is later removed.
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                op TEXT NOT NULL,
+                actor TEXT DEFAULT '',
+                ts TEXT NOT NULL,
+                before_json TEXT,
+                after_json TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
@@ -75,6 +90,8 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
             CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence);
             CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence);
+            CREATE INDEX IF NOT EXISTS idx_audit_node ON audit_log(node_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
         """)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
@@ -110,6 +127,27 @@ class GraphStore:
                 conn.execute("ALTER TABLE nodes ADD COLUMN source_context TEXT DEFAULT ''")
             if "last_referenced" not in columns:
                 conn.execute("ALTER TABLE nodes ADD COLUMN last_referenced TEXT")
+            # Provenance Layer (leg 6a): soft-invalidation marker. Nullable,
+            # backfills NULL on existing rows (every old node is live).
+            if "invalidated_at" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN invalidated_at TEXT")
+
+            # Provenance Layer (leg 6a): append-only audit trail for pre-6a DBs.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL,
+                    op TEXT NOT NULL,
+                    actor TEXT DEFAULT '',
+                    ts TEXT NOT NULL,
+                    before_json TEXT,
+                    after_json TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_node ON audit_log(node_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
 
             cursor = conn.execute("PRAGMA table_info(edges)")
             edge_columns = {row[1] for row in cursor.fetchall()}
@@ -145,6 +183,108 @@ class GraphStore:
             self._conn.close()
             self._conn = None
 
+    # ── Provenance Layer (leg 6a): append-only audit ──────
+
+    def record_audit(
+        self,
+        node_id: str,
+        op: str,
+        actor: str = "",
+        before: Optional[dict] = None,
+        after: Optional[dict] = None,
+        ts: Optional[datetime] = None,
+    ) -> None:
+        """Append one row to the audit_log. Defensive by design.
+
+        Provenance is append-only: this only ever INSERTs. An audit-write
+        failure must NEVER break the underlying op, so any error here is
+        swallowed (the operation that triggered it has already committed).
+        """
+        try:
+            conn = self._get_conn()
+            stamp = (ts or datetime.now(timezone.utc)).isoformat()
+            conn.execute(
+                """INSERT INTO audit_log (node_id, op, actor, ts, before_json, after_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    node_id,
+                    op,
+                    actor or "",
+                    stamp,
+                    json.dumps(before) if before is not None else None,
+                    json.dumps(after) if after is not None else None,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            # Never let provenance bookkeeping break the underlying op.
+            pass
+
+    @staticmethod
+    def _audit_snapshot(node: Optional["Node"]) -> Optional[dict]:
+        """Compact, JSON-safe snapshot of a node for audit before/after fields."""
+        if node is None:
+            return None
+        try:
+            return node.model_dump(mode="json")
+        except Exception:
+            return None
+
+    def _record_node_audit(
+        self,
+        node_id: str,
+        op: str,
+        actor: str = "",
+        before_node: Optional["Node"] = None,
+        after_node: Optional["Node"] = None,
+    ) -> None:
+        """Snapshot the given nodes and append an audit row — fully guarded.
+
+        Snapshotting AND the write both happen inside one try/except so an
+        audit-write failure (snapshot or INSERT) can never break the op that
+        triggered it. Provenance is best-effort and append-only.
+        """
+        try:
+            self.record_audit(
+                node_id, op, actor=actor,
+                before=self._audit_snapshot(before_node),
+                after=self._audit_snapshot(after_node),
+            )
+        except Exception:
+            pass
+
+    def get_node_audit(self, node_id: str) -> list[dict]:
+        """Full audit history for one node, chronological (oldest first)."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT id, node_id, op, actor, ts, before_json, after_json
+               FROM audit_log WHERE node_id = ? ORDER BY id ASC""",
+            (node_id,),
+        ).fetchall()
+        return [self._row_to_audit(r) for r in rows]
+
+    def get_recent_audit(self, limit: int = 50) -> list[dict]:
+        """Most recent audit entries across all nodes (newest first)."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT id, node_id, op, actor, ts, before_json, after_json
+               FROM audit_log ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_audit(r) for r in rows]
+
+    @staticmethod
+    def _row_to_audit(row: tuple) -> dict:
+        return {
+            "id": row[0],
+            "node_id": row[1],
+            "op": row[2],
+            "actor": row[3] or "",
+            "ts": row[4],
+            "before": json.loads(row[5]) if row[5] else None,
+            "after": json.loads(row[6]) if row[6] else None,
+        }
+
     # ── Node CRUD ─────────────────────────────────────────
 
     def add_node(self, node: Node) -> Node:
@@ -154,8 +294,9 @@ class GraphStore:
                (node_id, node_type, label, content, source_id,
                 created_at, last_accessed, access_count, metadata,
                 source_type, confidence, pinned, confidence_set_at,
-                confidence_set_by, source_context, last_referenced)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                confidence_set_by, source_context, last_referenced,
+                invalidated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -173,9 +314,16 @@ class GraphStore:
                 node.confidence_set_by,
                 node.source_context,
                 node.last_referenced.isoformat() if node.last_referenced else None,
+                node.invalidated_at.isoformat() if node.invalidated_at else None,
             ),
         )
         conn.commit()
+        # Provenance hook: record node creation (append-only, never fatal).
+        self._record_node_audit(
+            node.node_id, "create",
+            actor=node.confidence_set_by,
+            before_node=None, after_node=node,
+        )
         return node
 
     def get_node(self, node_id: str) -> Optional[Node]:
@@ -187,8 +335,18 @@ class GraphStore:
             return None
         return self._row_to_node(row)
 
-    def update_node(self, node_id: str, **kwargs) -> Optional[Node]:
-        """Update specific fields on a node. Returns updated node or None."""
+    def update_node(
+        self, node_id: str, _audit_op: Optional[str] = "update",
+        _audit_actor: str = "", **kwargs
+    ) -> Optional[Node]:
+        """Update specific fields on a node. Returns updated node or None.
+
+        Provenance (leg 6a): records an audit entry (default op ``update``)
+        capturing before/after snapshots. Callers in the operations/engine layer
+        that record their own semantic op (reinforce/correct/decay/invalidate/
+        access) pass ``_audit_op=None`` to suppress this generic entry and avoid
+        double-logging.
+        """
         existing = self.get_node(node_id)
         if existing is None:
             return None
@@ -198,7 +356,7 @@ class GraphStore:
             "label", "content", "source_id", "access_count", "metadata",
             "last_accessed", "confidence", "pinned", "source_type",
             "confidence_set_at", "confidence_set_by", "source_context",
-            "last_referenced",
+            "last_referenced", "invalidated_at",
         )
         for field in allowed_fields:
             if field in kwargs:
@@ -210,7 +368,9 @@ class GraphStore:
         conn = self._get_conn()
         set_clauses = []
         values = []
-        datetime_fields = ("last_accessed", "confidence_set_at", "last_referenced")
+        datetime_fields = (
+            "last_accessed", "confidence_set_at", "last_referenced", "invalidated_at",
+        )
         for key, val in updates.items():
             set_clauses.append(f"{key} = ?")
             if key == "metadata":
@@ -230,7 +390,15 @@ class GraphStore:
             values,
         )
         conn.commit()
-        return self.get_node(node_id)
+        updated = self.get_node(node_id)
+        # Provenance hook: generic update entry unless a semantic caller
+        # (reinforce/correct/decay/invalidate/access) suppresses it.
+        if _audit_op:
+            self._record_node_audit(
+                node_id, _audit_op, actor=_audit_actor,
+                before_node=existing, after_node=updated,
+            )
+        return updated
 
     def delete_node(self, node_id: str) -> bool:
         """Delete a node and all its connected edges. Returns True if deleted."""
@@ -388,6 +556,8 @@ class GraphStore:
             confidence_set_by=row[13] if len(row) > 13 and row[13] else "",
             source_context=row[14] if len(row) > 14 and row[14] else "",
             last_referenced=datetime.fromisoformat(row[15]) if len(row) > 15 and row[15] else None,
+            # Provenance Layer (column 16): soft-invalidation marker.
+            invalidated_at=datetime.fromisoformat(row[16]) if len(row) > 16 and row[16] else None,
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:

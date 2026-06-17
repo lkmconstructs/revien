@@ -42,6 +42,7 @@ class RecallRequest(BaseModel):
     query: str
     top_n: int = 5
     min_score: float = 0.01
+    include_invalidated: bool = False
 
 
 class NodeUpdateRequest(BaseModel):
@@ -153,6 +154,7 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             query=request.query,
             top_n=request.top_n,
             min_score=request.min_score,
+            include_invalidated=request.include_invalidated,
         )
         return {
             "query": response.query,
@@ -392,6 +394,61 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             "confidence": updated.confidence,
             "source_type": updated.source_type.value,
         }
+
+    # ── POST /v1/nodes/{id}/invalidate ─────────────────
+    # Provenance (leg 6a): soft-invalidation. Marks a node stale WITHOUT
+    # deleting it. Content is retained; the node drops out of default recall but
+    # is still inspectable and recoverable. NOT right-to-forget (that is 6b).
+
+    class InvalidateRequest(BaseModel):
+        reason: str = ""
+        construct_id: str = ""
+
+    @app.post("/v1/nodes/{node_id}/invalidate")
+    async def invalidate_node_endpoint(
+        node_id: str, request: Optional[InvalidateRequest] = None
+    ):
+        """Soft-invalidate a node (mark stale, retain content). Non-destructive."""
+        req = request or InvalidateRequest()
+        updated = ops.invalidate_node(
+            node_id, reason=req.reason, construct_id=req.construct_id
+        )
+        if updated is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return {
+            "status": "invalidated",
+            "node_id": node_id,
+            "invalidated_at": (
+                updated.invalidated_at.isoformat() if updated.invalidated_at else None
+            ),
+        }
+
+    # ── GET /v1/nodes/{id}/audit ───────────────────────
+    # Provenance (leg 6a): full append-only history for one node, chronological.
+
+    @app.get("/v1/nodes/{node_id}/audit")
+    async def node_audit(node_id: str):
+        """Full audit history for a node (oldest first)."""
+        if store.get_node(node_id) is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return {"node_id": node_id, "audit": store.get_node_audit(node_id)}
+
+    # ── GET /v1/audit/recent ───────────────────────────
+
+    @app.get("/v1/audit/recent")
+    async def recent_audit(limit: int = Query(50, ge=1, le=1000)):
+        """Most recent audit entries across all nodes (newest first)."""
+        return {"limit": limit, "audit": store.get_recent_audit(limit=limit)}
+
+    # ── GET /v1/nodes/{id}/lineage ─────────────────────
+    # Provenance (leg 6a): derivation trace via DERIVED_FROM edges.
+
+    @app.get("/v1/nodes/{node_id}/lineage")
+    async def node_lineage(node_id: str, max_depth: int = Query(10, ge=1, le=100)):
+        """Trace a node's source/ancestor chain via DERIVED_FROM edges."""
+        if store.get_node(node_id) is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return ops.get_lineage(node_id, max_depth=max_depth)
 
     # ── POST /v1/reindex ───────────────────────────────
     # Backfill embeddings for existing nodes (opt-in semantic layer). When the

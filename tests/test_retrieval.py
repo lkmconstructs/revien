@@ -299,3 +299,59 @@ class TestScoringCustomConfig:
                 response.results[0].score_breakdown["proximity"]
                 >= response.results[-1].score_breakdown["proximity"]
             )
+
+
+# ── Provenance Layer (leg 6a): recall excludes invalidated nodes ──
+
+class TestRecallInvalidation:
+    """Recall excludes soft-invalidated nodes by default; include_invalidated
+    surfaces them. Behavior is byte-identical when nothing is invalidated."""
+
+    def _seed(self, store):
+        from revien.graph.schema import Node, NodeType, SourceType
+        from revien.graph.operations import GraphOperations
+        ops = GraphOperations(store)
+        ids = []
+        for i in range(4):
+            n = store.add_node(Node(
+                node_id=f"fixed-{i}", node_type=NodeType.FACT, label=f"node {i}",
+                content=f"postgres database fact number {i}",
+                source_type=SourceType.EXTRACTED, confidence=1.0,
+            ))
+            ids.append(n.node_id)
+        return ops, ids
+
+    def test_byte_identical_when_nothing_invalidated(self, store):
+        ops, _ = self._seed(store)
+        eng = RetrievalEngine(store)
+        # Two separate fresh stores would differ by side effects; instead seed a
+        # second identical store and compare first-call signatures.
+        from revien.graph.store import GraphStore
+        import tempfile, os
+        fd, p2 = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        s2 = GraphStore(db_path=p2)
+        self._seed(s2)
+        eng2 = RetrievalEngine(s2)
+        a = [(r.node_id, round(r.score, 12)) for r in
+             eng.recall("postgres database", top_n=10).results]
+        b = [(r.node_id, round(r.score, 12)) for r in
+             eng2.recall("postgres database", top_n=10, include_invalidated=True).results]
+        s2.close(); os.unlink(p2)
+        assert a == b
+
+    def test_default_excludes_invalidated(self, store):
+        ops, ids = self._seed(store)
+        eng = RetrievalEngine(store)
+        ops.invalidate_node("fixed-0")
+        result_ids = {r.node_id for r in eng.recall("postgres database", top_n=10).results}
+        assert "fixed-0" not in result_ids
+        assert "fixed-1" in result_ids
+
+    def test_include_invalidated_surfaces_it(self, store):
+        ops, ids = self._seed(store)
+        eng = RetrievalEngine(store)
+        ops.invalidate_node("fixed-0")
+        result_ids = {r.node_id for r in
+                      eng.recall("postgres database", top_n=10,
+                                 include_invalidated=True).results}
+        assert "fixed-0" in result_ids

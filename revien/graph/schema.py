@@ -30,6 +30,8 @@ class EdgeType(str, Enum):
     CONTRADICTS = "contradicts"
     # Confidence audit
     CORRECTS = "corrects"
+    # Provenance / lineage (leg 6a): target is derived FROM source.
+    DERIVED_FROM = "derived_from"
 
 
 class SourceType(str, Enum):
@@ -59,6 +61,12 @@ class Node(BaseModel):
     confidence_set_by: str = ""  # Which construct set this confidence
     source_context: str = ""  # Why this confidence value
     last_referenced: Optional[datetime] = None  # For freshness/decay checks
+
+    # Provenance Layer (leg 6a): soft-invalidation. Non-destructive staleness
+    # marker — content is RETAINED. NULL means live; a timestamp means the node
+    # has been marked stale (superseded/archived/corrected) and is excluded from
+    # default recall. This is NOT deletion and NOT forget.
+    invalidated_at: Optional[datetime] = None
 
 
 class Edge(BaseModel):

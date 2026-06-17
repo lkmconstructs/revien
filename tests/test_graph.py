@@ -155,7 +155,9 @@ class TestEdgeCreation:
 
     def test_all_edge_types_covered(self):
         # 6 core relationship types + CORRECTS (confidence-layer audit edge)
-        assert len(EdgeType) == 7
+        # + DERIVED_FROM (provenance/lineage edge, leg 6a)
+        assert len(EdgeType) == 8
+        assert EdgeType.DERIVED_FROM in EdgeType
 
 
 # ── Update Operations ─────────────────────────────────────
@@ -395,3 +397,119 @@ class TestListingAndCounting:
         assert len(neighbors) == 2
         assert n2.node_id in neighbors
         assert n3.node_id in neighbors
+
+
+# ── Provenance Layer (leg 6a): audit, lineage, soft-invalidation ──
+
+class TestAuditLog:
+    """Append-only audit trail. Records create/reinforce/correct/invalidate;
+    access via mark_used. Audit-write failures never break the underlying op."""
+
+    def test_create_records_audit(self, store):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        hist = store.get_node_audit(n.node_id)
+        assert [e["op"] for e in hist] == ["create"]
+        assert hist[0]["before"] is None
+        assert hist[0]["after"]["node_id"] == n.node_id
+
+    def test_reinforce_correct_invalidate_recorded_in_order(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x",
+                                source_type=SourceType.INFERRED, confidence=0.5))
+        ops.reinforce_node(n.node_id, construct_id="bash")
+        ops.correct_node(n.node_id, correction_context="wrong", construct_id="bash")
+        ops.invalidate_node(n.node_id, reason="superseded", construct_id="bash")
+        ops_seen = [e["op"] for e in store.get_node_audit(n.node_id)]
+        assert ops_seen == ["create", "reinforce", "correct", "invalidate"]
+
+    def test_decay_records_audit(self, store, ops):
+        old = datetime.now(timezone.utc) - timedelta(weeks=100)
+        n = store.add_node(Node(node_type=NodeType.FACT, label="aged", content="x",
+                                source_type=SourceType.INFERRED, confidence=0.9,
+                                last_referenced=old))
+        ops._apply_decay(n)
+        ops_seen = [e["op"] for e in store.get_node_audit(n.node_id)]
+        assert "decay" in ops_seen
+
+    def test_recent_audit_newest_first(self, store):
+        a = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        b = store.add_node(Node(node_type=NodeType.FACT, label="b", content="y"))
+        recent = store.get_recent_audit(limit=10)
+        assert recent[0]["node_id"] == b.node_id  # newest first
+        assert {r["node_id"] for r in recent} == {a.node_id, b.node_id}
+
+    def test_audit_failure_never_breaks_op(self, store, monkeypatch):
+        # Simulate an audit-write failure: make record_audit raise (e.g. a DB
+        # error inside the INSERT). The guarded _record_node_audit wrapper used
+        # by add_node must swallow it so the underlying op still succeeds.
+        def boom(*a, **k):
+            raise RuntimeError("audit boom")
+        monkeypatch.setattr(store, "record_audit", boom)
+        try:
+            n = store.add_node(Node(node_type=NodeType.FACT, label="z", content="x"))
+        except RuntimeError:
+            pytest.fail("audit-write failure must not break add_node")
+        # Underlying op succeeded; the audit row is simply absent (write failed),
+        # which is the acceptable degraded outcome.
+        assert store.get_node(n.node_id) is not None
+
+
+class TestLineage:
+    """DERIVED_FROM trace: ancestor chain, bounded depth, cycle-safe."""
+
+    def _n(self, store, label):
+        return store.add_node(Node(node_type=NodeType.FACT, label=label, content=label))
+
+    def test_simple_chain(self, store, ops):
+        a = self._n(store, "a"); b = self._n(store, "b"); c = self._n(store, "c")
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(c.node_id, b.node_id, EdgeType.DERIVED_FROM)
+        lin = ops.get_lineage(c.node_id)
+        anc = [x["node_id"] for x in lin["ancestors"]]
+        assert anc == [b.node_id, a.node_id]
+        assert lin["truncated"] is False
+
+    def test_no_ancestors(self, store, ops):
+        a = self._n(store, "a")
+        assert ops.get_lineage(a.node_id)["ancestors"] == []
+
+    def test_depth_bounded(self, store, ops):
+        a = self._n(store, "a"); b = self._n(store, "b"); c = self._n(store, "c")
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(c.node_id, b.node_id, EdgeType.DERIVED_FROM)
+        lin = ops.get_lineage(c.node_id, max_depth=1)
+        assert [x["node_id"] for x in lin["ancestors"]] == [b.node_id]
+        assert lin["truncated"] is True
+
+    def test_cycle_safe(self, store, ops):
+        a = self._n(store, "a"); b = self._n(store, "b")
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(a.node_id, b.node_id, EdgeType.DERIVED_FROM)  # cycle
+        lin = ops.get_lineage(b.node_id)  # must terminate
+        assert len(lin["ancestors"]) <= 2
+
+
+class TestSoftInvalidation:
+    """invalidate_node marks stale, retains content, is idempotent."""
+
+    def test_invalidate_sets_timestamp_retains_content(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="keepme"))
+        ops.invalidate_node(n.node_id, reason="archived")
+        got = store.get_node(n.node_id)
+        assert got is not None                  # NOT deleted
+        assert got.content == "keepme"          # content RETAINED
+        assert got.invalidated_at is not None
+
+    def test_invalidate_idempotent(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        first = ops.invalidate_node(n.node_id).invalidated_at
+        second = ops.invalidate_node(n.node_id).invalidated_at
+        assert first == second                  # original timestamp preserved
+
+    def test_invalidate_missing_node(self, store, ops):
+        assert ops.invalidate_node("nope") is None
+
+    def test_invalidated_at_persists_roundtrip(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        ops.invalidate_node(n.node_id)
+        reloaded = store.get_node(n.node_id)
+        assert isinstance(reloaded.invalidated_at, datetime)
