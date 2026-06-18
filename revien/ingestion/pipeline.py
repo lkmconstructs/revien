@@ -121,10 +121,14 @@ class IngestionPipeline:
             id_map[old_id] = actual_node.node_id
             if is_new:
                 nodes_created += 1
-                if actual_node.node_type != NodeType.CONTEXT:
-                    newly_created.append(
-                        (actual_node.node_id, actual_node.label, actual_node.content)
-                    )
+                # Index ALL new nodes, INCLUDING CONTEXT (verbatim turns). For
+                # conversational memory the verbatim turn is the answer-bearing
+                # content; excluding context left the only coherent representation
+                # of a turn invisible to semantic search (only the extracted —
+                # and sometimes shredded — nodes were searchable).
+                newly_created.append(
+                    (actual_node.node_id, actual_node.label, actual_node.content)
+                )
             else:
                 nodes_deduped += 1
 

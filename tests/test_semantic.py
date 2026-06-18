@@ -90,8 +90,9 @@ class TestDisabledDegradesToBase:
         eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
         resp = eng.recall("What database did we choose?", top_n=5)
 
-        # The disabled path must not introduce a semantic_boost key.
+        # The disabled path must not introduce a semantic key.
         for r in resp.results:
+            assert "semantic_sim" not in r.score_breakdown
             assert "semantic_boost" not in r.score_breakdown
         # And it must still retrieve via the keyword path (unchanged behavior).
         assert resp.nodes_examined >= 0
@@ -199,9 +200,9 @@ class TestHybridWiringWithMock:
         results = eng_on.recall(query).results
         assert results, "hybrid recall returned nothing"
         assert results[0].node_id == dog.node_id
-        # The semantic component is recorded in the breakdown when enabled.
-        assert "semantic_boost" in results[0].score_breakdown
-        assert results[0].score_breakdown["semantic_boost"] > 0
+        # The semantic component (similarity) is recorded in the breakdown when enabled.
+        assert "semantic_sim" in results[0].score_breakdown
+        assert results[0].score_breakdown["semantic_sim"] > 0
 
     def test_ingest_indexes_new_nodes(self, store):
         sem = _InMemoryVectorIndex(store, _MockEmbedder())

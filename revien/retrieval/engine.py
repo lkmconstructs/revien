@@ -75,21 +75,24 @@ class RetrievalEngine:
     # Community membership boost — nodes in the same community as anchors score higher
     COMMUNITY_BOOST = 0.15
 
-    # Semantic blend — when the opt-in semantic layer surfaces a node, add a
-    # bounded bonus proportional to how far the node's similarity exceeds a
-    # floor. Mirrors COMMUNITY_BOOST in magnitude so it nudges ranking without
-    # dominating the three-factor base.
-    SEMANTIC_BOOST = 0.15
-    # How many nearest neighbours to consider at recall time.
-    SEMANTIC_TOP_K = 10
-    # Similarity floor. Embedding models (e.g. bge-small) score almost every
-    # node as mildly related to almost any query, which would flatten ranking
-    # if every neighbour became an equal-weight anchor. We only treat a node as
-    # a semantic anchor / give it a boost when its similarity clears this floor,
-    # and the boost is scaled by (sim - floor) so weak matches contribute ~0.
-    # This keeps keyword queries unchanged-or-better while still letting a
-    # keyword-less query reach a genuinely-close node.
-    SEMANTIC_SIM_FLOOR = 0.55
+    # Semantic-FIRST ranking — when the opt-in semantic layer is enabled, a node
+    # the query embeds close to is ranked PRIMARILY by that similarity, and the
+    # three-factor graph composite only REFINES it (weight GRAPH_REFINE). This is
+    # what makes recall query-discriminative: a genuinely relevant node outranks
+    # high-frequency/high-proximity hub nodes, instead of being given a weak
+    # additive nudge that the hubs swamp (the v1 bug: same hubs returned for
+    # every query). When the layer is disabled this path is inert and the graph
+    # composite is used unchanged.
+    GRAPH_REFINE = 0.25
+    # How many nearest neighbours to pull as semantic anchors/candidates.
+    SEMANTIC_TOP_K = 30
+    # Similarity floor for treating a node as a semantic match. bge-small scores
+    # genuinely-relevant turns in roughly the 0.3-0.6 band, so the old 0.55 floor
+    # rejected most real matches and recall fell back to hub-walking. 0.30 admits
+    # real matches while excluding pure noise; the candidates are already the
+    # top-K nearest, so relative rank — not an absolute threshold — carries the
+    # signal.
+    SEMANTIC_SIM_FLOOR = 0.30
 
     def __init__(
         self,
@@ -127,6 +130,7 @@ class RetrievalEngine:
         min_score: float = 0.01,
         now: Optional[datetime] = None,
         include_invalidated: bool = False,
+        include_context: bool = False,
     ) -> RetrievalResponse:
         """
         Query the memory graph and return ranked results.
@@ -201,8 +205,10 @@ class RetrievalEngine:
             if node is None:
                 continue
 
-            # Skip context nodes from results (they're structural, not content)
-            if node.node_type == NodeType.CONTEXT:
+            # CONTEXT nodes are the verbatim turns — answer-bearing content for
+            # conversational memory. Surface them by default; callers wanting only
+            # distilled extract nodes can pass include_context=False.
+            if node.node_type == NodeType.CONTEXT and not include_context:
                 continue
 
             # Provenance (leg 6a): exclude soft-invalidated nodes by default.
@@ -233,27 +239,20 @@ class RetrievalEngine:
                 if node_community is not None and node_community in relevant_communities:
                     community_boost = self.COMMUNITY_BOOST
 
-            # Semantic boost (opt-in). When the semantic layer surfaced this
-            # node for the query, add a bounded similarity-weighted bonus.
-            # semantic_sims is empty whenever the layer is disabled, so this
-            # branch never runs and the score expression below is unchanged.
-            semantic_boost = 0.0
-            if semantic_sims:
-                sim = semantic_sims.get(node_id)
-                if sim is not None:
-                    # Scale by how far similarity clears the floor, normalized so
-                    # a perfect match (sim==1) yields the full SEMANTIC_BOOST and
-                    # a just-at-floor match yields ~0. Floor-gated above, so sim
-                    # here is always >= SEMANTIC_SIM_FLOOR.
-                    span = max(1e-6, 1.0 - self.SEMANTIC_SIM_FLOOR)
-                    norm = (sim - self.SEMANTIC_SIM_FLOOR) / span
-                    semantic_boost = self.SEMANTIC_BOOST * norm
-
             # Layer 1 (leg 1): confidence multiplier as a post-factor.
-            # Lazy decay for INFERRED nodes is applied here, reusing leg-1's
-            # GraphOperations._apply_decay helper (no duplicated decay logic).
             effective_confidence = self._effective_confidence(node, now)
-            final_score = (base_score + community_boost + semantic_boost) * effective_confidence
+
+            # Semantic-FIRST ranking (opt-in). When the semantic layer surfaced
+            # this node for the query, similarity is the PRIMARY term and the
+            # graph composite only refines it (GRAPH_REFINE) — so query-relevant
+            # nodes outrank frequency/proximity hubs. semantic_sims is empty when
+            # the layer is disabled, so sim is None and the graph-only expression
+            # below runs unchanged (byte-identical to the pre-semantic path).
+            sim = semantic_sims.get(node_id)
+            if sim is not None:
+                final_score = (sim + self.GRAPH_REFINE * base_score + community_boost) * effective_confidence
+            else:
+                final_score = (base_score + community_boost) * effective_confidence
 
             if final_score < min_score:
                 continue
@@ -278,7 +277,7 @@ class RetrievalEngine:
             # Only surface the semantic component when the opt-in layer is
             # enabled, so the disabled-path breakdown is byte-for-byte unchanged.
             if self.semantic.is_enabled:
-                score_breakdown["semantic_boost"] = semantic_boost
+                score_breakdown["semantic_sim"] = sim if sim is not None else 0.0
 
             scored_results.append(RetrievalResult(
                 node_id=node.node_id,

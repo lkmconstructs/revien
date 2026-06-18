@@ -431,8 +431,8 @@ class SemanticIndex:
             batch: List[Tuple[str, str, str]] = []
             total = 0
             for node in all_nodes:
-                if node.node_type == NodeType.CONTEXT:
-                    continue
+                # Index every node, including CONTEXT (verbatim turns) — the
+                # coherent answer-bearing content for conversational memory.
                 batch.append((node.node_id, node.label, node.content))
                 if len(batch) >= batch_size:
                     total += self.index_nodes(batch)

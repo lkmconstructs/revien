@@ -100,7 +100,9 @@ def _score_qa(
     now_dt = parse_session_date(conv.last_session_date) or datetime.now(timezone.utc)
 
     t0 = time.perf_counter()
-    resp = engine.recall(qa.question, top_n=RECALL_TOP_N, now=now_dt)
+    # Surface verbatim turns (CONTEXT nodes): for conversational QA the answer
+    # lives in the turn itself, not only in distilled extract nodes.
+    resp = engine.recall(qa.question, top_n=RECALL_TOP_N, now=now_dt, include_context=True)
     recall_ms = (time.perf_counter() - t0) * 1000.0
 
     ctx = A.RetrievedContext(
@@ -155,6 +157,7 @@ def run_benchmark(
     dataset_path: Path,
     out_dir: Path,
     limit_convs: Optional[int] = None,
+    max_qa: Optional[int] = None,
 ) -> Dict:
     cfg = _load_config(config_name)
     prev_env = _apply_env(cfg.get("env", {}))
@@ -164,13 +167,23 @@ def run_benchmark(
         conversations = load_locomo(dataset_path)
         if limit_convs is not None:
             conversations = conversations[:limit_convs]
+        # Cap QA per conversation for fast subset runs. Non-destructive: we copy
+        # the truncated list onto each conv so retrieval/answerer paths are
+        # identical, just over fewer questions.
+        if max_qa is not None:
+            for _conv in conversations:
+                _conv.qa = _conv.qa[:max_qa]
 
         per_q: List[Dict] = []
         ingest_rates: List[float] = []
         recall_latencies: List[float] = []
         supporting_for_provenance: List[str] = []
         total_audit_creates_expected = 0
-        cloud_calls = 0  # headline path makes none; tracked explicitly
+        # Network/cost accounting is read off the answerer AFTER the run loop
+        # (cloud readers self-count their calls + accumulate a cost estimate;
+        # local readers stay at 0 / $0.0). Defaults here in case the loop is empty.
+        cloud_calls = 0
+        cost_usd_estimate = 0.0
 
         # We keep ONE store alive at provenance-check time, so we sample the
         # first conversation's store for the provenance/audit assertions (each
@@ -240,7 +253,16 @@ def run_benchmark(
                 os.unlink(provenance_db_path)
             except OSError:
                 pass
-        checks.append(S.network_egress_zero(cloud_calls=cloud_calls))
+        # Read network/cost accounting off the answerer (cloud readers count
+        # their own calls + accumulate a labelled cost ESTIMATE; local readers
+        # report 0 / $0.0).
+        cloud_calls = int(getattr(answerer, "network_calls", 0))
+        cost_usd_estimate = float(getattr(answerer, "cost_usd_estimate", 0.0))
+
+        # Honest egress check: config-derived, names any cloud backend.
+        checks.append(
+            S.network_egress_zero(cloud_calls=cloud_calls, answerer=answerer_name)
+        )
         checks.extend(S.run_consent_subtests())
 
         # ── Aggregate metrics ─────────────────────────────────────────────────
@@ -259,7 +281,11 @@ def run_benchmark(
             "sha256": read_locked_hash(),
             "conversations": len(conversations),
         }
-        report["cost_usd"] = 0.0
+        # All-local headline run: cost_usd_estimate is 0.0 and cloud_calls is 0,
+        # so this preserves the honest $0 / 0-calls local default. Cloud answerer
+        # runs surface a non-zero, clearly-labelled cost ESTIMATE + real call count.
+        report["cost_usd"] = round(cost_usd_estimate, 6)
+        report["cost_usd_is_estimate"] = True
         report["network_calls"] = cloud_calls
         report["environment"] = {
             "revien_version": revien.__version__,
@@ -326,11 +352,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Revien LoCoMo benchmark (headline track)")
     ap.add_argument("--config", default="graph_only",
                     choices=["graph_only", "semantic", "neural"])
-    ap.add_argument("--answerer", default="extractive", choices=["extractive"])
+    ap.add_argument("--answerer", default="extractive",
+                    help="reader spec: extractive | ollama:<model> | "
+                         "openai:<model> | openrouter:<model> | together:<model> | "
+                         "claude:<model>")
     ap.add_argument("--out", default=str(_REPO_ROOT / "results"))
     ap.add_argument("--dataset", default=str(DATA_PATH))
     ap.add_argument("--limit", type=int, default=None,
-                    help="limit number of conversations (debug)")
+                    help="limit number of conversations (debug/subset)")
+    ap.add_argument("--max-qa", type=int, default=None, dest="max_qa",
+                    help="cap QA per conversation (debug/subset)")
     args = ap.parse_args(argv)
 
     dataset_path = Path(args.dataset)
@@ -345,6 +376,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         dataset_path=dataset_path,
         out_dir=Path(args.out),
         limit_convs=args.limit,
+        max_qa=args.max_qa,
     )
     _print_summary(report)
     return 0
@@ -365,7 +397,8 @@ def _print_summary(report: Dict) -> None:
     lat = report["latency_ms"]["recall"]
     print(f"recall latency: p50={lat['p50']}ms p90={lat['p90']}ms p99={lat['p99']}ms")
     print(f"ingest        : {report['ingest_turns_per_sec']} turns/sec")
-    print(f"cost          : ${report['cost_usd']}   network_calls={report['network_calls']}")
+    _est = " (est.)" if report.get("cost_usd") else ""
+    print(f"cost          : ${report['cost_usd']}{_est}   network_calls={report['network_calls']}")
     sov = report["sovereignty"]
     print(f"sovereignty   : {'PASS' if sov['all_passed'] else 'FAIL'}")
     for c in sov["checks"]:

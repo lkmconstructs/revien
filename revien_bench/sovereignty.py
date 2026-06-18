@@ -12,9 +12,13 @@ Checks
 2. audit_integrity — the append-only audit_log row count equals what we expect
    (>= one 'create' per node, plus the dia_id-tag 'update's), and is monotonic /
    never rewritten. Verified via store.get_all_audit() / get_node_audit().
-3. network_egress_zero — assert the configured embedder/extractor are LOCAL
-   (REVIEN_EMBEDDER local, REVIEN_EXTRACTOR not a cloud backend), and that the
-   measured cloud-call counter is 0. The headline path makes no outbound calls.
+3. network_egress_zero — assert EVERY active backend is local: the extractor
+   (REVIEN_EXTRACTOR), embedder (REVIEN_EMBEDDER), answerer (--answerer reader),
+   and judge. PASSES only if none is a cloud provider; FAILS and names the
+   off-device backend(s) if any sends data to a cloud API. The decision is made
+   from the run config (env + answerer spec), NOT by intercepting HTTP — a cloud
+   run must never be able to claim zero egress. The measured cloud-call counter
+   is folded in as a secondary signal. The headline path makes no outbound calls.
 4. consent — two sub-tests:
      a. REVIEN_INGEST_DENY -> denied source_id produces 0 nodes.
      b. soft-invalidate -> an invalidated node is EXCLUDED from default recall
@@ -32,10 +36,18 @@ from revien.graph.schema import NodeType
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine
+from revien.ingestion.extractor_llm import (
+    CLOUD_BACKENDS as CLOUD_EXTRACTORS,
+    DEFAULT_EXTRACTOR,
+)
 from revien.semantic.index import (
     CLOUD_EMBEDDERS,
     DEFAULT_EMBEDDER,
 )
+
+# Answerer (reader) cloud providers. Imported from the answerer layer so there
+# is ONE source of truth for "which reader backends leave the machine".
+from .answerers import CLOUD_PROVIDERS as CLOUD_ANSWERERS, parse_provider
 
 
 @dataclass
@@ -102,28 +114,79 @@ def audit_integrity(store: GraphStore, expected_min_creates: int) -> Check:
 
 
 # ── 3. Network egress == 0 ────────────────────────────────────────────────────
-def network_egress_zero(cloud_calls: int = 0) -> Check:
-    """Assert the default path is local and made zero cloud calls.
+# A backend is LOCAL unless its provider is one of these cloud sets. The decision
+# is made from the run config — never from "did we happen to observe HTTP" — so a
+# cloud run can never claim zero egress just because a counter wasn't incremented.
+_LOCAL_EXTRACTORS = ("rule", "", "local", "ollama")
+_LOCAL_EMBEDDERS = ("", "local")  # plus anything not in CLOUD_EMBEDDERS
+_LOCAL_ANSWERERS = ("extractive", "", "local", "ollama")
+_LOCAL_JUDGES = ("rule", "f1", "extractive", "", "local", "none", "ollama")
 
-    `cloud_calls` is the runner's measured counter (always 0 on the headline
-    path — no cloud answerer, local/absent embedder). We also inspect the env
-    so a misconfiguration (REVIEN_EMBEDDER=openai) is caught as a FAIL.
+
+def network_egress_zero(
+    cloud_calls: int = 0,
+    answerer: Optional[str] = None,
+    judge: Optional[str] = None,
+) -> Check:
+    """PASS only if EVERY active backend is local; FAIL naming any cloud backend.
+
+    Active backends inspected from the run CONFIG (not from intercepted HTTP):
+      * extractor  — REVIEN_EXTRACTOR (default 'rule'); cloud set CLOUD_EXTRACTORS
+      * embedder   — REVIEN_EMBEDDER  (default 'fastembed'); cloud set CLOUD_EMBEDDERS
+      * answerer   — the --answerer reader spec; cloud set CLOUD_ANSWERERS
+      * judge      — the scorer; the headline build uses local F1 (no cloud judge)
+
+    If ANY backend is a cloud provider (openai/openrouter/anthropic/together/
+    claude), the check FAILS and `detail["cloud_backends"]` names which component
+    sent data off-device — even if `cloud_calls` is 0. The measured `cloud_calls`
+    counter is a secondary safety signal: a positive count alone also fails.
     """
     embedder = (os.environ.get("REVIEN_EMBEDDER", DEFAULT_EMBEDDER) or DEFAULT_EMBEDDER).lower().strip()
-    extractor = (os.environ.get("REVIEN_EXTRACTOR", "rule") or "rule").lower().strip()
-    embedder_local = embedder not in CLOUD_EMBEDDERS
-    # Any extractor other than the local "rule" default is treated as potentially
-    # cloud-bound for this assertion (llm backends can be cloud).
-    extractor_local = extractor in ("rule", "", "local")
-    passed = embedder_local and extractor_local and cloud_calls == 0
+    extractor = (os.environ.get("REVIEN_EXTRACTOR", DEFAULT_EXTRACTOR) or DEFAULT_EXTRACTOR).lower().strip()
+    # The answerer is passed in (it is a CLI arg, not an env var); fall back to
+    # the local default reader.
+    answerer_spec = (answerer or "extractive").strip()
+    answerer_provider, _ = parse_provider(answerer_spec)
+    # The judge is local F1 in this build (no cloud-judge wiring yet); accept an
+    # explicit override so the assertion stays honest if one is ever added.
+    judge_name = (judge or "f1").strip().lower()
+
+    # Local determination, per backend, from config.
+    extractor_local = (extractor in _LOCAL_EXTRACTORS) and (extractor not in CLOUD_EXTRACTORS)
+    embedder_local = (embedder in _LOCAL_EMBEDDERS or embedder not in CLOUD_EMBEDDERS)
+    answerer_local = (answerer_provider in _LOCAL_ANSWERERS) and (answerer_provider not in CLOUD_ANSWERERS)
+    judge_local = (judge_name in _LOCAL_JUDGES) and (judge_name not in CLOUD_ANSWERERS)
+
+    # Name every component that leaves the machine (config-derived).
+    cloud_backends: List[str] = []
+    if not extractor_local:
+        cloud_backends.append(f"extractor={extractor}")
+    if not embedder_local:
+        cloud_backends.append(f"embedder={embedder}")
+    if not answerer_local:
+        cloud_backends.append(f"answerer={answerer_provider}")
+    if not judge_local:
+        cloud_backends.append(f"judge={judge_name}")
+
+    all_local = not cloud_backends
+    # PASS requires every backend local AND no observed cloud call. A cloud
+    # backend in config fails even if cloud_calls==0; a positive counter fails
+    # even if config somehow looked local.
+    passed = all_local and cloud_calls == 0
     return Check(
         name="network_egress_zero",
         passed=passed,
         detail={
-            "embedder": embedder,
-            "embedder_local": embedder_local,
             "extractor": extractor,
             "extractor_local": extractor_local,
+            "embedder": embedder,
+            "embedder_local": embedder_local,
+            "answerer": answerer_provider,
+            "answerer_local": answerer_local,
+            "judge": judge_name,
+            "judge_local": judge_local,
+            "all_backends_local": all_local,
+            "cloud_backends": cloud_backends,
             "cloud_calls": cloud_calls,
         },
     )
