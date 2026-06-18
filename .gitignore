@@ -35,6 +35,12 @@ htmlcov/
 *.sqlite3
 revien_data/
 
+# Benchmark (dev-only) — LoCoMo dataset is fetched+checksummed, never vendored
+data/locomo10.json
+data/*.json
+results/
+revien_bench/DATASET.lock
+
 # OS
 .DS_Store
 Thumbs.db

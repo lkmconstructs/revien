@@ -5,7 +5,9 @@ setup(
     version="0.1.0",
     description="Graph-based memory engine for AI systems. Memory that returns.",
     author="LKM Constructs LLC",
-    packages=find_packages(),
+    # revien_bench is a DEV-ONLY benchmark harness (LoCoMo). It is intentionally
+    # excluded from the wheel — never shipped to end users.
+    packages=find_packages(exclude=["revien_bench", "revien_bench.*", "tests", "tests.*"]),
     python_requires=">=3.10",
     install_requires=[
         "pydantic>=2.0",

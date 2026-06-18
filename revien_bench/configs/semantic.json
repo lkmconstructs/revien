@@ -1,0 +1,10 @@
+{
+  "name": "semantic",
+  "description": "Graph + opt-in LOCAL semantic/vector layer (sqlite-vec + fastembed, BAAI/bge-small-en-v1.5, 384-dim). Still LOCAL/zero-egress (local embedder). Requires `pip install revien[semantic]`; degrades silently to graph_only when the extra is absent.",
+  "env": {
+    "REVIEN_SEMANTIC": "1",
+    "REVIEN_EXTRACTOR": "rule",
+    "REVIEN_EMBEDDER": "fastembed"
+  },
+  "cluster": false
+}

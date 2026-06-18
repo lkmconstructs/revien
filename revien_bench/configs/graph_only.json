@@ -1,0 +1,10 @@
+{
+  "name": "graph_only",
+  "description": "HEADLINE. Zero-LLM, zero-cloud, deterministic. Base three-factor + community + confidence scoring, no semantic vectors, no neural rerank, no clustering. $0, zero egress.",
+  "env": {
+    "REVIEN_SEMANTIC": "0",
+    "REVIEN_EXTRACTOR": "rule",
+    "REVIEN_EMBEDDER": "fastembed"
+  },
+  "cluster": false
+}
