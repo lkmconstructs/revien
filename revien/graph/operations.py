@@ -63,34 +63,43 @@ class GraphOperations:
 
     # ── Confidence Layer: Scoring, Decay, Reinforcement ───────
 
-    def _apply_decay(self, node: Node) -> Node:
-        """Apply lazy decay to INFERRED nodes not referenced recently.
+    def _compute_decayed_confidence(self, node: Node) -> float:
+        """PURE: effective (decayed) confidence for a node — NO writes, NO audit.
 
-        Decay rate: -0.01 per week since last_referenced (or created_at).
-        Decay DEMOTES but never DELETES: confidence floors at DECAY_FLOOR, so
-        aged memories rank low but stay retrievable. Only explicit correction
-        (correct_node) drives confidence to 0.0. Pinned and non-INFERRED nodes
-        are immune. Persists only when the change is meaningful (> 0.005).
+        Decay rate: -0.01/week since last_referenced (or created_at), floored at
+        DECAY_FLOOR (demote, never delete). Pinned and non-INFERRED nodes are
+        immune (return stored confidence unchanged). This is the single source
+        of the decay MATH and is safe on the read/recall path — it never touches
+        the store, so reads never trigger writes or audit entries.
         """
         if node.pinned or node.source_type != SourceType.INFERRED:
-            return node
-
+            return node.confidence
         now = datetime.now(timezone.utc)
         reference_time = node.last_referenced or node.created_at
         if reference_time.tzinfo is None:
             reference_time = reference_time.replace(tzinfo=timezone.utc)
-        days_since = (now - reference_time).days
-        weeks_since = days_since / 7.0
+        weeks_since = (now - reference_time).days / 7.0
         decay_amount = weeks_since * 0.01
+        # Demote, don't delete: floor at DECAY_FLOOR; min() guard never raises a
+        # node already sitting below the floor.
+        return min(node.confidence, max(self.DECAY_FLOOR, node.confidence - decay_amount))
 
-        # Demote, don't delete: floor at DECAY_FLOOR; min() guard never raises
-        # a node already sitting below the floor.
-        new_confidence = min(node.confidence, max(self.DECAY_FLOOR, node.confidence - decay_amount))
+    def _apply_decay(self, node: Node) -> Node:
+        """PERSIST decay (write + 'decay' audit) for a node.
+
+        Use ONLY on an explicit maintenance/retention pass — NOT on the
+        read/recall path, which uses the pure _compute_decayed_confidence so
+        reads never write. Persists only when the change is meaningful (> 0.005).
+        Demotes, never deletes (floored at DECAY_FLOOR); only correct_node zeroes.
+        """
+        if node.pinned or node.source_type != SourceType.INFERRED:
+            return node
+        new_confidence = self._compute_decayed_confidence(node)
         if node.confidence - new_confidence > 0.005:
             return self.store.update_node(
                 node.node_id,
                 confidence=new_confidence,
-                confidence_set_at=now,
+                confidence_set_at=datetime.now(timezone.utc),
                 source_context="lazy_decay",
                 _audit_op="decay",
             ) or node
@@ -618,9 +627,11 @@ class GraphOperations:
 
         nodes_with_scores = []
         for node in raw_nodes:
-            decayed_node = self._apply_decay(node)
-            score = decayed_node.confidence
-            nodes_with_scores.append((decayed_node.model_dump(), score))
+            # Pure read: compute effective confidence without persisting/auditing.
+            score = self._compute_decayed_confidence(node)
+            view = node.model_dump()
+            view["confidence"] = score
+            nodes_with_scores.append((view, score))
 
         nodes_with_scores.sort(key=lambda x: x[1], reverse=True)
         nodes = [n for n, _ in nodes_with_scores]

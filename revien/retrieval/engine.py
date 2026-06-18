@@ -326,27 +326,21 @@ class RetrievalEngine:
 
     def _effective_confidence(self, node: Node, now: datetime) -> float:
         """
-        Layer 1 (leg 1): effective confidence used as the recall post-factor.
+        Layer 1: effective confidence used as the recall post-factor — PURE.
 
-        INFERRED nodes decay -0.01/week since last_referenced; EXTRACTED,
-        DERIVED, CORRECTED and pinned nodes are immune. Decayed confidence is
-        lazily persisted when the change is meaningful (> 0.005).
+        INFERRED nodes decay -0.01/week since last_referenced (floored at
+        DECAY_FLOOR); EXTRACTED, DERIVED, CORRECTED and pinned nodes are immune.
+        Delegates the decay MATH to GraphOperations._compute_decayed_confidence,
+        which performs NO writes — so recall NEVER persists or audits. Decay is
+        only persisted by the explicit maintenance pass (_apply_decay). This
+        keeps reads pure: no write latency, no decay-spam in the audit log.
 
-        This does NOT reimplement decay — it delegates to leg-1's
-        GraphOperations._apply_decay (the single source of truth for the decay
-        rate, the INFERRED/pinned immunity rules, and the lazy-persist
-        threshold), then returns the resulting confidence. Non-decaying nodes
-        short-circuit so we avoid a redundant store round-trip.
-
-        Note (seam): leg-1's _apply_decay anchors decay to the wall-clock
-        datetime.now(), so the `now` argument here is accepted for API parity
-        with the server engine but the decay clock is owned by leg 1. For
-        live recall now == wall clock, so behavior matches.
+        The `now` arg is accepted for API parity but unused — decay anchors to
+        wall-clock now inside the pure helper.
         """
         if node.pinned or node.source_type != SourceType.INFERRED:
             return node.confidence
-        decayed = self.ops._apply_decay(node)
-        return decayed.confidence
+        return self.ops._compute_decayed_confidence(node)
 
     def _find_anchors(self, query: str) -> List[str]:
         """
