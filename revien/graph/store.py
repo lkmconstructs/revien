@@ -273,6 +273,15 @@ class GraphStore:
         ).fetchall()
         return [self._row_to_audit(r) for r in rows]
 
+    def get_all_audit(self) -> list[dict]:
+        """Entire audit log, chronological (oldest first). For full export."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT id, node_id, op, actor, ts, before_json, after_json
+               FROM audit_log ORDER BY id ASC""",
+        ).fetchall()
+        return [self._row_to_audit(r) for r in rows]
+
     @staticmethod
     def _row_to_audit(row: tuple) -> dict:
         return {

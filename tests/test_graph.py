@@ -513,3 +513,163 @@ class TestSoftInvalidation:
         ops.invalidate_node(n.node_id)
         reloaded = store.get_node(n.node_id)
         assert isinstance(reloaded.invalidated_at, datetime)
+
+
+# ── Governance Layer (leg 6b): retention, forget, export, ingest policy ──
+
+def _aged(store, label, days, **kw):
+    """Helper: add a node whose freshness clock is `days` in the past."""
+    old = datetime.now(timezone.utc) - timedelta(days=days)
+    return store.add_node(Node(
+        node_type=NodeType.FACT, label=label, content=label.upper(),
+        created_at=old, last_referenced=old, **kw,
+    ))
+
+
+class TestRetentionKeep:
+    """keep mode is a pure no-op — nothing removed, nothing invalidated."""
+
+    def test_keep_removes_nothing(self, store, ops):
+        n = _aged(store, "stale", 500)
+        r = ops.apply_retention(mode="keep", days=90)
+        assert r["archived"] == 0 and r["expired"] == 0
+        got = store.get_node(n.node_id)
+        assert got is not None and got.invalidated_at is None
+
+
+class TestRetentionArchive:
+    """archive soft-invalidates stale unpinned nodes (recoverable, content kept)."""
+
+    def test_stale_archived_recoverable(self, store, ops):
+        stale = _aged(store, "stale", 200)
+        r = ops.apply_retention(mode="archive", days=90)
+        assert r["archived"] == 1
+        got = store.get_node(stale.node_id)
+        assert got is not None                       # NOT deleted
+        assert got.content == "STALE"                # content RETAINED
+        assert got.invalidated_at is not None        # recoverable via include_invalidated
+
+    def test_pinned_immune(self, store, ops):
+        pinned = _aged(store, "pin", 200, pinned=True)
+        ops.apply_retention(mode="archive", days=90)
+        assert store.get_node(pinned.node_id).invalidated_at is None
+
+    def test_fresh_survives(self, store, ops):
+        fresh = store.add_node(Node(node_type=NodeType.FACT, label="f", content="F"))
+        ops.apply_retention(mode="archive", days=90)
+        assert store.get_node(fresh.node_id).invalidated_at is None
+
+    def test_already_archived_not_recounted(self, store, ops):
+        _aged(store, "stale", 200)
+        first = ops.apply_retention(mode="archive", days=90)
+        second = ops.apply_retention(mode="archive", days=90)
+        assert first["archived"] == 1 and second["archived"] == 0
+
+
+class TestRetentionExpire:
+    """expire HARD-deletes stale unpinned nodes (+content-free tombstone audit)."""
+
+    def test_stale_hard_deleted_with_tombstone(self, store, ops):
+        stale = _aged(store, "stale", 200)
+        r = ops.apply_retention(mode="expire", days=90)
+        assert r["expired"] == 1
+        assert store.get_node(stale.node_id) is None       # HARD deleted
+        forget_entries = [a for a in store.get_node_audit(stale.node_id)
+                          if a["op"] == "forget"]
+        assert len(forget_entries) == 1
+        assert forget_entries[0]["before"] is None          # no forgotten content
+        assert forget_entries[0]["after"]["reason"] == "retention_expire"
+
+    def test_pinned_and_fresh_survive_expire(self, store, ops):
+        pinned = _aged(store, "pin", 200, pinned=True)
+        fresh = store.add_node(Node(node_type=NodeType.FACT, label="f", content="F"))
+        ops.apply_retention(mode="expire", days=90)
+        assert store.get_node(pinned.node_id) is not None
+        assert store.get_node(fresh.node_id) is not None
+
+
+class TestForget:
+    """Right-to-forget: hard-delete content, tombstone, lineage re-point, cascade."""
+
+    def _chain(self, store, ops):
+        # A <- B <- C  (B derived_from A; C derived_from B)
+        a = store.add_node(Node(node_type=NodeType.FACT, label="A", content="secretA"))
+        b = store.add_node(Node(node_type=NodeType.FACT, label="B", content="B"))
+        c = store.add_node(Node(node_type=NodeType.FACT, label="C", content="C"))
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(c.node_id, b.node_id, EdgeType.DERIVED_FROM)
+        return a, b, c
+
+    def test_forget_hard_deletes_and_tombstones(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        res = ops.forget_node(a.node_id, reason="gdpr")
+        assert res["count"] == 1
+        assert store.get_node(a.node_id) is None            # content GONE
+        ts = [x for x in store.get_node_audit(a.node_id) if x["op"] == "forget"]
+        assert len(ts) == 1 and ts[0]["before"] is None     # content-free tombstone
+        assert "secretA" not in str(ts[0])
+
+    def test_forget_repoints_child_lineage(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        ops.forget_node(a.node_id, reason="gdpr")
+        labels = [x["label"] for x in ops.get_lineage(b.node_id)["ancestors"]]
+        assert labels == ["[forgotten node]"]               # no orphan, points to gravestone
+        tomb = store.get_node(ops._tombstone_id(a.node_id))
+        assert tomb is not None and tomb.pinned and tomb.content == ""
+        assert tomb.node_type == NodeType.CONTEXT           # excluded from recall
+
+    def test_forget_preview_lists_subtree(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        prev = ops.forget_preview(a.node_id)
+        assert prev["exists"] and prev["count"] == 3
+        assert set(prev["node_ids"]) == {a.node_id, b.node_id, c.node_id}
+
+    def test_forget_cascade_removes_chain(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        res = ops.forget_node(a.node_id, cascade=True, reason="gdpr")
+        assert res["count"] == 3
+        assert store.get_node(a.node_id) is None
+        assert store.get_node(b.node_id) is None
+        assert store.get_node(c.node_id) is None
+
+    def test_forget_missing_node(self, store, ops):
+        assert ops.forget_node("nope")["status"] == "not_found"
+
+    def test_forget_refuses_tombstone(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        ops.forget_node(a.node_id, reason="gdpr")
+        tid = ops._tombstone_id(a.node_id)
+        assert ops.forget_node(tid)["status"] == "skipped"
+
+
+class TestExportEverything:
+    """export_everything returns graph (nodes+edges) + audit."""
+
+    def test_export_shape(self, store, ops):
+        store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        exp = ops.export_everything()
+        assert "graph" in exp and "audit" in exp
+        assert "nodes" in exp["graph"] and "edges" in exp["graph"]
+        assert len(exp["graph"]["nodes"]) == 1
+        assert len(exp["audit"]) >= 1                       # at least the create entry
+
+
+class TestRetentionConfig:
+    """Env-driven mode/window resolution with safe fallbacks."""
+
+    def test_default_mode_is_keep(self, monkeypatch):
+        from revien.graph.operations import get_retention_mode, get_retention_days
+        monkeypatch.delenv("REVIEN_RETENTION", raising=False)
+        monkeypatch.delenv("REVIEN_RETENTION_DAYS", raising=False)
+        assert get_retention_mode() == "keep"
+        assert get_retention_days() == 90
+
+    def test_unknown_mode_falls_back_to_keep(self, monkeypatch):
+        from revien.graph.operations import get_retention_mode
+        monkeypatch.setenv("REVIEN_RETENTION", "nonsense")
+        assert get_retention_mode() == "keep"
+
+    def test_bad_days_falls_back(self, monkeypatch):
+        from revien.graph.operations import get_retention_days
+        monkeypatch.setenv("REVIEN_RETENTION_DAYS", "-5")
+        assert get_retention_days() == 90

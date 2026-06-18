@@ -450,6 +450,72 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             raise HTTPException(404, f"Node not found: {node_id}")
         return ops.get_lineage(node_id, max_depth=max_depth)
 
+    # ── Governance Layer (leg 6b): retention / forget / export ─────────
+    # "Choose your storage." Nothing auto-deletes by default; only explicit
+    # forget, or the opt-in `expire` retention mode, ever deletes.
+
+    # ── POST /v1/retention/sweep ───────────────────────
+    class RetentionSweepRequest(BaseModel):
+        # Optional per-call overrides; default to the env-resolved policy.
+        mode: Optional[str] = None  # keep | archive | expire
+        days: Optional[int] = None
+        construct_id: str = ""
+
+    @app.post("/v1/retention/sweep")
+    async def retention_sweep(request: Optional[RetentionSweepRequest] = None):
+        """Run one retention sweep under the selected storage policy.
+
+        Mode/window resolve from REVIEN_RETENTION / REVIEN_RETENTION_DAYS unless
+        overridden in the body. ``keep`` is a no-op; ``archive`` soft-invalidates
+        stale unpinned nodes (recoverable); ``expire`` hard-deletes them
+        (+tombstone). Pinned nodes are always immune. Returns counts.
+        """
+        req = request or RetentionSweepRequest()
+        return ops.apply_retention(
+            mode=req.mode, days=req.days, construct_id=req.construct_id
+        )
+
+    # ── GET /v1/nodes/{id}/forget/preview ──────────────
+    @app.get("/v1/nodes/{node_id}/forget/preview")
+    async def forget_preview(node_id: str):
+        """Show what a cascade forget WOULD remove (count + ids) — never blind."""
+        preview = ops.forget_preview(node_id)
+        if not preview.get("exists", False):
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return preview
+
+    # ── POST /v1/nodes/{id}/forget ─────────────────────
+    class ForgetRequest(BaseModel):
+        cascade: bool = False
+        reason: str = ""
+        construct_id: str = ""
+
+    @app.post("/v1/nodes/{node_id}/forget")
+    async def forget_node_endpoint(node_id: str, request: Optional[ForgetRequest] = None):
+        """Right-to-forget: HARD-delete the node's content (privacy).
+
+        Distinct from invalidate (which retains). Writes a content-free tombstone
+        audit entry and re-points children's lineage to a tombstone marker.
+        cascade=True forgets the whole DERIVED_FROM subtree.
+        """
+        req = request or ForgetRequest()
+        result = ops.forget_node(
+            node_id, cascade=req.cascade, reason=req.reason,
+            construct_id=req.construct_id,
+        )
+        if result.get("status") == "not_found":
+            raise HTTPException(404, f"Node not found: {node_id}")
+        return result
+
+    # ── GET /v1/export ─────────────────────────────────
+    @app.get("/v1/export")
+    async def export_everything():
+        """Export the FULL graph (nodes + edges) + audit log as JSON.
+
+        "Your data, portable." Superset of /v1/graph — adds the audit trail.
+        """
+        return ops.export_everything()
+
     # ── POST /v1/reindex ───────────────────────────────
     # Backfill embeddings for existing nodes (opt-in semantic layer). When the
     # `semantic` extra is absent or REVIEN_SEMANTIC=0, this reports status

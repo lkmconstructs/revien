@@ -5,11 +5,48 @@ Confidence layer: confidence tagging, reinforcement, decay, propagation
 (2-hop bounded).
 """
 
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
+
+
+# ── Governance Layer (leg 6b): retention config ──────────────────────────────
+# "Choose your storage." Nothing auto-deletes by default. The mode is read once
+# from the environment per sweep so a deployment can flip storage policy without
+# code changes.
+RETENTION_KEEP = "keep"        # no-op sweep — current behavior (decay demotes only)
+RETENTION_ARCHIVE = "archive"  # sweep soft-invalidates stale nodes (recoverable)
+RETENTION_EXPIRE = "expire"    # sweep HARD-deletes stale nodes (+tombstone) — opt-in
+VALID_RETENTION_MODES = (RETENTION_KEEP, RETENTION_ARCHIVE, RETENTION_EXPIRE)
+DEFAULT_RETENTION_MODE = RETENTION_KEEP
+DEFAULT_RETENTION_DAYS = 90
+
+
+def get_retention_mode() -> str:
+    """Resolve the retention mode from ``REVIEN_RETENTION`` (default ``keep``).
+
+    Unknown values fall back to the safe default (``keep`` — nothing removed).
+    """
+    raw = (os.environ.get("REVIEN_RETENTION") or DEFAULT_RETENTION_MODE).strip().lower()
+    return raw if raw in VALID_RETENTION_MODES else DEFAULT_RETENTION_MODE
+
+
+def get_retention_days() -> int:
+    """Resolve the retention window in days from ``REVIEN_RETENTION_DAYS``.
+
+    Non-numeric / non-positive values fall back to the default window.
+    """
+    raw = os.environ.get("REVIEN_RETENTION_DAYS")
+    if raw is None:
+        return DEFAULT_RETENTION_DAYS
+    try:
+        days = int(raw)
+        return days if days > 0 else DEFAULT_RETENTION_DAYS
+    except (TypeError, ValueError):
+        return DEFAULT_RETENTION_DAYS
 
 
 class GraphOperations:
@@ -207,6 +244,304 @@ class GraphOperations:
                 frontier.append((ancestor_id, depth + 1))
 
         return {"node_id": node_id, "ancestors": ancestors, "truncated": truncated}
+
+    # ── Governance Layer (leg 6b): right-to-forget ───────────
+
+    # Tombstone marker representation. When a node is forgotten (hard-deleted for
+    # privacy), any child that was DERIVED_FROM it would otherwise be left with a
+    # dangling lineage edge pointing at a deleted row. Instead we re-point those
+    # edges at a lightweight tombstone MARKER node so the trace reads
+    # "derived from [forgotten node, deleted <ts>]" — no orphaned hole, and NO
+    # forgotten content. The marker is:
+    #   - a CONTEXT node (CONTEXT is structural — engine.recall() skips it, so a
+    #     tombstone never surfaces as a recall result),
+    #   - pinned (immune to decay AND to retention sweeps — a tombstone is a
+    #     permanent gravestone, never itself swept),
+    #   - id-stable: "tombstone:<original_node_id>" so repeated forgets / cascade
+    #     re-point to the same marker and we never spawn duplicates.
+    TOMBSTONE_PREFIX = "tombstone:"
+
+    @classmethod
+    def _tombstone_id(cls, original_node_id: str) -> str:
+        return f"{cls.TOMBSTONE_PREFIX}{original_node_id}"
+
+    def _ensure_tombstone(
+        self, original_node_id: str, deleted_at: datetime, reason: str
+    ) -> Node:
+        """Create (or return the existing) tombstone marker for a forgotten node.
+
+        Holds NO forgotten content — only the fact that a node once existed here
+        and when it was deleted. Idempotent on the stable tombstone id.
+        """
+        tid = self._tombstone_id(original_node_id)
+        existing = self.store.get_node(tid)
+        if existing is not None:
+            return existing
+        marker = Node(
+            node_id=tid,
+            node_type=NodeType.CONTEXT,  # structural — excluded from recall
+            label="[forgotten node]",
+            content="",  # content is forgotten — the marker carries none
+            pinned=True,  # gravestone: immune to decay and retention sweeps
+            source_type=SourceType.DERIVED,
+            confidence=0.0,
+            source_context="tombstone",
+            metadata={
+                "_tombstone": True,
+                "_original_node_id": original_node_id,
+                "_deleted_at": deleted_at.isoformat(),
+                "_reason": reason,
+            },
+        )
+        return self.store.add_node(marker)
+
+    def _children_derived_from(self, node_id: str) -> List[str]:
+        """IDs of nodes that are DERIVED_FROM ``node_id`` (its direct children).
+
+        A child C records ``DERIVED_FROM`` as an edge with C as SOURCE and the
+        parent as TARGET, so we collect edges where this node is the TARGET.
+        """
+        children: List[str] = []
+        for edge in self.store.get_edges_for_node(node_id):
+            if (
+                edge.edge_type == EdgeType.DERIVED_FROM
+                and edge.target_node_id == node_id
+            ):
+                children.append(edge.source_node_id)
+        return children
+
+    def forget_preview(self, node_id: str) -> Dict:
+        """Report what a cascade forget WOULD remove — so cascade is never blind.
+
+        Returns the node itself plus every descendant reachable via DERIVED_FROM
+        (the nodes that would be forgotten under ``cascade=True``). Cycle-safe.
+        """
+        root = self.store.get_node(node_id)
+        if root is None or node_id.startswith(self.TOMBSTONE_PREFIX):
+            return {"node_id": node_id, "exists": False, "count": 0, "node_ids": []}
+
+        to_delete: List[str] = []
+        seen = set()
+        frontier = [node_id]
+        while frontier:
+            current = frontier.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            to_delete.append(current)
+            for child in self._children_derived_from(current):
+                if child not in seen:
+                    frontier.append(child)
+
+        return {
+            "node_id": node_id,
+            "exists": True,
+            "count": len(to_delete),
+            "node_ids": to_delete,
+        }
+
+    def _forget_one(self, node_id: str, reason: str, construct_id: str) -> bool:
+        """Hard-delete ONE node's content + row; tombstone it; re-point children.
+
+        Privacy semantics: the content is actually GONE (row removed). A
+        tombstone audit entry is written recording only {original_node_id,
+        deleted_at, reason} — never the forgotten content. Any child that was
+        DERIVED_FROM this node has its lineage edge re-pointed to a tombstone
+        marker so the trace stays intact with no orphaned hole.
+        """
+        node = self.store.get_node(node_id)
+        if node is None:
+            return False
+
+        now = datetime.now(timezone.utc)
+
+        # 1. Re-point children's DERIVED_FROM edges to the tombstone marker BEFORE
+        #    deleting the node (delete_node cascades edges via FK, so we must move
+        #    the lineage edges off the doomed node first).
+        children = self._children_derived_from(node_id)
+        if children:
+            marker = self._ensure_tombstone(node_id, now, reason)
+            for child_id in children:
+                for edge in self.store.get_edges_for_node(child_id):
+                    if (
+                        edge.edge_type == EdgeType.DERIVED_FROM
+                        and edge.source_node_id == child_id
+                        and edge.target_node_id == node_id
+                    ):
+                        # Re-point: child DERIVED_FROM tombstone(original).
+                        self.store.add_edge(Edge(
+                            edge_type=EdgeType.DERIVED_FROM,
+                            source_node_id=child_id,
+                            target_node_id=marker.node_id,
+                            weight=edge.weight,
+                            source_context="lineage_repointed_to_tombstone",
+                        ))
+                        self.store.delete_edge(edge.edge_id)
+
+        # 2. Tombstone audit FIRST (content-free), so provenance survives even if
+        #    the row delete races. Records the gravestone fact, never content.
+        self.store.record_audit(
+            node_id, "forget", actor=construct_id,
+            before=None,  # NO content snapshot — it is being forgotten
+            after={
+                "_tombstone": True,
+                "original_node_id": node_id,
+                "deleted_at": now.isoformat(),
+                "reason": reason,
+            },
+            ts=now,
+        )
+
+        # 3. Hard-delete the node row + its remaining edges. Content is GONE.
+        return self.store.delete_node(node_id)
+
+    def forget_node(
+        self, node_id: str, cascade: bool = False, reason: str = "",
+        construct_id: str = "",
+    ) -> Dict:
+        """Right-to-forget: hard-delete a node's content (privacy).
+
+        Distinct from invalidate/archive — those RETAIN content (recoverable).
+        forget actually removes the row; the content is gone. A content-free
+        tombstone audit entry records {original_node_id, deleted_at, reason}, and
+        children's DERIVED_FROM edges are re-pointed to a tombstone marker so
+        lineage has no orphaned hole.
+
+        cascade=False (default): forget only this node. Children survive and now
+        trace to the tombstone marker.
+        cascade=True: also forget every node DERIVED_FROM this one, recursively
+        (each tombstoned). Use ``forget_preview`` first to see the blast radius.
+        """
+        if node_id.startswith(self.TOMBSTONE_PREFIX):
+            # Refuse to forget a gravestone — that would orphan lineage.
+            return {"status": "skipped", "node_id": node_id,
+                    "forgotten": [], "count": 0, "reason": "is_tombstone"}
+
+        if self.store.get_node(node_id) is None:
+            return {"status": "not_found", "node_id": node_id,
+                    "forgotten": [], "count": 0}
+
+        if cascade:
+            # Resolve the full set first (preview), then forget LEAVES-FIRST so a
+            # parent's children are already tombstoned/re-pointed before the
+            # parent goes. Reverse of BFS order = deepest first.
+            order = self.forget_preview(node_id)["node_ids"]
+            targets = list(reversed(order))
+        else:
+            targets = [node_id]
+
+        forgotten: List[str] = []
+        for tid in targets:
+            if self._forget_one(tid, reason=reason, construct_id=construct_id):
+                forgotten.append(tid)
+
+        return {
+            "status": "forgotten",
+            "node_id": node_id,
+            "cascade": cascade,
+            "forgotten": forgotten,
+            "count": len(forgotten),
+        }
+
+    # ── Governance Layer (leg 6b): retention sweep ───────────
+
+    def _is_stale(self, node: Node, cutoff: datetime) -> bool:
+        """A node is stale when its freshness clock predates the cutoff.
+
+        Freshness clock = last_referenced if set, else created_at. Access /
+        reinforce update last_referenced, so using a node resets its clock and
+        keeps it out of the sweep. Pinned nodes and tombstone markers are NEVER
+        stale (handled by the caller's immunity guard).
+        """
+        clock = node.last_referenced or node.created_at
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=timezone.utc)
+        return clock < cutoff
+
+    def apply_retention(
+        self,
+        mode: Optional[str] = None,
+        days: Optional[int] = None,
+        construct_id: str = "",
+    ) -> Dict:
+        """Run one retention sweep under the selected storage policy.
+
+        "Choose your storage." Resolves mode/window from the environment unless
+        overridden by args (the override exists chiefly for tests and the
+        endpoint body).
+
+          keep    — no-op. Nothing is removed (decay still only demotes).
+          archive — soft-invalidate stale, unpinned, live nodes (REUSES leg-6a
+                    ``invalidate_node``). Recoverable — include_invalidated
+                    surfaces them, and access/reinforce resets the clock.
+          expire  — HARD-delete those same stale nodes (REUSES ``forget_node``
+                    so each gets a content-free tombstone audit + lineage
+                    re-point). The ONLY auto-destructive mode; opt-in.
+
+        Pinned nodes (and tombstone markers) are ALWAYS immune. Returns counts:
+        {"mode", "window_days", "scanned", "archived", "expired"}.
+        """
+        mode = (mode or get_retention_mode()).strip().lower()
+        if mode not in VALID_RETENTION_MODES:
+            mode = DEFAULT_RETENTION_MODE
+        window = days if (days is not None and days > 0) else get_retention_days()
+
+        result = {"mode": mode, "window_days": window,
+                  "scanned": 0, "archived": 0, "expired": 0}
+        if mode == RETENTION_KEEP:
+            return result  # no-op sweep — nothing removed
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=window)
+
+        # Snapshot candidate ids up front. archive mutates in place (safe), but
+        # expire DELETES rows + can spawn tombstone markers, so iterate over a
+        # fixed id list rather than a live cursor.
+        candidates = self.store.list_nodes(limit=999999)
+        result["scanned"] = len(candidates)
+
+        stale_ids: List[str] = []
+        for node in candidates:
+            if node.pinned:
+                continue  # pinned is always immune (covers tombstone markers)
+            if node.node_id.startswith(self.TOMBSTONE_PREFIX):
+                continue  # belt-and-suspenders: never sweep a gravestone
+            if mode == RETENTION_ARCHIVE and node.invalidated_at is not None:
+                continue  # already archived — don't re-touch
+            if self._is_stale(node, cutoff):
+                stale_ids.append(node.node_id)
+
+        if mode == RETENTION_ARCHIVE:
+            for nid in stale_ids:
+                updated = self.invalidate_node(
+                    nid, reason="retention_archive", construct_id=construct_id
+                )
+                if updated is not None:
+                    result["archived"] += 1
+        elif mode == RETENTION_EXPIRE:
+            for nid in stale_ids:
+                outcome = self.forget_node(
+                    nid, cascade=False, reason="retention_expire",
+                    construct_id=construct_id,
+                )
+                if outcome.get("count", 0) > 0:
+                    result["expired"] += 1
+
+        return result
+
+    def export_everything(self) -> Dict:
+        """Full portable snapshot: graph (nodes + edges) + the audit log.
+
+        "Your data, portable." JSON-safe dict suitable for a single response
+        body or a file dump. Reuses the store's graph export and audit reads.
+        """
+        graph = self.store.export_graph()
+        return {
+            "graph": graph.model_dump(mode="json"),
+            "audit": self.store.get_all_audit(),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "version": "1.0",
+        }
 
     def propagate_confidence(
         self, source_node_id: str, max_hops: int = 2

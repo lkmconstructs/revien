@@ -286,3 +286,36 @@ User: Let's go with that approach. Always use json.loads, never eval."""
             content_type="code",
         ))
         assert result.nodes_created >= 1
+
+
+# ── Governance Layer (leg 6b): per-source ingestion policy ──
+
+class TestIngestDenyPolicy:
+    """REVIEN_INGEST_DENY: denied source_ids are a clean no-op (nothing stored)."""
+
+    def test_denied_source_is_noop(self, pipeline, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_INGEST_DENY", "blocked,evil")
+        result = pipeline.ingest(IngestionInput(
+            source_id="blocked",
+            content="Alice met Bob in Paris to decide the budget.",
+        ))
+        assert result.nodes_created == 0
+        assert result.context_node_id == ""
+        assert store.count_nodes() == 0          # graph untouched
+
+    def test_allowed_source_still_captured(self, pipeline, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_INGEST_DENY", "blocked")
+        result = pipeline.ingest(IngestionInput(
+            source_id="allowed",
+            content="Carol decided to ship the release on Friday.",
+        ))
+        assert result.nodes_created >= 1
+        assert store.count_nodes() >= 1
+
+    def test_empty_deny_list_denies_nothing(self, pipeline, monkeypatch):
+        monkeypatch.delenv("REVIEN_INGEST_DENY", raising=False)
+        result = pipeline.ingest(IngestionInput(
+            source_id="anything",
+            content="David likes Postgres for the analytics pipeline.",
+        ))
+        assert result.nodes_created >= 1

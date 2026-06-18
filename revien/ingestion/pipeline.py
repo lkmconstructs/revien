@@ -3,6 +3,7 @@ Revien Ingestion Pipeline — Orchestrates extraction, deduplication, and storag
 The main entry point for feeding content into the graph.
 """
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -10,6 +11,16 @@ from typing import Dict, List, Optional
 from revien.graph.schema import Edge, EdgeType, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
+
+
+def _ingest_deny_set() -> set:
+    """Source IDs that are never captured (per-source ingestion policy, leg 6b).
+
+    Comma-separated ``REVIEN_INGEST_DENY``. Read per-call so policy changes take
+    effect without a restart. Empty/unset => deny nothing (current behavior).
+    """
+    raw = os.environ.get("REVIEN_INGEST_DENY", "")
+    return {s.strip() for s in raw.split(",") if s.strip()}
 from .extractor import ExtractionResult, RuleBasedExtractor
 from .extractor_llm import TextExtractor, build_extractor
 from .dedup import Deduplicator
@@ -73,6 +84,24 @@ class IngestionPipeline:
         Ingest raw content into the graph.
         Returns a summary of what was created/deduplicated.
         """
+        # 0. Per-source ingestion policy (leg 6b). If this source_id is on the
+        #    deny list, capture is a clean no-op: nothing is extracted, stored,
+        #    or embedded, and the reason is logged. The graph is untouched.
+        deny = _ingest_deny_set()
+        if input_data.source_id in deny:
+            print(
+                f"[revien] ingest denied for source_id={input_data.source_id!r} "
+                f"(REVIEN_INGEST_DENY) — no content captured."
+            )
+            return IngestionOutput(
+                context_node_id="",
+                nodes_created=0,
+                nodes_deduplicated=0,
+                edges_created=0,
+                total_nodes_in_graph=self.store.count_nodes(),
+                total_edges_in_graph=self.store.count_edges(),
+            )
+
         # 1. Extract nodes and edges
         extraction = self.extractor.extract(
             content=input_data.content,
