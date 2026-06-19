@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -165,7 +166,35 @@ ANSWER_PROMPT_SHA256 = "eaab3885c6591c81491c08ab762fbeeab6d2893c1d49922cb887b29a
 # already the top-K from recall(); we cap total characters so a pathological
 # context can't blow the model's window or the request size.
 MAX_CONTEXT_CHARS = 4000
-REQUEST_TIMEOUT = 60  # seconds, mirrors the extractor/embedder transport budget
+
+# HTTP socket timeout (seconds) for EVERY LLM answerer request. A stalled
+# connection (dead Ollama, hung cloud endpoint, half-open socket) must raise a
+# socket.timeout rather than block the whole benchmark forever — a single hung
+# call was one of the two ways a 20-min run lost everything. Env-overridable via
+# REVIEN_ANSWERER_TIMEOUT (seconds); falls back to 60s if unset/invalid.
+_DEFAULT_REQUEST_TIMEOUT = 60.0
+
+
+def _resolve_timeout() -> float:
+    """Read REVIEN_ANSWERER_TIMEOUT (seconds); fall back to the 60s default.
+
+    Invalid / non-positive values fall back to the default rather than wedging
+    the transport with a 0/negative timeout.
+    """
+    raw = os.environ.get("REVIEN_ANSWERER_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_REQUEST_TIMEOUT
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_REQUEST_TIMEOUT
+    return val if val > 0 else _DEFAULT_REQUEST_TIMEOUT
+
+
+# Resolved once at import for the module-level constant other code reads, but the
+# transport re-reads the env on each call so a test (or operator) can override it
+# without re-importing. Mirrors the extractor/embedder transport budget.
+REQUEST_TIMEOUT = _resolve_timeout()
 
 # Cloud providers (disclose once before any text leaves the machine). Ollama is
 # LOCAL and never discloses. `CLOUD_PROVIDERS` is the PUBLIC source of truth the
@@ -317,7 +346,15 @@ def _disclose_cloud(provider: str) -> None:
 
 
 def _http_post_json(url: str, payload: dict, headers: dict) -> dict:
-    """POST JSON, return parsed JSON. stdlib urllib only — no SDKs."""
+    """POST JSON, return parsed JSON. stdlib urllib only — no SDKs.
+
+    The socket timeout is re-resolved from REVIEN_ANSWERER_TIMEOUT on every call
+    so a stalled connection RAISES (socket.timeout) instead of blocking forever.
+    A timeout is normalized to a RuntimeError so the runner can catch one bad
+    call, record the QA as unanswered, and continue — a hung call can't kill the
+    whole run.
+    """
+    timeout = _resolve_timeout()
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -325,11 +362,26 @@ def _http_post_json(url: str, payload: dict, headers: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:  # pragma: no cover - network path
         body = e.read().decode("utf-8", "replace")[:500]
         raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
+    except socket.timeout as e:  # pragma: no cover - network path
+        raise RuntimeError(
+            f"timeout after {timeout}s contacting {url} "
+            f"(set REVIEN_ANSWERER_TIMEOUT to adjust)"
+        ) from e
+    except urllib.error.URLError as e:  # pragma: no cover - network path
+        # urllib wraps socket.timeout as URLError(reason=socket.timeout) on some
+        # platforms; surface either as a clean, catchable RuntimeError.
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, socket.timeout):
+            raise RuntimeError(
+                f"timeout after {timeout}s contacting {url} "
+                f"(set REVIEN_ANSWERER_TIMEOUT to adjust)"
+            ) from e
+        raise RuntimeError(f"network error contacting {url}: {reason}") from e
 
 
 class OllamaAnswerer:

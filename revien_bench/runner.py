@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -74,6 +75,72 @@ def _restore_env(prev: Dict[str, Optional[str]]) -> None:
             os.environ[k] = v
 
 
+# ── Per-conversation checkpoint / resume ──────────────────────────────────────
+# A full LoCoMo run is ~20 min and ~2000 QA. Writing results only at the very
+# end means any interruption (laptop sleep, a single hung HTTP call) loses
+# everything and re-burns the API calls on retry. We append ONE JSON line per
+# COMPLETED conversation to a checkpoint file and flush it immediately, so an
+# interruption loses at most the in-progress conversation. On startup we load it
+# and SKIP conversations already done (keyed by conv_id), guarded by the dataset
+# SHA so a changed dataset never falsely resumes.
+
+
+def _sanitize(text: str) -> str:
+    """Make an answerer/config spec safe for a filename (e.g. 'openai:gpt-4o')."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "x"
+
+
+def _checkpoint_path(out_dir: Path, config_name: str, answerer_name: str) -> Path:
+    """Stable checkpoint path for this exact config+answerer pair."""
+    return out_dir / f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}.jsonl"
+
+
+def _load_checkpoint(
+    ckpt_path: Path, dataset_sha: Optional[str]
+) -> Dict[str, Dict]:
+    """Load completed-conversation records, keyed (de-duplicated) by conv_id.
+
+    Only records whose stored dataset_sha matches the CURRENT dataset SHA are
+    honored — a changed dataset must NOT falsely resume. Records for a different
+    SHA (or malformed lines) are skipped. Later lines win on duplicate conv_id
+    (an append-only re-run of the same conv supersedes the earlier one).
+    """
+    done: Dict[str, Dict] = {}
+    if not ckpt_path.exists():
+        return done
+    for line in ckpt_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # tolerate a torn final line from a hard kill
+        if not isinstance(rec, dict) or "conv_id" not in rec:
+            continue
+        # Dataset-SHA guard: skip records that don't match the current dataset.
+        if dataset_sha is not None and rec.get("dataset_sha") != dataset_sha:
+            continue
+        done[str(rec["conv_id"])] = rec
+    return done
+
+
+def _append_checkpoint(ckpt_path: Path, record: Dict) -> None:
+    """Append one completed-conversation record and flush+fsync to disk.
+
+    fsync so a crash/sleep immediately after a conversation can't lose the line
+    that was already 'written' to a buffer.
+    """
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(ckpt_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+        fh.flush()
+        try:
+            os.fsync(fh.fileno())
+        except OSError:
+            pass
+
+
 def _retrieved_dia_ids(store: GraphStore, results) -> List[str]:
     """Map ranked retrieval results -> ordered, de-duplicated dia_ids (gold space)."""
     seen = set()
@@ -111,10 +178,21 @@ def _score_qa(
         labels=[r.label for r in resp.results],
     )
     t1 = time.perf_counter()
-    prediction = answerer.answer(ctx)
+    # A single hung/failing answerer call (socket timeout, HTTP error, malformed
+    # response) must NOT kill the whole run. Catch it here, record the QA as
+    # unanswered (empty prediction -> F1 0), note the error, and continue. The
+    # extractive reader never raises; this guard matters for the LLM readers.
+    answer_error: Optional[str] = None
+    try:
+        prediction = answerer.answer(ctx)
+    except Exception as e:  # noqa: BLE001 - intentional: one bad call ≠ dead run
+        prediction = ""
+        answer_error = f"{type(e).__name__}: {e}"
     answer_ms = (time.perf_counter() - t1) * 1000.0
 
-    # F1 / adversarial scoring.
+    # F1 / adversarial scoring. An empty prediction scores F1 0 for a normal
+    # question; for an adversarial question an empty/failed answer is NOT a valid
+    # refusal, so adversarial_score("") is 0 too — a failed call is never rewarded.
     if qa.is_adversarial:
         f1 = M.adversarial_score(prediction)
     else:
@@ -139,6 +217,7 @@ def _score_qa(
         "prediction": prediction,
         "f1": round(f1, 4),
         "is_adversarial": qa.is_adversarial,
+        "answer_error": answer_error,
         "refused": A.REFUSAL == prediction or M.is_refusal(prediction),
         "gold_evidence": sorted(gold),
         "retrieved_dia_ids": retrieved,
@@ -158,6 +237,7 @@ def run_benchmark(
     out_dir: Path,
     limit_convs: Optional[int] = None,
     max_qa: Optional[int] = None,
+    fresh: bool = False,
 ) -> Dict:
     cfg = _load_config(config_name)
     prev_env = _apply_env(cfg.get("env", {}))
@@ -174,36 +254,91 @@ def run_benchmark(
             for _conv in conversations:
                 _conv.qa = _conv.qa[:max_qa]
 
+        # ── Checkpoint / resume setup ─────────────────────────────────────────
+        dataset_sha = read_locked_hash()
+        ckpt_path = _checkpoint_path(out_dir, config_name, answerer_name)
+        if fresh:
+            # --fresh: ignore + delete any prior checkpoint and start over.
+            try:
+                ckpt_path.unlink()
+            except OSError:
+                pass
+            done_records: Dict[str, Dict] = {}
+        else:
+            # Resume: load completed conversations (SHA-guarded), skip them below.
+            done_records = _load_checkpoint(ckpt_path, dataset_sha)
+        resumed_conv_ids = set(done_records)
+
         per_q: List[Dict] = []
         ingest_rates: List[float] = []
         recall_latencies: List[float] = []
-        supporting_for_provenance: List[str] = []
         total_audit_creates_expected = 0
+        n_resumed = 0
+        n_ran = 0
         # Network/cost accounting is read off the answerer AFTER the run loop
         # (cloud readers self-count their calls + accumulate a cost estimate;
         # local readers stay at 0 / $0.0). Defaults here in case the loop is empty.
         cloud_calls = 0
         cost_usd_estimate = 0.0
+        # Cost/calls carried in from resumed conversations (summed with the live
+        # answerer's counters at the end so the aggregate covers resumed+new).
+        resumed_cloud_calls = 0
+        resumed_cost_usd = 0.0
+
+        # ── Replay resumed conversations into the accumulators FIRST ──────────
+        # The final aggregate (F1, per-category, recall@k, latency, cost) must
+        # cover ALL conversations — resumed + newly run. We fold each completed
+        # record's rows + stats back in here, then run only the not-yet-done
+        # conversations below.
+        for conv in conversations:
+            rec = done_records.get(conv.conv_id)
+            if rec is None:
+                continue
+            n_resumed += 1
+            for row in rec.get("rows", []):
+                per_q.append(row)
+                recall_latencies.append(row.get("recall_latency_ms", 0.0))
+            ir = rec.get("ingest_rate")
+            if ir:
+                ingest_rates.append(ir)
+            total_audit_creates_expected += rec.get("nodes_created", 0)
+            resumed_cloud_calls += int(rec.get("conv_network_calls", 0) or 0)
+            resumed_cost_usd += float(rec.get("conv_cost_usd", 0.0) or 0.0)
 
         # We keep ONE store alive at provenance-check time, so we sample the
-        # first conversation's store for the provenance/audit assertions (each
-        # store is structurally identical; checking one is representative and
-        # avoids holding 10 stores open).
+        # first FRESHLY-RUN conversation's store for the provenance/audit
+        # assertions (each store is structurally identical; checking one is
+        # representative and avoids holding 10 stores open). On a full resume
+        # (all conversations already done) there is no live store to sample, so
+        # the provenance/audit checks are skipped — noted in the report.
         provenance_store: Optional[GraphStore] = None
         provenance_supporting: List[str] = []
+        provenance_db_path: Optional[str] = None
+        provenance_expected = 0
 
-        for ci, conv in enumerate(conversations):
+        for conv in conversations:
+            if conv.conv_id in resumed_conv_ids:
+                continue  # already completed in a prior run — skip (resume)
+            # Snapshot the answerer's counters so we can attribute per-conv
+            # cost/calls to THIS conversation's checkpoint record.
+            calls_before = int(getattr(answerer, "network_calls", 0))
+            cost_before = float(getattr(answerer, "cost_usd_estimate", 0.0))
+            is_first_fresh = provenance_store is None
+
             fd, db_path = tempfile.mkstemp(suffix=f"_{config_name}_{conv.conv_id}.db")
             os.close(fd)
             store = GraphStore(db_path=db_path)
+            keep_store_open = False
             try:
                 semantic = SemanticIndex(store)  # self-disables without the extra
 
                 t0 = time.perf_counter()
                 summary = ingest_conversation(conv, store, semantic=semantic)
                 ingest_s = time.perf_counter() - t0
+                conv_ingest_rate = 0.0
                 if ingest_s > 0 and summary["turns_ingested"]:
-                    ingest_rates.append(summary["turns_ingested"] / ingest_s)
+                    conv_ingest_rate = summary["turns_ingested"] / ingest_s
+                    ingest_rates.append(conv_ingest_rate)
                 total_audit_creates_expected += summary["nodes_created"]
 
                 clustering = None
@@ -215,24 +350,47 @@ def run_benchmark(
 
                 engine = RetrievalEngine(store, clustering=clustering, semantic=semantic)
 
+                conv_rows: List[Dict] = []
                 for qa in conv.qa:
                     row = _score_qa(store, engine, qa, conv, answerer)
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
+                    conv_rows.append(row)
 
-                # Sample the first conversation for provenance/audit checks.
-                if ci == 0:
+                n_ran += 1
+
+                # Per-conv cost/calls delta (cloud readers self-count globally).
+                conv_calls = int(getattr(answerer, "network_calls", 0)) - calls_before
+                conv_cost = float(getattr(answerer, "cost_usd_estimate", 0.0)) - cost_before
+
+                # ── Persist this conversation's checkpoint line (flush+fsync) ──
+                # Written AFTER the conversation fully completes, so an
+                # interruption loses at most the in-progress conversation.
+                _append_checkpoint(
+                    ckpt_path,
+                    {
+                        "conv_id": conv.conv_id,
+                        "dataset_sha": dataset_sha,
+                        "rows": conv_rows,
+                        "ingest_rate": round(conv_ingest_rate, 4),
+                        "nodes_created": summary["nodes_created"],
+                        "conv_network_calls": conv_calls,
+                        "conv_cost_usd": round(conv_cost, 6),
+                    },
+                )
+
+                # Sample the FIRST freshly-run conversation for provenance/audit.
+                if is_first_fresh:
                     provenance_supporting = []
-                    for row in per_q:
-                        if row["conv"] == conv.conv_id:
-                            provenance_supporting.extend(row["_supporting_ids"])
+                    for row in conv_rows:
+                        provenance_supporting.extend(row["_supporting_ids"])
                     # Keep this store open for the assertions below.
                     provenance_store = store
                     provenance_db_path = db_path
                     provenance_expected = summary["nodes_created"]
-                    continue  # don't close/delete yet
+                    keep_store_open = True
             finally:
-                if ci != 0:
+                if not keep_store_open:
                     store.close()
                     try:
                         os.unlink(db_path)
@@ -255,9 +413,13 @@ def run_benchmark(
                 pass
         # Read network/cost accounting off the answerer (cloud readers count
         # their own calls + accumulate a labelled cost ESTIMATE; local readers
-        # report 0 / $0.0).
-        cloud_calls = int(getattr(answerer, "network_calls", 0))
-        cost_usd_estimate = float(getattr(answerer, "cost_usd_estimate", 0.0))
+        # report 0 / $0.0). The live counters reflect only THIS session's
+        # freshly-run conversations, so we add back the cost/calls carried in
+        # from resumed conversations — the aggregate must cover resumed + new.
+        cloud_calls = int(getattr(answerer, "network_calls", 0)) + resumed_cloud_calls
+        cost_usd_estimate = (
+            float(getattr(answerer, "cost_usd_estimate", 0.0)) + resumed_cost_usd
+        )
 
         # Honest egress check: config-derived, names any cloud backend.
         checks.append(
@@ -294,6 +456,15 @@ def run_benchmark(
             "processor": platform.processor() or platform.machine(),
         }
         report["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Resume bookkeeping: how many conversations were replayed from the
+        # checkpoint vs. freshly run this session, and where the checkpoint lives.
+        report["resume"] = {
+            "checkpoint_path": str(ckpt_path),
+            "conversations_resumed": n_resumed,
+            "conversations_ran": n_ran,
+            "fresh": bool(fresh),
+            "provenance_checked": provenance_store is not None,
+        }
         # Drop the internal _supporting_ids from the persisted per-question rows.
         for row in per_q:
             row.pop("_supporting_ids", None)
@@ -362,6 +533,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="limit number of conversations (debug/subset)")
     ap.add_argument("--max-qa", type=int, default=None, dest="max_qa",
                     help="cap QA per conversation (debug/subset)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore + delete any existing checkpoint and start over "
+                         "(default: resume from the checkpoint, skipping completed "
+                         "conversations)")
     args = ap.parse_args(argv)
 
     dataset_path = Path(args.dataset)
@@ -377,6 +552,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_dir=Path(args.out),
         limit_convs=args.limit,
         max_qa=args.max_qa,
+        fresh=args.fresh,
     )
     _print_summary(report)
     return 0
@@ -403,6 +579,11 @@ def _print_summary(report: Dict) -> None:
     print(f"sovereignty   : {'PASS' if sov['all_passed'] else 'FAIL'}")
     for c in sov["checks"]:
         print(f"   [{'PASS' if c['passed'] else 'FAIL'}] {c['name']}")
+    res = report.get("resume")
+    if res:
+        print(f"resume        : ran={res['conversations_ran']} "
+              f"resumed={res['conversations_resumed']} "
+              f"(checkpoint: {res['checkpoint_path']})")
     print(f"results JSON  : {report.get('_out_path')}")
 
 
