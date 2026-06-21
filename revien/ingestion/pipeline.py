@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from revien.graph.schema import Edge, EdgeType, Node, NodeType
+from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 
@@ -37,6 +37,14 @@ class IngestionInput:
     content_type: str = "conversation"  # conversation | document | note | code
     timestamp: Optional[datetime] = None
     metadata: Dict = field(default_factory=dict)
+    # Claim Sovereignty Layer (Leg 1): the caller declares the modality of THIS
+    # input. Defaults describe plain text, so every existing caller is unchanged.
+    # A caller that knows the unit carries a non-text medium (e.g. a shared photo)
+    # sets source_modality + answerable_by_text=False; a vision pass that has read
+    # the medium sets vision_processed=True.
+    source_modality: Modality = Modality.TEXT
+    answerable_by_text: bool = True
+    vision_processed: bool = False
 
 
 @dataclass
@@ -107,6 +115,19 @@ class IngestionPipeline:
             content=input_data.content,
             source_id=input_data.source_id,
         )
+
+        # 1b. Stamp the input's modality onto every node it produced (Leg 1).
+        # source_modality + vision_processed are provenance — they ride onto all
+        # nodes so we know an entity/fact came from, say, an image-bearing turn.
+        # answerable_by_text=False propagates ONLY to the verbatim CONTEXT unit:
+        # the extracted nodes were pulled FROM the text, so text answered for them;
+        # it is the turn-as-a-whole whose answer may live in the unread medium.
+        ctx_id = extraction.context_node.node_id if extraction.context_node else None
+        for node in extraction.nodes:
+            node.source_modality = input_data.source_modality
+            node.vision_processed = input_data.vision_processed
+            if node.node_id == ctx_id:
+                node.answerable_by_text = input_data.answerable_by_text
 
         # 2. Deduplicate and store nodes, building ID mapping
         id_map = {}  # old_id -> actual_id (may differ if deduplicated)

@@ -12,6 +12,13 @@ import pytest
 
 from revien.graph.schema import Modality, Node, NodeType
 from revien.graph.store import GraphStore
+from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
+from revien.modality import (
+    RETRIEVAL_FAILURE,
+    UNAVAILABLE_MODALITY,
+    answer_available_in_text,
+    classify_miss,
+)
 
 
 @pytest.fixture
@@ -124,3 +131,112 @@ def test_migration_backfills_legacy_db():
         s.close()
     finally:
         Path(path).unlink(missing_ok=True)
+
+
+# ── L1 part 2: pipeline propagation ───────────────────────────────────────────
+
+def test_pipeline_defaults_to_text(store):
+    """A caller that says nothing about modality produces plain text nodes."""
+    pipe = IngestionPipeline(store)
+    out = pipe.ingest(IngestionInput(
+        source_id="s1", content="Alice: our backend uses PostgreSQL and Python."))
+    ctx = store.get_node(out.context_node_id)
+    assert ctx.source_modality is Modality.TEXT
+    assert ctx.answerable_by_text is True
+
+
+def test_pipeline_propagates_mixed_to_context_only(store):
+    """answerable_by_text=False rides onto the verbatim turn, NOT extracted nodes.
+
+    Extracted entity/fact nodes were pulled from the text, so text answered for
+    them; only the turn-as-a-whole has answer content potentially locked in the
+    unread image.
+    """
+    pipe = IngestionPipeline(store)
+    out = pipe.ingest(IngestionInput(
+        source_id="s2",
+        content="Melanie: take a look at this. Our backend uses PostgreSQL.",
+        source_modality=Modality.MIXED,
+        answerable_by_text=False,
+        vision_processed=False,
+    ))
+    ctx = store.get_node(out.context_node_id)
+    assert ctx.source_modality is Modality.MIXED
+    assert ctx.answerable_by_text is False
+
+    others = [n for n in store.list_nodes(limit=10**9)
+              if n.node_id != out.context_node_id]
+    assert others, "expected at least one extracted node"
+    # Provenance modality rides onto extracted nodes...
+    assert all(n.source_modality is Modality.MIXED for n in others)
+    # ...but they stay answerable by text (they came FROM the text).
+    assert all(n.answerable_by_text is True for n in others)
+
+
+# ── L1 part 2: miss classification ────────────────────────────────────────────
+
+def test_classify_miss_unavailable_modality():
+    """All gold nodes are unread images -> the miss is unavoidable, not retrieval."""
+    img = Node(node_type=NodeType.CONTEXT, label="p", content="p",
+               source_modality=Modality.MIXED, answerable_by_text=False,
+               vision_processed=False)
+    assert classify_miss([img]) == UNAVAILABLE_MODALITY
+    assert answer_available_in_text(img) is False
+
+
+def test_classify_miss_retrieval_failure_when_any_text_available():
+    """If even one gold node is answerable by text, the miss is a retrieval bug."""
+    txt = Node(node_type=NodeType.CONTEXT, label="t", content="t")
+    img = Node(node_type=NodeType.CONTEXT, label="p", content="p",
+               source_modality=Modality.MIXED, answerable_by_text=False)
+    assert classify_miss([txt, img]) == RETRIEVAL_FAILURE
+    assert classify_miss([txt]) == RETRIEVAL_FAILURE
+
+
+def test_classify_miss_vision_processed_counts_as_available():
+    """A processed image (caption now in text) is no longer a modality excuse."""
+    vp = Node(node_type=NodeType.CONTEXT, label="p", content="p",
+              source_modality=Modality.MIXED, answerable_by_text=True,
+              vision_processed=True)
+    assert answer_available_in_text(vp) is True
+    assert classify_miss([vp]) == RETRIEVAL_FAILURE
+
+
+def test_classify_miss_no_gold_is_retrieval_failure():
+    """No gold nodes -> cannot blame modality; conservative default."""
+    assert classify_miss([]) == RETRIEVAL_FAILURE
+
+
+# ── L1 part 2: bench tags image turns at ingest ───────────────────────────────
+
+def test_bench_ingest_tags_image_turn_mixed(store):
+    """ingest_conversation marks an image turn MIXED/not-answerable, text turn TEXT."""
+    from revien_bench.loader import Conversation, Turn
+    from revien_bench.ingest_locomo import ingest_conversation
+
+    conv = Conversation(conv_id="c1", speaker_a="A", speaker_b="B")
+    conv.session_dates = {1: "8 May, 2023"}
+    conv.turns = [
+        Turn(dia_id="D1:1", speaker="A", text="Hi there, good to chat",
+             session=1, session_date="8 May, 2023", has_image=False),
+        Turn(dia_id="D1:2", speaker="B", text="take a look at this",
+             session=1, session_date="8 May, 2023",
+             blip_caption="a sunrise painting", has_image=True),
+    ]
+    ingest_conversation(conv, store, use_blip_caption=False)
+
+    nodes = store.list_nodes(limit=10**9)
+    def ctx_for(dia):
+        hits = [n for n in nodes if n.node_type == NodeType.CONTEXT
+                and (n.metadata or {}).get("dia_id") == dia]
+        assert hits, f"no context node for {dia}"
+        return hits[0]
+
+    img = ctx_for("D1:2")
+    assert img.source_modality is Modality.MIXED
+    assert img.answerable_by_text is False
+    assert classify_miss([img]) == UNAVAILABLE_MODALITY
+
+    txt = ctx_for("D1:1")
+    assert txt.source_modality is Modality.TEXT
+    assert txt.answerable_by_text is True

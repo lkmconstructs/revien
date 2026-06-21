@@ -36,6 +36,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from revien.graph.schema import Modality
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 
@@ -127,11 +128,25 @@ def ingest_conversation(
 
     for turn in conv.turns:
         text = turn.text
-        if use_blip_caption and turn.blip_caption:
+        captioned = bool(use_blip_caption and turn.blip_caption)
+        if captioned:
             text = f"{text} [image: {turn.blip_caption}]"
         content = f"{turn.speaker}: {text}"
         source_id = f"{conv.conv_id}:{turn.dia_id}"
         ts = parse_session_date(turn.session_date)
+
+        # Leg 1 modality. An image turn is MIXED (speaker text + a photo). When we
+        # appended the BLIP caption the image content is now IN the text — treat
+        # that as a cheap vision pass (answerable_by_text + vision_processed).
+        # Otherwise the image is dropped and its content is unavailable to text.
+        if turn.has_image:
+            modality = Modality.MIXED
+            answerable = captioned
+            vision_done = captioned
+        else:
+            modality = Modality.TEXT
+            answerable = True
+            vision_done = False
 
         out = pipe.ingest(
             IngestionInput(
@@ -145,6 +160,9 @@ def ingest_conversation(
                     "conv": conv.conv_id,
                     "session_date": turn.session_date,
                 },
+                source_modality=modality,
+                answerable_by_text=answerable,
+                vision_processed=vision_done,
             )
         )
         turns_ingested += 1

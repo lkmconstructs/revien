@@ -63,6 +63,10 @@ class Turn:
     session: int
     session_date: str = ""
     blip_caption: str = ""
+    # True when the raw turn carried an image (img_url and/or a BLIP caption).
+    # Drives Leg 1 modality tagging at ingest; matches the image-grounded signal
+    # used to measure that 46% of evidence-bearing gold is image-backed.
+    has_image: bool = False
 
 
 @dataclass
@@ -175,6 +179,7 @@ def _parse_conversation(raw_conv: dict, conv_id: str) -> Conversation:
                         session=sess_n,
                         session_date=sess_date,
                         blip_caption=str(turn.get("blip_caption", "") or ""),
+                        has_image=bool(turn.get("img_url") or turn.get("blip_caption")),
                     )
                 )
 
