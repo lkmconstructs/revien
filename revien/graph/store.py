@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
+from .schema import Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType
 
 
 class GraphStore:
@@ -49,7 +49,10 @@ class GraphStore:
                 confidence_set_by TEXT DEFAULT '',
                 source_context TEXT DEFAULT '',
                 last_referenced TEXT,
-                invalidated_at TEXT
+                invalidated_at TEXT,
+                source_modality TEXT DEFAULT 'text',
+                answerable_by_text INTEGER DEFAULT 1,
+                vision_processed INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -98,6 +101,8 @@ class GraphStore:
 
         # Upgrade pre-confidence databases in place (backwards compatibility).
         self._migrate_add_confidence_columns(conn)
+        # Claim Sovereignty Layer (Leg 1): add modality columns to older DBs.
+        self._migrate_add_modality_columns(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -163,6 +168,44 @@ class GraphStore:
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence)")
+
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Column already exists or other migration issue — log but don't fail.
+            print(f"Migration note: {e}")
+
+    def _migrate_add_modality_columns(self, conn: sqlite3.Connection) -> None:
+        """Add Claim Sovereignty Layer (Leg 1) modality columns to existing DBs.
+
+        Idempotent and no-op for fresh databases (columns already created in
+        ``_ensure_db``). For older databases this ALTERs the nodes table; the
+        column defaults backfill every existing row as a plain text node
+        (source_modality='text', answerable_by_text=1, vision_processed=0), so
+        recall/scoring stay byte-identical until something deliberately tags a
+        node with a non-text modality.
+        """
+        try:
+            cursor = conn.execute("PRAGMA table_info(nodes)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            if "source_modality" not in columns:
+                conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN source_modality TEXT DEFAULT 'text'"
+                )
+            if "answerable_by_text" not in columns:
+                conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN answerable_by_text INTEGER DEFAULT 1"
+                )
+            if "vision_processed" not in columns:
+                conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN vision_processed INTEGER DEFAULT 0"
+                )
+
+            # Index the answerability flag — the classification path filters on it
+            # (unavailable_modality vs retrieval_failure) and it is low-cardinality.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_modality ON nodes(source_modality)"
+            )
 
             conn.commit()
         except sqlite3.OperationalError as e:
@@ -304,8 +347,9 @@ class GraphStore:
                 created_at, last_accessed, access_count, metadata,
                 source_type, confidence, pinned, confidence_set_at,
                 confidence_set_by, source_context, last_referenced,
-                invalidated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                invalidated_at, source_modality, answerable_by_text,
+                vision_processed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -324,6 +368,9 @@ class GraphStore:
                 node.source_context,
                 node.last_referenced.isoformat() if node.last_referenced else None,
                 node.invalidated_at.isoformat() if node.invalidated_at else None,
+                node.source_modality.value,
+                1 if node.answerable_by_text else 0,
+                1 if node.vision_processed else 0,
             ),
         )
         conn.commit()
@@ -366,6 +413,9 @@ class GraphStore:
             "last_accessed", "confidence", "pinned", "source_type",
             "confidence_set_at", "confidence_set_by", "source_context",
             "last_referenced", "invalidated_at",
+            # Claim Sovereignty Layer (Leg 1): modality fields are mutable so a
+            # later vision pass can flip vision_processed / answerable_by_text.
+            "source_modality", "answerable_by_text", "vision_processed",
         )
         for field in allowed_fields:
             if field in kwargs:
@@ -386,9 +436,9 @@ class GraphStore:
                 values.append(json.dumps(val))
             elif key in datetime_fields:
                 values.append(val.isoformat() if isinstance(val, datetime) else val)
-            elif key == "source_type":
+            elif key in ("source_type", "source_modality"):
                 values.append(val.value if hasattr(val, "value") else val)
-            elif key == "pinned":
+            elif key in ("pinned", "answerable_by_text", "vision_processed"):
                 values.append(1 if val else 0)
             else:
                 values.append(val)
@@ -567,6 +617,12 @@ class GraphStore:
             last_referenced=datetime.fromisoformat(row[15]) if len(row) > 15 and row[15] else None,
             # Provenance Layer (column 16): soft-invalidation marker.
             invalidated_at=datetime.fromisoformat(row[16]) if len(row) > 16 and row[16] else None,
+            # Claim Sovereignty Layer (columns 17-19): modality awareness. Guards
+            # default to a plain text node so rows from a pre-Leg-1 DB read back
+            # unchanged even before the in-place migration runs.
+            source_modality=Modality(row[17]) if len(row) > 17 and row[17] else Modality.TEXT,
+            answerable_by_text=bool(row[18]) if len(row) > 18 and row[18] is not None else True,
+            vision_processed=bool(row[19]) if len(row) > 19 and row[19] is not None else False,
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:

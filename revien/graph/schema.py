@@ -42,6 +42,20 @@ class SourceType(str, Enum):
     CORRECTED = "corrected"  # Contradicted by later information, confidence 0.0
 
 
+class Modality(str, Enum):
+    """Source modality of the evidence a node was extracted from.
+
+    Claim Sovereignty Layer — Leg 1. Lets the system tell an
+    ``unavailable_modality`` miss (the answer lives in a non-text medium that was
+    never processed) apart from a true ``retrieval_failure`` — different bugs with
+    different fixes.
+    """
+    TEXT = "text"  # plain text turn/document
+    IMAGE = "image"  # the evidence is an image (e.g. a shared photo)
+    AUDIO = "audio"  # the evidence is audio
+    MIXED = "mixed"  # text PLUS attached non-text media in the same unit
+
+
 class Node(BaseModel):
     node_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     node_type: NodeType
@@ -67,6 +81,16 @@ class Node(BaseModel):
     # has been marked stale (superseded/archived/corrected) and is excluded from
     # default recall. This is NOT deletion and NOT forget.
     invalidated_at: Optional[datetime] = None
+
+    # Claim Sovereignty Layer (Leg 1): modality awareness. `source_modality` is
+    # the medium the evidence came from; `answerable_by_text` is False when the
+    # answer content lives ONLY in a non-text medium (e.g. a shared photo) and the
+    # text alone cannot satisfy a question about it; `vision_processed` records
+    # whether a vision model has actually read any attached non-text media. The
+    # defaults describe a plain text node, so every pre-Leg-1 node is unchanged.
+    source_modality: Modality = Modality.TEXT
+    answerable_by_text: bool = True
+    vision_processed: bool = False
 
 
 class Edge(BaseModel):
