@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .schema import Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType
+from .schema import (
+    Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
+)
 
 
 class GraphStore:
@@ -52,7 +54,13 @@ class GraphStore:
                 invalidated_at TEXT,
                 source_modality TEXT DEFAULT 'text',
                 answerable_by_text INTEGER DEFAULT 1,
-                vision_processed INTEGER DEFAULT 0
+                vision_processed INTEGER DEFAULT 0,
+                recorded_at TEXT,
+                event_time_start TEXT,
+                event_time_end TEXT,
+                event_time_granularity TEXT,
+                event_time_confidence REAL,
+                event_time_text TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -103,6 +111,8 @@ class GraphStore:
         self._migrate_add_confidence_columns(conn)
         # Claim Sovereignty Layer (Leg 1): add modality columns to older DBs.
         self._migrate_add_modality_columns(conn)
+        # Claim Sovereignty Layer (Leg 2): add temporal columns to older DBs.
+        self._migrate_add_temporal_columns(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -206,6 +216,37 @@ class GraphStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_modality ON nodes(source_modality)"
             )
+
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Column already exists or other migration issue — log but don't fail.
+            print(f"Migration note: {e}")
+
+    def _migrate_add_temporal_columns(self, conn: sqlite3.Connection) -> None:
+        """Add Claim Sovereignty Layer (Leg 2) temporal columns to existing DBs.
+
+        Idempotent and no-op for fresh databases. All columns are nullable and
+        backfill NULL on existing rows (recorded_at unknown, no event resolved),
+        so recall/scoring stay byte-identical until ingestion populates them.
+        event_time is stored as a [start, end] RANGE plus a granularity label so a
+        fuzzy expression is recorded honestly, never as a false-precise instant.
+        """
+        try:
+            cursor = conn.execute("PRAGMA table_info(nodes)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            if "recorded_at" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN recorded_at TEXT")
+            if "event_time_start" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN event_time_start TEXT")
+            if "event_time_end" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN event_time_end TEXT")
+            if "event_time_granularity" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN event_time_granularity TEXT")
+            if "event_time_confidence" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN event_time_confidence REAL")
+            if "event_time_text" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN event_time_text TEXT DEFAULT ''")
 
             conn.commit()
         except sqlite3.OperationalError as e:
@@ -348,8 +389,11 @@ class GraphStore:
                 source_type, confidence, pinned, confidence_set_at,
                 confidence_set_by, source_context, last_referenced,
                 invalidated_at, source_modality, answerable_by_text,
-                vision_processed)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                vision_processed, recorded_at, event_time_start,
+                event_time_end, event_time_granularity, event_time_confidence,
+                event_time_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -371,6 +415,12 @@ class GraphStore:
                 node.source_modality.value,
                 1 if node.answerable_by_text else 0,
                 1 if node.vision_processed else 0,
+                node.recorded_at.isoformat() if node.recorded_at else None,
+                node.event_time_start.isoformat() if node.event_time_start else None,
+                node.event_time_end.isoformat() if node.event_time_end else None,
+                node.event_time_granularity.value if node.event_time_granularity else None,
+                node.event_time_confidence,
+                node.event_time_text,
             ),
         )
         conn.commit()
@@ -416,6 +466,10 @@ class GraphStore:
             # Claim Sovereignty Layer (Leg 1): modality fields are mutable so a
             # later vision pass can flip vision_processed / answerable_by_text.
             "source_modality", "answerable_by_text", "vision_processed",
+            # Claim Sovereignty Layer (Leg 2): temporal fields, populated by the
+            # resolver at ingest and revisable by a later verify pass.
+            "recorded_at", "event_time_start", "event_time_end",
+            "event_time_granularity", "event_time_confidence", "event_time_text",
         )
         for field in allowed_fields:
             if field in kwargs:
@@ -429,6 +483,7 @@ class GraphStore:
         values = []
         datetime_fields = (
             "last_accessed", "confidence_set_at", "last_referenced", "invalidated_at",
+            "recorded_at", "event_time_start", "event_time_end",
         )
         for key, val in updates.items():
             set_clauses.append(f"{key} = ?")
@@ -436,7 +491,7 @@ class GraphStore:
                 values.append(json.dumps(val))
             elif key in datetime_fields:
                 values.append(val.isoformat() if isinstance(val, datetime) else val)
-            elif key in ("source_type", "source_modality"):
+            elif key in ("source_type", "source_modality", "event_time_granularity"):
                 values.append(val.value if hasattr(val, "value") else val)
             elif key in ("pinned", "answerable_by_text", "vision_processed"):
                 values.append(1 if val else 0)
@@ -623,6 +678,14 @@ class GraphStore:
             source_modality=Modality(row[17]) if len(row) > 17 and row[17] else Modality.TEXT,
             answerable_by_text=bool(row[18]) if len(row) > 18 and row[18] is not None else True,
             vision_processed=bool(row[19]) if len(row) > 19 and row[19] is not None else False,
+            # Claim Sovereignty Layer (columns 20-25): temporal resolution. All
+            # nullable — a pre-Leg-2 row reads back with no recorded/event time.
+            recorded_at=datetime.fromisoformat(row[20]) if len(row) > 20 and row[20] else None,
+            event_time_start=datetime.fromisoformat(row[21]) if len(row) > 21 and row[21] else None,
+            event_time_end=datetime.fromisoformat(row[22]) if len(row) > 22 and row[22] else None,
+            event_time_granularity=TemporalGranularity(row[23]) if len(row) > 23 and row[23] else None,
+            event_time_confidence=float(row[24]) if len(row) > 24 and row[24] is not None else None,
+            event_time_text=row[25] if len(row) > 25 and row[25] else "",
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:

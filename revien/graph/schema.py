@@ -56,6 +56,23 @@ class Modality(str, Enum):
     MIXED = "mixed"  # text PLUS attached non-text media in the same unit
 
 
+class TemporalGranularity(str, Enum):
+    """Precision of a resolved event time — Claim Sovereignty Layer, Leg 2.
+
+    The honest label on an event_time range. A DAY-granular range covers one day;
+    a YEAR-granular range covers a whole year ("sometime in 2025"). FUZZY marks a
+    bounded-but-low-confidence guess. Consumers MUST read the granularity and the
+    [start, end] range — never treat the range start as a precise instant. This is
+    what keeps "last year" from silently becoming a specific date the supersession
+    layer would later trust as fact.
+    """
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    YEAR = "year"
+    FUZZY = "fuzzy"
+
+
 class Node(BaseModel):
     node_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     node_type: NodeType
@@ -91,6 +108,23 @@ class Node(BaseModel):
     source_modality: Modality = Modality.TEXT
     answerable_by_text: bool = True
     vision_processed: bool = False
+
+    # Claim Sovereignty Layer (Leg 2): ingestion-time temporal resolution. Four
+    # DISTINCT time concepts, never collapsed. `recorded_at` is WHEN THE CONTENT
+    # WAS SAID (= IngestionInput.timestamp) — distinct from created_at (when the
+    # row was written). `event_time_start`/`event_time_end` BOUND when the event
+    # the claim refers to actually happened, as a RANGE: a fuzzy expression ("last
+    # year") is stored honestly as "sometime in 2025", never a guessed day.
+    # `event_time_granularity` is the precision label; `event_time_confidence` the
+    # resolver's confidence; `event_time_text` the raw expression, kept verbatim.
+    # valid_from/valid_until/last_verified_at are DEFERRED to L3 — they depend on
+    # claim durability (L2.5), not derivable from text alone.
+    recorded_at: Optional[datetime] = None
+    event_time_start: Optional[datetime] = None
+    event_time_end: Optional[datetime] = None
+    event_time_granularity: Optional[TemporalGranularity] = None
+    event_time_confidence: Optional[float] = None
+    event_time_text: str = ""
 
 
 class Edge(BaseModel):
