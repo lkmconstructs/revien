@@ -132,16 +132,28 @@ class SemanticSensitivityRecognizer:
     SENS_THRESHOLD = 0.66   # >= -> sensitive (data gap: neutral<=0.64, sensitive>=0.69)
     NEUT_THRESHOLD = 0.62   # >= (and sens<SENS) -> confident neutral; else abstain
 
+    # Near-miss guard (paranoid mode). confident_neutral additionally requires the
+    # claim to be clearly FAR from sensitive (sens < ceiling) with a clear margin.
+    # Defaults below are permissive (ceiling 1.0, margin 0.0) so the base behavior
+    # is unchanged; a paranoid config tightens them to chase zero leaks.
+    NEUTRAL_SENS_CEILING = 1.0   # no ceiling -> inert
+    NEUTRAL_MARGIN = -1.0        # always satisfied -> inert (base behavior unchanged)
+
     def __init__(self, embedder=None,
                  sens_prototypes: Optional[List[str]] = None,
                  neut_prototypes: Optional[List[str]] = None,
                  sens_threshold: Optional[float] = None,
-                 neut_threshold: Optional[float] = None):
+                 neut_threshold: Optional[float] = None,
+                 neutral_sens_ceiling: Optional[float] = None,
+                 neutral_margin: Optional[float] = None):
         self._embedder = embedder
         self._sens_texts = sens_prototypes if sens_prototypes is not None else SENSITIVE_PROTOTYPES
         self._neut_texts = neut_prototypes if neut_prototypes is not None else NEUTRAL_PROTOTYPES
         self.sens_threshold = sens_threshold if sens_threshold is not None else self.SENS_THRESHOLD
         self.neut_threshold = neut_threshold if neut_threshold is not None else self.NEUT_THRESHOLD
+        self.neutral_sens_ceiling = (
+            neutral_sens_ceiling if neutral_sens_ceiling is not None else self.NEUTRAL_SENS_CEILING)
+        self.neutral_margin = neutral_margin if neutral_margin is not None else self.NEUTRAL_MARGIN
         self._sens_vecs: Optional[List[List[float]]] = None
         self._neut_vecs: Optional[List[List[float]]] = None
         self._available: Optional[bool] = None
@@ -179,7 +191,9 @@ class SemanticSensitivityRecognizer:
         neut = max(_cos(v, p) for p in self._neut_vecs)
         if sens >= self.sens_threshold:
             route = SensitivityRoute.SENSITIVE
-        elif neut >= self.neut_threshold:
+        elif (neut >= self.neut_threshold
+              and sens < self.neutral_sens_ceiling
+              and (neut - sens) >= self.neutral_margin):
             route = SensitivityRoute.CONFIDENT_NEUTRAL
         else:
             route = SensitivityRoute.ABSTAIN
