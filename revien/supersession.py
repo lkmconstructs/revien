@@ -206,8 +206,13 @@ class SupersessionGate:
         # therefore NEVER auto-superseded. This guard runs ahead of all
         # configurable logic (protected_set, thresholds) and reads NO config, so
         # the protection cannot be lowered through the config back door — the floor
-        # holds even with protected_set=frozenset(). Closes the gap until the
-        # hybrid backend's sensitive-recognition (the named safety trigger) lands.
+        # holds even with protected_set=frozenset(). NOTE: that promise is scoped
+        # to the UNCLASSIFIED default only; emptying protected_set still de-protects
+        # CLASSIFIED named-sensitive claims by design (governance). And the floor
+        # covers only manifestation 1 of the recognition gap (sensitive content
+        # classified as NOTHING) — content confidently MISNAMED into a non-protected
+        # type ("I love being sober" -> preference_habit) is NOT floored; that is
+        # the hybrid backend's job (HYBRID_BACKEND_TRIGGERS.md Trigger 2).
         if existing.result.classification_status is not ClassificationStatus.CLASSIFIED:
             trace.append("sensitive_floor:existing_not_classified")
             return SupersessionDecision(
@@ -291,6 +296,12 @@ class SupersessionMetrics:
     candidate: int = 0
     version_locked: int = 0
     no_conflict: int = 0
+    # SAFETY-relevant overlay (not a disposition): decisions the interim sensitive
+    # floor caught. A floor catch has action=NO_CONFLICT, so it would otherwise
+    # vanish into no_conflict and read as a quiet queue during a sensitive-heavy
+    # stream. Counted separately so a workload-defer decision can't be blind to
+    # sensitive volume — reinforces the Trigger-1/Trigger-2 firewall.
+    sensitive_floor_caught: int = 0
 
     def record(self, decision: SupersessionDecision) -> None:
         a = decision.action
@@ -302,6 +313,8 @@ class SupersessionMetrics:
             self.version_locked += 1
         else:
             self.no_conflict += 1
+        if "sensitive_floor:existing_not_classified" in decision.trace:
+            self.sensitive_floor_caught += 1
 
     @property
     def total(self) -> int:
@@ -326,5 +339,6 @@ class SupersessionMetrics:
             "version_locked": self.version_locked,
             "no_conflict": self.no_conflict,
             "candidate_queue_depth": self.candidate_queue_depth,
+            "sensitive_floor_caught": self.sensitive_floor_caught,
             "auto_fire_rate": round(self.auto_fire_rate, 4),
         }

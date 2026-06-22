@@ -108,3 +108,17 @@ def test_queue_metrics_track_depth_and_rate(clf):
     assert m.candidate_queue_depth == m.candidate + m.version_locked
     snap = m.snapshot()
     assert snap["total"] == 4 and "candidate_queue_depth" in snap and "auto_fire_rate" in snap
+
+
+def test_floor_catches_are_counted_separately_not_pooled_into_no_conflict(clf):
+    """Safety observability: a sensitive-heavy stream of floored claims must be
+    visible (sensitive_floor_caught), not hidden inside no_conflict / a quiet queue."""
+    gate = SupersessionGate()
+    m = SupersessionMetrics()
+    for _ in range(5):
+        d = gate.evaluate(Claim("I'm sober.", clf.classify("I'm sober.")),
+                          Claim("I'm drinking again.", clf.classify("I'm drinking again.")))
+        m.record(d)
+    assert m.sensitive_floor_caught == 5
+    assert m.candidate_queue_depth == 0           # the queue looks quiet...
+    assert m.snapshot()["sensitive_floor_caught"] == 5   # ...but the safety overlay shows the volume
