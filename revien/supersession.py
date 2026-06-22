@@ -46,7 +46,7 @@ from revien.claims import (
     PROTECTED_DEFAULT,
     SENSITIVE_FLOOR,
 )
-from revien.tripwire import DistrustTripwire
+from revien.tripwire import DistrustTripwire, verify_tripwire
 
 
 class Lock(str, Enum):
@@ -151,7 +151,13 @@ class SupersessionGate:
         self.protected_set = protected_set
         self.new_conf_bar = new_conf_bar
         # Interim distrust tripwire (content-level, strictly additive). Default-on.
-        self.tripwire = tripwire if tripwire is not None else DistrustTripwire()
+        # BEHAVIORAL config-floor enforcement (invariant 4): an injected tripwire
+        # that fails to trip the core reproduced-harm sentinels — a blinded subclass,
+        # a duck-typed no-op, a shrunk lexicon — is REFUSED. We fall back to a
+        # known-good DistrustTripwire so the core can never be removed through the
+        # injection/subclass back door (which a lexical-only check could not see).
+        candidate_tw = tripwire if tripwire is not None else DistrustTripwire()
+        self.tripwire = candidate_tw if verify_tripwire(candidate_tw) else DistrustTripwire()
 
     # ── scope_overlap: a first-class score ────────────────────────────────────
     def _scope_overlap(self, e: Claim, n: Claim) -> float:

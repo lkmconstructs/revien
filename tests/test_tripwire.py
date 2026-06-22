@@ -15,7 +15,7 @@ from revien.supersession import (
     SupersessionGate,
     SupersessionMetrics,
 )
-from revien.tripwire import DistrustTripwire
+from revien.tripwire import DistrustTripwire, verify_tripwire
 
 
 @pytest.fixture
@@ -154,3 +154,58 @@ def test_metrics_count_tripwire_catches_by_domain(clf):
     assert m.tripwire_by_domain.get("recovery") == 2
     assert m.tripwire_by_domain.get("relationship_status") == 1
     assert m.snapshot()["tripwire_caught"] == 3
+
+
+# ── adversarial-verification follow-ups (wf_ba3205db) ─────────────────────────
+
+class _BlindWire(DistrustTripwire):
+    """A subclass that keeps the lexicon but blinds check() — the attack that
+    passed the OLD lexical covers_core() while defeating the floor."""
+    def check(self, text):  # noqa: D401
+        return None
+
+
+class _NullDuck:
+    """A duck-typed no-op tripwire (no inheritance) injected via the gate param."""
+    def check(self, text):
+        return None
+
+
+def test_behavioral_covers_core_detects_blinded_subclass():
+    """covers_core() is now behavioral: a blinded check() fails its own proof,
+    where the old lexical-only check falsely reported True."""
+    blind = _BlindWire()
+    assert blind.covers_core() is False
+    assert verify_tripwire(blind) is False
+    assert verify_tripwire(DistrustTripwire()) is True
+
+
+@pytest.mark.parametrize("injected", [_BlindWire(), _NullDuck()])
+def test_gate_refuses_blind_injected_tripwire_and_falls_back(clf, injected):
+    """Invariant 4: the gate behaviorally validates an injected tripwire and falls
+    back to a known-good one, so the core cannot be removed by subclass/injection.
+    The canonical recovery pair must still route to candidate, never auto-erased."""
+    gate = SupersessionGate(tripwire=injected)
+    assert verify_tripwire(gate.tripwire) is True  # the gate swapped in a good one
+    d = gate.evaluate(Claim("I love being sober.", clf.classify("I love being sober.")),
+                      Claim("I don't enjoy being sober.", clf.classify("I don't enjoy being sober.")))
+    assert d.action is SupersessionAction.CANDIDATE
+    assert d.reason == "tripwire_distrust:recovery"
+
+
+@pytest.mark.parametrize("text", [
+    "I love being trans.", "I'm gay.", "I'm a proud lesbian.",
+    "I'm bisexual.", "I identify as queer.",
+])
+def test_identity_short_forms_now_caught(tw, text):
+    """Coverage gap closed: short-form identity disclosures the IDENTITY classifier
+    treats as protected are no longer invisible to the tripwire."""
+    assert tw.check(text) == "identity_transition"
+
+
+def test_trans_disclosure_no_longer_auto_supersedes(clf):
+    gate = SupersessionGate()
+    d = gate.evaluate(Claim("I love being trans.", clf.classify("I love being trans.")),
+                      Claim("I don't enjoy being trans.", clf.classify("I don't enjoy being trans.")))
+    assert d.action is SupersessionAction.CANDIDATE
+    assert d.reason == "tripwire_distrust:identity_transition"

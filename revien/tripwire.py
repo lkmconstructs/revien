@@ -24,7 +24,13 @@ extra reviews. The tripwire is the interim promise it won't, while the real fix
      type-keyed protected guard misses.
   4. Core domain is a config-floor. Operators may ADD domains and lexemes; they may
      NEVER remove the reproduced-harm core set. The learning loop may never modify
-     it. No config, attribute, or subclass can shrink the core.
+     it. The extra_domains path is union-only (no removal API). The proof is
+     BEHAVIORAL: covers_core() and the gate run the core reproduced-harm sentinels
+     through check(), so a blinded/overridden/duck-typed check() FAILS the proof
+     (a lexical-only check could not see it). The gate REFUSES an injected tripwire
+     that fails the sentinels and falls back to a known-good one. Runtime mutation
+     of private attributes is out of scope (equivalent to editing source) and is
+     flagged by covers_core() flipping False.
   5. The tripwire does not close Trigger 2. It is lexemes, not meaning; it WILL
      miss sensitive content phrased without a core lexeme. It structurally cannot
      satisfy the sensitive-recognition test and never retires it. It may be demoted
@@ -53,8 +59,9 @@ CORE_DOMAINS: Dict[str, List[str]] = {
         r"in recovery", r"twelve.?step", r"12.?step", r"clean and sober",
     ],
     "identity_transition": [
-        r"transition", r"transgender", r"nonbinary", r"non-binary", r"deadnam",
-        r"pronoun", r"genderqueer", r"gender identity", r"coming out",
+        r"transition", r"transgender", r"\btrans\b", r"nonbinary", r"non-binary",
+        r"deadnam", r"pronoun", r"genderqueer", r"gender identity", r"coming out",
+        r"\bgay\b", r"lesbian", r"bisexual", r"\bqueer\b", r"asexual",
     ],
     "relationship_status": [
         r"single", r"married", r"divorc", r"widow", r"engaged", r"separated",
@@ -80,6 +87,34 @@ CORE_DOMAINS: Dict[str, List[str]] = {
 def _normalize(text: str) -> str:
     """Punctuation-light, lowercased form so 's.o.b.e.r' / 'sober!' still match."""
     return re.sub(r"[^a-z0-9\s]", " ", text.lower())
+
+
+# Behavioral config-floor sentinels — at least one reproduced-harm string per core
+# domain. The floor's proof is BEHAVIORAL (run these through check()), not lexical:
+# a blinded / overridden / duck-typed check() that a lexical inspection would miss
+# fails this battery. Every sentinel MUST trip a domain.
+SENTINEL_CASES = (
+    "I am sober.", "I'm in recovery.",                 # recovery
+    "I am transgender.", "I love being trans.",        # identity_transition
+    "I'm single.", "I'm married.",                     # relationship_status
+    "I'm nursing my newborn.", "my diagnosis came back",  # health_diagnosis
+    "my faith matters to me.", "I'm a christian.",     # faith_religion
+    "I'm politically liberal.", "I lean conservative.",  # political_belief
+)
+
+
+def verify_tripwire(tw) -> bool:
+    """Behavioral proof the core is intact: EVERY reproduced-harm sentinel trips.
+
+    Stronger than a lexical lexicon check — it actually runs the candidate object's
+    ``check`` and so detects a subclass/duck-typed/blinded ``check`` that returns
+    None while the lexicon still looks present. The gate uses this to refuse an
+    injected tripwire that does not protect the core (invariant 4).
+    """
+    try:
+        return all(tw.check(s) is not None for s in SENTINEL_CASES)
+    except Exception:  # noqa: BLE001 - any failure means "not trustworthy"
+        return False
 
 
 class DistrustTripwire:
@@ -120,5 +155,8 @@ class DistrustTripwire:
         return None
 
     def covers_core(self) -> bool:
-        """True iff the effective lexicon still contains the entire core set."""
-        return all(set(lex) <= set(self._domains[d]) for d, lex in CORE_DOMAINS.items())
+        """BEHAVIORAL proof the core is intact: every reproduced-harm sentinel trips
+        AND the lexicon still contains the core set. Behavioral first so an
+        overridden/blinded check() (which a lexical-only proof cannot see) fails."""
+        lexical_ok = all(set(lex) <= set(self._domains[d]) for d, lex in CORE_DOMAINS.items())
+        return lexical_ok and verify_tripwire(self)
