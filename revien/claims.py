@@ -56,6 +56,21 @@ PROTECTED_DEFAULT = frozenset({
     ClaimType.RELATIONSHIP,
 })
 
+# Interim sensitive floor (gate ruling, 2026-06-21). Forward-compatible with
+# Leg 6's irongrip_floor_minimum, brought forward NOW to close a config back door.
+#
+# The rule classifier cannot yet RECOGNIZE every sensitive claim — "I'm sober"
+# classifies as nothing. So an unclassified (or low_confidence) claim might BE a
+# sensitive claim the classifier could not name. Until the hybrid backend closes
+# sensitive-recognition (the named safety trigger), the generic candidate-only
+# default for not-confidently-classified claims is PINNED at the named-sensitive
+# protection level (candidate_only / never auto-superseded) and is NON-CONFIGURABLE
+# — it cannot be lowered through the protected-set config back door. SENSITIVE_FLOOR
+# names the reference level; the floor itself is enforced in revien/supersession.py
+# (SupersessionGate) ahead of any configurable protected-set logic.
+SENSITIVE_FLOOR = PROTECTED_DEFAULT  # health_state, identity, belief_value, relationship
+
+
 # Durability PRIOR per type (§7.1). A PRIOR ONLY — per-claim signals may override
 # it. Implementations must never collapse to `durability = DEFAULTS[claim_type]`;
 # that shortcut is the rot the contract names.

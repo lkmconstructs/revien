@@ -44,6 +44,7 @@ from revien.claims import (
     ClassificationStatus,
     Durability,
     PROTECTED_DEFAULT,
+    SENSITIVE_FLOOR,
 )
 
 
@@ -192,8 +193,27 @@ class SupersessionGate:
         return False
 
     # ── the gate ──────────────────────────────────────────────────────────────
+    # The non-configurable protection level the interim floor pins the generic
+    # default to. Named for verification; the floor below does not read config.
+    FLOOR_LEVEL = SENSITIVE_FLOOR
+
     def evaluate(self, existing: Claim, new: Claim) -> SupersessionDecision:
         trace: List[str] = []
+
+        # ── INTERIM SENSITIVE FLOOR (non-configurable, checked FIRST) ─────────
+        # A claim that is not confidently classified might BE a sensitive claim
+        # the rule classifier could not name ("I'm sober" -> unclassified). It is
+        # therefore NEVER auto-superseded. This guard runs ahead of all
+        # configurable logic (protected_set, thresholds) and reads NO config, so
+        # the protection cannot be lowered through the config back door — the floor
+        # holds even with protected_set=frozenset(). Closes the gap until the
+        # hybrid backend's sensitive-recognition (the named safety trigger) lands.
+        if existing.result.classification_status is not ClassificationStatus.CLASSIFIED:
+            trace.append("sensitive_floor:existing_not_classified")
+            return SupersessionDecision(
+                SupersessionAction.NO_CONFLICT,
+                "sensitive_floor_unclassified_existing_never_auto", 0.0, False, trace)
+
         so = self._scope_overlap(existing, new)
         trace.append(f"scope_overlap={so}")
 
@@ -251,3 +271,60 @@ class SupersessionGate:
         trace.append("all_clear")
         return SupersessionDecision(
             SupersessionAction.AUTO_SUPERSEDE, "gate_cleared", so, True, trace)
+
+
+@dataclass
+class SupersessionMetrics:
+    """Production instrumentation for the candidate-queue WORKLOAD trigger.
+
+    Per the gate ruling, the coverage decision ships rule-based and the
+    candidate-queue depth is instrumented in REAL USE — volume, not a benchmark,
+    decides whether the hybrid backend's workload trigger fires. Feed every gate
+    decision via ``record``; read ``candidate_queue_depth`` (items awaiting human
+    adjudication) and the dispositions over time.
+
+    This is the WORKLOAD trigger only. It is independent of — and must never be
+    read as covering — the SAFETY trigger (sensitive-recognition), which fires
+    regardless of queue depth. See HYBRID_BACKEND_TRIGGERS.md.
+    """
+    auto: int = 0
+    candidate: int = 0
+    version_locked: int = 0
+    no_conflict: int = 0
+
+    def record(self, decision: SupersessionDecision) -> None:
+        a = decision.action
+        if a is SupersessionAction.AUTO_SUPERSEDE:
+            self.auto += 1
+        elif a is SupersessionAction.CANDIDATE:
+            self.candidate += 1
+        elif a is SupersessionAction.VERSION_LOCKED:
+            self.version_locked += 1
+        else:
+            self.no_conflict += 1
+
+    @property
+    def total(self) -> int:
+        return self.auto + self.candidate + self.version_locked + self.no_conflict
+
+    @property
+    def candidate_queue_depth(self) -> int:
+        """Decisions awaiting human adjudication (candidate + iron-grip version)."""
+        return self.candidate + self.version_locked
+
+    @property
+    def auto_fire_rate(self) -> float:
+        """Auto-fires over decisions that ACTED (excludes no_conflict no-ops)."""
+        acted = self.auto + self.candidate + self.version_locked
+        return self.auto / acted if acted else 0.0
+
+    def snapshot(self) -> dict:
+        return {
+            "total": self.total,
+            "auto": self.auto,
+            "candidate": self.candidate,
+            "version_locked": self.version_locked,
+            "no_conflict": self.no_conflict,
+            "candidate_queue_depth": self.candidate_queue_depth,
+            "auto_fire_rate": round(self.auto_fire_rate, 4),
+        }
