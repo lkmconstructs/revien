@@ -76,24 +76,37 @@ def test_non_protected_changeable_can_be_auto_eligible(clf):
     assert r.route() == "auto_eligible"
 
 
-# ── Known L2.5d defects — tracked for the gate, not hidden ────────────────────
+# ── Fixed defects (Fix 1 blocking, Fix 3 pre-bar) ─────────────────────────────
 
-@pytest.mark.xfail(reason="L2.5d defect: 'my partner' (strong relationship signal) + negative "
-                          "sentiment misclassifies as relationship instead of emotion_state. "
-                          "Safe today ONLY because relationship is protected-by-default.")
 def test_negative_sentiment_about_partner_is_emotion(clf):
+    """Fix 1 (blocking): negative sentiment whose object is a person is an
+    emotion claim, NOT a relationship status claim. Was a confident error."""
     assert clf.classify("Ugh, my partner is driving me crazy lately.").claim_type is ClaimType.EMOTION_STATE
 
 
-@pytest.mark.xfail(reason="L2.5d defect: compound detection weak (1/4) — needs a softer "
-                          "second-claim signal than two STRONG hits.")
-def test_compound_detection_single_but_kids(clf):
-    assert clf.classify("I'm single, but I really want to have kids someday.").compound is True
-
-
-@pytest.mark.xfail(reason="L2.5d defect: chronic conditions get the health fast-prior; "
-                          "durability should be slow_change for a standing diagnosis.")
-def test_chronic_health_durability_is_not_fast(clf):
+def test_chronic_health_durability_is_slow(clf):
+    """Fix 3: a named chronic condition is a standing state -> slow_change,
+    overriding health_state's fast prior."""
     r = clf.classify("I have Hashimoto's.")
     assert r.claim_type is ClaimType.HEALTH_STATE
     assert r.durability is Durability.SLOW_CHANGE
+
+
+def test_compound_detection_flags_distinct_claims(clf):
+    """Fix 2: clause-split flags genuinely multi-claim turns."""
+    assert clf.classify("I love hiking, and last week I finally climbed Mount Rainier.").compound is True
+    assert clf.classify("Politically I'm liberal, and I'm planning to volunteer next month.").compound is True
+
+
+def test_missed_compound_still_routes_candidate_only(clf):
+    """Defense-in-depth: even the compound case detection misses stays safe —
+    relationship is protected, so it routes candidate_only regardless."""
+    assert clf.classify("I'm single, but I really want to have kids someday.").route() == "candidate_only"
+
+
+@pytest.mark.xfail(reason="residual rule ceiling: an adverb between 'I' and 'want to' "
+                          "('I really want to') hides the 2nd-clause aspiration signal, so "
+                          "compound detection misses. Safe via the protected guard above; "
+                          "not chased further — pattern-stuffing here is how rule sets rot.")
+def test_compound_detection_adverb_insertion(clf):
+    assert clf.classify("I'm single, but I really want to have kids someday.").compound is True

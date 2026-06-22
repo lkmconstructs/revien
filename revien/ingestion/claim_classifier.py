@@ -59,7 +59,12 @@ _TYPE_PATTERNS: Dict[ClaimType, List[Tuple[str, float]]] = {
         (r"\bi(?:'m| am) (?:originally )?from [a-z]+\b", _MEDIUM),
     ],
     ClaimType.RELATIONSHIP: [
-        (r"\bmy (?:husband|wife|partner|boyfriend|girlfriend|spouse|fianc[eé]e?)\b", _STRONG),
+        # A bare person-mention is only MEDIUM — it is weak evidence of a
+        # relationship STATUS claim (you mention your partner while talking about
+        # something else). The explicit status assertions below are the STRONG
+        # signal. This is what stops "my partner is driving me crazy" (an emotion
+        # whose object is a person) from being read as a relationship claim.
+        (r"\bmy (?:husband|wife|partner|boyfriend|girlfriend|spouse|fianc[eé]e?)\b", _MEDIUM),
         (r"\bi(?:'m| am) (?:married|single|divorced|engaged|dating|widowed|seeing someone)\b", _STRONG),
         (r"\bwe(?:'ve| have) been (?:married|together|friends|dating)\b", _STRONG),
         (r"\bmy (?:mom|mum|dad|mother|father|sister|brother|son|daughter|kids?|children|grandma|grandpa|grandmother|grandfather|cousin|aunt|uncle|best friend)\b", _MEDIUM),
@@ -87,8 +92,13 @@ _TYPE_PATTERNS: Dict[ClaimType, List[Tuple[str, float]]] = {
     ClaimType.EMOTION_STATE: [
         (r"\bi feel (?:so |really |very )?[a-z]+\b", _STRONG),
         (r"\bi(?:'m| am) (?:so |really |very |feeling )?(?:happy|sad|excited|thrilled|frustrated|anxious|nervous|proud|angry|upset|grateful|thankful|scared|worried|glad|stressed|annoyed)\b", _STRONG),
+        # Colloquial frustration framing — the claim is an emotion even when its
+        # OBJECT is a person ("negative sentiment alone is not contradiction").
+        (r"\bdriving me (?:crazy|nuts|insane|up the wall|mad)\b", _STRONG),
+        (r"\b(?:annoyed|frustrated|fed up|furious|irritated|upset|mad|sick) (?:with|at|by|about|of)\b", _STRONG),
         (r"\bi was (?:so |really |very )?(?:happy|sad|excited|thrilled|frustrated|anxious|proud|scared|grateful)\b", _MEDIUM),
         (r"\bmakes me feel\b", _MEDIUM),
+        (r"\b(?:ugh|argh|ngl)\b", _WEAK),
     ],
     ClaimType.HISTORICAL_EVENT: [
         (r"\bi (?:went|attended|visited|launched|graduated|completed|finished|moved|travel?led|hosted|threw)\b", _STRONG),
@@ -100,6 +110,7 @@ _TYPE_PATTERNS: Dict[ClaimType, List[Tuple[str, float]]] = {
         (r"\bi(?:'m| am) in the (?:middle|process) of\b", _STRONG),
         (r"\bmy plan is to\b", _STRONG),
         (r"\bi started (?:a |an |my )?[a-z]+", _MEDIUM),
+        (r"\b(?:i've|i have)? ?started [a-z]+ing\b", _MEDIUM),
         (r"\bi(?:'m| am) (?:trying|looking) to\b", _WEAK),
     ],
     ClaimType.SCHEDULE: [
@@ -119,6 +130,7 @@ _TYPE_PATTERNS: Dict[ClaimType, List[Tuple[str, float]]] = {
     ],
     ClaimType.ASPIRATION_GOAL: [
         (r"\bi want to (?:be|become)\b", _STRONG),
+        (r"\bi want to [a-z]+\b", _MEDIUM),  # "want to <anything>" is desire/goal-shaped
         (r"\bi (?:hope|dream|aspire|aim) to\b", _STRONG),
         (r"\bmy (?:goal|dream|ambition) is\b", _STRONG),
         (r"\bsomeday i(?:'d| would| want| hope)\b", _STRONG),
@@ -147,6 +159,13 @@ _DUR_STABLE = re.compile(
 _DUR_SLOW = re.compile(
     r"\b(?:usually|often|always|regularly|i (?:like|love|enjoy|prefer|believe|value)"
     r"|want to (?:be|become)|hope to|aspire|my (?:goal|dream)|prioriti[sz]e|favou?rite)\b", re.I)
+# Chronic standing conditions are slow_change, not the health fast-prior (Fix 3).
+_DUR_CHRONIC = re.compile(
+    r"\b(?:hashimoto'?s|diabetes|cancer|asthma|arthritis|hypertension|lupus|crohn'?s"
+    r"|epilepsy|fibromyalgia|chronic|thyroid)\b", re.I)
+
+# Clause connectors — compound turns join distinct claims with these (Fix 2).
+_CLAUSE_SPLIT = re.compile(r",\s*(?:and|but)\s+|;\s*|\.\s+", re.I)
 
 
 class ClaimClassifier:
@@ -169,8 +188,32 @@ class ClaimClassifier:
                 scores[ct] = min(1.0, s)
         return scores
 
+    def _detect_compound(self, text: str) -> bool:
+        """Compound = distinct claims joined in one turn (clause-split, Fix 2).
+
+        Split on clause connectors; if two clauses carry DIFFERENT top claim types
+        (each clearing MEDIUM), the turn is compound. More precise than "two strong
+        signals anywhere", which conflated single boundary-ambiguous claims with
+        genuine multi-claim turns.
+        """
+        parts = [p for p in _CLAUSE_SPLIT.split(text) if p and p.strip()]
+        if len(parts) < 2:
+            return False
+        tops = []
+        for p in parts:
+            sc = self._type_scores(p)
+            if sc:
+                t, s = max(sc.items(), key=lambda kv: kv[1])
+                if s >= _MEDIUM:
+                    tops.append(t)
+        return len(set(tops)) >= 2
+
     def _durability(self, text: str, claim_type) -> Tuple[Durability, float]:
         """Classify durability independently; type prior only as a fallback (§7.1)."""
+        # A named chronic condition on a health claim is a STANDING state —
+        # slow_change, overriding health_state's fast prior (Fix 3).
+        if claim_type is ClaimType.HEALTH_STATE and _DUR_CHRONIC.search(text):
+            return Durability.SLOW_CHANGE, 0.70
         onetime = _DUR_ONETIME.search(text)
         fast = _DUR_FAST.search(text)
         stable = _DUR_STABLE.search(text)
@@ -215,8 +258,8 @@ class ClaimClassifier:
         margin = (top_score - second_score) / top_score if top_score > 0 else 1.0
         confidence = top_score * (0.5 + 0.5 * margin)
 
-        # Compound: two independent STRONG claims of different types in one turn.
-        compound = second_score >= _STRONG
+        # Compound: distinct claims joined in one turn (clause-split, Fix 2).
+        compound = self._detect_compound(text)
         if compound:
             notes.append("compound")
 
