@@ -36,7 +36,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from revien.claims import (
     ClaimType,
@@ -46,6 +46,7 @@ from revien.claims import (
     PROTECTED_DEFAULT,
     SENSITIVE_FLOOR,
 )
+from revien.tripwire import DistrustTripwire
 
 
 class Lock(str, Enum):
@@ -145,9 +146,12 @@ class SupersessionGate:
     NEW_CONF_BAR = 0.60  # new claim must be confidently classified
 
     def __init__(self, protected_set: Set[ClaimType] = PROTECTED_DEFAULT,
-                 new_conf_bar: float = NEW_CONF_BAR):
+                 new_conf_bar: float = NEW_CONF_BAR,
+                 tripwire: Optional[DistrustTripwire] = None):
         self.protected_set = protected_set
         self.new_conf_bar = new_conf_bar
+        # Interim distrust tripwire (content-level, strictly additive). Default-on.
+        self.tripwire = tripwire if tripwire is not None else DistrustTripwire()
 
     # ── scope_overlap: a first-class score ────────────────────────────────────
     def _scope_overlap(self, e: Claim, n: Claim) -> float:
@@ -271,6 +275,21 @@ class SupersessionGate:
             return SupersessionDecision(
                 SupersessionAction.CANDIDATE, "durability_not_changeable", so, True, trace)
 
+        # ── DISTRUST TRIPWIRE (strictly additive, content-level, type-independent) ──
+        # The gate would auto-supersede. Before it does, distrust the classifier's
+        # type: if the EXISTING or NEW claim's raw/normalized CONTENT names a
+        # sensitive domain, route to candidate instead — covering the
+        # confidently-misnamed manifestation ("I love being sober" -> preference_habit)
+        # the type-keyed protected guard misses. This can ONLY downgrade auto ->
+        # candidate (invariant 1); it never reaches this line on a non-auto path.
+        # It does NOT close Trigger 2 (lexemes, not meaning — it misses unlexed
+        # sensitive content); it is the interim promise, not the fix.
+        tripped = self.tripwire.check(existing.text) or self.tripwire.check(new.text)
+        if tripped:
+            trace.append(f"tripwire:{tripped}")
+            return SupersessionDecision(
+                SupersessionAction.CANDIDATE, f"tripwire_distrust:{tripped}", so, True, trace)
+
         # Every axis cleared: classified, single-claim, scoped contradiction,
         # changeable, non-protected, non-irongrip, confident new claim.
         trace.append("all_clear")
@@ -296,12 +315,15 @@ class SupersessionMetrics:
     candidate: int = 0
     version_locked: int = 0
     no_conflict: int = 0
-    # SAFETY-relevant overlay (not a disposition): decisions the interim sensitive
-    # floor caught. A floor catch has action=NO_CONFLICT, so it would otherwise
-    # vanish into no_conflict and read as a quiet queue during a sensitive-heavy
-    # stream. Counted separately so a workload-defer decision can't be blind to
-    # sensitive volume — reinforces the Trigger-1/Trigger-2 firewall.
+    # SAFETY-relevant overlays (not dispositions). A floor catch has
+    # action=NO_CONFLICT and a tripwire catch action=CANDIDATE, so without these
+    # counters sensitive activity would blur into the ordinary disposition counts
+    # and a sensitive-heavy stream could read as a quiet/normal queue. Counted
+    # separately so a workload-defer decision can't be blind to sensitive volume —
+    # reinforces the Trigger-1/Trigger-2 firewall.
     sensitive_floor_caught: int = 0
+    tripwire_caught: int = 0
+    tripwire_by_domain: Dict[str, int] = field(default_factory=dict)
 
     def record(self, decision: SupersessionDecision) -> None:
         a = decision.action
@@ -315,6 +337,10 @@ class SupersessionMetrics:
             self.no_conflict += 1
         if "sensitive_floor:existing_not_classified" in decision.trace:
             self.sensitive_floor_caught += 1
+        if decision.reason.startswith("tripwire_distrust:"):
+            self.tripwire_caught += 1
+            domain = decision.reason.split(":", 1)[1]
+            self.tripwire_by_domain[domain] = self.tripwire_by_domain.get(domain, 0) + 1
 
     @property
     def total(self) -> int:
@@ -340,5 +366,7 @@ class SupersessionMetrics:
             "no_conflict": self.no_conflict,
             "candidate_queue_depth": self.candidate_queue_depth,
             "sensitive_floor_caught": self.sensitive_floor_caught,
+            "tripwire_caught": self.tripwire_caught,
+            "tripwire_by_domain": dict(self.tripwire_by_domain),
             "auto_fire_rate": round(self.auto_fire_rate, 4),
         }

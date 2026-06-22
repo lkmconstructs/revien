@@ -100,3 +100,47 @@ Emptying the protected set is a governance action that **does** de-protect
 identity/belief claim becomes auto-eligible when its type is removed from the set.
 The floor is a minimum for the unclassified default, **not** a blanket minimum for
 all sensitive content.
+
+---
+
+## Interim distrust tripwire (in force NOW — covers manifestation 2, LEXED only)
+
+The floor covers manifestation 1 (unclassified). The **distrust tripwire**
+(`revien/tripwire.py`, default-on in `SupersessionGate`) covers the *lexed* slice
+of manifestation 2: when a claim's raw/normalized **content** names a core
+sensitive domain, the gate distrusts its own classifier's type and routes the
+claim to **candidate** with a labeled reason (`tripwire_distrust:<domain>`), even
+though the type came out non-protected. So "I love being sober" no longer
+auto-erases — it goes to human review.
+
+It is a deliberately blunt, interim instrument, governed by **six invariants**
+(committed verbatim in `revien/tripwire.py`):
+
+1. **Strictly additive** — only routes to candidate; never grants auto, never
+   removes protection, never alters type/durability/content. Only ever more
+   conservative.
+2. **Candidate-only** — a match is human review; it never auto-acts.
+3. **Type-independent** — inspects raw + normalized content, not `claim_type`;
+   the distrust of the classifier's type is the point.
+4. **Core domain is a config-floor** — operators may ADD domains/lexemes; they may
+   NEVER remove the reproduced-harm core set; the learning loop never touches it;
+   no config/attribute/subclass can shrink it.
+5. **Does not close Trigger 2** — lexemes, not meaning. It WILL miss sensitive
+   content phrased without a core lexeme ("I love being off the bottle" still
+   auto-supersedes today — see `tests/test_sensitive_gap_regression.py`). It
+   structurally cannot satisfy the sensitive-recognition test and never retires it.
+6. **False positives are humility, not failure** — deliberately over-broad
+   ("recovery from the flu", "single-minded" trip it). Over-catch = an extra
+   review = safe. Narrowing to reduce false positives is the defect, not the fix:
+   betrayal with a stack trace costs more than an extra review.
+
+**This does NOT move Trigger 2 off red.** The tripwire closes the lexed slice; the
+unlexed/semantic slice stays open and is pinned as the backend's success criterion.
+
+**Demotion path (the only way the tripwire retires):** ship it → instrument
+catches (`SupersessionMetrics.tripwire_caught` / `tripwire_by_domain`) + queue +
+miss data in real use → build the semantic recognition backend (Trigger 2) →
+**demote the tripwire only after the backend's MEASURED performance proves it
+safe to.** Until then it stands as the interim promise that the trust product
+will not betray a sensitive disclosure with a stack trace while the real fix is
+built.
