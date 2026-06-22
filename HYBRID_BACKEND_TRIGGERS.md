@@ -58,6 +58,31 @@ The hybrid backend must close **both** manifestations so sensitive claims are
 confidently classified AND protected by the gate's own mechanisms (protected-set,
 iron-grip), not only by the interim floor.
 
+### Trigger 2 — Attempt 1 (embedding recognizer): adversarially proven INSUFFICIENT
+
+`revien/sensitivity.py::SemanticSensitivityRecognizer` (local bge-small embeddings
+vs sensitive/neutral prototype banks, two-sided routing with required abstention)
+passed the seeded acceptance fixtures (100% sensitive→candidate incl. 5 unseeded,
+0 unsafe leaks, measure_sensitivity.py) — but the **required adversarial pass
+(`wf_194fc6c9`, 6 agents) FAILED it.** 31 real disclosures routed
+`confident_neutral` (recovery chip/sponsor/AA, psych meds, cancer imaging,
+immigration, coming-out, domestic-violence orders, **bankruptcy via procedural
+rephrasing — a *seeded* domain**, parole, IVF). Proof it keys on **surface
+construction, not cost-of-erasure**: a contraction flips "I am out at work now"
+(sensitive 0.669) vs "I'm out at work now" (neutral 0.644) across the line, and
+the classes overlap in embedding space ("refill at the pharmacy" leak sens 0.637 >
+"I love painting" neutral sens 0.616) so no threshold separates them. This is the
+"fuzzier lexeme matcher with a bigger wordlist" the spec warned against.
+
+**Status: embedding recognizer is an ADDITIVE layer (more protective than
+tripwire-only, opt-in `recognizer=` on the gate), but it does NOT close Trigger 2.
+Trigger 2 stays RED.** Genuine cost-of-erasure recognition needs a mechanism that
+reasons about MEANING (an LLM that can answer "would erasing this betray the
+user?"), not embedding-cosine. The mechanism is an open architecture decision
+(local Ollama vs cloud vs hybrid embedding-prescreen + LLM). The 31 leaks are the
+measurable success criterion: the real recognizer must drive them to 0
+confident_neutral.
+
 - This trigger fires **regardless of queue depth.** A comfortable queue does not
   retire it. (And note: floor-caught sensitive volume is counted separately in
   `SupersessionMetrics.sensitive_floor_caught`, NOT in `candidate_queue_depth` —

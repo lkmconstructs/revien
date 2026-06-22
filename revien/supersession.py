@@ -147,9 +147,15 @@ class SupersessionGate:
 
     def __init__(self, protected_set: Set[ClaimType] = PROTECTED_DEFAULT,
                  new_conf_bar: float = NEW_CONF_BAR,
-                 tripwire: Optional[DistrustTripwire] = None):
+                 tripwire: Optional[DistrustTripwire] = None,
+                 recognizer=None):
         self.protected_set = protected_set
         self.new_conf_bar = new_conf_bar
+        # Trigger 2 semantic sensitive recognizer (primary recognition when set).
+        # Opt-in: when None, the gate runs tripwire-only (interim, degraded-safety).
+        # Production/launch wires a SemanticSensitivityRecognizer; the tripwire then
+        # serves as additive backup, not primary recognition.
+        self.recognizer = recognizer
         # Interim distrust tripwire (content-level, strictly additive). Default-on.
         # BEHAVIORAL config-floor enforcement (invariant 4): an injected tripwire
         # that fails to trip the core reproduced-harm sentinels — a blinded subclass,
@@ -281,6 +287,22 @@ class SupersessionGate:
             return SupersessionDecision(
                 SupersessionAction.CANDIDATE, "durability_not_changeable", so, True, trace)
 
+        # ── SEMANTIC SENSITIVE RECOGNITION (Trigger 2, PRIMARY) ──────────────
+        # Recognize sensitive MEANING independent of lexemes. SENSITIVE or ABSTAIN
+        # both route to candidate (abstention required — an ambiguous disclosure
+        # the recognizer cannot confidently call neutral must NOT auto). Only a
+        # confidently-neutral reading of BOTH claims proceeds to the tripwire
+        # (additive backup) and possible auto. When no recognizer is wired the
+        # gate is in interim tripwire-only mode (degraded-safety, not launch-safe).
+        if self.recognizer is not None:
+            for who, claim in (("existing", existing), ("new", new)):
+                v = self.recognizer.recognize(claim.text)
+                if v.routes_candidate:
+                    trace.append(f"semantic_sensitive:{who}:{v.route.value}")
+                    return SupersessionDecision(
+                        SupersessionAction.CANDIDATE,
+                        f"semantic_sensitive:{v.route.value}", so, True, trace)
+
         # ── DISTRUST TRIPWIRE (strictly additive, content-level, type-independent) ──
         # The gate would auto-supersede. Before it does, distrust the classifier's
         # type: if the EXISTING or NEW claim's raw/normalized CONTENT names a
@@ -330,6 +352,10 @@ class SupersessionMetrics:
     sensitive_floor_caught: int = 0
     tripwire_caught: int = 0
     tripwire_by_domain: Dict[str, int] = field(default_factory=dict)
+    # Trigger 2 semantic recognition overlay: claims caught as sensitive MEANING,
+    # split by whether the recognizer was confident (sensitive) or abstained.
+    semantic_sensitive_caught: int = 0
+    semantic_abstained: int = 0
 
     def record(self, decision: SupersessionDecision) -> None:
         a = decision.action
@@ -347,6 +373,12 @@ class SupersessionMetrics:
             self.tripwire_caught += 1
             domain = decision.reason.split(":", 1)[1]
             self.tripwire_by_domain[domain] = self.tripwire_by_domain.get(domain, 0) + 1
+        if decision.reason.startswith("semantic_sensitive:"):
+            route = decision.reason.split(":", 1)[1]
+            if route == "abstain":
+                self.semantic_abstained += 1
+            else:
+                self.semantic_sensitive_caught += 1
 
     @property
     def total(self) -> int:
@@ -374,5 +406,7 @@ class SupersessionMetrics:
             "sensitive_floor_caught": self.sensitive_floor_caught,
             "tripwire_caught": self.tripwire_caught,
             "tripwire_by_domain": dict(self.tripwire_by_domain),
+            "semantic_sensitive_caught": self.semantic_sensitive_caught,
+            "semantic_abstained": self.semantic_abstained,
             "auto_fire_rate": round(self.auto_fire_rate, 4),
         }
