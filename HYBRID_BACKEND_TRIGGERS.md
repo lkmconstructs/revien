@@ -162,6 +162,39 @@ It is a deliberately blunt, interim instrument, governed by **six invariants**
 **This does NOT move Trigger 2 off red.** The tripwire closes the lexed slice; the
 unlexed/semantic slice stays open and is pinned as the backend's success criterion.
 
+### Trigger 2 — Attempt 2 (LLM recognizer): VERIFIED at 0 leaks (recognition closed)
+
+`revien/sensitivity_llm.py::LLMSensitivityRecognizer` asks an LLM "would silently
+auto-erasing this betray the user?" → SENSITIVE / NEUTRAL / UNSURE; only a clean
+NEUTRAL auto-clears, UNSURE/unparseable/failure abstains. Backend-pluggable (local
+ollama = production zero-cloud default; openai/anthropic = cloud, opt-in, loud
+egress disclosure). Verified against **gpt-4.1**:
+
+- **Gate-1 battery: 0 leaks / 35** known sensitive incl. all 20 disclosures the
+  embedding recognizer failed (`measure_sensitivity_llm.py`).
+- **Adversarial battery (64 hand-authored: euphemism / indirect / procedural /
+  unseeded HIV·sexwork·gambling·military·conversion-therapy / context-dependent):
+  0 leaks.**
+- **Independent corpus (217 LLM-generated realistic entries, benign framing):
+  0 clear leaks** — 130 routed candidate (incl. every buried oblique disclosure:
+  "9 months… the chip", "six months on T", "egg retrieval scheduled", "biometrics
+  at USCIS", "P.O. check-in, pee test"); the 87 cleared-NEUTRAL are all genuinely
+  mundane (chores / pets / work / shopping). One borderline ("standing thing with
+  the group downtown" — discloses nothing on its face) flagged, defensibly neutral.
+- **Abstains** (~20% safe FP) on ambiguous/novel — required, measured, acceptable.
+- **Gate end-to-end** (recognizer wired): classified-sensitive → candidate; neutral
+  → auto. Tripwire + floor remain additive backup.
+
+Contrast: embedding leaked 31 and needed 96.7% stream abstention for zero leaks;
+the LLM holds 0 leaks at ~20% abstention because it reasons about meaning.
+
+**RECOGNITION CAPABILITY is closed** — an LLM genuinely recognizes cost-of-erasure.
+**Two deployment items remain before Trigger 2 is fully GREEN for launch:** (1) the
+zero-cloud production path (local ollama) is built but UNVERIFIED — needs the same
+batteries run against the chosen local model; a cloud recognizer egresses possibly-
+sensitive claims and is the verified *reference*, not the sovereign default. (2)
+Lissa's ruling on whether this clears her closing criterion.
+
 **Demotion path (the only way the tripwire retires):** ship it → instrument
 catches (`SupersessionMetrics.tripwire_caught` / `tripwire_by_domain`) + queue +
 miss data in real use → build the semantic recognition backend (Trigger 2) →
