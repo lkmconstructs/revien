@@ -1,0 +1,38 @@
+[
+  {"existing": "I love painting.", "existing_lock": "normal", "new": "Honestly, I don't like painting anymore.", "expected": "auto_supersede", "contradiction": true, "tags": ["preference", "polarity", "auto"]},
+  {"existing": "My favorite hobby is pottery.", "existing_lock": "normal", "new": "My favorite hobby is hiking now.", "expected": "auto_supersede", "contradiction": true, "tags": ["preference", "value", "auto"]},
+  {"existing": "I enjoy yoga.", "existing_lock": "normal", "new": "I don't enjoy yoga these days.", "expected": "auto_supersede", "contradiction": true, "tags": ["preference", "polarity", "auto"]},
+  {"existing": "My favorite food is sushi.", "existing_lock": "normal", "new": "My favorite food is ramen now.", "expected": "auto_supersede", "contradiction": true, "tags": ["preference", "value", "auto"]},
+  {"existing": "I love hiking on weekends.", "existing_lock": "normal", "new": "I don't like hiking anymore.", "expected": "auto_supersede", "contradiction": true, "tags": ["preference", "polarity", "auto"]},
+  {"existing": "My favorite season is winter.", "existing_lock": "normal", "new": "My favorite season is autumn now.", "expected": "auto_supersede", "contradiction": true, "tags": ["preference", "value", "auto"]},
+
+  {"existing": "I'm single.", "existing_lock": "normal", "new": "I'm married now.", "expected": "candidate", "contradiction": true, "tags": ["protected", "relationship", "status"]},
+  {"existing": "I'm dating someone.", "existing_lock": "normal", "new": "I'm single again.", "expected": "candidate", "contradiction": true, "tags": ["protected", "relationship", "status"]},
+  {"existing": "I'm from Sweden.", "existing_lock": "normal", "new": "Actually, I'm from Norway.", "expected": "candidate", "contradiction": true, "tags": ["protected", "identity", "place"]},
+  {"existing": "I believe in strict discipline.", "existing_lock": "normal", "new": "I don't believe in strict discipline anymore.", "expected": "candidate", "contradiction": true, "tags": ["protected", "belief", "polarity"]},
+  {"existing": "I'm nursing my newborn.", "existing_lock": "normal", "new": "I don't nurse anymore.", "expected": "candidate", "contradiction": true, "tags": ["protected", "health", "polarity"]},
+  {"existing": "I identify as nonbinary.", "existing_lock": "normal", "new": "I don't identify as nonbinary anymore.", "expected": "candidate", "contradiction": true, "tags": ["protected", "identity", "polarity"]},
+
+  {"existing": "I'm married.", "existing_lock": "irongrip", "new": "I'm divorced now.", "expected": "version_locked", "contradiction": true, "tags": ["irongrip", "relationship", "precedence"]},
+  {"existing": "I'm sober.", "existing_lock": "irongrip", "new": "I'm not sober anymore.", "expected": "version_locked", "contradiction": true, "tags": ["irongrip", "health"]},
+
+  {"existing": "I went to the museum yesterday.", "existing_lock": "normal", "new": "Actually I didn't go to the museum, I went to the aquarium.", "expected": "candidate", "contradiction": true, "tags": ["historical", "one_time", "version"]},
+  {"existing": "I graduated last year.", "existing_lock": "normal", "new": "I didn't graduate last year after all.", "expected": "candidate", "contradiction": true, "tags": ["historical", "one_time", "polarity"]},
+
+  {"existing": "The ring represents our bond.", "existing_lock": "normal", "new": "The ring doesn't represent anything to me anymore.", "expected": "candidate", "contradiction": true, "tags": ["stable", "semantic_fact", "non_protected"]},
+  {"existing": "That painting symbolizes hope.", "existing_lock": "normal", "new": "That painting doesn't symbolize hope to me now.", "expected": "candidate", "contradiction": true, "tags": ["stable", "semantic_fact", "non_protected"]},
+
+  {"existing": "Revien is my company.", "existing_lock": "normal", "new": "I'm so frustrated with Revien today.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "key"]},
+  {"existing": "I'm married.", "existing_lock": "normal", "new": "I'm so annoyed at Jesse today.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "invariant", "key"]},
+  {"existing": "I'm politically liberal.", "existing_lock": "normal", "new": "I'm so frustrated with politics lately.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "invariant"]},
+  {"existing": "I founded the nonprofit.", "existing_lock": "normal", "new": "I'm exhausted from the nonprofit work.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard"]},
+
+  {"existing": "I love painting.", "existing_lock": "normal", "new": "I love hiking.", "expected": "no_conflict", "contradiction": false, "tags": ["compatible", "same_type"]},
+  {"existing": "I'm researching adoption agencies.", "existing_lock": "normal", "new": "I'm researching pottery classes.", "expected": "no_conflict", "contradiction": false, "tags": ["compatible", "same_type"]},
+
+  {"existing": "I love painting.", "existing_lock": "normal", "new": "yeah, not really my thing these days.", "expected": "no_conflict", "contradiction": false, "tags": ["precond2", "new_unclassified"]},
+  {"existing": "I'm single.", "existing_lock": "normal", "new": "it's complicated, honestly.", "expected": "no_conflict", "contradiction": false, "tags": ["precond2", "new_unclassified"]},
+
+  {"existing": "I'm nursing my newborn.", "existing_lock": "normal", "new": "Silas weaned this week.", "expected": "candidate", "contradiction": true, "tags": ["known_miss", "cross_subject", "implication"]},
+  {"existing": "I'm politically liberal.", "existing_lock": "normal", "new": "I've become pretty conservative.", "expected": "candidate", "contradiction": true, "tags": ["known_miss", "belief", "value_no_polarity"]}
+]
