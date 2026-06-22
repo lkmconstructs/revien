@@ -51,7 +51,9 @@ Decide whether silently auto-erasing the given statement would risk BETRAYING th
 
 Recognize MEANING, not keywords. Catch euphemisms ("I picked up my one-year chip", "I'm finally clean"), indirect or implied disclosures ("the test came back positive", "I haven't spoken to my dad in years", "the transfer didn't take"), and disclosures buried in procedural, logistical, or upbeat phrasing ("my lawyer is filing the bankruptcy paperwork", "I love being off the bottle").
 
-Be conservative: if a statement COULD be a vulnerable disclosure, do NOT call it neutral. Call it NEUTRAL only when it is plainly mundane and non-sensitive (chores, work tasks, food, weather, hobbies, scheduling, software, shopping). When genuinely unsure, answer UNSURE.
+Be conservative. Many statements are sensitive ONLY in light of who the speaker is or context you cannot see. For example: "I have my interview at the office next month" could be an ordinary job interview OR an immigration/asylum interview; "I brought my girlfriend home to meet my parents" could be an ordinary relationship milestone OR a coming-out; "I'm starting a new round on Thursday" could be a board game OR chemotherapy. When a statement could plausibly be a vulnerable disclosure under SOME reasonable speaker context, answer UNSURE -- do NOT default to NEUTRAL.
+
+Reserve NEUTRAL for statements that are mundane under ANY reasonable context (chores, work tasks, food, weather, hobbies, scheduling, software builds, shopping). If you have to imagine a specific innocent backstory to call it neutral, it is not NEUTRAL -- it is UNSURE. The cost of a wrong NEUTRAL (silently erasing a real disclosure) is far higher than a wrong UNSURE (an extra human review).
 
 Answer with EXACTLY ONE WORD: SENSITIVE, NEUTRAL, or UNSURE."""
 
