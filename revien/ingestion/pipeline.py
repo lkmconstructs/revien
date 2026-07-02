@@ -25,6 +25,7 @@ from .extractor import ExtractionResult, RuleBasedExtractor
 from .extractor_llm import TextExtractor, build_extractor
 from .dedup import Deduplicator
 from .temporal import resolve_event_time
+from .supersession_ingest import ClaimGovernor, build_governor
 # Semantic indexing is opt-in (pip install revien[semantic]). SemanticIndex
 # self-disables when the extra is absent, so ingest() is unchanged without it.
 from revien.semantic.index import SemanticIndex
@@ -57,6 +58,10 @@ class IngestionOutput:
     edges_created: int
     total_nodes_in_graph: int
     total_edges_in_graph: int
+    # Claim Sovereignty governance outcomes for THIS ingest (Leg B). Empty unless
+    # the CSL governor is wired. Each entry is a GovernanceOutcome: what the gate
+    # decided for a contradicting existing claim and what happened to the data.
+    governance: List = field(default_factory=list)
 
 
 class IngestionPipeline:
@@ -73,6 +78,7 @@ class IngestionPipeline:
         store: GraphStore,
         extractor: Optional[TextExtractor] = None,
         semantic: Optional[SemanticIndex] = None,
+        csl: Optional[ClaimGovernor] = None,
     ):
         self.store = store
         self.ops = GraphOperations(store)
@@ -87,6 +93,15 @@ class IngestionPipeline:
         # hybrid recall path can find them. Failures inside the index never
         # propagate (it self-disables), so ingest is robust either way.
         self.semantic = semantic if semantic is not None else SemanticIndex(store)
+        # Claim Sovereignty governance (Leg B), opt-in. Off unless a governor is
+        # injected or REVIEN_CSL is truthy, so default ingest is unchanged. When
+        # on, every ingested claim runs the full classify -> gate -> act path.
+        if csl is not None:
+            self.csl: Optional[ClaimGovernor] = csl
+        elif os.environ.get("REVIEN_CSL", "").strip().lower() in ("1", "true", "yes", "on"):
+            self.csl = build_governor(store, self.ops)
+        else:
+            self.csl = None
 
     def ingest(self, input_data: IngestionInput) -> IngestionOutput:
         """
@@ -212,6 +227,20 @@ class IngestionPipeline:
             extraction.context_node.node_id,
         )
 
+        # 5. Claim Sovereignty governance (Leg B, opt-in). Run the full gate path
+        #    on the verbatim claim (the stored context node) against existing
+        #    memory: classify -> contradiction -> floor/recognizer/tripwire ->
+        #    auto-supersede | candidate | preserve. Best-effort: a governance error
+        #    must never break ingestion — the new claim is already safely stored.
+        governance: List = []
+        if self.csl is not None and context_id:
+            ctx_node = self.store.get_node(context_id)
+            if ctx_node is not None:
+                try:
+                    governance = self.csl.govern(ctx_node)
+                except Exception:  # noqa: BLE001 - governance never breaks ingest
+                    governance = []
+
         return IngestionOutput(
             context_node_id=context_id,
             nodes_created=nodes_created,
@@ -219,6 +248,7 @@ class IngestionPipeline:
             edges_created=edges_created,
             total_nodes_in_graph=self.store.count_nodes(),
             total_edges_in_graph=self.store.count_edges(),
+            governance=governance,
         )
 
     def _edge_exists(

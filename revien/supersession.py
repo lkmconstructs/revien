@@ -47,6 +47,7 @@ from revien.claims import (
     SENSITIVE_FLOOR,
 )
 from revien.tripwire import DistrustTripwire, verify_tripwire
+from revien.fact_change import detect_change, _fav_category
 
 
 class Lock(str, Enum):
@@ -194,7 +195,11 @@ class SupersessionGate:
                 return True
         fe, fn = _favorite_value(et), _favorite_value(nt)
         if fe and fn and fe != fn:
-            return True
+            # Category-aware: a favourite SHOW vs a favourite FOOD are independent,
+            # not a contradiction — only a flip within the SAME category counts.
+            ce, cn = _fav_category(et), _fav_category(nt)
+            if not (ce and cn and ce != cn):
+                return True
 
         # Polarity flip on a shared object (works for any type).
         shared = _content_tokens(et) & _content_tokens(nt)
@@ -215,6 +220,75 @@ class SupersessionGate:
 
     def evaluate(self, existing: Claim, new: Claim) -> SupersessionDecision:
         trace: List[str] = []
+
+        # ── ORDINARY FACT-CHANGE PATH (CSL Leg B) ─────────────────────────────
+        # The rule classifier doesn't classify ordinary biographical facts (where
+        # you live/work, what you drive), so they fell to `unclassified` and the
+        # floor below blocked EVERY update — memory never moved off stale facts
+        # (measured: 0/68). This path recognizes a single-valued fact CHANGE
+        # directly from text and lets memory update — but ONLY after the SAME
+        # defense-in-depth the auto path uses: a fact-shaped SENSITIVE disclosure
+        # ("I moved into a sober-living house") is caught by the recognizer (or the
+        # tripwire, or the protected-type guard) and routed to review, NEVER
+        # silently erased. So this loosens the floor for ordinary facts without
+        # loosening it for sensitive ones.
+        fdim, fchange = detect_change(existing.text, new.text)
+        # The fact path is a FALLBACK only for claims the classifier could NOT name
+        # — ordinary biographical facts ("I live in Boston") fell to `unclassified`
+        # and the floor below blocked every update. Classified claims (preferences,
+        # relationships, health, ...) keep their existing handling untouched, so the
+        # verified gate behaviour is unchanged. The GENERIC path (a retraction over a
+        # shared topic with no recognized fact dimension) can also catch a SENSITIVE
+        # unclassified retraction ("I stopped transitioning"), which only a
+        # recognizer can tell from an ordinary one — so it runs ONLY when a
+        # recognizer is wired; otherwise we defer to the sensitive floor.
+        existing_unclassified = (
+            existing.result.classification_status is not ClassificationStatus.CLASSIFIED)
+        generic_needs_recognizer = (fdim == "generic_change" and self.recognizer is None)
+        # Favourite is the one ordinary dimension the gate ALREADY auto-superseded
+        # offline (classified preferences), so engage it regardless of class. The
+        # rest engage only as the unclassified fallback the floor was blocking.
+        fact_engage = bool(fchange and fdim is not None and (
+            fdim == "favourite"
+            or (existing_unclassified and not generic_needs_recognizer)))
+        if fact_engage:
+            trace.append(f"fact_change:{fdim}")
+            if existing.lock is Lock.IRONGRIP:
+                trace.append("irongrip")
+                return SupersessionDecision(
+                    SupersessionAction.VERSION_LOCKED,
+                    "irongrip_versions_on_explicit_only", 1.0, True, trace)
+            if self.recognizer is not None:
+                for who, claim in (("existing", existing), ("new", new)):
+                    v = self.recognizer.recognize(claim.text)
+                    if v.routes_candidate:
+                        trace.append(f"semantic_sensitive:{who}:{v.route.value}")
+                        return SupersessionDecision(
+                            SupersessionAction.CANDIDATE,
+                            f"semantic_sensitive:{v.route.value}", 1.0, True, trace)
+            tripped = self.tripwire.check(existing.text) or self.tripwire.check(new.text)
+            if tripped:
+                trace.append(f"tripwire:{tripped}")
+                return SupersessionDecision(
+                    SupersessionAction.CANDIDATE, f"tripwire_distrust:{tripped}", 1.0, True, trace)
+            if existing.result.is_protected(self.protected_set):
+                trace.append("protected")
+                return SupersessionDecision(
+                    SupersessionAction.CANDIDATE, "protected_requires_review", 1.0, True, trace)
+            if self.recognizer is None and fdim != "favourite":
+                # DEGRADED-SAFETY: with no sensitivity recognizer wired we cannot
+                # verify a residence/employer/generic change isn't a sensitive
+                # disclosure ("I moved into a sober-living house", "my visa came
+                # through"). So we SURFACE it for review rather than auto-erase.
+                # (Favourite is exempt: it's the dimension the gate already auto'd
+                # offline, guarded by the tripwire + protected check above.)
+                trace.append("fact_change_no_recognizer")
+                return SupersessionDecision(
+                    SupersessionAction.CANDIDATE,
+                    "fact_change_unverified_needs_recognizer", 1.0, True, trace)
+            trace.append("fact_change_all_clear")
+            return SupersessionDecision(
+                SupersessionAction.AUTO_SUPERSEDE, "fact_change_cleared", 1.0, True, trace)
 
         # ── INTERIM SENSITIVE FLOOR (non-configurable, checked FIRST) ─────────
         # A claim that is not confidently classified might BE a sensitive claim

@@ -93,6 +93,24 @@ class GraphStore:
                 after_json TEXT
             );
 
+            -- Claim Sovereignty Layer (Leg 3 wiring): supersession candidate queue.
+            -- When the gate routes a scoped contradiction to CANDIDATE / VERSION_LOCKED
+            -- (protected, sensitive, ambiguous, iron-grip, ...), NEITHER claim is
+            -- mutated — the pair is parked here for human adjudication. The queue is
+            -- the "preserve + surface" half of the policy; auto-supersede is the only
+            -- path that mutates data, and only after the full gate clears.
+            CREATE TABLE IF NOT EXISTS supersession_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                existing_node_id TEXT NOT NULL,
+                new_node_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT DEFAULT '',
+                trace TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolution TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
@@ -103,6 +121,8 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence);
             CREATE INDEX IF NOT EXISTS idx_audit_node ON audit_log(node_id);
             CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+            CREATE INDEX IF NOT EXISTS idx_candidates_unresolved
+                ON supersession_candidates(resolved_at);
         """)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
@@ -550,6 +570,51 @@ class GraphStore:
     def count_nodes(self) -> int:
         conn = self._get_conn()
         return conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+
+    # ── Supersession candidate queue (CSL Leg 3 wiring) ───────────────────────
+    def add_candidate(
+        self, existing_node_id: str, new_node_id: str, action: str,
+        reason: str = "", trace: str = "",
+    ) -> int:
+        """Park a contradiction the gate routed to review. Mutates no node."""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            """INSERT INTO supersession_candidates
+               (existing_node_id, new_node_id, action, reason, trace, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (existing_node_id, new_node_id, action, reason, trace, now),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    def list_candidates(self, unresolved_only: bool = True) -> list[dict]:
+        conn = self._get_conn()
+        q = ("SELECT id, existing_node_id, new_node_id, action, reason, trace, "
+             "created_at, resolved_at, resolution FROM supersession_candidates")
+        if unresolved_only:
+            q += " WHERE resolved_at IS NULL"
+        q += " ORDER BY id ASC"
+        cols = ["id", "existing_node_id", "new_node_id", "action", "reason",
+                "trace", "created_at", "resolved_at", "resolution"]
+        return [dict(zip(cols, r)) for r in conn.execute(q).fetchall()]
+
+    def resolve_candidate(self, candidate_id: int, resolution: str) -> None:
+        """Mark a queued candidate adjudicated (resolution is free-text/audit)."""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE supersession_candidates SET resolved_at = ?, resolution = ? WHERE id = ?",
+            (now, resolution, candidate_id),
+        )
+        conn.commit()
+
+    def count_candidates(self, unresolved_only: bool = True) -> int:
+        conn = self._get_conn()
+        q = "SELECT COUNT(*) FROM supersession_candidates"
+        if unresolved_only:
+            q += " WHERE resolved_at IS NULL"
+        return conn.execute(q).fetchone()[0]
 
     # ── Edge CRUD ─────────────────────────────────────────
 
