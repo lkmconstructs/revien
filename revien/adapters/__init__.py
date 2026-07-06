@@ -2,6 +2,7 @@ from .base import RevienAdapter
 from .file_watcher import FileWatcherAdapter
 from .claude_code import ClaudeCodeAdapter
 from .generic_api import GenericAPIAdapter
+from .obsidian import ObsidianVaultAdapter
 from .openai_adapter import OpenAIAdapter
 from .ollama_adapter import OllamaAdapter
 
@@ -17,6 +18,7 @@ __all__ = [
     "FileWatcherAdapter",
     "ClaudeCodeAdapter",
     "GenericAPIAdapter",
+    "ObsidianVaultAdapter",
     "OpenAIAdapter",
     "OllamaAdapter",
     *_LANGCHAIN_EXPORTS,

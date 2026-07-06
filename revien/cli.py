@@ -131,9 +131,26 @@ def connect(system: str, path: Optional[str]):
         click.echo(f"Connected generic API adapter.")
         click.echo(f"URL: {path}")
 
+    elif system == "obsidian":
+        if not path:
+            click.echo("Obsidian requires a vault path: revien connect obsidian --path /path/to/vault")
+            return
+        vault = Path(path).expanduser()
+        if not vault.is_dir():
+            click.echo(f"Vault directory not found: {vault}")
+            return
+        config["adapters"]["obsidian"] = {
+            "type": "obsidian",
+            "vault_dir": str(vault),
+        }
+        _save_config(config)
+        click.echo("Connected Obsidian vault adapter.")
+        click.echo(f"Vault: {vault}")
+        click.echo("Run 'revien sync-vault' to ingest the vault now.")
+
     else:
         click.echo(f"Unknown system: {system}")
-        click.echo("Supported: claude-code, file-watcher, api")
+        click.echo("Supported: claude-code, file-watcher, api, obsidian")
 
 
 @main.command()
@@ -221,6 +238,111 @@ def ingest(content: str, source: str, db: Optional[str]):
                    f"{result.total_edges_in_graph} edges")
     finally:
         store.close()
+
+
+@main.command(name="sync-vault")
+@click.option("--vault", default=None, help="Vault path (defaults to the connected obsidian adapter)")
+@click.option("--db", default=None, help="Database path")
+@click.option("--full", is_flag=True, help="Re-ingest every note, not just ones changed since last sync")
+def sync_vault(vault: Optional[str], db: Optional[str], full: bool):
+    """One-shot Obsidian vault sync: chunk notes by heading, transcribe
+    [[wikilinks]]/tags into graph edges, ingest as curated memory."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    from revien.adapters.obsidian import ObsidianVaultAdapter
+    from revien.graph.store import GraphStore
+    from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
+
+    config = _load_config()
+    vault_dir = vault or config.get("adapters", {}).get("obsidian", {}).get("vault_dir")
+    if not vault_dir:
+        click.echo("No vault configured. Run: revien connect obsidian --path /path/to/vault")
+        return
+    db_path = db or config.get("db_path", _default_db_path())
+
+    adapter = ObsidianVaultAdapter(vault_dir)
+    last_sync_key = "obsidian_last_sync"
+    since = datetime.fromtimestamp(0, tz=timezone.utc)
+    if not full and config.get(last_sync_key):
+        try:
+            since = datetime.fromisoformat(config[last_sync_key])
+        except ValueError:
+            pass
+
+    items = asyncio.run(adapter.fetch_new_content(since))
+    if not items:
+        click.echo("Vault is up to date — nothing new to ingest.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    pipeline = IngestionPipeline(store)
+    nodes = edges = 0
+    try:
+        for item in items:
+            ts = None
+            try:
+                ts = datetime.fromisoformat(item["timestamp"])
+            except (KeyError, ValueError, TypeError):
+                pass
+            out = pipeline.ingest(IngestionInput(
+                source_id=item["source_id"],
+                content=item["content"],
+                content_type=item.get("content_type", "note"),
+                timestamp=ts,
+                metadata=item.get("metadata", {}),
+                links=item.get("links", []),
+                curated=True,
+            ))
+            nodes += out.nodes_created
+            edges += out.edges_created
+    finally:
+        store.close()
+
+    config[last_sync_key] = datetime.now(timezone.utc).isoformat()
+    _save_config(config)
+    notes = len({i["metadata"]["note"] for i in items})
+    click.echo(f"Vault sync: {notes} notes -> {len(items)} chunks, "
+               f"{nodes} nodes, {edges} edges (curated).")
+
+
+@main.command(name="distill-vault")
+@click.option("--vault", default=None, help="Vault path (defaults to the connected obsidian adapter)")
+@click.option("--db", default=None, help="Database path")
+@click.option("--folder", default="Revien", help="Folder inside the vault to write into (default: Revien)")
+@click.option("--min-claims", default=1, help="Minimum machine-side claims an entity needs to earn a note")
+def distill_vault(vault: Optional[str], db: Optional[str], folder: str, min_claims: int):
+    """Write Revien's memory INTO the vault as readable markdown — one note
+    per entity, provenance on every claim, wikilinked into your graph.
+    Read-only view: writes only inside the distill folder, only overwrites
+    its own marked files, and distilled notes are never re-ingested."""
+    from revien.distill import VaultDistiller
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    vault_dir = vault or config.get("adapters", {}).get("obsidian", {}).get("vault_dir")
+    if not vault_dir:
+        click.echo("No vault configured. Run: revien connect obsidian --path /path/to/vault")
+        return
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' or 'revien ingest' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        summary = VaultDistiller(
+            store, vault_dir, folder=folder, min_claims=min_claims
+        ).distill()
+    finally:
+        store.close()
+
+    if summary.get("status") != "ok":
+        click.echo(f"Distill failed: {summary.get('error')}")
+        return
+    click.echo(f"Distilled {summary['notes']} entity notes -> {summary['out_dir']}")
+    click.echo(f"  written: {summary['written']}  unchanged: {summary['unchanged']}  "
+               f"pruned: {summary['pruned']}  vault-echo skipped: {summary['skipped_vault_echo']}")
 
 
 @main.command()

@@ -98,23 +98,39 @@ class ClaimGovernor:
             if decision.action is SupersessionAction.NO_CONFLICT:
                 continue
 
-            if decision.action is SupersessionAction.AUTO_SUPERSEDE:
+            # Curated shield (Obsidian vault leg): a human-curated claim is
+            # NEVER silently auto-superseded by a machine-side claim. The
+            # contradiction is real and preserved — it goes to the candidate
+            # queue for the human's hands, not the gate's. Consent Is Law,
+            # mechanized. A curated NEW claim superseding a machine claim is
+            # allowed through unchanged (the human's word outranks ours).
+            action = decision.action
+            reason = decision.reason
+            if (
+                action is SupersessionAction.AUTO_SUPERSEDE
+                and (existing_node.metadata or {}).get("curated")
+                and not (new_node.metadata or {}).get("curated")
+            ):
+                action = SupersessionAction.CANDIDATE
+                reason = f"curated_shield: {reason}"
+
+            if action is SupersessionAction.AUTO_SUPERSEDE:
                 self._supersede(existing_node, new_node)
                 effect = f"existing soft-invalidated (superseded_by {new_node.node_id})"
             else:  # CANDIDATE or VERSION_LOCKED -> queue, mutate nothing
                 cid = self.store.add_candidate(
                     existing_node.node_id, new_node.node_id,
-                    decision.action.value, decision.reason, " | ".join(decision.trace),
+                    action.value, reason, " | ".join(decision.trace),
                 )
                 effect = f"queued for review (candidate #{cid}); BOTH claims preserved"
 
             outcomes.append(GovernanceOutcome(
-                action=decision.action.value,
+                action=action.value,
                 existing_node_id=existing_node.node_id,
                 new_node_id=new_node.node_id,
                 existing_text=existing_node.content,
                 new_text=new_node.content,
-                reason=decision.reason,
+                reason=reason,
                 data_effect=effect,
                 trace=list(decision.trace),
             ))

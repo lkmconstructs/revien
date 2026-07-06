@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType
+from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 
@@ -47,6 +47,15 @@ class IngestionInput:
     source_modality: Modality = Modality.TEXT
     answerable_by_text: bool = True
     vision_processed: bool = False
+    # Curated-source support (Obsidian vault leg). `links` are labels of
+    # entities this unit explicitly references — e.g. [[wikilink]] targets and
+    # the note's own title. The pipeline resolves each to an ENTITY node
+    # (creating it if absent) and draws a strong CONTEXT->ENTITY edge: the
+    # author already drew the graph, we just transcribe it. `curated` marks
+    # human-curated content: full confidence, and the CSL gate will never let
+    # a machine claim silently supersede it (candidate queue instead).
+    links: List[str] = field(default_factory=list)
+    curated: bool = False
 
 
 @dataclass
@@ -148,6 +157,12 @@ class IngestionPipeline:
             node.recorded_at = input_data.timestamp
             if node.node_id == ctx_id:
                 node.answerable_by_text = input_data.answerable_by_text
+            # Curated provenance: human-curated content is ground truth —
+            # full confidence, and the `curated` metadata flag is what the
+            # CSL gate checks before allowing any auto-supersession.
+            if input_data.curated:
+                node.confidence = 1.0
+                node.metadata = {**(node.metadata or {}), "curated": True}
 
         # 1c. Temporal resolution (Leg 2): resolve the FIRST bounded temporal
         # expression in the content against recorded_at and attach an event-time
@@ -213,6 +228,49 @@ class IngestionPipeline:
             )
             self.store.add_edge(new_edge)
             edges_created += 1
+
+        # 3a2. Declared links (curated-source leg). Each link label becomes an
+        # ENTITY node (found case-insensitively or created) with a strong edge
+        # from this unit's CONTEXT node. This is where a vault's [[wikilinks]]
+        # become graph edges — the author drew them; we transcribe them. The
+        # miss taxonomy's `disconnected` bucket (gold unreachable from any
+        # anchor) is exactly what these edges close for curated content.
+        if input_data.links and extraction.context_node is not None:
+            link_ctx_id = id_map.get(
+                extraction.context_node.node_id, extraction.context_node.node_id
+            )
+            seen_links = set()
+            for raw_label in input_data.links:
+                label = (raw_label or "").strip()
+                if not label or label.lower() in seen_links:
+                    continue
+                seen_links.add(label.lower())
+                target = self.ops.find_node_by_label(label, node_type=NodeType.ENTITY)
+                if target is None:
+                    target = self.store.add_node(Node(
+                        node_type=NodeType.ENTITY,
+                        label=label,
+                        content=label,
+                        source_id=input_data.source_id,
+                        source_type=SourceType.EXTRACTED,
+                        confidence=1.0 if input_data.curated else 0.8,
+                        recorded_at=input_data.timestamp,
+                        metadata={"curated": True} if input_data.curated else {},
+                    ))
+                    nodes_created += 1
+                    newly_created.append((target.node_id, target.label, target.content))
+                if target.node_id == link_ctx_id:
+                    continue
+                if not self._edge_exists(link_ctx_id, target.node_id, EdgeType.RELATED_TO):
+                    self.store.add_edge(Edge(
+                        edge_type=EdgeType.RELATED_TO,
+                        source_node_id=link_ctx_id,
+                        target_node_id=target.node_id,
+                        # Author-drawn edges are strong: 0.8 vs the 0.3 the
+                        # extractor gives co-occurrence guesses.
+                        weight=0.8,
+                    ))
+                    edges_created += 1
 
         # 3b. Semantic indexing (opt-in). Embed the newly-created content nodes
         # so keyword-less queries can retrieve them. No-op when the layer is

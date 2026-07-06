@@ -90,11 +90,24 @@ class SyncScheduler:
         # Ingest each piece of content
         ingested = 0
         for item in new_content:
+            # timestamp was previously dropped here — every synced item
+            # ingested with recorded_at=None, so temporal resolution and
+            # content-time recency had nothing to anchor to.
+            ts = None
+            raw_ts = item.get("timestamp")
+            if raw_ts:
+                try:
+                    ts = datetime.fromisoformat(raw_ts)
+                except (ValueError, TypeError):
+                    ts = None
             input_data = IngestionInput(
                 source_id=item.get("source_id", f"adapter:{name}"),
                 content=item.get("content", ""),
                 content_type=item.get("content_type", "conversation"),
+                timestamp=ts,
                 metadata=item.get("metadata", {}),
+                links=item.get("links", []) or [],
+                curated=bool(item.get("curated", False)),
             )
             if input_data.content.strip():
                 self.pipeline.ingest(input_data)
