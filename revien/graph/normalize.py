@@ -14,6 +14,7 @@ Deliberately NOT here (each is a false-merge machine in this form):
 """
 
 import re
+from functools import lru_cache
 
 _SEPARATORS = re.compile(r"[-_./\\]+")
 _POSSESSIVE = re.compile(r"'s\b")
@@ -22,6 +23,7 @@ _SPACES = re.compile(r"\s+")
 _LEADING_ARTICLE = re.compile(r"^(?:the|a|an) ")
 
 
+@lru_cache(maxsize=65536)
 def normalize_label(label: str) -> str:
     """Canonical surface form: lowercase, separators to spaces, possessives
     and stray punctuation dropped, leading article stripped, whitespace

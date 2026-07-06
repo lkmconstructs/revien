@@ -65,12 +65,15 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     sqlite_vec = None
     _SQLITE_VEC_AVAILABLE = False
 
-try:
-    import fastembed  # noqa: F401  (provider imports the class lazily)
-    _FASTEMBED_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only without the extra
-    fastembed = None
-    _FASTEMBED_AVAILABLE = False
+# fastembed availability is checked WITHOUT importing it: importing fastembed
+# pulls in huggingface_hub machinery that can touch the network, and a hub
+# endpoint that accepts connections but never answers turned that into a
+# ~23-minute hang at IMPORT time (caught July 6 2026 — pytest collection and
+# every fresh process stalled identically). The actual import happens lazily
+# inside FastEmbedProvider._ensure_model, under offline-first control.
+import importlib.util
+
+_FASTEMBED_AVAILABLE = importlib.util.find_spec("fastembed") is not None
 
 # The vector STORAGE requires sqlite-vec. A cloud embedder can supply vectors
 # without fastembed, but with no local embedder and no sqlite-vec there is
@@ -169,9 +172,29 @@ class FastEmbedProvider:
             raise RuntimeError(
                 "fastembed not installed (pip install revien[semantic])"
             )
-        from fastembed import TextEmbedding
-
-        self._model = TextEmbedding(model_name=self.model_name)
+        # OFFLINE-FIRST: with a warm local cache the load must touch NOTHING —
+        # "zero network on the default path" is a product claim, and hub
+        # metadata revalidation both violated it and hung for ~23 minutes
+        # whenever the hub accepted connections without answering. Only a
+        # first-ever run (no cache) falls back to the one legitimate download.
+        prev = os.environ.get("HF_HUB_OFFLINE")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            from fastembed import TextEmbedding
+            self._model = TextEmbedding(model_name=self.model_name)
+        except Exception:
+            # No usable local cache: restore the env and allow the download.
+            if prev is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev
+            from fastembed import TextEmbedding
+            self._model = TextEmbedding(model_name=self.model_name)
+        finally:
+            if prev is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev
 
     @property
     def dim(self) -> int:

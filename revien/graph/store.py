@@ -494,6 +494,79 @@ class GraphStore:
             return None
         return self._row_to_node(row)
 
+    # SQLite's default parameter limit is 999; chunk IN() queries below it.
+    _IN_CHUNK = 500
+
+    def get_nodes_bulk(self, node_ids) -> dict:
+        """Fetch many nodes in chunked IN() queries: {node_id: Node}. The
+        recall path scores hundreds of walked nodes per query — one SELECT
+        per node was a measured latency driver (OPEN 2)."""
+        ids = [i for i in node_ids]
+        out: dict = {}
+        if not ids:
+            return out
+        conn = self._get_conn()
+        for i in range(0, len(ids), self._IN_CHUNK):
+            chunk = ids[i:i + self._IN_CHUNK]
+            rows = conn.execute(
+                f"SELECT * FROM nodes WHERE node_id IN "
+                f"({','.join('?' * len(chunk))})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                node = self._row_to_node(row)
+                out[node.node_id] = node
+        return out
+
+    def get_neighbors_bulk(self, node_ids) -> dict:
+        """Neighbor ids for many nodes at once: {node_id: [neighbor_ids]}.
+        Lets the BFS walker do one round-trip per LEVEL instead of one per
+        visited node. Every requested id gets a key (possibly empty list)."""
+        ids = [i for i in node_ids]
+        out: dict = {nid: [] for nid in ids}
+        if not ids:
+            return out
+        conn = self._get_conn()
+        for i in range(0, len(ids), self._IN_CHUNK):
+            chunk = ids[i:i + self._IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT source_node_id, target_node_id FROM edges "
+                f"WHERE source_node_id IN ({placeholders}) "
+                f"OR target_node_id IN ({placeholders})",
+                chunk + chunk,
+            ).fetchall()
+            wanted = set(chunk)
+            for src, tgt in rows:
+                if src in wanted:
+                    out[src].append(tgt)
+                if tgt in wanted:
+                    out[tgt].append(src)
+        # De-duplicate while keeping it a plain list per node.
+        return {nid: list(dict.fromkeys(neigh)) for nid, neigh in out.items()}
+
+    def search_nodes_keyword(
+        self, keywords, limit: int = 10, exclude_context: bool = True
+    ) -> list["Node"]:
+        """SQL-side keyword search over label+content (case-insensitive
+        substring, OR across keywords), newest first. Replaces the recall
+        fallback's list_nodes(limit=999999)-then-scan-in-Python, which was
+        the single biggest recall latency driver (OPEN 2). Semantics match
+        the old Python scan: any-keyword substring hit qualifies."""
+        kws = [k for k in keywords if k]
+        if not kws:
+            return []
+        conn = self._get_conn()
+        conditions = " OR ".join(
+            ["instr(lower(label || ' ' || content), ?) > 0"] * len(kws)
+        )
+        query = f"SELECT * FROM nodes WHERE ({conditions})"
+        if exclude_context:
+            query += " AND node_type != 'context'"
+        query += " ORDER BY created_at DESC LIMIT ?"
+        rows = conn.execute(query, [k.lower() for k in kws] + [limit]).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
     def update_node(
         self, node_id: str, _audit_op: Optional[str] = "update",
         _audit_actor: str = "", **kwargs

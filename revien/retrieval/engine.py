@@ -257,24 +257,26 @@ class RetrievalEngine:
                 self.clustering.get_communities_for_anchors(anchor_ids)
             )
 
-        # 3. Walk graph from anchors
+        # 3. Walk graph from anchors — ONE traversal yields both distances
+        # and paths (this used to be two full BFS passes per recall).
         if anchor_ids:
-            node_distances = self.walker.walk(anchor_ids)
-            node_paths = self.walker.walk_with_paths(anchor_ids)
+            node_distances, node_paths = self.walker.walk_full(anchor_ids)
         else:
             node_distances = {}
             node_paths = {}
 
-        # 4. Score all reachable nodes
+        # 4. Score all reachable nodes. One bulk fetch for the whole walked
+        # frontier — a SELECT per node here was a measured latency driver.
         scored_results: List[RetrievalResult] = []
         nodes_examined = len(node_distances)
+        nodes_map = self.store.get_nodes_bulk(node_distances.keys())
         # Debug bookkeeping (leg: per-query failure analysis). Cheap dicts,
         # built only when asked for.
         diag_scores: Dict[str, float] = {}
         diag_filtered: Dict[str, str] = {}
 
         for node_id, distance in node_distances.items():
-            node = self.store.get_node(node_id)
+            node = nodes_map.get(node_id)
             if node is None:
                 if debug:
                     diag_filtered[node_id] = "missing"
@@ -345,11 +347,12 @@ class RetrievalEngine:
             if final_score < min_score:
                 continue
 
-            # Build path labels
+            # Build path labels (path nodes are all within the walked set,
+            # so the bulk map already has them).
             path_ids = node_paths.get(node_id, [node_id])
             path_labels = []
             for pid in path_ids:
-                pnode = self.store.get_node(pid)
+                pnode = nodes_map.get(pid)
                 if pnode:
                     path_labels.append(pnode.label)
 
@@ -505,19 +508,14 @@ class RetrievalEngine:
         if not keywords:
             return []
 
-        anchor_ids = []
-        all_nodes = self.store.list_nodes(limit=999999)
-
-        for node in all_nodes:
-            if node.node_type == NodeType.CONTEXT:
-                continue
-            text = f"{node.label} {node.content}".lower()
-            # Score by keyword overlap
-            matches = sum(1 for kw in keywords if kw in text)
-            if matches > 0:
-                anchor_ids.append(node.node_id)
-
-        return anchor_ids[:10]  # Cap at 10 anchors to prevent explosion
+        # SQL-side substring search (same semantics as the old Python scan:
+        # any-keyword hit on label+content, newest first, CONTEXT excluded,
+        # capped at 10 anchors). The old list_nodes(limit=999999) full scan
+        # was the single biggest recall latency driver (OPEN 2).
+        matches = self.store.search_nodes_keyword(
+            keywords, limit=10, exclude_context=True
+        )
+        return [n.node_id for n in matches]
 
     def mark_used(self, node_id: str, query: Optional[str] = None) -> None:
         """

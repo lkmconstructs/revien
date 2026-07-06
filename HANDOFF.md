@@ -96,9 +96,32 @@ run kept dying on a flaky background-process executor (not Revien); each `python
 
 ## OPEN items
 1. **(optional) Extend the benchmark** past 304 QA by resuming the checkpoint on a stable executor.
-2. **Recall latency ~250ms** (pre-existing): `_keyword_search` does `list_nodes(limit=999999)`
-   full-table-scan + redundant `get_node` in the recall path. The 2 red `test_retrieval_time_under_100ms*`
-   tests assert an aspirational <100ms the code never met. Fix the scan OR set honest thresholds (best-of-N).
+2. **Recall latency: FIXED (July 6 2026 late) — the <100ms tests pass for the first time.**
+   Graph-only recall 903ms -> 40-47ms. Three separate rots, each found by an instrument:
+   * **Training doom loop (the big one):** TrainingLoop._maybe_train ran on EVERY recall,
+     exporting the ENTIRE signal table to attempt training that could never succeed
+     (sklearn absent -> _last_train_count never advanced -> permanently "ready"). ~750ms
+     of every recall once the table grew. NOTE: this variably inflated EVERY latency
+     number recorded July 2-6 (the 349->949ms "creep" was mostly this table growing).
+     Fixed: availability check before any data export + failed-attempt backoff.
+   * Structural: double BFS per recall -> single walk_full(); SELECT-per-node -> bulk
+     IN() queries (get_nodes_bulk/get_neighbors_bulk, one round-trip per BFS level);
+     Python full-table keyword scan -> SQL-side search_nodes_keyword (same semantics);
+     normalize_label lru_cached.
+   * **onnxruntime import hangs on WMI** (machine-level: wedged winmgmt made
+     platform.system() take 21 MINUTES; found via faulthandler stack dump after three
+     25-min network-theory probes came back wrong). Revien-side hardening that stays:
+     fastembed availability via find_spec (no import at module load — pytest collection
+     went 26min -> 15s on the wedged box), model load offline-first (HF_HUB_OFFLINE with
+     first-install fallback — also stops fastembed's silent 65MB re-download loop and
+     closes a real zero-network gap). Machine cure: elevated
+     `Restart-Service winmgmt -Force` or reboot (was PENDING at handoff).
+   * **PENDING before OPEN 2 fully closes:** (a) recall-identity sample — retrieval
+     numbers must reproduce EXACTLY under the new plumbing (sweep baseline --limit 2 vs
+     the recorded 0.5516/0.1794/0.3013 slice; blocked on WMI fix for query embedding);
+     (b) one clean full-bench latency re-measure for the official p50 (all prior p50s
+     carried the doom-loop tax). Suite: 463 passed, 0 failed (embedding-dependent tests
+     deselected on the wedged box).
 3. **Silent extractor fallback** — `LLMExtractor` silently falls back to rule on failure; make it
    loud (it masked the leak under quota 429s). (Semantic-layer silent degrade is FIXED — same
    pattern still open for the extractor.)

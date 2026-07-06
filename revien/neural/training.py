@@ -176,18 +176,51 @@ class TrainingLoop:
             for r in rows
         ]
 
+    def _neural_available(self) -> bool:
+        """Cheap availability check BEFORE any data is touched. Without it,
+        train() exported the ENTIRE signal table just to discover sklearn is
+        missing — measured at ~750ms of every recall once the table grew
+        (the single biggest recall latency driver found in the OPEN 2 leg:
+        recall p50 crept 349ms -> 949ms over a day of bench runs purely from
+        this table growing)."""
+        try:
+            import numpy  # noqa: F401
+            import sklearn  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
     def _maybe_train(self) -> bool:
-        """Check threshold and trigger training if ready."""
+        """Check threshold and trigger training if ready.
+
+        Failure backoff: a train attempt that fails (sklearn absent, bad
+        data) previously left _last_train_count untouched, so 'ready to
+        train' stayed permanently true and EVERY subsequent recall re-ran
+        the doomed attempt. Now a failed attempt still advances the marker —
+        the next attempt waits for RETRAIN_INTERVAL fresh signals like any
+        other retrain."""
         if not self.is_ready_for_training():
             return False
-        return self.train()
+        trained = self.train()
+        if not trained:
+            self._last_train_count = self.get_signal_count()
+            self._save_train_state()
+        return trained
 
     def train(self) -> bool:
         """
         Run training loop on accumulated signals.
         """
+        # Availability first — never export the signal table to no-op.
+        if not self._neural_available():
+            logger.info(
+                "sklearn/numpy not installed. Neural training disabled "
+                "(install with: pip install revien[neural])."
+            )
+            return False
+
         count = self.get_signal_count()
-        
+
         if count < self.INITIAL_THRESHOLD:
             logger.info(
                 f"Not enough signals for training: "
