@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ from revien.retrieval.engine import RetrievalEngine
 from revien.semantic.index import SemanticIndex
 
 from . import answerers as A
+from . import failure_analysis as FA
 from . import metrics as M
 from . import sovereignty as S
 from .fetch_locomo import DATA_PATH, read_locked_hash
@@ -141,6 +143,33 @@ def _append_checkpoint(ckpt_path: Path, record: Dict) -> None:
             pass
 
 
+# ── Pristine ingest cache ─────────────────────────────────────────────────────
+# Ingest (extraction + embedding every turn) dominates bench wall-clock (~10 min
+# for the full dataset) and is IDENTICAL across scoring-knob sweeps. --db-cache
+# keeps one pristine post-ingest DB per (config, conversation), SHA-guarded, and
+# every run works on a TEMP COPY — recall's touch_node writes and clustering
+# never contaminate the cache, so sweep variants stay comparable.
+
+
+def _cache_paths(db_cache: Path, config_name: str, conv_id: str) -> tuple:
+    base = db_cache / f"{_sanitize(config_name)}_{_sanitize(conv_id)}.db"
+    return base, Path(str(base) + ".meta.json")
+
+
+def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Dict]:
+    """Meta for a cached DB, or None when absent/SHA-mismatched (never falsely
+    reuse a cache built from a different dataset)."""
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if dataset_sha is not None and meta.get("dataset_sha") != dataset_sha:
+        return None
+    return meta
+
+
 def _retrieved_dia_ids(store: GraphStore, results) -> List[str]:
     """Map ranked retrieval results -> ordered, de-duplicated dia_ids (gold space)."""
     seen = set()
@@ -162,6 +191,7 @@ def _score_qa(
     qa: QA,
     conv: Conversation,
     answerer: A.Answerer,
+    dia_map: Optional[Dict[str, List[str]]] = None,
 ) -> Dict:
     """Run one QA through recall -> extractive answer -> score."""
     now_dt = parse_session_date(conv.last_session_date) or datetime.now(timezone.utc)
@@ -169,7 +199,12 @@ def _score_qa(
     t0 = time.perf_counter()
     # Surface verbatim turns (CONTEXT nodes): for conversational QA the answer
     # lives in the turn itself, not only in distilled extract nodes.
-    resp = engine.recall(qa.question, top_n=RECALL_TOP_N, now=now_dt, include_context=True)
+    # debug=True: per-node scores/filters/anchors feed the miss classification
+    # below. Overhead is a few dict copies — negligible vs the ~350ms p50, and
+    # it's applied to EVERY config equally so latency comparisons stay fair.
+    resp = engine.recall(
+        qa.question, top_n=RECALL_TOP_N, now=now_dt, include_context=True, debug=True
+    )
     recall_ms = (time.perf_counter() - t0) * 1000.0
 
     ctx = A.RetrievedContext(
@@ -205,6 +240,16 @@ def _score_qa(
     rr = M.mrr(retrieved, gold)
     ndcg = M.ndcg_at_k(retrieved, gold, 10)
 
+    # Per-query failure taxonomy: WHERE did each missed gold item die —
+    # never_extracted / no_anchors / walk_depth_miss / disconnected /
+    # filtered_out / outranked. The raw diagnostics dict is NOT persisted
+    # (it's the whole walked frontier); only the classification is.
+    gold_miss_causes: Optional[Dict[str, Dict]] = None
+    if dia_map is not None and gold:
+        gold_miss_causes = FA.classify_misses(
+            store, resp.diagnostics, gold, retrieved, dia_map
+        )
+
     # Supporting node ids (for provenance check): top results that contributed.
     supporting_ids = [r.node_id for r in resp.results[:5]]
 
@@ -221,6 +266,7 @@ def _score_qa(
         "refused": A.REFUSAL == prediction or M.is_refusal(prediction),
         "gold_evidence": sorted(gold),
         "retrieved_dia_ids": retrieved,
+        "gold_miss_causes": gold_miss_causes,
         **{k: round(v, 4) for k, v in recalls.items()},
         "mrr": round(rr, 4),
         "ndcg@10": round(ndcg, 4),
@@ -238,6 +284,7 @@ def run_benchmark(
     limit_convs: Optional[int] = None,
     max_qa: Optional[int] = None,
     fresh: bool = False,
+    db_cache: Optional[Path] = None,
 ) -> Dict:
     cfg = _load_config(config_name)
     prev_env = _apply_env(cfg.get("env", {}))
@@ -327,18 +374,60 @@ def run_benchmark(
 
             fd, db_path = tempfile.mkstemp(suffix=f"_{config_name}_{conv.conv_id}.db")
             os.close(fd)
+
+            # Pristine-cache lookup: on a hit, the working temp DB starts as a
+            # COPY of the post-ingest snapshot and ingest is skipped entirely.
+            cached_meta: Optional[Dict] = None
+            cache_db = cache_meta_path = None
+            if db_cache is not None:
+                cache_db, cache_meta_path = _cache_paths(db_cache, config_name, conv.conv_id)
+                cached_meta = _cache_load_meta(cache_meta_path, dataset_sha)
+                if cached_meta is not None and cache_db.exists():
+                    shutil.copyfile(cache_db, db_path)
+                else:
+                    cached_meta = None
+
             store = GraphStore(db_path=db_path)
             keep_store_open = False
             try:
                 semantic = SemanticIndex(store)  # self-disables without the extra
 
-                t0 = time.perf_counter()
-                summary = ingest_conversation(conv, store, semantic=semantic)
-                ingest_s = time.perf_counter() - t0
                 conv_ingest_rate = 0.0
-                if ingest_s > 0 and summary["turns_ingested"]:
-                    conv_ingest_rate = summary["turns_ingested"] / ingest_s
-                    ingest_rates.append(conv_ingest_rate)
+                if cached_meta is not None:
+                    summary = {
+                        "turns_ingested": cached_meta["turns_ingested"],
+                        "nodes_created": cached_meta["nodes_created"],
+                    }
+                    # Fold the ORIGINAL measured rate so the aggregate stays an
+                    # honest ingest number, not a cache-copy artifact.
+                    conv_ingest_rate = float(cached_meta.get("ingest_rate", 0.0))
+                    if conv_ingest_rate:
+                        ingest_rates.append(conv_ingest_rate)
+                else:
+                    t0 = time.perf_counter()
+                    summary = ingest_conversation(conv, store, semantic=semantic)
+                    ingest_s = time.perf_counter() - t0
+                    if ingest_s > 0 and summary["turns_ingested"]:
+                        conv_ingest_rate = summary["turns_ingested"] / ingest_s
+                        ingest_rates.append(conv_ingest_rate)
+                    if db_cache is not None:
+                        # Snapshot the pristine post-ingest state via SQLite's
+                        # backup API (safe on a live connection, WAL included),
+                        # then the meta sidecar with the SHA guard.
+                        db_cache.mkdir(parents=True, exist_ok=True)
+                        import sqlite3 as _sq
+                        dst = _sq.connect(str(cache_db))
+                        try:
+                            store._get_conn().backup(dst)
+                        finally:
+                            dst.close()
+                        cache_meta_path.write_text(json.dumps({
+                            "dataset_sha": dataset_sha,
+                            "conv_id": conv.conv_id,
+                            "turns_ingested": summary["turns_ingested"],
+                            "nodes_created": summary["nodes_created"],
+                            "ingest_rate": round(conv_ingest_rate, 4),
+                        }), encoding="utf-8")
                 total_audit_creates_expected += summary["nodes_created"]
 
                 clustering = None
@@ -350,9 +439,13 @@ def run_benchmark(
 
                 engine = RetrievalEngine(store, clustering=clustering, semantic=semantic)
 
+                # dia_id -> node_ids, built once per conversation; feeds the
+                # per-query miss classification in _score_qa.
+                dia_map = FA.build_dia_map(store)
+
                 conv_rows: List[Dict] = []
                 for qa in conv.qa:
-                    row = _score_qa(store, engine, qa, conv, answerer)
+                    row = _score_qa(store, engine, qa, conv, answerer, dia_map=dia_map)
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
                     conv_rows.append(row)
@@ -429,6 +522,9 @@ def run_benchmark(
 
         # ── Aggregate metrics ─────────────────────────────────────────────────
         report = _aggregate(per_q, ingest_rates, recall_latencies)
+        # Retrieval failure taxonomy: where the missed gold evidence died.
+        # Rows from pre-taxonomy checkpoints are counted as unclassified.
+        report["retrieval_failure_analysis"] = FA.aggregate_failures(per_q)
         report["sovereignty"] = S.checks_to_dict(checks)
         report["config"] = {
             "name": config_name,
@@ -537,6 +633,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="ignore + delete any existing checkpoint and start over "
                          "(default: resume from the checkpoint, skipping completed "
                          "conversations)")
+    ap.add_argument("--db-cache", default=None, dest="db_cache",
+                    help="directory of pristine post-ingest DB snapshots (per "
+                         "config+conversation, SHA-guarded). On a hit, ingest is "
+                         "skipped and recall runs against a temp COPY — the cache "
+                         "is never mutated. Cuts sweep iterations from ~10min to "
+                         "recall-only time.")
     args = ap.parse_args(argv)
 
     dataset_path = Path(args.dataset)
@@ -553,6 +655,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         limit_convs=args.limit,
         max_qa=args.max_qa,
         fresh=args.fresh,
+        db_cache=Path(args.db_cache) if args.db_cache else None,
     )
     _print_summary(report)
     return 0
@@ -570,6 +673,16 @@ def _print_summary(report: Dict) -> None:
     print(f"retrieval     : recall@1={r['recall@1']} @5={r['recall@5']} "
           f"@10={r['recall@10']} MRR={r['mrr']} nDCG@10={r['ndcg@10']} "
           f"(n_evid={r['n_with_evidence']})")
+    fa = report.get("retrieval_failure_analysis") or {}
+    if fa.get("gold_items_missed"):
+        causes = ", ".join(f"{c}={n}" for c, n in fa["by_cause"].items())
+        print(f"miss taxonomy : {fa['gold_items_missed']} gold items missed — {causes}")
+        od = fa.get("outranked_detail")
+        if od:
+            print(f"   outranked   : median best rank {od['median_best_rank']}, "
+                  f"{od['within_20']}/{od['n']} within top-20")
+        if fa.get("rows_unclassified"):
+            print(f"   (unclassified rows from old checkpoint: {fa['rows_unclassified']})")
     lat = report["latency_ms"]["recall"]
     print(f"recall latency: p50={lat['p50']}ms p90={lat['p90']}ms p99={lat['p99']}ms")
     print(f"ingest        : {report['ingest_turns_per_sec']} turns/sec")
