@@ -137,11 +137,35 @@ run kept dying on a flaky background-process executor (not Revien); each `python
      mechanics tested with explicit 7d configs).
    * Sweep tooling kept: `revien_bench/sweep.py` + `--db-cache` pristine-ingest cache
      (ingest once, sweep ranking knobs in recall-only time).
-6. **Ingest edge gap** (second priority): 27% of semantic misses are `disconnected` —
-   extracted nodes lack edges to reach gold turns from query anchors. Fact↔entity edges,
-   cross-type entity normalization in `revien/ingestion/`. First task when this leg opens:
-   entity regex matches across newlines (`\s+` in the multi-word pattern) — produces junk
-   entities like "Deployment\nRuns" on markdown and turn boundaries.
+6. **Entity normalization leg: SHIPPED with a measured verdict (July 6 2026).**
+   * Prong A — `revien/graph/normalize.py`: ONE definition of label equivalence (case,
+     separators, possessives, LEADING ARTICLES — the extractor captures "The Atlas Server";
+     deliberately NOT plurals/aliases). Applied at dedup, find_node_by_label, fuzzy,
+     anchors, link resolution. Everywhere, free, correct.
+   * Prong B — gazetteer mention pass in the pipeline: known entities get CONTEXT->ENTITY
+     edges (weight 0.6) when a turn mentions them in ANY surface form (word-boundary on
+     normalized text, min-length 4 guard, per-pipeline cache). **GATED TO CURATED ENTITIES
+     ONLY** after the measured verdict below.
+   * **Verdict, two corpora:** cross-corpus DECISIVE — attachment 0.625→1.0 clean,
+     0→0.75 fragile (the one holdout is semantic aliasing: "offline mode"→Roadmap 2026 —
+     vocabulary work, correctly out of scope). Pure conversation: ZERO recall gain
+     (0.5141 identical to 4 decimals) — ungated gazetteer moved 25 items from
+     `disconnected` to `outranked` (reachable, then buried by ranking) at −19% ingest and
+     +60% recall latency. Hence curated gating: keep the whole win, drop the whole cost.
+     Cross-type MERGING (Asher's framing) deliberately not built — collapsing FACT into
+     ENTITY destroys type semantics; the mention edge achieves walkability with distinct
+     nodes, and the identical-recall result shows merging wouldn't have bought recall either.
+   * **False-merge precision surface (Asher's guard):** every normalization-only merge is
+     audit-logged with both labels and surfaced in both benches
+     (`normalization_merges` in vault eval, `normalization_merges_sample` in runner).
+     Vault corpus first reading: 2 merges, both correct article variants, zero false.
+     Substring merges impossible by construction (exact canonical equality; word-boundary
+     gazetteer) — pinned by tests. Same-name-different-referent residue is what the audit
+     list exists for.
+   * Conversational `disconnected` (now ~454) is NOT surface-form fragmentation — the
+     remaining bottleneck stays RANKING (1,094 outranked, median rank 35 → reranker /
+     top-N headroom) and extraction coverage. Still open: entity regex matches across
+     newlines (junk like "Deployment\nRuns").
 
 ## Obsidian vault legs (July 2 2026 — Lissa's scoping)
 **Framing (hers, binding): AND-not-OR.** The vault is a SECOND corpus with its OWN eval and

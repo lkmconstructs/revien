@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
+from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
 
 
@@ -102,6 +103,11 @@ class IngestionPipeline:
         # hybrid recall path can find them. Failures inside the index never
         # propagate (it self-disables), so ingest is robust either way.
         self.semantic = semantic if semantic is not None else SemanticIndex(store)
+        # Known-entity gazetteer for mention linking: [(node_id, normalized
+        # label)]. Loaded lazily from the store on first ingest, appended as
+        # new entities are created, so the scan never re-reads the store per
+        # turn. Per-pipeline-instance cache — a fresh pipeline reloads.
+        self._gazetteer: Optional[List[tuple]] = None
         # Claim Sovereignty governance (Leg B), opt-in. Off unless a governor is
         # injected or REVIEN_CSL is truthy, so default ingest is unchanged. When
         # on, every ingested claim runs the full classify -> gate -> act path.
@@ -111,6 +117,68 @@ class IngestionPipeline:
             self.csl = build_governor(store, self.ops)
         else:
             self.csl = None
+
+    # Named-mention edges: more precise than the extractor's 0.3 co-occurrence
+    # guesses (the entity's NAME appears in the turn), below the 0.8 an author
+    # explicitly drew.
+    MENTION_EDGE_WEIGHT = 0.6
+    # Guard against noise links from short labels ("go", "q3") appearing as
+    # ordinary words. Normalized length, so "Go" never matches "let's go".
+    MIN_MENTION_LABEL_LEN = 4
+
+    def _gazetteer_entries(self) -> List[tuple]:
+        """CURATED entities only. Measured verdict (July 6 2026, both benches):
+        mention-linking against curated entities is decisive for cross-corpus
+        attachment (0.625->1.0 clean, 0->0.75 fragile variants), while scanning
+        machine-extracted entities on pure conversation bought ZERO recall
+        (identical 0.5141 to 4 decimals — the newly-reachable gold just moved
+        from `disconnected` to `outranked`) at -19% ingest rate and +60%
+        recall latency. Curated labels are human-written note titles; the
+        extractor's entities include noise like 'Deployment\\nRuns'. Gate to
+        where the value is, skip the cost where it isn't."""
+        if self._gazetteer is None:
+            self._gazetteer = [
+                (n.node_id, normalize_label(n.label))
+                for n in self.store.list_nodes(node_type=NodeType.ENTITY, limit=999999)
+                if (n.metadata or {}).get("curated")
+            ]
+        return self._gazetteer
+
+    def _register_entity(self, node: Node) -> None:
+        """Keep the gazetteer current as this pipeline creates curated entities."""
+        if (
+            self._gazetteer is not None
+            and node.node_type == NodeType.ENTITY
+            and (node.metadata or {}).get("curated")
+        ):
+            self._gazetteer.append((node.node_id, normalize_label(node.label)))
+
+    def _link_known_mentions(self, ctx_id: str, content: str) -> int:
+        """Draw CONTEXT->ENTITY edges for known entities the content mentions
+        in ANY surface form. Word-boundary match on normalized text; skips
+        pairs already connected by the extractor. Returns edges created."""
+        entries = self._gazetteer_entries()
+        if not entries:
+            return 0  # conversational-only graph: no curated entities, no scan
+        haystack = f" {normalize_text(content)} "
+        created = 0
+        for node_id, norm in entries:  # noqa: B007 - (id, normalized-label) pairs
+            if len(norm) < self.MIN_MENTION_LABEL_LEN or node_id == ctx_id:
+                continue
+            if f" {norm} " not in haystack:
+                continue
+            if self._edge_exists(ctx_id, node_id, EdgeType.RELATED_TO):
+                continue
+            if self._edge_exists(node_id, ctx_id, EdgeType.MENTIONED_BY):
+                continue
+            self.store.add_edge(Edge(
+                edge_type=EdgeType.RELATED_TO,
+                source_node_id=ctx_id,
+                target_node_id=node_id,
+                weight=self.MENTION_EDGE_WEIGHT,
+            ))
+            created += 1
+        return created
 
     def ingest(self, input_data: IngestionInput) -> IngestionOutput:
         """
@@ -195,6 +263,7 @@ class IngestionPipeline:
             id_map[old_id] = actual_node.node_id
             if is_new:
                 nodes_created += 1
+                self._register_entity(actual_node)
                 # Index ALL new nodes, INCLUDING CONTEXT (verbatim turns). For
                 # conversational memory the verbatim turn is the answer-bearing
                 # content; excluding context left the only coherent representation
@@ -258,6 +327,7 @@ class IngestionPipeline:
                         metadata={"curated": True} if input_data.curated else {},
                     ))
                     nodes_created += 1
+                    self._register_entity(target)
                     newly_created.append((target.node_id, target.label, target.content))
                 if target.node_id == link_ctx_id:
                     continue
@@ -271,6 +341,21 @@ class IngestionPipeline:
                         weight=0.8,
                     ))
                     edges_created += 1
+
+        # 3a3. Known-entity mention linking (gazetteer pass). The regex
+        # extractor only catches Capitalized surface forms — a turn saying
+        # "the atlas-server needs a fan" never links to the entity 'Atlas
+        # Server' even though the graph KNOWS that entity. Here: scan the
+        # content's normalized form for every known entity label (word-
+        # boundary, min length guard) and draw the CONTEXT->ENTITY edge the
+        # extractor missed. This is the `disconnected` fix for the miss
+        # taxonomy and the fragile-variant fix for the attachment track.
+        if extraction.context_node is not None:
+            edges_created += self._link_known_mentions(
+                id_map.get(extraction.context_node.node_id,
+                           extraction.context_node.node_id),
+                input_data.content,
+            )
 
         # 3b. Semantic indexing (opt-in). Embed the newly-created content nodes
         # so keyword-less queries can retrieve them. No-op when the layer is

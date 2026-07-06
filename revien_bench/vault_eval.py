@@ -267,6 +267,7 @@ def run_vault_eval(out_dir: Path, semantic_enabled: bool = True) -> Dict:
             "retrieval": retrieval,
             "per_category": per_category,
             "attachment": measure_attachment(store),
+            "normalization_merges": FA.normalization_merge_report(store),
             "retrieval_failure_analysis": FA.aggregate_failures(per_q),
             "ingest": ingest_counts,
             "latency_ms": {"recall": M.latency_percentiles(latencies)},
@@ -304,6 +305,9 @@ def _print_summary(report: Dict) -> None:
     a = report["attachment"]
     print(f"attachment    : {a['attach_rate_expected']} on {a['n_expected']} clean-label "
           f"turns; {a['attach_rate_fragile_variants']} on {a['n_fragile']} fragile variants")
+    nm = report.get("normalization_merges", {})
+    print(f"norm merges   : {nm.get('count', 0)} normalization-only merges "
+          f"(precision surface — review pairs in results JSON)")
     fa = report["retrieval_failure_analysis"]
     if fa.get("gold_items_missed"):
         causes = ", ".join(f"{c}={n}" for c, n in fa["by_cause"].items())

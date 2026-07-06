@@ -46,6 +46,20 @@ from revien.retrieval.walker import GraphWalker
 DEEP_DEPTH = 6
 
 
+def normalization_merge_report(store: GraphStore) -> Dict:
+    """The false-merge precision surface: every dedup merge that happened ONLY
+    because of label normalization, as '"candidate" -> "existing"' pairs from
+    the audit log. Recall gains from normalization are only trustworthy next
+    to this list — a greedy matcher shows up here before it shows up as a
+    wrong answer."""
+    pairs = sorted({
+        row["actor"]
+        for row in store.get_all_audit()
+        if row.get("op") == "normalized_merge" and row.get("actor")
+    })
+    return {"count": len(pairs), "pairs": pairs}
+
+
 def build_dia_map(store: GraphStore) -> Dict[str, List[str]]:
     """Map dia_id -> [node_ids] for every node in the store. Built ONCE per
     conversation (one full node scan), then shared across all its QA rows."""

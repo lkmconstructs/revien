@@ -641,10 +641,18 @@ class GraphOperations:
     def find_node_by_label(
         self, label: str, node_type: Optional[NodeType] = None
     ) -> Optional[Node]:
-        """Find a node by exact label match, optionally filtered by type."""
+        """Find a node by NORMALIZED label match, optionally filtered by type.
+
+        Normalized, not raw-lowercase: 'Providence-Core' and 'Providence Core'
+        are the same entity in different surface forms, and this lookup is
+        where dedup, anchor selection, and link resolution all meet. The
+        entity-fragmentation this closes was the top cause of unattached
+        cross-corpus claims (vault eval attachment track)."""
+        from revien.graph.normalize import normalize_label
+        target = normalize_label(label)
         nodes = self.store.list_nodes(node_type=node_type, limit=999999)
         for node in nodes:
-            if node.label.lower() == label.lower():
+            if normalize_label(node.label) == target:
                 return node
         return None
 
@@ -653,15 +661,18 @@ class GraphOperations:
     ) -> List[Node]:
         """Find nodes with similar labels using both Levenshtein distance
         and ratio-based matching. Ratio-based matching handles length
-        differences better (e.g., 'PostgreSQL' vs 'Postgres')."""
+        differences better (e.g., 'PostgreSQL' vs 'Postgres'). Labels are
+        normalized first so separator/case noise doesn't eat the distance
+        budget."""
         from difflib import SequenceMatcher
+        from revien.graph.normalize import normalize_label
         nodes = self.store.list_nodes(limit=999999)
         matches = []
+        target = normalize_label(label)
         for node in nodes:
-            label_lower = label.lower()
-            node_lower = node.label.lower()
-            dist = _levenshtein(node_lower, label_lower)
-            ratio = SequenceMatcher(None, node_lower, label_lower).ratio()
+            node_norm = normalize_label(node.label)
+            dist = _levenshtein(node_norm, target)
+            ratio = SequenceMatcher(None, node_norm, target).ratio()
             if dist < max_distance or ratio >= min_ratio:
                 matches.append(node)
         return matches

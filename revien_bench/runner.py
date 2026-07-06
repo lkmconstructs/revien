@@ -492,7 +492,12 @@ def run_benchmark(
 
         # ── Sovereignty assertions (on the sampled conversation 0 store) ──────
         checks: List[S.Check] = []
+        norm_merges_sample: Optional[Dict] = None
         if provenance_store is not None:
+            # False-merge precision surface, sampled from the same store the
+            # provenance checks use (one conversation is representative for
+            # eyeballing pairs; the vault eval reports its full list).
+            norm_merges_sample = FA.normalization_merge_report(provenance_store)
             checks.append(
                 S.provenance_completeness(provenance_store, provenance_supporting)
             )
@@ -525,6 +530,7 @@ def run_benchmark(
         # Retrieval failure taxonomy: where the missed gold evidence died.
         # Rows from pre-taxonomy checkpoints are counted as unclassified.
         report["retrieval_failure_analysis"] = FA.aggregate_failures(per_q)
+        report["normalization_merges_sample"] = norm_merges_sample
         report["sovereignty"] = S.checks_to_dict(checks)
         report["config"] = {
             "name": config_name,

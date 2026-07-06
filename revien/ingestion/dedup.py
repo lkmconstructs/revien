@@ -36,9 +36,21 @@ class Deduplicator:
             stored = self.store.add_node(candidate)
             return stored, True
 
-        # 1. Exact label match (case-insensitive), same type
+        # 1. Exact label match (NORMALIZED, same type). Precision guard: a
+        # merge that happened ONLY because of normalization (raw lowercase
+        # labels differ) is written to the audit log with BOTH labels — the
+        # reviewable surface for false merges ("Lincoln" the city absorbing
+        # "Lincoln" the person is invisible to any surface rule; the audit
+        # list is where a human catches it). Benches surface these per run.
         existing = self._find_exact_match(candidate)
         if existing:
+            if existing.label.lower() != candidate.label.lower():
+                self.store._record_node_audit(
+                    existing.node_id,
+                    "normalized_merge",
+                    actor=f"{candidate.label!r} -> {existing.label!r}",
+                    after_node=existing,
+                )
             self.ops.touch_node(existing.node_id)
             return existing, False
 
