@@ -146,6 +146,12 @@ class _InMemoryVectorIndex(SemanticIndex):
         # Force-enable regardless of SEMANTIC_AVAILABLE — we supply our own store.
         self._enabled = True
         self._vectors = {}
+        # Base __init__ only registers when enabled at construction time; we
+        # forced enablement after, so wire the sync hooks explicitly.
+        self._register_store_listener()
+
+    def remove_node(self, node_id):
+        self._vectors.pop(node_id, None)
 
     def index_node(self, node_id, label, content):
         text = self._node_text(label, content)
@@ -280,3 +286,120 @@ class TestRealSemanticExtra:
         results = eng_on.recall(query).results
         assert results, "real hybrid recall returned nothing"
         assert results[0].node_id == dog.node_id
+
+
+# ── Spine behavior: embeddings stay in sync with node edits/deletes ────
+
+class TestAutoReindexOnUpdate:
+    def test_content_update_refreshes_vector(self, store):
+        """The stale-vector bug: before the content listener, an edited node
+        kept matching its OLD content in vector search until a manual
+        reindex_all(). Now update_node(content=...) re-embeds immediately."""
+        node = _add_fact(store, "pet", "A friendly dog at the park.")
+        sem = _InMemoryVectorIndex(store, _MockEmbedder())
+        sem.reindex_all()
+
+        hits = dict(sem.search("dog"))
+        assert node.node_id in hits
+
+        # Edit the node so it is no longer about dogs at all.
+        store.update_node(node.node_id, content="A sourdough bread recipe.")
+
+        assert node.node_id not in dict(sem.search("dog"))
+        assert node.node_id in dict(sem.search("bread recipe"))
+
+    def test_metadata_only_update_does_not_reembed(self, store):
+        """Metadata/access updates are the hot path (the bench tags every node
+        after every turn) — they must NOT trigger an embed."""
+        node = _add_fact(store, "pet", "A friendly dog at the park.")
+        sem = _InMemoryVectorIndex(store, _MockEmbedder())
+        sem.reindex_all()
+        before = sem._vectors[node.node_id]
+
+        calls = {"n": 0}
+        orig = sem.index_node
+
+        def counting(nid, lbl, ct):
+            calls["n"] += 1
+            return orig(nid, lbl, ct)
+
+        sem.index_node = counting
+        store.update_node(node.node_id, metadata={"dia_id": "D1:3"})
+        store.update_node(node.node_id, access_count=5)
+        assert calls["n"] == 0
+        assert sem._vectors[node.node_id] == before
+
+    def test_delete_drops_vector(self, store):
+        node = _add_fact(store, "pet", "A friendly dog at the park.")
+        sem = _InMemoryVectorIndex(store, _MockEmbedder())
+        sem.reindex_all()
+        assert node.node_id in sem._vectors
+
+        store.delete_node(node.node_id)
+        assert node.node_id not in sem._vectors
+        assert node.node_id not in dict(sem.search("dog"))
+
+    def test_listener_error_never_breaks_store_write(self, store):
+        node = _add_fact(store, "pet", "A friendly dog at the park.")
+
+        def boom(*_a, **_k):
+            raise RuntimeError("embedder exploded")
+
+        store.register_content_listener("semantic_index", on_content_change=boom,
+                                        on_delete=boom)
+        updated = store.update_node(node.node_id, content="new content")
+        assert updated is not None and updated.content == "new content"
+        assert store.delete_node(node.node_id) is True
+
+
+# ── Spine behavior: degrade is LOUD, require mode is fatal ─────────────
+
+class TestLoudDegrade:
+    def test_recall_response_reports_semantic_state(self, store):
+        eng_off = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        resp = eng_off.recall("anything")
+        assert resp.semantic_active is False
+        assert resp.semantic_note  # a reason, not None
+
+        sem = _InMemoryVectorIndex(store, _MockEmbedder())
+        eng_on = RetrievalEngine(store, semantic=sem)
+        resp_on = eng_on.recall("anything")
+        assert resp_on.semantic_active is True
+        assert resp_on.semantic_note is None
+
+    def test_engine_warns_once_when_semantic_inactive(self, store, capsys):
+        import revien.retrieval.engine as eng_mod
+        eng_mod._SEMANTIC_OFF_WARNED = False
+        RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        err = capsys.readouterr().err
+        assert "GRAPH-ONLY" in err
+        # Second engine: no repeat (one warning per process).
+        RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert "GRAPH-ONLY" not in capsys.readouterr().err
+
+    def test_status_carries_broken_reason(self, store):
+        sem = _InMemoryVectorIndex(store, _MockEmbedder())
+        try:
+            sem._safe_disable(RuntimeError("vec0 load failed"))
+        except RuntimeError:
+            pytest.fail("_safe_disable must not raise without REVIEN_SEMANTIC=require")
+        assert sem.is_enabled is False
+        st = sem.status()
+        assert st["broken"] is True
+        assert "vec0 load failed" in st["broken_reason"]
+        assert "vec0 load failed" in sem.inactive_reason()
+
+    def test_require_mode_makes_runtime_failure_fatal(self, store, monkeypatch):
+        sem = _InMemoryVectorIndex(store, _MockEmbedder())
+        monkeypatch.setenv("REVIEN_SEMANTIC", "require")
+        with pytest.raises(RuntimeError, match="require"):
+            sem._safe_disable(RuntimeError("vec0 load failed"))
+
+    def test_require_mode_refuses_construction_when_unavailable(
+        self, store, monkeypatch
+    ):
+        import revien.semantic.index as idx
+        monkeypatch.setenv("REVIEN_SEMANTIC", "require")
+        monkeypatch.setattr(idx, "SEMANTIC_AVAILABLE", False)
+        with pytest.raises(RuntimeError, match="REVIEN_SEMANTIC=require"):
+            SemanticIndex(store)

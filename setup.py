@@ -18,6 +18,14 @@ setup(
         "watchdog>=3.0.0",
         "httpx>=0.25.0",
         "click>=8.1.0",
+        # Semantic/vector retrieval is SPINE, not an extra. Graph-only recall
+        # has no query-relevance signal beyond keyword overlap (LoCoMo
+        # recall@10: 0.05 graph-only vs 0.47 hybrid), so shipping without the
+        # semantic layer ships degraded recall. sqlite-vec stores embeddings in
+        # the SAME SQLite db; fastembed (bge-small, 384-dim) embeds locally —
+        # still zero-network, zero-cloud on the default path.
+        "sqlite-vec>=0.1.0",
+        "fastembed>=0.3.0",
     ],
     extras_require={
         "dev": ["pytest>=7.4.0", "pytest-asyncio>=0.21.0"],
@@ -31,16 +39,10 @@ setup(
         # When absent, recall() runs base scoring (three-factor + community +
         # confidence) unchanged and the neural adjustment is silently skipped.
         "neural": ["scikit-learn>=1.3.0", "numpy>=1.24.0"],
-        # Opt-in LOCAL-FIRST semantic/vector search. sqlite-vec stores node
-        # embeddings in a vec0 virtual table inside the SAME SQLite db (no
-        # separate service); fastembed (BAAI/bge-small-en-v1.5, 384-dim) is the
-        # LOCAL default embedder — no network on the default path. NOT installed
-        # by default. Enable with:
-        #   pip install revien[semantic]
-        # When absent, recall()/ingest() run the unchanged graph-only path and
-        # the semantic layer is silently disabled (REVIEN_SEMANTIC gates it; it
-        # defaults on iff sqlite-vec is importable). A cloud embedder (OpenAI)
-        # is opt-in via REVIEN_EMBEDDER=openai and is disclosed once on use.
+        # Semantic deps are now CORE (see install_requires). This extra is kept
+        # as a backward-compatible alias so `pip install revien[semantic]` and
+        # existing docs/scripts keep working. REVIEN_SEMANTIC=0 force-disables;
+        # REVIEN_SEMANTIC=require makes a broken/missing layer a hard error.
         "semantic": ["sqlite-vec>=0.1.0", "fastembed>=0.3.0"],
         "all": [
             "langchain-core>=0.1.0",

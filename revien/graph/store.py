@@ -20,7 +20,40 @@ class GraphStore:
     def __init__(self, db_path: str = "revien.db"):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        # Content listeners: {name: (on_content_change, on_delete)}. Keyed so a
+        # layer (e.g. the semantic index) registering twice replaces itself
+        # instead of firing twice. Listener errors never break store writes.
+        self._content_listeners: dict = {}
         self._ensure_db()
+
+    def register_content_listener(
+        self, name: str, on_content_change=None, on_delete=None
+    ) -> None:
+        """Register callbacks fired after a node's label/content changes or a
+        node is deleted. on_content_change(node_id, label, content);
+        on_delete(node_id). Re-registering the same name replaces the prior
+        callbacks. This is how the semantic index keeps embeddings in sync
+        with node edits (stale-vector bug: edits used to require a manual
+        /v1/reindex before vector search saw the new content)."""
+        self._content_listeners[name] = (on_content_change, on_delete)
+
+    def _fire_content_change(self, node: "Node") -> None:
+        for on_change, _ in list(self._content_listeners.values()):
+            if on_change is None:
+                continue
+            try:
+                on_change(node.node_id, node.label, node.content)
+            except Exception:  # noqa: BLE001 - listeners must never break writes
+                pass
+
+    def _fire_delete(self, node_id: str) -> None:
+        for _, on_delete in list(self._content_listeners.values()):
+            if on_delete is None:
+                continue
+            try:
+                on_delete(node_id)
+            except Exception:  # noqa: BLE001 - listeners must never break writes
+                pass
 
     def _ensure_db(self) -> None:
         """Create tables if they don't exist, with confidence-layer columns.
@@ -532,6 +565,14 @@ class GraphStore:
                 node_id, _audit_op, actor=_audit_actor,
                 before_node=existing, after_node=updated,
             )
+        # Content listeners: fire only when the embedded text actually changed,
+        # so metadata/access-count updates (the hot path) never trigger a
+        # re-embed.
+        if updated is not None and (
+            ("label" in updates and updated.label != existing.label)
+            or ("content" in updates and updated.content != existing.content)
+        ):
+            self._fire_content_change(updated)
         return updated
 
     def delete_node(self, node_id: str) -> bool:
@@ -544,7 +585,10 @@ class GraphStore:
         )
         cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
         conn.commit()
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+        if deleted:
+            self._fire_delete(node_id)
+        return deleted
 
     def list_nodes(
         self,

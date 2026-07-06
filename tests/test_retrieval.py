@@ -66,20 +66,31 @@ class TestThreeFactorScorer:
         assert result.recency > 0.99, f"Just-accessed node should score ~1.0, got {result.recency}"
 
     def test_recency_old_scores_low(self):
-        scorer = ThreeFactorScorer()
+        # Explicit 7d half-life: this test verifies the DECAY MECHANIC, not the
+        # shipped default (365d — recency as tiebreak, sweep-shipped July 2026).
+        scorer = ThreeFactorScorer(ScoringConfig(recency_half_life_days=7.0))
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
         result = scorer.score(thirty_days_ago, access_count=0, graph_distance=0, now=now)
         assert result.recency < 0.1, f"30-day-old node should score low, got {result.recency}"
 
     def test_recency_half_life(self):
-        """After exactly 1 half-life (7 days), recency should be ~0.5."""
-        scorer = ThreeFactorScorer()
+        """After exactly 1 half-life, recency should be ~0.5."""
+        scorer = ThreeFactorScorer(ScoringConfig(recency_half_life_days=7.0))
         now = datetime.now(timezone.utc)
         one_halflife = now - timedelta(days=7)
         result = scorer.score(one_halflife, access_count=0, graph_distance=0, now=now)
         assert abs(result.recency - 0.5) < 0.01, \
             f"After 1 half-life, recency should be ~0.5, got {result.recency}"
+
+    def test_default_half_life_is_gentle(self):
+        """Shipped default (365d): a month-old memory is NOT buried."""
+        scorer = ThreeFactorScorer()
+        now = datetime.now(timezone.utc)
+        thirty_days_ago = now - timedelta(days=30)
+        result = scorer.score(thirty_days_ago, access_count=0, graph_distance=0, now=now)
+        assert result.recency > 0.9, \
+            f"30-day-old node should barely decay at the 365d default, got {result.recency}"
 
     def test_frequency_zero_access(self):
         scorer = ThreeFactorScorer()
@@ -257,13 +268,19 @@ class TestRetrievalEngine:
         response = engine.recall("pricing")
         assert len(response.results) <= 5
 
-    def test_access_tracking_on_retrieval(self, engine, seeded_store):
-        """Retrieved nodes should have access_count incremented."""
+    def test_no_access_tracking_on_retrieval_by_default(self, engine, seeded_store):
+        """Sweep-shipped default: recall() does NOT touch its own results (the
+        feedback loop made frequency a popularity prior — being returned bumped
+        the score that got it returned again). Only mark_used() feeds
+        access_count; REVIEN_TOUCH_ON_RECALL=1 restores the old behavior."""
         response = engine.recall("pricing")
         if response.results:
-            node = seeded_store.get_node(response.results[0].node_id)
-            assert node.access_count >= 1, \
-                "Retrieved node should have access_count >= 1"
+            node_id = response.results[0].node_id
+            assert seeded_store.get_node(node_id).access_count == 0, \
+                "recall() must not touch its own results by default"
+            engine.mark_used(node_id)
+            assert seeded_store.get_node(node_id).access_count == 1, \
+                "mark_used() is the honest frequency signal"
 
     def test_path_field_populated(self, engine):
         """Results should include a path showing how the node was reached."""

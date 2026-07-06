@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Tuple
 
-from revien.graph.schema import Edge, EdgeType, Node, NodeType
+from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
 
 
 @dataclass
@@ -127,7 +127,13 @@ class RuleBasedExtractor:
         result = ExtractionResult()
         now = datetime.now(timezone.utc)
 
-        # 1. Create context node for the full interaction
+        # 1. Create context node for the full interaction. The verbatim turn
+        # is GROUND TRUTH of what was said — EXTRACTED at confidence 1.0, per
+        # the schema's own definition and matching the LLM extractor. Leaving
+        # the dataclass defaults (inferred/0.5) halved every conversation
+        # turn's recall score against curated content AND put verbatim memory
+        # on the INFERRED decay path (-0.01/week) — found by the vault eval's
+        # attachment track.
         context_node = Node(
             node_type=NodeType.CONTEXT,
             label=self._make_context_label(content),
@@ -135,6 +141,8 @@ class RuleBasedExtractor:
             source_id=source_id,
             created_at=now,
             last_accessed=now,
+            source_type=SourceType.EXTRACTED,
+            confidence=1.0,
         )
         result.context_node = context_node
         result.nodes.append(context_node)

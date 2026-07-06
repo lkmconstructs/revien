@@ -15,10 +15,16 @@ when numpy/scikit-learn are absent, neural is silently disabled and every other
 layer runs unchanged.
 """
 
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+# One-shot flag for the graph-only degrade warning (per process, not per engine
+# — bench runs construct hundreds of engines and one warning is the message).
+_SEMANTIC_OFF_WARNED = False
 
 from revien.graph.schema import Node, NodeType, SourceType
 from revien.graph.store import GraphStore
@@ -34,7 +40,7 @@ from revien.neural.training import TrainingLoop
 # imports cleanly without the extra and self-disables (is_enabled False), so
 # recall() runs the unchanged graph path when it is absent or REVIEN_SEMANTIC=0.
 from revien.semantic.index import SemanticIndex
-from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer
+from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
 
 
@@ -58,6 +64,17 @@ class RetrievalResponse:
     nodes_examined: int
     retrieval_time_ms: float
     neural_active: bool = False
+    # Semantic-layer visibility: recall quality differs ~10x between the hybrid
+    # and graph-only paths (LoCoMo recall@10 0.47 vs 0.05), so every response
+    # says WHICH path served it. semantic_note is None when active, else a
+    # one-line reason the layer is off — the caller must be able to see a
+    # degrade, not infer it from mysteriously worse results.
+    semantic_active: bool = False
+    semantic_note: Optional[str] = None
+    # Populated only when recall(debug=True): anchor sets, walked distances,
+    # per-node final scores, and filter reasons. This is what per-query
+    # retrieval failure analysis (extraction/seed/walk/ranking miss) reads.
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class RetrievalEngine:
@@ -107,10 +124,34 @@ class RetrievalEngine:
         self.store = store
         self.ops = GraphOperations(store)
         self.extractor = RuleBasedExtractor()
-        self.scorer = ThreeFactorScorer(scoring_config)
+        # No explicit config -> defaults + env overrides (ScoringConfig.from_env;
+        # unset env == exact defaults). This is what lets the bench sweep ranking
+        # knobs without code edits.
+        self.scorer = ThreeFactorScorer(scoring_config or ScoringConfig.from_env())
         self.walker = GraphWalker(store, max_depth=max_depth)
         self.max_depth = max_depth
         self.clustering = clustering
+
+        # Ranking knobs (see class constants for semantics). Env-overridable for
+        # sweeps; the class constants remain the shipped defaults. The miss
+        # taxonomy says 72% of semantic-path misses are `outranked` — these are
+        # the levers that decide that ranking.
+        self.semantic_top_k = int(_env_float("REVIEN_SEMANTIC_TOP_K", self.SEMANTIC_TOP_K))
+        self.semantic_sim_floor = _env_float(
+            "REVIEN_SEMANTIC_SIM_FLOOR", self.SEMANTIC_SIM_FLOOR
+        )
+        self.graph_refine = _env_float("REVIEN_GRAPH_REFINE", self.GRAPH_REFINE)
+        self.community_boost = _env_float("REVIEN_COMMUNITY_BOOST", self.COMMUNITY_BOOST)
+        # Frequency feedback-loop gate — DEFAULT OFF (sweep-shipped July 2026):
+        # recall() touching its own results made access_count a popularity
+        # prior contaminated by the engine's own behavior (being returned →
+        # higher frequency → returned again), measured at -21% recall@10 vs
+        # honest frequency at full scale. Only mark_used() — a caller
+        # confirming the memory was actually useful — feeds access_count.
+        # Set REVIEN_TOUCH_ON_RECALL=1 to restore the old behavior.
+        self.touch_on_recall = os.environ.get(
+            "REVIEN_TOUCH_ON_RECALL", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
 
         # Neural components (opt-in). These construct cleanly even without the
         # `neural` extra: NeuralScorer.is_neural stays False and adjust_score()
@@ -118,10 +159,29 @@ class RetrievalEngine:
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
 
-        # Semantic/vector layer (opt-in). Constructs cleanly even without the
-        # `semantic` extra: SemanticIndex.is_enabled stays False and all of its
-        # methods no-op, so recall() degrades to the exact graph-only path.
+        # Semantic/vector layer (SPINE — core deps as of the promote-to-spine
+        # change). Constructs cleanly even when the deps are absent (source
+        # install): SemanticIndex.is_enabled stays False and all of its methods
+        # no-op, so recall() degrades to the graph-only path — but LOUDLY:
         self.semantic = semantic if semantic is not None else SemanticIndex(store)
+        self._warn_if_semantic_inactive()
+
+    def _warn_if_semantic_inactive(self) -> None:
+        """One warning per process when recall will run graph-only. Graph-only
+        recall has no query-relevance signal beyond keyword overlap (LoCoMo
+        recall@10: 0.05 vs 0.47 hybrid) — an engine silently running in that
+        mode is the bug this warning exists to catch."""
+        global _SEMANTIC_OFF_WARNED
+        if self.semantic.is_enabled or _SEMANTIC_OFF_WARNED:
+            return
+        _SEMANTIC_OFF_WARNED = True
+        sys.stderr.write(
+            f"[revien] recall is running GRAPH-ONLY (keyword) retrieval - "
+            f"semantic layer inactive: {self.semantic.inactive_reason()}. "
+            f"Recall quality is significantly degraded. Set "
+            f"REVIEN_SEMANTIC=require to make this fatal.\n"
+        )
+        sys.stderr.flush()
 
     def recall(
         self,
@@ -131,6 +191,7 @@ class RetrievalEngine:
         now: Optional[datetime] = None,
         include_invalidated: bool = False,
         include_context: bool = False,
+        debug: bool = False,
     ) -> RetrievalResponse:
         """
         Query the memory graph and return ranked results.
@@ -146,6 +207,11 @@ class RetrievalEngine:
                 are retained and recoverable, just hidden from default recall.
                 When no node is invalidated this flag changes nothing, so recall
                 is byte-identical to the pre-6a behavior.
+            debug: When True, the response carries a ``diagnostics`` dict
+                (anchor sets by origin, walked node distances, per-node final
+                scores including sub-threshold ones, and filter reasons) so a
+                caller can classify WHY a given node was or wasn't returned.
+                Default False: zero overhead, response unchanged.
 
         Returns:
             RetrievalResponse with ranked nodes and timing data
@@ -157,11 +223,14 @@ class RetrievalEngine:
             now = datetime.now(timezone.utc)
 
         # 1. Parse query — extract entities and topics
-        anchor_ids = self._find_anchors(query)
+        entity_anchor_ids = self._find_anchors(query)
+        anchor_ids = list(entity_anchor_ids)
 
         # 2. If no anchors found, try keyword search across all nodes
+        keyword_anchor_ids: List[str] = []
         if not anchor_ids:
-            anchor_ids = self._keyword_search(query)
+            keyword_anchor_ids = self._keyword_search(query)
+            anchor_ids = list(keyword_anchor_ids)
 
         # 2a. Hybrid semantic anchors (opt-in). When the semantic layer is
         # enabled, embed the query, pull the nearest stored nodes, and UNION
@@ -171,11 +240,11 @@ class RetrievalEngine:
         # is byte-for-byte what it was before this leg.
         semantic_sims: Dict[str, float] = {}
         if self.semantic.is_enabled:
-            for node_id, sim in self.semantic.search(query, top_k=self.SEMANTIC_TOP_K):
+            for node_id, sim in self.semantic.search(query, top_k=self.semantic_top_k):
                 # Only nodes that clear the floor act as semantic anchors. This
                 # is what lets a keyword-less query reach a genuinely-close node
                 # without near-uniform mild similarity reshuffling keyword hits.
-                if sim < self.SEMANTIC_SIM_FLOOR:
+                if sim < self.semantic_sim_floor:
                     continue
                 semantic_sims[node_id] = sim
                 if node_id not in anchor_ids:
@@ -199,26 +268,42 @@ class RetrievalEngine:
         # 4. Score all reachable nodes
         scored_results: List[RetrievalResult] = []
         nodes_examined = len(node_distances)
+        # Debug bookkeeping (leg: per-query failure analysis). Cheap dicts,
+        # built only when asked for.
+        diag_scores: Dict[str, float] = {}
+        diag_filtered: Dict[str, str] = {}
 
         for node_id, distance in node_distances.items():
             node = self.store.get_node(node_id)
             if node is None:
+                if debug:
+                    diag_filtered[node_id] = "missing"
                 continue
 
             # CONTEXT nodes are the verbatim turns — answer-bearing content for
             # conversational memory. Surface them by default; callers wanting only
             # distilled extract nodes can pass include_context=False.
             if node.node_type == NodeType.CONTEXT and not include_context:
+                if debug:
+                    diag_filtered[node_id] = "context_excluded"
                 continue
 
             # Provenance (leg 6a): exclude soft-invalidated nodes by default.
             # No-op when nothing is invalidated, so recall stays byte-identical.
             if node.invalidated_at is not None and not include_invalidated:
+                if debug:
+                    diag_filtered[node_id] = "invalidated"
                 continue
 
-            # Three-factor base score (recency + frequency + proximity)
+            # Three-factor base score (recency + frequency + proximity).
+            # Recency scores CONTENT time — when the memory was said
+            # (recorded_at), falling back to when it entered the graph
+            # (created_at). Scoring last_accessed here made "recency" mean
+            # recently-touched: it correlated with retrieval popularity, was
+            # constant in any evaluation querying at a historical `now`, and
+            # buried old-but-true facts behind whatever was returned last.
             breakdown = self.scorer.score(
-                last_accessed=node.last_accessed,
+                timestamp=node.recorded_at or node.created_at,
                 access_count=node.access_count,
                 graph_distance=distance,
                 now=now,
@@ -237,7 +322,7 @@ class RetrievalEngine:
             if relevant_communities and self.clustering:
                 node_community = self.clustering.get_community(node_id)
                 if node_community is not None and node_community in relevant_communities:
-                    community_boost = self.COMMUNITY_BOOST
+                    community_boost = self.community_boost
 
             # Layer 1 (leg 1): confidence multiplier as a post-factor.
             effective_confidence = self._effective_confidence(node, now)
@@ -250,9 +335,12 @@ class RetrievalEngine:
             # below runs unchanged (byte-identical to the pre-semantic path).
             sim = semantic_sims.get(node_id)
             if sim is not None:
-                final_score = (sim + self.GRAPH_REFINE * base_score + community_boost) * effective_confidence
+                final_score = (sim + self.graph_refine * base_score + community_boost) * effective_confidence
             else:
                 final_score = (base_score + community_boost) * effective_confidence
+
+            if debug:
+                diag_scores[node_id] = final_score
 
             if final_score < min_score:
                 continue
@@ -293,9 +381,17 @@ class RetrievalEngine:
         scored_results.sort(key=lambda r: r.score, reverse=True)
         top_results = scored_results[:top_n]
 
-        # 6. Touch retrieved nodes (update access tracking)
-        for result in top_results:
-            self.ops.touch_node(result.node_id)
+        # 6. Touch retrieved nodes (update access tracking). Env-gated
+        # (REVIEN_TOUCH_ON_RECALL=0 disables) because this is the frequency
+        # feedback loop: being RETURNED bumps access_count, which raises the
+        # frequency score, which gets the node returned again — retrieval
+        # popularity masquerading as relevance. With the gate off, only
+        # mark_used() (a caller confirming the memory was actually useful)
+        # feeds the frequency signal. Default ON (shipped behavior unchanged)
+        # pending the sweep verdict.
+        if self.touch_on_recall:
+            for result in top_results:
+                self.ops.touch_node(result.node_id)
 
         # 7. Log retrieval for neural training. The TrainingLoop is pure
         # stdlib, so signals accumulate even when the neural extra is absent —
@@ -315,12 +411,30 @@ class RetrievalEngine:
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
+        diagnostics: Optional[Dict[str, Any]] = None
+        if debug:
+            diagnostics = {
+                "anchors": {
+                    "entity": entity_anchor_ids,
+                    "keyword": keyword_anchor_ids,
+                    "semantic": list(semantic_sims.keys()),
+                    "all": list(anchor_ids),
+                },
+                "node_distances": dict(node_distances),
+                "scores": diag_scores,
+                "filtered": diag_filtered,
+                "max_depth": self.max_depth,
+            }
+
         return RetrievalResponse(
             query=query,
             results=top_results,
             nodes_examined=nodes_examined,
             retrieval_time_ms=round(elapsed_ms, 2),
             neural_active=self.neural_scorer.is_neural,
+            semantic_active=self.semantic.is_enabled,
+            semantic_note=self.semantic.inactive_reason(),
+            diagnostics=diagnostics,
         )
 
     def _effective_confidence(self, node: Node, now: datetime) -> float:

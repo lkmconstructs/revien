@@ -167,13 +167,22 @@ class TestCrossConversationRetrieval:
 # ── Scoring Self-Reinforcement ────────────────────────────
 
 class TestScoringReinforcement:
-    def test_access_count_increments_on_retrieval(self, engine, seeded_store):
-        """Retrieved nodes should have their access_count bumped."""
+    def test_recall_does_not_self_touch_by_default(self, engine, seeded_store):
+        """Sweep-shipped default (July 2026): recall() no longer bumps
+        access_count on its own results — that feedback loop poisoned the
+        frequency signal. mark_used() is the reinforcement path now;
+        REVIEN_TOUCH_ON_RECALL=1 restores the old behavior."""
+        # NB: access_count is not necessarily 0 here — ingest-dedup bumps it
+        # for every repeat mention (an honest signal). What recall() must NOT
+        # do is bump it further just for returning the node.
         response = engine.recall("enterprise pricing")
         if response.results:
             node_id = response.results[0].node_id
-            node = seeded_store.get_node(node_id)
-            assert node.access_count >= 1
+            before = seeded_store.get_node(node_id).access_count
+            engine.recall("enterprise pricing")
+            assert seeded_store.get_node(node_id).access_count == before
+            engine.mark_used(node_id)
+            assert seeded_store.get_node(node_id).access_count == before + 1
 
     def test_frequency_boost_on_repeated_query(self, engine):
         """Second query for same topic should return higher or equal scores."""

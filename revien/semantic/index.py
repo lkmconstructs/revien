@@ -9,16 +9,23 @@ for the same graph walk (union with keyword anchors), plus an optional semantic
 score blend.
 
 =========================== HARD CONTRACT ===========================
-This whole layer is OPT-IN and self-disabling, mirroring the leg-3 NeuralScorer
-pattern:
+This layer is SPINE, not an extra: sqlite-vec + fastembed are CORE dependencies
+(graph-only recall has no query-relevance signal — LoCoMo recall@10 0.05 vs
+0.47 hybrid — so shipping without it ships degraded recall). The contract:
 
-  * The heavy deps (sqlite-vec, fastembed) live in the `semantic` extra and are
-    NOT base requirements. Their imports are GUARDED. When absent,
+  * Imports stay GUARDED so a source install without the deps still runs:
     ``SemanticIndex.is_enabled`` is False, every method is an inert no-op, and
-    all existing graph retrieval / ingestion runs exactly as before.
+    graph retrieval / ingestion run unchanged — but the degrade is LOUD
+    (stderr at engine construction + ``semantic_note`` on every recall
+    response), never silent.
 
-  * ``REVIEN_SEMANTIC`` gates activation. Default: enabled IFF the extra is
-    importable. Set ``REVIEN_SEMANTIC=0`` to force-disable even when installed.
+  * ``REVIEN_SEMANTIC`` gates activation. Default: enabled IFF sqlite-vec is
+    importable. ``REVIEN_SEMANTIC=0`` force-disables. ``REVIEN_SEMANTIC=require``
+    makes any missing dep or runtime failure a HARD ERROR instead of a degrade.
+
+  * Embeddings stay in sync: the index registers a content listener on the
+    store, so node label/content updates re-embed immediately and deletes drop
+    the vector (no more stale-until-manual-reindex).
 
 =========================== ARCHITECTURE ===========================
 Storage  — sqlite-vec loadable extension (``sqlite_vec.load(conn)``) creates a
@@ -86,15 +93,24 @@ REQUEST_TIMEOUT = 30.0
 
 
 def _semantic_enabled_by_env() -> bool:
-    """REVIEN_SEMANTIC gate. Default: enabled iff the storage extra imports.
+    """REVIEN_SEMANTIC gate. Default: enabled iff the storage backend imports.
 
-    Accepts 1/true/yes/on (force-on) and 0/false/no/off (force-off). Unset =>
-    default to extra-availability so install-and-go works without extra config.
+    Accepts 1/true/yes/on/require (force-on) and 0/false/no/off (force-off).
+    Unset => default to availability. sqlite-vec is now a CORE dependency, so
+    on a normal install this is on out of the box.
     """
     raw = os.environ.get("REVIEN_SEMANTIC")
     if raw is None:
         return SEMANTIC_AVAILABLE
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    return raw.strip().lower() in ("1", "true", "yes", "on", "require", "required", "strict")
+
+
+def _semantic_required() -> bool:
+    """REVIEN_SEMANTIC=require: a missing/broken semantic layer is a hard error
+    instead of a silent degrade to graph-only recall. For deployments where
+    degraded recall quality is worse than a loud failure."""
+    raw = os.environ.get("REVIEN_SEMANTIC", "")
+    return raw.strip().lower() in ("require", "required", "strict")
 
 
 # ── Cloud disclosure (mirrors leg-4 extractor_llm._disclose_cloud) ─────
@@ -281,11 +297,39 @@ class SemanticIndex:
         self._table_ready = False
         self._dim: Optional[int] = None
         self._broken = False  # set if extension load fails at runtime
+        self._broken_reason: Optional[str] = None
 
         # Resolve enablement: explicit arg wins, else env gate.
         if enabled is None:
             enabled = _semantic_enabled_by_env()
         self._enabled = bool(enabled) and SEMANTIC_AVAILABLE
+
+        # REVIEN_SEMANTIC=require: refuse to construct a degraded engine.
+        if _semantic_required() and not self._enabled:
+            raise RuntimeError(
+                "REVIEN_SEMANTIC=require but the semantic layer cannot start "
+                f"(sqlite_vec importable: {_SQLITE_VEC_AVAILABLE}, "
+                f"fastembed importable: {_FASTEMBED_AVAILABLE}). "
+                "Install the missing dependency or unset REVIEN_SEMANTIC."
+            )
+
+        # Keep embeddings in sync with node edits/deletes. Without this, an
+        # updated node kept its STALE vector until a manual reindex_all() —
+        # vector search would keep matching the old content. Registration is
+        # keyed, so the newest index over a store replaces the previous one
+        # (they share the same vec table, so any live instance can serve).
+        if self._enabled:
+            self._register_store_listener()
+
+    def _register_store_listener(self) -> None:
+        """Wire this index to the store's content-change/delete hooks.
+        Subclasses that force-enable after construction call this themselves."""
+        if hasattr(self.store, "register_content_listener"):
+            self.store.register_content_listener(
+                "semantic_index",
+                on_content_change=self._on_node_content_change,
+                on_delete=self.remove_node,
+            )
 
     # ── State ──────────────────────────────────────────────
     @property
@@ -306,8 +350,23 @@ class SemanticIndex:
                 else ("local:fastembed" if self._embedder_built else "unbuilt")
             ),
             "broken": self._broken,
+            "broken_reason": self._broken_reason,
+            "required": _semantic_required(),
             "dim": self._dim,
         }
+
+    def inactive_reason(self) -> Optional[str]:
+        """One-line human answer to 'why is semantic recall not running?'.
+        None when the layer is active."""
+        if self.is_enabled:
+            return None
+        if self._broken:
+            return f"disabled after runtime error: {self._broken_reason}"
+        if not _SQLITE_VEC_AVAILABLE:
+            return "sqlite-vec not importable (core dependency missing?)"
+        if not _semantic_enabled_by_env():
+            return "force-disabled via REVIEN_SEMANTIC"
+        return "disabled at construction (enabled=False)"
 
     # ── Lazy wiring ────────────────────────────────────────
     def _get_embedder(self) -> EmbeddingProvider:
@@ -342,14 +401,42 @@ class SemanticIndex:
         self._table_ready = True
 
     def _safe_disable(self, exc: Exception) -> None:
-        """A runtime failure must never break plain graph retrieval. Log once
-        to stderr and mark the layer broken so the engine falls back."""
+        """A runtime failure must never break plain graph retrieval — UNLESS
+        REVIEN_SEMANTIC=require, in which case a broken layer is a hard error
+        (degraded recall is the failure mode that hides for weeks; require-mode
+        deployments prefer the crash). Otherwise: mark broken, record WHY, and
+        warn. The reason is surfaced through status() and every
+        RetrievalResponse.semantic_note so the caller can see the degrade
+        instead of silently getting graph-only results."""
+        if _semantic_required():
+            raise RuntimeError(
+                f"semantic layer failed with REVIEN_SEMANTIC=require: {exc!r}"
+            ) from exc
         self._broken = True
+        self._broken_reason = repr(exc)
         sys.stderr.write(
-            f"[revien.semantic] disabled after runtime error: {exc!r}. "
-            f"Graph retrieval continues without the semantic layer.\n"
+            f"[revien.semantic] DISABLED after runtime error: {exc!r}. "
+            f"Recall is now graph-only (keyword) retrieval - quality is "
+            f"significantly degraded. Set REVIEN_SEMANTIC=require to make "
+            f"this fatal instead.\n"
         )
         sys.stderr.flush()
+
+    def _on_node_content_change(self, node_id: str, label: str, content: str) -> None:
+        """Store listener: a node's label/content changed — refresh its vector."""
+        self.index_node(node_id, label, content)
+
+    def remove_node(self, node_id: str) -> None:
+        """Store listener: node deleted — drop its vector so search can't
+        return a ghost. Safe no-op when disabled or the table doesn't exist."""
+        if not self.is_enabled or not self._table_ready:
+            return
+        try:
+            conn = self.store._get_conn()
+            conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (node_id,))
+            conn.commit()
+        except Exception as e:  # noqa: BLE001 - cleanup must not break deletes
+            self._safe_disable(e)
 
     @staticmethod
     def _node_text(label: str, content: str) -> str:

@@ -172,6 +172,11 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             ],
             "nodes_examined": response.nodes_examined,
             "retrieval_time_ms": response.retrieval_time_ms,
+            # Degrade visibility: which retrieval path served this query.
+            # semantic_note is null when the hybrid path is active, else a
+            # one-line reason recall is running graph-only (degraded).
+            "semantic_active": response.semantic_active,
+            "semantic_note": response.semantic_note,
         }
 
     # ── GET /v1/nodes ─────────────────────────────────
