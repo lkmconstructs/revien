@@ -346,6 +346,52 @@ judgment calls surfaced by the verification pass, below.
 - [ ] [Lissa] MERGE GATE: feat/advanced-core-port -> main is HER hands (or Julien's).
   Never an instance's. Then tag v0.2.0.
 
+## NEXT LEGS (planned July 7 2026, post-PyPI — Lissa + Asher's gap analysis, corrected
+## against the code and merged with the instruments' findings)
+
+Two tracks; every item names which master it serves. Standing rules bind: both corpora
+re-run after any ingest/scoring change; new identity-memory features need their OWN eval
+track (LoCoMo/vault fixtures don't measure them); no public number without its JSON.
+
+**Track A — recall numbers (the public wedge). Ordered by measured leverage:**
+- A1. **Weighted walk + reranker** (lever #1 per taxonomy: 1,072 outranked, median rank
+  33, 316 already in top-20). Includes wiring the DEAD edge-weight code — edges already
+  have weight + confidence (schema.py:140) and mark_used() reinforcement; the walker does
+  unweighted BFS and reads none of it. Then train/replace the neural scorer (signals
+  accumulate; force_train never called). This subsumes the doc's item 4.
+- A2. **Extraction coverage** (disconnected=479) + the newline entity-regex fix
+  ("Deployment\nRuns" junk — documented first task).
+- A3. **Per-NodeType recency half-life** — small ScoringConfig change (identity/preference
+  long, event/observation short). NOTE: confidence decay is ALREADY type-gated (INFERRED
+  only, pinned immune); this is recency ranking only, and the sweep says recency is a weak
+  recall lever — do it for identity-modeling correctness, expect no headline movement.
+
+**Track B — identity memory (VesselOS-class use). Ordered by leverage-per-effort:**
+- B1. **Tension/COEXIST** — CONTRADICTS edge type EXISTS (schema.py:30), never drawn.
+  Add a COEXIST gate outcome for preference/identity-class claims: draw CONTRADICTS, both
+  nodes stay live, neither queued nor superseded ("I want closeness" + "I want space").
+  CLAIM_TAXONOMY §7.2 (sentiment ≠ contradiction) is the guardrail. Needs its own small
+  eval/tests — invisible to existing benches. (Engram-harvest task a6c924dc relates.)
+- B2. **Bi-temporal validity** — event_time_start/end columns EXIST (CSL Leg 2); schema
+  comment says valid_from/valid_until were deliberately deferred to L3. The leg: (a)
+  supersession closes the OLD fact's validity window instead of just invalidating,
+  (b) recall(..., as_of=) query path, (c) tests. "Where did she live in March?" becomes
+  answerable. This is our own L3, not a Graphiti import.
+- B3. **Dream mode (autonomous consolidation)** — a periodic daemon sweep that also mops
+  the KNOWN dangling threads: _apply_decay is never called automatically (verified),
+  neural training never fires, reindex/clustering refresh are manual, orphan cleanup.
+  Any pass that MERGES existing nodes must feed the false-merge audit surface.
+- B4 (defer). **FSRS-6 decay** — measure per-type recency (A3) first; FSRS is
+  tuning-heavy and the sweep says recency isn't the lever. Revisit with data.
+- B5 (far). **Knowledge-gap detection** — product feature atop clustering + density;
+  not a memory-engine primitive. Park it.
+
+**Corrections to the gap analysis (so nobody re-litigates):** CONTRADICTS edge type,
+edge confidence/weights, and event-time interval columns ALL already exist — the gaps are
+that nothing draws/reads/closes them. The candidate queue already preserves both sides of
+a contradiction. Confidence decay is already per-type-gated. The doc's items 1/2/4 are
+therefore smaller than specced; what it omitted (reranker) is the largest measured lever.
+
 **Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
 - Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
   neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
