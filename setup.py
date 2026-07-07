@@ -12,6 +12,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="LKM Constructs LLC",
+    author_email="melissa@lkmconstructs.com",
     license="Apache-2.0",
     url="https://github.com/lkmconstructs/revien",
     project_urls={
