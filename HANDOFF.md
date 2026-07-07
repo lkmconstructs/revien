@@ -116,12 +116,14 @@ run kept dying on a flaky background-process executor (not Revien); each `python
      first-install fallback — also stops fastembed's silent 65MB re-download loop and
      closes a real zero-network gap). Machine cure: elevated
      `Restart-Service winmgmt -Force` or reboot (was PENDING at handoff).
-   * **PENDING before OPEN 2 fully closes:** (a) recall-identity sample — retrieval
-     numbers must reproduce EXACTLY under the new plumbing (sweep baseline --limit 2 vs
-     the recorded 0.5516/0.1794/0.3013 slice; blocked on WMI fix for query embedding);
-     (b) one clean full-bench latency re-measure for the official p50 (all prior p50s
-     carried the doom-loop tax). Suite: 463 passed, 0 failed (embedding-dependent tests
-     deselected on the wedged box).
+   * **CLOSED (July 7 2026, post-reboot):** full-bench identity VERIFIED — every
+     retrieval figure exact to 4 decimals (0.1974/0.4128/0.5141/0.3231/0.3562) and the
+     taxonomy exact to the item (1072/479/9/4, median rank 33) vs the pre-perf run on
+     the same cache. **Official post-fix latency: recall p50 85ms / p90 250ms** (was
+     p50 950ms) — 11x, zero retrieval change, sovereignty PASS
+     (`results/20260707T151942Z_semantic.json`). Suite: 463 passed, 0 failed. The
+     <100ms latency tests pass. WMI was healed by reboot; the find_spec/offline-first
+     hardening stays regardless.
 3. **Silent extractor fallback** — `LLMExtractor` silently falls back to rule on failure; make it
    loud (it masked the leak under quota 429s). (Semantic-layer silent degrade is FIXED — same
    pattern still open for the extractor.)
