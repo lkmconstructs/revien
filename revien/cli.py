@@ -243,14 +243,17 @@ def ingest(content: str, source: str, db: Optional[str]):
 @main.command(name="sync-vault")
 @click.option("--vault", default=None, help="Vault path (defaults to the connected obsidian adapter)")
 @click.option("--db", default=None, help="Database path")
+@click.option("--folder", default="Revien", help="Distill folder to reconcile edits from (default: Revien)")
 @click.option("--full", is_flag=True, help="Re-ingest every note, not just ones changed since last sync")
-def sync_vault(vault: Optional[str], db: Optional[str], full: bool):
-    """One-shot Obsidian vault sync: chunk notes by heading, transcribe
-    [[wikilinks]]/tags into graph edges, ingest as curated memory."""
+def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool):
+    """One-shot Obsidian vault sync. First reconciles your edits to distilled
+    notes back into the graph (correct / delete / add), then ingests new or
+    changed vault notes as curated memory."""
     import asyncio
     from datetime import datetime, timezone
 
     from revien.adapters.obsidian import ObsidianVaultAdapter
+    from revien.distill import VaultReconciler
     from revien.graph.store import GraphStore
     from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 
@@ -261,24 +264,31 @@ def sync_vault(vault: Optional[str], db: Optional[str], full: bool):
         return
     db_path = db or config.get("db_path", _default_db_path())
 
-    adapter = ObsidianVaultAdapter(vault_dir)
-    last_sync_key = "obsidian_last_sync"
-    since = datetime.fromtimestamp(0, tz=timezone.utc)
-    if not full and config.get(last_sync_key):
-        try:
-            since = datetime.fromisoformat(config[last_sync_key])
-        except ValueError:
-            pass
-
-    items = asyncio.run(adapter.fetch_new_content(since))
-    if not items:
-        click.echo("Vault is up to date — nothing new to ingest.")
-        return
-
     store = GraphStore(db_path=db_path)
-    pipeline = IngestionPipeline(store)
-    nodes = edges = 0
     try:
+        # 1. Reconcile edits to distilled notes back into the graph (always —
+        #    independent of whether there are new user notes to ingest).
+        rec = VaultReconciler(store, vault_dir, folder=folder).reconcile()
+        if rec["corrected"] or rec["added"] or rec["forgotten"]:
+            click.echo(
+                f"Reconciled edits: {rec['corrected']} corrected, "
+                f"{rec['added']} added, {rec['forgotten']} forgotten "
+                f"across {rec['notes_reconciled']} note(s)."
+            )
+
+        # 2. Ingest new / changed vault notes as curated memory.
+        adapter = ObsidianVaultAdapter(vault_dir)
+        last_sync_key = "obsidian_last_sync"
+        since = datetime.fromtimestamp(0, tz=timezone.utc)
+        if not full and config.get(last_sync_key):
+            try:
+                since = datetime.fromisoformat(config[last_sync_key])
+            except ValueError:
+                pass
+
+        items = asyncio.run(adapter.fetch_new_content(since))
+        pipeline = IngestionPipeline(store)
+        nodes = edges = 0
         for item in items:
             ts = None
             try:
@@ -301,9 +311,44 @@ def sync_vault(vault: Optional[str], db: Optional[str], full: bool):
 
     config[last_sync_key] = datetime.now(timezone.utc).isoformat()
     _save_config(config)
-    notes = len({i["metadata"]["note"] for i in items})
-    click.echo(f"Vault sync: {notes} notes -> {len(items)} chunks, "
-               f"{nodes} nodes, {edges} edges (curated).")
+    if items:
+        notes = len({i["metadata"]["note"] for i in items})
+        click.echo(f"Vault sync: {notes} notes -> {len(items)} chunks, "
+                   f"{nodes} nodes, {edges} edges (curated).")
+    elif not (rec["corrected"] or rec["added"] or rec["forgotten"]):
+        click.echo("Vault is up to date — nothing to reconcile or ingest.")
+
+
+@main.command(name="reconcile-vault")
+@click.option("--vault", default=None, help="Vault path (defaults to the connected obsidian adapter)")
+@click.option("--db", default=None, help="Database path")
+@click.option("--folder", default="Revien", help="Distill folder to reconcile from (default: Revien)")
+def reconcile_vault(vault: Optional[str], db: Optional[str], folder: str):
+    """Reconcile your edits to distilled notes back into the graph, without
+    ingesting anything else. Correct a claim to supersede it, delete a line to
+    forget it, add a line under a heading to teach it."""
+    from revien.distill import VaultReconciler
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    vault_dir = vault or config.get("adapters", {}).get("obsidian", {}).get("vault_dir")
+    if not vault_dir:
+        click.echo("No vault configured. Run: revien connect obsidian --path /path/to/vault")
+        return
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        rec = VaultReconciler(store, vault_dir, folder=folder).reconcile()
+    finally:
+        store.close()
+    click.echo(
+        f"Reconciled: {rec['corrected']} corrected, {rec['added']} added, "
+        f"{rec['forgotten']} forgotten across {rec['notes_reconciled']} note(s)."
+    )
 
 
 @main.command(name="distill-vault")

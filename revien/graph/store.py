@@ -144,6 +144,24 @@ class GraphStore:
                 resolution TEXT
             );
 
+            -- Distill manifest (editable-vault leg): the last-rendered snapshot
+            -- per distilled note. This is the ONLY safe referent for
+            -- deletion-as-rejection — a line's absence means "the user deleted
+            -- it" only relative to what was last SHOWN, which the live graph
+            -- cannot reconstruct (it may hold claims rendered after the user
+            -- last saw the note). anchor_node_id is the immutable join key that
+            -- matches the file's <!--rv:ID--> comment; current_node_id follows
+            -- corrections so file and manifest never desync after an edit.
+            CREATE TABLE IF NOT EXISTS distill_manifest (
+                note_stem TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                anchor_node_id TEXT NOT NULL,
+                current_node_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                section TEXT DEFAULT '',
+                PRIMARY KEY (note_stem, anchor_node_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
@@ -544,6 +562,98 @@ class GraphStore:
                     out[tgt].append(src)
         # De-duplicate while keeping it a plain list per node.
         return {nid: list(dict.fromkeys(neigh)) for nid, neigh in out.items()}
+
+    # ── Distill manifest (editable-vault leg) ──────────────────────────
+    def replace_distill_manifest(self, note_stem: str, rows: list) -> None:
+        """Replace all manifest rows for a note (full regen at distill time).
+        Each row is a dict: entity_id, anchor_node_id, current_node_id,
+        content_hash, section."""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM distill_manifest WHERE note_stem = ?", (note_stem,))
+        for r in rows:
+            conn.execute(
+                """INSERT INTO distill_manifest
+                   (note_stem, entity_id, anchor_node_id, current_node_id,
+                    content_hash, section)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (note_stem, r["entity_id"], r["anchor_node_id"],
+                 r["current_node_id"], r["content_hash"], r.get("section", "")),
+            )
+        conn.commit()
+
+    def get_distill_manifest(self, note_stem: str) -> list:
+        """All manifest rows for one note, as dicts."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT entity_id, anchor_node_id, current_node_id, content_hash, section
+               FROM distill_manifest WHERE note_stem = ?""",
+            (note_stem,),
+        ).fetchall()
+        return [
+            {"entity_id": r[0], "anchor_node_id": r[1], "current_node_id": r[2],
+             "content_hash": r[3], "section": r[4]}
+            for r in rows
+        ]
+
+    def list_manifest_note_stems(self) -> list:
+        """Every note stem that has a manifest (the reconcilable notes)."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT note_stem FROM distill_manifest"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def update_manifest_row(
+        self, note_stem: str, anchor_node_id: str,
+        current_node_id: str, content_hash: str,
+    ) -> None:
+        """After absorbing an edit: point the anchor at its correction and
+        record the new text hash, so the next reconcile sees no phantom diff.
+        The anchor_node_id (file join key) is never changed."""
+        conn = self._get_conn()
+        conn.execute(
+            """UPDATE distill_manifest SET current_node_id = ?, content_hash = ?
+               WHERE note_stem = ? AND anchor_node_id = ?""",
+            (current_node_id, content_hash, note_stem, anchor_node_id),
+        )
+        conn.commit()
+
+    def add_manifest_row(
+        self, note_stem: str, entity_id: str, anchor_node_id: str,
+        current_node_id: str, content_hash: str, section: str = "",
+    ) -> None:
+        """Record a user-added claim so a later re-add of the same line is a
+        no-op, and it round-trips like any other line."""
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO distill_manifest
+               (note_stem, entity_id, anchor_node_id, current_node_id,
+                content_hash, section)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (note_stem, entity_id, anchor_node_id, current_node_id, content_hash, section),
+        )
+        conn.commit()
+
+    def delete_manifest_row(self, note_stem: str, anchor_node_id: str) -> None:
+        """After absorbing a deletion: drop the row so the forgotten claim is
+        no longer expected in the note."""
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM distill_manifest WHERE note_stem = ? AND anchor_node_id = ?",
+            (note_stem, anchor_node_id),
+        )
+        conn.commit()
+
+    def manifest_refs_elsewhere(self, node_id: str, exclude_stem: str) -> bool:
+        """True if this node is rendered into a DIFFERENT note's manifest — so
+        deleting its line from one note must not soft-invalidate it globally."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM distill_manifest WHERE current_node_id = ? "
+            "AND note_stem != ? LIMIT 1",
+            (node_id, exclude_stem),
+        ).fetchone()
+        return row is not None
 
     def search_nodes_keyword(
         self, keywords, limit: int = 10, exclude_context: bool = True
