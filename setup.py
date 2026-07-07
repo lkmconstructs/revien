@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="revien",
-    version="0.1.0",
+    version="0.2.0",
     description="Graph-based memory engine for AI systems. Memory that returns.",
     author="LKM Constructs LLC",
     # revien_bench is a DEV-ONLY benchmark harness (LoCoMo). It is intentionally

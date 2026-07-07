@@ -1,11 +1,12 @@
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
-
+![CI](https://github.com/lkmconstructs/revien/actions/workflows/ci.yml/badge.svg)
+![Network](https://img.shields.io/badge/network%20calls-0-blue)
 
 # Revien
 
 **Memory that returns.**
 
-Revien is a graph-based memory engine for AI systems. It gives any AI tool — local models, Claude Code, API-based assistants, agent frameworks — persistent memory across sessions, allowing cross-session AI context. No GPU required. No cloud account needed. Nothing is compacted away by default. 
+Revien is a local-first, graph-based memory engine for AI systems. It gives any AI tool — local models, Claude Code, API assistants, agent frameworks — persistent memory across sessions. No GPU. No cloud account. No telemetry. Nothing is compacted away, and nothing you feed it leaves your machine.
 
 ```bash
 pip install revien
@@ -13,106 +14,136 @@ revien connect claude-code
 revien start
 ```
 
-That's it. Revien starts building persistent memory.
+That's it. Revien starts building persistent memory on disk, in a single SQLite file you own.
 
 ---
 
-## Why Revien?
+## The wedge: sovereignty you can verify
 
-Most AI tools still lose continuity between sessions. Most memory systems either forget too much, hide too much, or force developers to assemble the pipeline themselves.
+Most memory systems ask you to trust that your data is handled well. Revien is built so you don't have to — every sovereignty claim below is enforced in code and checked by the benchmark suite on every run:
 
-| Feature | Revien | LangChain Memory | Mem0 | Zep |
-|---------|--------|-----------------|------|-----|
-| Graph-based retrieval | ✅ | ❌ (linear/compaction) | ❌ | Partial |
-| Three-factor scoring | ✅ | ❌ | ❌ | ❌ |
-| OpenAI export ingestion | ✅ | ❌ | ❌ | ❌ |
-| LangChain drop-in | ✅ | N/A | ✅ | ✅ |
-| Ollama integration | ✅ | ❌ | ❌ | ❌ |
-| Claude Code integration | ✅ | ❌ | ❌ | ❌ |
-| Zero cloud dependency | ✅ | Partial | ❌ | ❌ |
-| File watcher auto-ingest | ✅ | ❌ | ❌ | ❌ |
+- **$0, zero network egress on the default path.** Local extraction, local embeddings (`bge-small`, on-device), local SQLite. The benchmark asserts `network_calls == 0` and fails if anything phones home. Model files load offline-first — a warm install touches nothing.
+- **Zero telemetry.** Revien collects no usage data, no crash reports, no phone-home. See [TELEMETRY.md](TELEMETRY.md).
+- **Nothing compacted away.** The full graph is preserved. Retrieval is surgical — it returns only what's relevant — but it never summarizes your history into oblivion to save space.
+- **A non-destructive audit trail.** Every node creation, update, supersession, and merge is recorded. You can trace any fact back to the exact turn it came from, and review every automatic decision the engine made.
+- **Consent is enforced, not requested.** A per-source deny list stops capture at the door. Soft-invalidation is reversible. Nothing is hard-deleted behind your back.
+- **Your curated knowledge outranks the machine's.** If you connect an Obsidian vault, a machine-extracted claim can never silently overwrite something you wrote by hand — contradictions go to a review queue, not a destructive merge.
 
-Revien takes a different approach: **store everything as a graph, compact nothing, retrieve surgically.**
-
-Every piece of context becomes a node in a knowledge graph with typed relationships to other nodes. When your AI needs context, Revien walks the graph and returns only what's relevant — scored by recency, frequency, and relationship proximity. The full history remains preserved in the graph. Nothing is ever summarized away.
+The discipline behind these claims is the product. Revien ships with a benchmark harness that measures its own retrieval honestly — including where it's weak — and it has already caught its own bugs before they could reach a user.
 
 ---
 
-## How It Works
+## How it works
 
-### Memory is a graph, not a vector store
+### Memory is a graph, not a compaction buffer
 
-When you feed Revien a conversation, it extracts:
-- **Entities** — people, projects, tools, organizations
-- **Decisions** — choices that were made and why
-- **Facts** — specific data points, configurations, values
-- **Topics** — recurring themes across conversations
-- **Preferences** — how you like things done
-- **Events** — things that happened at specific times
+When you feed Revien a conversation or a note, it extracts typed nodes — **entities, decisions, facts, preferences, topics, events** — and connects them with typed edges. Every ingestion also stores the verbatim turn as a `context` node, so the original wording is never lost. The graph grows; nothing is thrown away.
 
-These become nodes. Relationships between them become edges. The graph grows over time but retrieval stays fast because you're walking edges, not scanning embeddings.
+### Retrieval is semantic-first, refined by the graph
 
-### Three-factor retrieval scoring
+When you query Revien:
 
-When you query Revien, every candidate node gets scored on three dimensions:
+1. **Semantic search** embeds your query and finds the nearest stored memories by meaning — so "what did we pick for the database?" finds a turn about "we went with Postgres" even with no shared keywords.
+2. **A graph walk** from those anchors pulls in connected context — the decision, the entity, the reasoning that surrounds the hit.
+3. **Three-factor scoring** refines the ranking:
+   - **Recency** — how recent is the memory's *content* (when it was actually said), decaying gently so old-but-true facts aren't buried.
+   - **Frequency** — how often the memory has been *confirmed useful* (via explicit use, not merely returned — a retrieval popularity loop would just surface whatever it surfaced last).
+   - **Proximity** — how many graph hops from the query's anchors.
 
-- **Recency** — when was this last relevant? (exponential decay)
-- **Frequency** — how often does this come up? (logarithmic, diminishing returns)
-- **Proximity** — how many graph edges from the query anchor? (hop distance)
+Only the top results come back. Your AI gets a lean, relevant context window instead of a dump.
 
-The composite score determines what gets surfaced. Only the top results are returned — your AI gets a lean, relevant context window instead of a bloated dump.
-
-### Self-reinforcing memory
-
-Every time a node is retrieved, its access count increases. This boosts its frequency score in future queries. Memory that's actually useful becomes easier to find over time — automatically, with no ML model, no training step, no user intervention.
+The semantic layer is the spine: with it, retrieval finds the right memory by meaning; without it, recall falls back to keyword matching and degrades sharply — so Revien makes that degrade **loud** (a warning on every recall, and a `semantic_note` on every response) rather than silently returning worse results.
 
 ---
 
-## Quick Start
+## Benchmarks
+
+Revien is measured on two separate corpora. **They are reported separately and never blended** — conversational memory (episodic: who said what, when) and vault memory (curated: decisions, facts, reference) are different problems, and averaging them would hide more than it shows.
+
+All numbers below are reproducible from a fresh checkout: local extraction, local `bge-small` embeddings, a zero-LLM extractive reader, **$0 and 0 network calls**. Each has a results JSON in `results/`.
+
+### Conversational recall — LoCoMo, 1,986 QA
+
+| Metric | Value |
+|--------|-------|
+| Recall@10 | **0.514** |
+| Recall@5 | 0.413 |
+| Recall@1 | 0.197 |
+| MRR | 0.323 |
+| nDCG@10 | 0.356 |
+| Recall latency (p50 / p90) | **85ms / 250ms** |
+| Cost / network calls | **$0 / 0** |
+| Sovereignty checks | **PASS** |
+
+### Vault recall — curated Obsidian corpus, 43 QA
+
+| Metric | Value |
+|--------|-------|
+| Recall@10 (overall) | **0.884** |
+| Single-note questions | 0.933 |
+| Cross-note (multi-hop) questions | 0.733 |
+| MRR | 0.738 |
+
+**Attachment rate** — a vault-specific measure of whether a conversation about a known entity actually connects to it in the graph — is reported on its own line, with its known gap stated openly:
+
+- **1.00** on clean-label mentions (8 turns)
+- **0.75** on fragile variants — lowercase, hyphenated, or aliased (4 turns)
+
+The one attachment miss is semantic aliasing ("offline mode" → the roadmap note that plans it): a *concept* mapping to an entity, not a surface form. That's vocabulary work on the roadmap, not a bug we're hiding.
+
+### How to read these numbers honestly
+
+- **These are retrieval numbers, not end-to-end answer quality.** The default reader is a zero-LLM extractive stub, chosen so the benchmark measures *retrieval* cleanly rather than a language model's fluency. End-to-end token-F1 with this stub is low by design (~0.06); swapping in a real LLM reader raises answer quality substantially — but that's the reader's contribution, not Revien's retrieval, so we don't headline it.
+- **The adversarial category is a trap for naive scoring.** A system that retrieves *nothing* scores a perfect 1.0 on "refuse to answer" questions, because an empty result correctly produces a refusal. So a broken retriever can post a *higher* adversarial score than a working one. We surface this rather than let it flatter the numbers — it's exactly the kind of metric artifact the honest-numbers discipline exists to catch.
+- **The remaining conversational gap is ranking, not coverage.** A per-query miss taxonomy (shipped in the bench) shows the answer is usually *retrieved* but *out-ranked* — it's in the result set, below the top-10 cutoff (median rank ~33), while extraction and the graph walk are near-lossless. Ranking is the next lever, and we can point to exactly where it leaks.
+
+---
+
+## Quick start
 
 ### Install
 
 ```bash
-# Core
+# From PyPI (semantic layer included as a core dependency)
 pip install revien
 
-# With LangChain support
-pip install revien[langchain]
+# From source
+git clone https://github.com/lkmconstructs/revien
+cd revien
+pip install -e .
 
-# With all adapters
+# Optional extras: LangChain adapter, neural reranker, Leiden clustering
+pip install revien[langchain]
 pip install revien[all]
 ```
 
-### Start the daemon
+Semantic retrieval (`sqlite-vec` + `fastembed`) is a **core dependency**, not an extra — graph-only recall is a fraction as good, so it ships on by default. Set `REVIEN_SEMANTIC=0` to force it off, or `REVIEN_SEMANTIC=require` to make a missing/broken layer a hard error instead of a silent degrade.
 
-```bash
-revien start
-```
-
-This launches the Revien daemon on `localhost:7437`. It serves the REST API and runs the auto-sync scheduler.
-
-### Connect to Claude Code
+### Connect Claude Code and start
 
 ```bash
 revien connect claude-code
+revien start
 ```
 
-Revien reads local session logs and indexes them into the graph. Every new session gets ingested automatically.
+The daemon runs on `localhost:7437`, serving the REST API and auto-syncing connected adapters.
 
-### Query from the terminal
+### Recall from the terminal
 
 ```bash
 revien recall "What database did we decide to use?"
 ```
 
-Returns scored results from your memory graph:
-
 ```
-1. [decision] Enterprise tier at $499/month, 20% annual discount, PostgreSQL
-   Score: 0.89 | Recency: 1.00 | Frequency: 0.63 | Proximity: 1.00
+Query: What database did we decide to use?
+Found 3 results (85.2ms, 14 nodes examined)
 
-2. [entity] PostgreSQL
-   Score: 0.84 | Recency: 1.00 | Frequency: 0.46 | Proximity: 1.00
+  [1] We decided to deploy the backend on PostgreSQL, not MySQL.
+      Type: context | Score: 0.910
+  [2] PostgreSQL
+      Type: entity | Score: 0.884
+  [3] Enterprise tier decision
+      Type: decision | Score: 0.803
 ```
 
 ### Use the API
@@ -120,95 +151,62 @@ Returns scored results from your memory graph:
 ```python
 import httpx
 
-# Ingest a conversation
 httpx.post("http://localhost:7437/v1/ingest", json={
     "source_id": "my-session",
     "content": "We decided to use PostgreSQL for the database layer.",
     "content_type": "conversation",
 })
 
-# Recall relevant memory
-response = httpx.post("http://localhost:7437/v1/recall", json={
-    "query": "What database are we using?"
+resp = httpx.post("http://localhost:7437/v1/recall", json={
+    "query": "What database are we using?",
 })
-for result in response.json()["results"]:
-    print(f"[{result['node_type']}] {result['label']} (score: {result['score']:.2f})")
+data = resp.json()
+if not data["semantic_active"]:
+    print("warning: running degraded —", data["semantic_note"])
+for r in data["results"]:
+    print(f"[{r['node_type']}] {r['label']} ({r['score']:.2f})")
 ```
 
 ---
 
-## Integrations
+## Obsidian: a second corpus, in and out
 
-Revien integrates with popular AI platforms and frameworks. Migrate existing conversation history, drop in as a replacement memory backend, or bridge to local models — all without losing context.
-
-### OpenAI / ChatGPT
-
-Migrate conversation history into persistent graph-based AI memory. Export your ChatGPT conversations and transform them into a queryable knowledge graph:
+Revien treats an Obsidian vault as a second memory corpus *beside* your conversations — not instead of them. A vault is a knowledge graph a human already drew: `[[wikilinks]]` are edges, headings are chunk boundaries, frontmatter dates are timestamps. Revien reads that structure directly.
 
 ```bash
-revien ingest --source openai --file conversations.json --bulk
+# Connect a vault and ingest it (chunked by heading, wikilinks become edges)
+revien connect obsidian --path ~/my-vault
+revien sync-vault
+
+# Write Revien's memory BACK into the vault as readable markdown
+revien distill-vault
 ```
 
-Conversations become queryable graph nodes with three-factor scoring. Instead of losing old conversations to context limits, they remain accessible and searchable. This is your ChatGPT memory alternative — a true OpenAI conversation persistence layer that doesn't forget.
-
-### LangChain
-
-Drop-in replacement for LangChain's memory backend. Use graph-based AI memory instead of compaction:
-
-```python
-from revien.adapters.langchain_adapter import RevienMemory
-memory = RevienMemory(graph_path="./my_graph")
-chain = ConversationChain(llm=llm, memory=memory)
-```
-
-No compaction, no summarization loss. LangChain memory replacement that retrieves what's relevant instead of what's recent. This LangChain memory replacement uses graph-based retrieval, ensuring your agent always has access to the full context it needs.
-
-### Ollama
-
-Zero-cloud persistent memory for local models. Run your own LLM with Revien's local AI memory engine:
-
-```bash
-revien chat --backend ollama --model llama3
-```
-
-Every conversation persists in your local graph. Full privacy, full memory, zero cloud dependency. Deploy Ollama persistent memory that remembers everything without surveillance. This is local AI memory that doesn't forget — no vendor lock-in, no cloud bills, just your models and your graph.
+- **Ingest** brings your curated notes in as high-confidence, human-authored memory. They outrank machine-extracted claims on conflict.
+- **Distill** writes one markdown note per entity into a `Revien/` folder inside your vault — every claim with its provenance, related entities as `[[wikilinks]]`, so Revien's memory threads into your vault's own graph view. It only ever writes inside its own folder, only overwrites files it created, and never re-ingests its own output. Your memory becomes files you can open.
 
 ---
 
 ## Adapters
 
-Revien connects to AI systems through adapters. These ship with the package:
+| Adapter | What it does | Interface |
+|---------|-------------|-----------|
+| **Claude Code** | Reads Claude Code session logs (JSONL), auto-syncs on schedule | `revien connect claude-code` |
+| **Obsidian** | Ingests a vault chunked by heading; distills memory back out | `revien connect obsidian` |
+| **File Watcher** | Watches a directory for new/changed files | `revien connect file-watcher --path DIR` |
+| **Generic API** | Pulls conversation data from a REST endpoint | `revien connect api --path URL` |
+| **OpenAI / ChatGPT** | Ingests ChatGPT conversation exports | Python: `OpenAIAdapter` |
+| **LangChain** | Drop-in `BaseMemory` replacement | Python: `RevienMemory` |
+| **Ollama** | Bridges Revien memory to local Ollama models | Python: `OllamaAdapter` |
 
-| Adapter | What it does |
-|---------|-------------|
-| **Claude Code** | Reads Claude Code session logs (JSONL). Auto-syncs on schedule. |
-| **File Watcher** | Watches a directory for new/changed files. Ingests on change. |
-| **Generic API** | Connects to any REST endpoint returning conversation data. |
-| **OpenAI / ChatGPT** | Ingests ChatGPT conversation exports. Supports single and bulk formats. |
-| **LangChain** | Drop-in `BaseMemory` replacement. Graph-based retrieval instead of compaction. |
-| **Ollama** | Bridges Revien memory to local Ollama models. Zero cloud dependency. |
-
-### Connect an adapter
-
-```bash
-# Claude Code (auto-detects log location)
-revien connect claude-code
-
-# Watch a directory
-revien connect file-watcher --path /path/to/conversations/
-
-# Generic API endpoint
-revien connect api --url https://your-system.com/api/conversations --header "Authorization: Bearer ..."
-```
-
-### Build your own adapter
+### Build your own
 
 ```python
 from revien.adapters.base import RevienAdapter
 
 class MyAdapter(RevienAdapter):
     async def fetch_new_content(self, since):
-        # Return list of {content, content_type, timestamp, metadata}
+        # Return a list of {content, content_type, timestamp, metadata}
         ...
 
     async def health_check(self):
@@ -219,129 +217,89 @@ class MyAdapter(RevienAdapter):
 
 ## REST API
 
-The daemon exposes a full REST API on `localhost:7437`:
+The daemon exposes a REST API on `localhost:7437`:
 
 | Method | Endpoint | Function |
 |--------|----------|----------|
 | POST | `/v1/ingest` | Ingest raw content into the graph |
-| POST | `/v1/recall` | Query memory with three-factor scoring |
-| GET | `/v1/nodes` | List nodes (filter by type, date, source) |
-| GET | `/v1/nodes/{id}` | Get a specific node with edges |
+| POST | `/v1/recall` | Query memory (returns results + `semantic_active` / `semantic_note`) |
+| GET | `/v1/nodes` | List nodes (filter by type, source) |
+| GET | `/v1/nodes/{id}` | Get a node with its edges |
 | PUT | `/v1/nodes/{id}` | Update a node |
 | DELETE | `/v1/nodes/{id}` | Delete a node and its edges |
-| GET | `/v1/graph` | Export full graph as JSON |
-| POST | `/v1/graph/import` | Import graph from JSON |
-| POST | `/v1/sync` | Trigger manual sync |
+| POST | `/v1/sync` | Trigger a manual adapter sync |
 | GET | `/v1/health` | Health check |
 
 Interactive docs at `http://localhost:7437/docs` when the daemon is running.
 
 ---
 
-## Graph Schema
+## Graph schema
 
-### Node Types
+**Node types:** `entity` · `topic` · `decision` · `fact` · `preference` · `event` · `context`
 
-`entity` · `topic` · `decision` · `fact` · `preference` · `event` · `context`
+**Edge types:** `related_to` · `decided_in` · `mentioned_by` · `depends_on` · `followed_by` · `contradicts` · `corrects` · `derived_from`
 
-### Edge Types
+Every ingestion creates a `context` node holding the verbatim interaction; extracted nodes connect back to it. Any fact or decision traces to its origin.
 
-`related_to` · `decided_in` · `mentioned_by` · `depends_on` · `followed_by` · `contradicts`
+---
 
-Every ingestion creates a `context` node representing the full interaction. All extracted nodes connect back to it. You can always trace any fact or decision back to the conversation where it originated.
+## Configuration
+
+Config lives at `~/.revien/config.json`, created on first run. Retrieval is also tunable via environment variables (the scoring knobs the benchmark sweeps):
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `REVIEN_SEMANTIC` | on | `0` disables semantic; `require` makes a broken layer fatal |
+| `REVIEN_RECENCY_HALF_LIFE_DAYS` | `365` | Content-recency decay; long by default so old facts aren't buried |
+| `REVIEN_TOUCH_ON_RECALL` | off | On restores retrieval-driven frequency (a popularity loop; off by default) |
+| `REVIEN_RECENCY_WEIGHT` / `_FREQUENCY_WEIGHT` / `_PROXIMITY_WEIGHT` | `0.35 / 0.30 / 0.35` | Three-factor blend |
+| `REVIEN_EXTRACTOR` | `rule` | `ollama` / `openai` / etc. for LLM-based extraction (regex fallback always attached) |
+| `REVIEN_INGEST_DENY` | — | Comma-separated source IDs that are never captured |
 
 ---
 
 ## Architecture
 
 ```
-Any AI System
-     │
-     ▼
-┌─────────────┐     ┌──────────────┐
-│  Revien API  │────▶│  Ingestion    │──── extract nodes + edges
-│  (FastAPI)   │     │  Engine       │     from raw content
-└──────┬──────┘     └──────────────┘
-       │                    │
-       ▼                    ▼
-┌─────────────┐     ┌──────────────┐
-│  Retrieval   │◀───│  Graph Store  │──── SQLite (local)
-│  Engine      │     │  (nodes +     │     PostgreSQL (hosted)
-│  (3-factor)  │     │   edges)      │
-└─────────────┘     └──────────────┘
-       │
-       ▼
-  Scored results
-  (top N nodes)
-       │
-       ▼
-  Any AI's context window
-  (lean, relevant, surgical)
+Any AI System / Obsidian vault
+            │
+            ▼
+     ┌─────────────┐     ┌──────────────┐
+     │  Revien API  │────▶│  Ingestion    │──── extract typed nodes + edges,
+     │  (FastAPI)   │     │  Pipeline     │     embed, dedup, govern claims
+     └──────┬──────┘     └──────┬───────┘
+            │                    ▼
+            │            ┌──────────────┐
+            │            │  Graph Store  │──── SQLite + sqlite-vec (all local)
+            │            │  nodes/edges/ │
+            │            │  audit log    │
+            ▼            └──────┬───────┘
+     ┌─────────────┐           │
+     │  Retrieval   │◀──────────┘
+     │  semantic-   │──── nearest-by-meaning anchors → graph walk
+     │  first +     │      → three-factor refine → top-N
+     │  graph walk  │
+     └──────┬──────┘
+            ▼
+   Lean, relevant context  ──▶  distill back to vault (optional)
 ```
-
----
-
-## Early Benchmarks
-
-From 5 sample conversations (60 nodes, 147 edges):
-
-| Metric | Value |
-|--------|-------|
-| Average retrieval time | 38.75ms |
-| Queries under 50ms | 67% |
-| Queries under 100ms | 100% |
-| Hit rate (relevant results) | 87% (13/15) |
-| Zero GPU | ✓ |
-| Zero cloud dependency | ✓ |
-
-The two misses were intentionally vague queries with no extractable entities ("Tell me about our architecture").
-
----
-
-## Configuration
-
-Config lives at `~/.revien/config.json`. Created automatically on first run.
-
-```json
-{
-  "daemon": {
-    "host": "127.0.0.1",
-    "port": 7437
-  },
-  "sync": {
-    "interval_hours": 6
-  },
-  "retrieval": {
-    "max_results": 5,
-    "max_hops": 3,
-    "recency_weight": 0.35,
-    "frequency_weight": 0.30,
-    "proximity_weight": 0.35,
-    "recency_half_life_days": 7
-  },
-  "adapters": []
-}
-```
-
-All retrieval weights are configurable. Adjust to your use case — boost recency for fast-moving projects, boost frequency for stable knowledge bases.
 
 ---
 
 ## Roadmap
 
-- Additional adapters for popular AI tools
-- Improved vague-query handling
-- Hosted deployment option
+- Reranking to close the ranking gap (the largest remaining recall lever)
+- Broader extraction coverage for conversational memory
+- Alias/vocabulary resolution (the attachment holdout)
+- Note-edit reconciliation for vault re-sync
 - Graph visualization and inspection tools
-- Performance tuning and scale improvements
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## About
 
@@ -349,6 +307,4 @@ Revien is the open-source memory layer from [LKM Constructs](https://lkmconstruc
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
-
-Copyright 2026 LKM Constructs LLC.
+Apache 2.0 — see [LICENSE](LICENSE). Copyright 2026 LKM Constructs LLC.

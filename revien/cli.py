@@ -42,7 +42,7 @@ def _save_config(config: dict) -> None:
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="revien")
+@click.version_option(version="0.2.0", prog_name="revien")
 def main():
     """Revien — Memory that returns. Graph-based memory engine for AI systems."""
     pass
@@ -77,7 +77,7 @@ def start(host: str, port: int, db: Optional[str], sync_interval: float):
 @click.argument("system")
 @click.option("--path", default=None, help="Custom path for the adapter")
 def connect(system: str, path: Optional[str]):
-    """Connect an AI system to Revien. Supported: claude-code, file-watcher, api."""
+    """Connect an AI system to Revien. Supported: claude-code, file-watcher, api, obsidian."""
     config = _load_config()
 
     if system == "claude-code":
