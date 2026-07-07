@@ -1,10 +1,36 @@
+from pathlib import Path
+
 from setuptools import setup, find_packages
+
+# Rendered on the PyPI project page.
+long_description = Path(__file__).parent.joinpath("README.md").read_text(encoding="utf-8")
 
 setup(
     name="revien",
     version="0.2.0",
-    description="Graph-based memory engine for AI systems. Memory that returns.",
+    description="Local-first, graph-based memory engine for AI systems. Memory that returns.",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="LKM Constructs LLC",
+    license="Apache-2.0",
+    url="https://github.com/lkmconstructs/revien",
+    project_urls={
+        "Homepage": "https://lkmconstructs.com",
+        "Source": "https://github.com/lkmconstructs/revien",
+        "Changelog": "https://github.com/lkmconstructs/revien/blob/main/CHANGELOG.md",
+    },
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: Apache Software License",
+        "Operating System :: OS Independent",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+    ],
+    keywords="memory, graph, retrieval, ai, agents, local-first, obsidian, rag",
     # revien_bench is a DEV-ONLY benchmark harness (LoCoMo). It is intentionally
     # excluded from the wheel — never shipped to end users.
     packages=find_packages(exclude=["revien_bench", "revien_bench.*", "tests", "tests.*"]),
