@@ -3,6 +3,18 @@
 All notable changes to Revien are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.2.1] — 2026-07-07
+
+### Fixed
+- **First-install semantic load.** On a cold model cache — every fresh `pip install`, before
+  the model is fetched — the embedding model failed to download and the semantic layer
+  silently degraded to graph-only (recall@10 ~0.05 instead of ~0.51). The offline-first
+  loader set `HF_HUB_OFFLINE=1` as an env var, but `huggingface_hub` freezes that into a
+  module constant at import, locking the process offline so the download fallback could
+  never fire. Now uses fastembed's per-call `local_files_only=True` parameter: warm cache
+  loads locally (zero network), cold cache downloads once. Caught by CI's cold cache — a
+  warm dev machine could not reproduce it.
+
 ## [0.2.0] — 2026-07-07
 
 The recall-and-sovereignty release. Retrieval went from a keyword-matching baseline to a
