@@ -160,12 +160,54 @@ class LLMExtractor:
         self.backend = backend
         self.fallback: TextExtractor = fallback or RuleBasedExtractor()
 
+        # Degrade visibility (OPEN 3): per-call fallback lines scroll away in
+        # a busy ingest; what masked the quota-429 leak was the ABSENCE of an
+        # aggregate signal. Track state, escalate ONCE per process when the
+        # LLM path has effectively stopped working.
+        self.total_calls = 0
+        self.total_fallbacks = 0
+        self.consecutive_fallbacks = 0
+        self._escalated = False
+
         cfg = _BACKEND_DEFAULTS[backend]
         self.url = cfg["url"]
         self.model = os.environ.get("REVIEN_EXTRACTION_MODEL", cfg["model"])
         self.key_env = cfg["key_env"]
         self.api_key = os.environ.get(cfg["key_env"], "") if cfg["key_env"] else ""
         self.is_cloud = backend in CLOUD_BACKENDS
+
+    # Consecutive failures before the one-time "you are running on regex"
+    # escalation. 3 = fast enough to catch a dead key on the first sync,
+    # tolerant of a single transient timeout.
+    ESCALATE_AFTER = 3
+
+    def status(self) -> dict:
+        """Aggregate extractor health for callers/daemons to surface."""
+        return {
+            "backend": self.backend,
+            "total_calls": self.total_calls,
+            "total_fallbacks": self.total_fallbacks,
+            "consecutive_fallbacks": self.consecutive_fallbacks,
+            "degraded": self.consecutive_fallbacks >= self.ESCALATE_AFTER,
+        }
+
+    def _note_fallback(self, reason: str) -> None:
+        self.total_fallbacks += 1
+        self.consecutive_fallbacks += 1
+        sys.stderr.write(
+            f"[LLMExtractor:{self.backend}] {reason}; "
+            f"falling back to rule-based extraction\n"
+        )
+        if self.consecutive_fallbacks >= self.ESCALATE_AFTER and not self._escalated:
+            self._escalated = True
+            sys.stderr.write(
+                f"[revien] WARNING: LLM extraction ({self.backend}) has failed "
+                f"{self.consecutive_fallbacks} consecutive times - ingestion is "
+                f"EFFECTIVELY RULE-BASED (degraded extraction quality) until the "
+                f"backend recovers. Check the {self.key_env or 'backend'} key, "
+                f"quota, and connectivity.\n"
+            )
+        sys.stderr.flush()
 
     # ── Public contract ───────────────────────────────────
     def extract(self, content: str, source_id: str = "") -> ExtractionResult:
@@ -192,22 +234,23 @@ class LLMExtractor:
         if self.is_cloud:
             _disclose_cloud(self.backend)
 
-        # 3. Try model extraction; fall back to regex on ANY failure.
+        # 3. Try model extraction; fall back to regex on ANY failure — loudly,
+        # with escalation once the failures are consecutive (OPEN 3).
+        self.total_calls += 1
         try:
             parsed = self._call_model(content)
         except Exception as e:  # noqa: BLE001 — fallback must catch everything
-            sys.stderr.write(
-                f"[LLMExtractor:{self.backend}] model call failed ({e!r}); "
-                f"falling back to rule-based extraction\n"
-            )
+            self._note_fallback(f"model call failed ({e!r})")
             return self.fallback.extract(content, source_id)
 
         if parsed is None:
-            sys.stderr.write(
-                f"[LLMExtractor:{self.backend}] unparseable model output; "
-                f"falling back to rule-based extraction\n"
-            )
+            self._note_fallback("unparseable model output")
             return self.fallback.extract(content, source_id)
+
+        # A success resets the consecutive counter (and re-arms escalation, so
+        # a later sustained outage warns again).
+        self.consecutive_fallbacks = 0
+        self._escalated = False
 
         # 4. Build typed nodes from parsed JSON.
         self._build_typed_nodes(parsed, "entities", NodeType.ENTITY,

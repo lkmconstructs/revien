@@ -266,6 +266,71 @@ integrity + isolation assertions.
   story. **The three publishable numbers: conversational 0.5141, vault 0.8837, attachment
   0.625-clean/0.0-fragile (own line, known gap).** The publish CALL itself remains Lissa's.
 
+## LAUNCH PLAN (July 7 2026 — the finish-out order)
+Written at 87% Fable budget; anything below marked [mech] is executable by any instance
+from this document alone. [Lissa] items need her hands or voice. Work top to bottom.
+
+**Phase 0 — close the verification debt (in flight now)**
+- [x] WMI healed post-reboot (platform 0.26s, model load 2.91s offline-first).
+- [ ] [mech] Full-bench identity + official p50: the running post-perf full bench must
+  reproduce recall@10 0.5141 / @1 0.1974 / MRR 0.3231 and taxonomy 1072/479/9/4 EXACTLY
+  (same cache as the pre-perf July 6 run). If yes: OPEN 2 CLOSED, record the new p50 as
+  the official latency number (slice preview: ~105ms p50 with semantic on, was ~500ms+).
+  If retrieval numbers differ AT ALL: stop, bisect commit 370917e — do not rationalize.
+
+**Phase 1 — last code item (small)**
+- [ ] [mech] OPEN 3: LLMExtractor silent fallback -> loud. One stderr warning per process
+  when the LLM path falls back to rule (mirror the semantic-degrade pattern in
+  engine._warn_if_semantic_inactive). Test: force a failing backend, assert the warning.
+  ~30 min including tests. Commit alone.
+
+**Phase 2 — the launch surface (docs, no code)**
+- [ ] [mech draft, Lissa voice-pass] README rewrite. Structure: sovereignty wedge first
+  ($0 / zero egress / zero telemetry / audit log / consent / curated shield), then HONEST
+  NUMBERS exactly as banked: conversational recall@10 0.5141 (LoCoMo 1,986 QA, local
+  extractive, $0), vault 0.8837, attachment 0.625->1.0 clean / 0.75 fragile with the
+  aliasing holdout named. RULES: AND-not-OR (vault + conversational are separate tables,
+  never blended); state the recall-vs-cloud gap openly (gpt-4.1-mini reader lifts F1 to
+  0.367 — reader quality, not retrieval); the adversarial-F1 caveat (graph_only "wins"
+  adversarial only by retrieving nothing) goes IN the README, not a footnote. Kill the
+  stale comparison table's unverifiable checkmarks. Update install/quickstart for
+  `revien connect obsidian` / `sync-vault` / `distill-vault`.
+- [ ] [Lissa] Design writeup in her voice — the credibility artifact. The two banked
+  stories carry it: (1) the verbatim-confidence bug ("our eval caught our own system
+  disbelieving the user's literal words"), (2) the training doom loop ("the learning
+  loop was the latency bug; three network theories lost to one stack dump"). Both are
+  the honest-numbers wedge demonstrating itself — the Mem0 contrast writes itself.
+- [ ] [mech] Zero-telemetry statement — now fully true incl. model loads (offline-first).
+  One paragraph in README + a TELEMETRY.md if she wants it standalone.
+- [ ] [mech] Letta courtesy line ("recursive summarization inspired by Letta's
+  partial-evict pattern") wherever the summarization docs land.
+
+**Phase 3 — release mechanics**
+- [ ] [mech] CI: GitHub Actions, ubuntu-latest, `pip install -e .[dev] && pytest tests
+  revien_bench/tests`. Linux likely dodges the Windows teardown errors; if not, mark
+  those fixtures xfail-on-windows with the known-issue comment. Badge in README.
+- [ ] [mech] Version 0.1.0 -> 0.2.0 in setup.py (+ revien.__version__); CHANGELOG.md
+  summarizing the seven commits' arc.
+- [ ] [Lissa] PyPI publish decision + credentials (README's `pip install revien` is a
+  claim until then). Build: `python -m build`, wheel excludes revien_bench (already
+  configured).
+- [ ] [Lissa] MERGE GATE: feat/advanced-core-port -> main is HER hands (or Julien's).
+  Never an instance's. Then tag v0.2.0.
+
+**Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
+- Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
+  neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
+- Extraction coverage (conversational disconnected=479 is extraction, not matching) +
+  the newline entity-regex fix.
+- Aliasing/vocabulary ("offline mode" -> Roadmap 2026 — the attachment holdout).
+- Daemon config->adapter auto-sync factory (pre-existing gap, all adapters).
+- Vault note-edit chunk reconciliation (re-ingest currently duplicates CONTEXT units).
+
+**Standing rules that survive any instance change:** verify against the running system;
+both corpora re-run after ANY ingest-touching change; taxonomy read before any tuning;
+the attachment line always reported separately; no public number without its results
+JSON; the false-merge pairs list reviewed each run; merge gate is Lissa's.
+
 ## Notes
 - Strategy is settled: **pure OSS**, goal = credibility/portfolio for consulting. Path A
   (local-first port of RCE *concepts*, clean-room — RCE itself is internal IP, never ported).
