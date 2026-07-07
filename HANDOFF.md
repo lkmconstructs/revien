@@ -213,6 +213,19 @@ prize isn't purity, it's structure: the author already drew the graph.
   reconciliation is future work). Daemon config→adapter auto-sync factory is a PRE-EXISTING
   gap for every adapter; sync-vault is the guaranteed path.
 
+**Leg 2b — EDITABLE distilled memory: SHIPPED (commit 8f3d040, 23 tests + live).**
+Distilled notes are now editable, not read-only: correct a claim (curated node
+CORRECTS-supersedes), delete a line (soft-invalidate), add a line (new curated claim),
+reconciled on `revien sync-vault` / `reconcile-vault`. Safety rests on a per-note manifest
+(distill_manifest table = last-rendered snapshot; the ONLY safe delete referent — Mentat
+caught this dependency pre-build). Hardened through TWO adversarial passes (28 findings:
+8 original data-loss bugs fixed, 1 fix-introduced regression (global-redistill wiped user
+free-text) replaced with surgical anchor-writeback, 4 refuted). This makes the "edit, own"
+half of the hero literally true. Known v1 limits (documented, not bugs): dup-edited-line
+winner is order-dependent (but stable, no oscillation); shared-claim delete from one note
+drops that note's row but doesn't invalidate globally; wikilinks inside reconcile-added
+claims aren't parsed into edges until next full distill.
+
 **Leg 2 — distill-OUT: SHIPPED (built + wired + tested, 12 tests + live-verified).**
 "Your AI's memory is files you can open." `revien/distill.py` (VaultDistiller) + CLI
 `revien distill-vault [--folder Revien] [--min-claims N]`:
