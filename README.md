@@ -95,7 +95,7 @@ The one attachment miss is semantic aliasing ("offline mode" → the roadmap not
 
 - **These are retrieval numbers, not end-to-end answer quality.** The default reader is a zero-LLM extractive stub, chosen so the benchmark measures *retrieval* cleanly rather than a language model's fluency. End-to-end token-F1 with this stub is low by design (~0.06); swapping in a real LLM reader raises answer quality substantially — but that's the reader's contribution, not Revien's retrieval, so we don't headline it.
 - **The adversarial category is a trap for naive scoring.** A system that retrieves *nothing* scores a perfect 1.0 on "refuse to answer" questions, because an empty result correctly produces a refusal. So a broken retriever can post a *higher* adversarial score than a working one. We surface this rather than let it flatter the numbers — it's exactly the kind of metric artifact the honest-numbers discipline exists to catch.
-- **The remaining conversational gap is ranking, not coverage.** A per-query miss taxonomy (shipped in the bench) shows the answer is usually *retrieved* but *out-ranked* — it's in the result set, below the top-10 cutoff (median rank ~33), while extraction and the graph walk are near-lossless. Ranking is the next lever, and we can point to exactly where it leaks.
+- **The remaining conversational gap is ranking, not coverage.** A per-query miss taxonomy (shipped in the bench) shows the answer is usually *found* — the graph walk reaches it and the scorer scores it — but it lands at a median rank of ~33, outside the top-10 we return. It's in the graph; it just isn't surfaced. Extraction and the walk are near-lossless; ranking is the next lever, and the taxonomy points to exactly where it leaks.
 
 ---
 
