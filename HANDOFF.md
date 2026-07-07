@@ -286,8 +286,22 @@ from this document alone. [Lissa] items need her hands or voice. Work top to bot
   engine._warn_if_semantic_inactive). Test: force a failing backend, assert the warning.
   ~30 min including tests. Commit alone.
 
-**Phase 2 — the launch surface (docs, no code)**
-- [ ] [mech draft, Lissa voice-pass] README rewrite. Structure: sovereignty wedge first
+**Phase 2 — the launch surface (docs, no code) — [mech] items DONE (commit ac5f08d)**
+STATUS (July 7): README/CHANGELOG/TELEMETRY/CI all written + committed, adversarially
+verified (64 claims, 0 false/fabricated/wrong-number). Version 0.1.0->0.2.0 (3 sites).
+STILL NEEDS LISSA: (1) voice-pass on the README — it's honest and structured but written
+in my register, not hers; (2) the design writeup (her voice, the two bug stories); (3) two
+judgment calls surfaced by the verification pass, below.
+  - LETTA LINE REMOVED: the "recursive summarization inspired by Letta" courtesy had no
+    honest home — Revien ships NO summarization feature (thesis is the opposite). If a
+    future eviction/summarization feature ships, attach the courtesy there. Not in the
+    launch README.
+  - CI CAVEAT: 30 test "errors" on Windows are environmental (daemon socket-bind + SQLite
+    temp-file permission races), not product failures — a fresh full run is 467 passed /
+    0 real failures. Linux CI should be clean; if the daemon/integration tests error on
+    CI too, mark those fixtures xfail-on-CI with the known-issue note (do NOT chase green
+    by deleting coverage).
+- [x] ~~[mech draft, Lissa voice-pass] README rewrite.~~ DONE — voice-pass pending. Structure: sovereignty wedge first
   ($0 / zero egress / zero telemetry / audit log / consent / curated shield), then HONEST
   NUMBERS exactly as banked: conversational recall@10 0.5141 (LoCoMo 1,986 QA, local
   extractive, $0), vault 0.8837, attachment 0.625->1.0 clean / 0.75 fragile with the
