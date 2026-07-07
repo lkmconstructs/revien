@@ -28,6 +28,7 @@ Most memory systems ask you to trust that your data is handled well. Revien is b
 - **A non-destructive audit trail.** Every node creation, update, supersession, and merge is recorded. You can trace any fact back to the exact turn it came from, and review every automatic decision the engine made.
 - **Consent is enforced, not requested.** A per-source deny list stops capture at the door. Soft-invalidation is reversible. Nothing is hard-deleted behind your back.
 - **Your curated knowledge outranks the machine's.** If you connect an Obsidian vault, a machine-extracted claim can never silently overwrite something you wrote by hand — contradictions go to a review queue, not a destructive merge.
+- **Memory you can open — and change.** Most AI memory is a black box: the agent decides what to remember, what's true, what to forget, and you never see it. Revien's memory is markdown files in your own vault. You don't have to trust it's right — you can open the file, correct a claim, delete one, or add your own, and your edits reconcile back into the graph.
 
 The discipline behind these claims is the product. Revien ships with a benchmark harness that measures its own retrieval honestly — including where it's weak — and it has already caught its own bugs before they could reach a user.
 
@@ -171,19 +172,20 @@ for r in data["results"]:
 
 ## Obsidian: a second corpus, in and out
 
-Revien treats an Obsidian vault as a second memory corpus *beside* your conversations — not instead of them. A vault is a knowledge graph a human already drew: `[[wikilinks]]` are edges, headings are chunk boundaries, frontmatter dates are timestamps. Revien reads that structure directly.
+Revien treats an Obsidian vault as a second memory corpus *beside* your conversations — not instead of them. A vault is a knowledge graph a human already drew: `[[wikilinks]]` are edges, headings are chunk boundaries, frontmatter dates are timestamps. Revien reads that structure directly — and writes its own memory back out as markdown you can read, correct, and own.
 
 ```bash
 # Connect a vault and ingest it (chunked by heading, wikilinks become edges)
 revien connect obsidian --path ~/my-vault
 revien sync-vault
 
-# Write Revien's memory BACK into the vault as readable markdown
+# Write Revien's memory back into the vault as editable markdown
 revien distill-vault
 ```
 
 - **Ingest** brings your curated notes in as high-confidence, human-authored memory. They outrank machine-extracted claims on conflict.
-- **Distill** writes one markdown note per entity into a `Revien/` folder inside your vault — every claim with its provenance, related entities as `[[wikilinks]]`, so Revien's memory threads into your vault's own graph view. It only ever writes inside its own folder, only overwrites files it created, and never re-ingests its own output. Your memory becomes files you can open.
+- **Distill** writes one markdown note per entity into a `Revien/` folder inside your vault — every claim with its provenance, related entities as `[[wikilinks]]`, so Revien's memory threads into your vault's own graph view. It only writes inside its own folder and only touches files it created; your notes are untouched.
+- **Edit it back.** These notes aren't read-only. Correct a claim and your version supersedes the machine's; delete a line and that memory is forgotten (reversibly — nothing is hard-deleted); add a line under a heading and you've taught it something new. Your edits reconcile into the graph on the next `revien sync-vault`. That's the whole point: **you don't have to trust the memory — you can open the file and change it.**
 
 ---
 
@@ -192,7 +194,7 @@ revien distill-vault
 | Adapter | What it does | Interface |
 |---------|-------------|-----------|
 | **Claude Code** | Reads Claude Code session logs (JSONL), auto-syncs on schedule | `revien connect claude-code` |
-| **Obsidian** | Ingests a vault chunked by heading; distills memory back out | `revien connect obsidian` |
+| **Obsidian** | Ingests a vault chunked by heading; distills editable memory back out (correct / delete / add) | `revien connect obsidian` |
 | **File Watcher** | Watches a directory for new/changed files | `revien connect file-watcher --path DIR` |
 | **Generic API** | Pulls conversation data from a REST endpoint | `revien connect api --path URL` |
 | **OpenAI / ChatGPT** | Ingests ChatGPT conversation exports | Python: `OpenAIAdapter` |
@@ -282,7 +284,7 @@ Any AI System / Obsidian vault
      │  graph walk  │
      └──────┬──────┘
             ▼
-   Lean, relevant context  ──▶  distill back to vault (optional)
+   Lean, relevant context  ──▶  distill to / edit from vault (optional)
 ```
 
 ---
@@ -292,7 +294,6 @@ Any AI System / Obsidian vault
 - Reranking to close the ranking gap (the largest remaining recall lever)
 - Broader extraction coverage for conversational memory
 - Alias/vocabulary resolution (the attachment holdout)
-- Note-edit reconciliation for vault re-sync
 - Graph visualization and inspection tools
 
 ---
