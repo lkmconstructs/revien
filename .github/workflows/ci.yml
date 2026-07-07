@@ -29,11 +29,16 @@ jobs:
           pip install -e .
           pip install -r requirements-dev.txt
 
+      # fastembed defaults to /tmp/fastembed_cache; cache THAT path so the
+      # ~65MB bge-small model downloads once, not on every run. FASTEMBED_CACHE_PATH
+      # pins it so the cache action and the model loader always agree.
       - name: Cache the fastembed model
         uses: actions/cache@v4
         with:
-          path: ~/.cache/fastembed
+          path: /tmp/fastembed_cache
           key: fastembed-bge-small-${{ runner.os }}
 
       - name: Run the test suite
+        env:
+          FASTEMBED_CACHE_PATH: /tmp/fastembed_cache
         run: pytest tests revien_bench/tests -q

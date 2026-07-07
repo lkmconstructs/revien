@@ -226,6 +226,38 @@ class TestHybridWiringWithMock:
         assert len(sem._vectors) >= 1
 
 
+# ── Offline-first model load (regression: cold-cache first install) ────
+
+class TestOfflineFirstModelLoad:
+    def test_tries_local_first_then_downloads_on_cold_cache(self, monkeypatch):
+        """The model loader must try local_files_only=True FIRST (warm cache =
+        zero network) and fall back to a real download on a COLD cache. The old
+        HF_HUB_OFFLINE env approach froze huggingface_hub offline at import, so
+        the fallback never fired — silently disabling the semantic spine for
+        every fresh `pip install` (caught by CI's cold cache, not the dev box's
+        warm one)."""
+        import fastembed
+        pytest.importorskip("fastembed")
+        calls = []
+
+        class _FakeModel:
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        def fake_te(model_name, local_files_only=False, **kw):
+            calls.append(local_files_only)
+            if local_files_only:
+                raise RuntimeError("no local cache (simulated cold start)")
+            return _FakeModel()
+
+        monkeypatch.setattr(fastembed, "TextEmbedding", fake_te)
+        prov = FastEmbedProvider()
+        prov._ensure_model()
+        assert calls == [True, False], \
+            "must attempt local-only first, then fall back to a download"
+        assert prov._model is not None
+
+
 # ── Embedder selection ────────────────────────────────────────────────
 
 class TestEmbedderSelection:

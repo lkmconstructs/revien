@@ -172,29 +172,22 @@ class FastEmbedProvider:
             raise RuntimeError(
                 "fastembed not installed (pip install revien[semantic])"
             )
-        # OFFLINE-FIRST: with a warm local cache the load must touch NOTHING —
-        # "zero network on the default path" is a product claim, and hub
-        # metadata revalidation both violated it and hung for ~23 minutes
-        # whenever the hub accepted connections without answering. Only a
-        # first-ever run (no cache) falls back to the one legitimate download.
-        prev = os.environ.get("HF_HUB_OFFLINE")
-        os.environ["HF_HUB_OFFLINE"] = "1"
+        from fastembed import TextEmbedding
+        # OFFLINE-FIRST via the per-call `local_files_only` PARAMETER — NOT the
+        # HF_HUB_OFFLINE env var. huggingface_hub reads HF_HUB_OFFLINE into a
+        # module constant at IMPORT time, so setting it before the first import
+        # locks the whole process offline: the download fallback can never fire,
+        # and on a COLD cache (every fresh `pip install`, every CI run) the model
+        # can never be fetched — silently disabling the semantic spine for every
+        # first-run user. `local_files_only` is honored per call, so the fallback
+        # works: warm cache loads locally (zero network), cold cache downloads
+        # once (the one legitimate, one-time fetch — see TELEMETRY.md).
         try:
-            from fastembed import TextEmbedding
-            self._model = TextEmbedding(model_name=self.model_name)
+            self._model = TextEmbedding(
+                model_name=self.model_name, local_files_only=True
+            )
         except Exception:
-            # No usable local cache: restore the env and allow the download.
-            if prev is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev
-            from fastembed import TextEmbedding
             self._model = TextEmbedding(model_name=self.model_name)
-        finally:
-            if prev is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev
 
     @property
     def dim(self) -> int:
