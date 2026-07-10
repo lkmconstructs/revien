@@ -124,6 +124,17 @@ VARIANTS: Dict[str, Dict[str, str]] = {
         "REVIEN_EDGE_WEIGHT_BLEND": "0.5",
         "REVIEN_EDGE_CONFIDENCE_IN_WALK": "1",
     },
+    # ROUND 3b (cross-encoder rerank, July 10 2026). The ew ladder came back
+    # IDENTICAL to baseline on both corpora — measured mechanism: the entire
+    # top-20 is distance-0 semantic anchors, so proximity (hop OR strength)
+    # never decides ranks; the outranked bucket is anchor-vs-anchor bi-encoder
+    # misranking. The lever that CAN reorder the head is a cross-encoder
+    # reading query+candidate together: rescore the top-K base-ranked results
+    # (median outrank 26 -> a 30-head covers it), tail untouched.
+    # Hypothesis: outranked shrinks, recall@1 moves most (head reordering),
+    # recall_p50_ms pays the model cost — the sweep prices that trade.
+    "rerank": {"REVIEN_RERANK": "1"},
+    "rerank_k50": {"REVIEN_RERANK": "1", "REVIEN_RERANK_TOP_K": "50"},
 }
 
 

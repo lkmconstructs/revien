@@ -40,6 +40,7 @@ from revien.neural.training import TrainingLoop
 # imports cleanly without the extra and self-disables (is_enabled False), so
 # recall() runs the unchanged graph path when it is absent or REVIEN_SEMANTIC=0.
 from revien.semantic.index import SemanticIndex
+from revien.semantic.rerank import CrossEncoderReranker
 from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
 
@@ -120,6 +121,7 @@ class RetrievalEngine:
         model_dir: Optional[str] = None,
         training_db: Optional[str] = None,
         semantic: Optional[SemanticIndex] = None,
+        reranker: Optional[CrossEncoderReranker] = None,
     ):
         self.store = store
         self.ops = GraphOperations(store)
@@ -174,6 +176,13 @@ class RetrievalEngine:
         # no-op, so recall() degrades to the graph-only path — but LOUDLY:
         self.semantic = semantic if semantic is not None else SemanticIndex(store)
         self._warn_if_semantic_inactive()
+
+        # Cross-encoder head reranker (A1). OPT-IN via REVIEN_RERANK=1 —
+        # measured lever for the `outranked` bucket: with semantic-as-spine
+        # the top of the ranking is all distance-0 anchors, and only a model
+        # that reads query+candidate together can reorder them. Inert (empty
+        # pass-through) unless enabled; degrades loudly on runtime failure.
+        self.reranker = reranker if reranker is not None else CrossEncoderReranker()
 
     def _warn_if_semantic_inactive(self) -> None:
         """One warning per process when recall will run graph-only. Graph-only
@@ -399,8 +408,12 @@ class RetrievalEngine:
                 path=path_labels,
             ))
 
-        # 5. Rank by final score, return top N
+        # 5. Rank by final score, then (opt-in) cross-encoder rerank of the
+        # HEAD — before the top_n slice, so a gold node at base rank ~26 can
+        # be pulled into a top-10 (the outranked bucket's median lives there).
         scored_results.sort(key=lambda r: r.score, reverse=True)
+        if self.reranker.is_enabled:
+            scored_results = self.reranker.rerank(query, scored_results)
         top_results = scored_results[:top_n]
 
         # 6. Touch retrieved nodes (update access tracking). Env-gated
