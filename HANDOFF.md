@@ -525,6 +525,40 @@ invalidated, tension drawn as a CONFLICTS_WITH edge (the type the morning patch
 - NEXT for identity memory: recall/lineage surfacing of tension edges (a "tensions"
   view — who am I in conflict with myself about?), B2 bi-temporal validity.
 
+## B1 SURFACING + B2 SHIPPED (July 10 2026, same session)
+
+**Tension surfacing (`fbb19bf`):** the B1 edges are now visible on three surfaces —
+recall(include_tensions=True) attaches the LIVE other side of any CONFLICTS_WITH edge
+to each result (flag-off = key absent, response byte-identical); GET /v1/tensions +
+store.list_tension_pairs(live_only) is the "what am I in tension with myself about?"
+view (live_only=false includes invalidation-retired pairs for lineage); `revien
+tensions [--all] [--json-output]` at the CLI. Invalidated counterparts never surface
+as live tension.
+
+**B2 bi-temporal validity (`ba16c44`):** "Where did she live in March?" is answerable
+after June's fact replaced it. Our own L3, as planned — not a Graphiti import.
+- Node.valid_from/valid_until (nullable, idempotent in-place migration, pre-B2 rows
+  read back unbounded). store.set_node_validity: partial, audited, and NEVER
+  overwrites a set bound — a recorded transition is a fact; a racing second
+  supersession cannot move it.
+- The supersession IS the transition: _supersede closes old.valid_until and opens
+  new.valid_from at the same instant T = new claim's best content time
+  (event_time_start > recorded_at > now), backfilling old.valid_from from its own
+  content time. CSL-gated like all of Leg B.
+- recall(as_of=): a SUPERSEDED node whose closed window covers as_of COMES BACK —
+  recovering the old truth is the point. Invalidated with no window stays hidden
+  (unknown is not historical). Not-yet-valid facts excluded. Recency scores relative
+  to as_of when now isn't given. as_of=None byte-identical. Surfaces:
+  RecallRequest.as_of (ISO), NodeResponse.valid_from/valid_until, CLI recall --as-of.
+- Diagnostics grew not_yet_valid / no_longer_valid filter reasons (taxonomy-ready if
+  an as-of eval track is ever built).
+- Bench waiver: same double-gate class as B1 (validity writes are CSL-path only;
+  as_of default None) — suite 544 green, byte-identical pinned by tests.
+- Deliberately NOT built (scope): last_verified_at (needs a verification flow),
+  windows on the CANDIDATE path (human adjudication should set them via the queue),
+  as-of eval fixtures. Next candidates: B3 dream-mode consolidation, the aliasing/
+  vocabulary class from A2's residuals, or Lissa's launch items.
+
 **Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
 - Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
   neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
