@@ -214,6 +214,50 @@ def recall(query: str, top: int, db: Optional[str], json_output: bool):
 
 
 @main.command()
+@click.option("--db", default=None, help="Database path")
+@click.option("--all", "include_history", is_flag=True,
+              help="Include tensions where one side was later invalidated")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+def tensions(db: Optional[str], include_history: bool, json_output: bool):
+    """List recognized coexisting tensions (B1) — pairs of claims that pull
+    in opposite directions and BOTH remain true. 'What am I in tension with
+    myself about?'"""
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        pairs = store.list_tension_pairs(live_only=not include_history)
+
+        if json_output:
+            click.echo(json.dumps({"count": len(pairs), "tensions": pairs}, indent=2))
+            return
+
+        if not pairs:
+            click.echo("No tensions recorded. (Tension detection is opt-in: "
+                       "set REVIEN_TENSION_BACKEND with REVIEN_CSL=1, or "
+                       "resolve queue candidates as coexist.)")
+            return
+
+        click.echo(f"\n{len(pairs)} tension{'s' if len(pairs) != 1 else ''}:\n")
+        for i, p in enumerate(pairs, 1):
+            a, b = p["a"], p["b"]
+            click.echo(f"  [{i}] {a['content'][:100]}")
+            click.echo(f"   ⇄  {b['content'][:100]}")
+            if p.get("source_context"):
+                click.echo(f"      ({p['source_context']}, {p['created_at'][:10]})")
+            click.echo()
+    finally:
+        store.close()
+
+
+@main.command()
 @click.argument("content")
 @click.option("--source", default="cli", help="Source identifier")
 @click.option("--db", default=None, help="Database path")

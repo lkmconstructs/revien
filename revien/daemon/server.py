@@ -45,6 +45,7 @@ class RecallRequest(BaseModel):
     min_score: float = 0.01
     include_invalidated: bool = False
     include_context: bool = False
+    include_tensions: bool = False
 
 
 class NodeUpdateRequest(BaseModel):
@@ -188,6 +189,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             min_score=request.min_score,
             include_invalidated=request.include_invalidated,
             include_context=request.include_context,
+            include_tensions=request.include_tensions,
         )
         return {
             "query": response.query,
@@ -200,6 +202,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "score": r.score,
                     "score_breakdown": r.score_breakdown,
                     "path": r.path,
+                    # Only present when asked for — the flag-off response
+                    # shape is byte-identical to pre-B1.
+                    **({"tensions": r.tensions} if request.include_tensions else {}),
                 }
                 for r in response.results
             ],
@@ -309,6 +314,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             source_context=request.source_context,
         ))
         return _edge_to_response(edge)
+
+    # ── GET /v1/tensions ──────────────────────────────
+
+    @app.get("/v1/tensions")
+    async def list_tensions(live_only: bool = Query(True)):
+        """The tensions view (B1): every recognized coexisting tension —
+        pairs of claims joined by a CONFLICTS_WITH edge, both sides live.
+        'What am I in tension with myself about?' as an endpoint.
+        live_only=false includes pairs where a side was later invalidated
+        (lineage/audit reading)."""
+        pairs = store.list_tension_pairs(live_only=live_only)
+        return {"count": len(pairs), "tensions": pairs}
 
     # ── GET /v1/graph ─────────────────────────────────
 

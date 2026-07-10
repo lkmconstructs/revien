@@ -885,6 +885,42 @@ class GraphStore:
             q += " WHERE resolved_at IS NULL"
         return conn.execute(q).fetchone()[0]
 
+    def list_tension_pairs(self, live_only: bool = True) -> list[dict]:
+        """The tensions view (B1): every CONFLICTS_WITH pair with both claims.
+
+        live_only (default) keeps pairs where BOTH claims are un-invalidated —
+        a superseded claim's tension is history, not a live pull. Pass False
+        to include those for lineage/audit reading.
+        """
+        conn = self._get_conn()
+        q = (
+            "SELECT e.edge_id, e.source_context, e.created_at, e.weight, "
+            "       e.confidence_set_by, "
+            "       a.node_id, a.label, a.content, a.invalidated_at, "
+            "       b.node_id, b.label, b.content, b.invalidated_at "
+            "FROM edges e "
+            "JOIN nodes a ON a.node_id = e.source_node_id "
+            "JOIN nodes b ON b.node_id = e.target_node_id "
+            "WHERE e.edge_type = 'conflicts_with' "
+            "ORDER BY e.created_at ASC"
+        )
+        out = []
+        for r in conn.execute(q).fetchall():
+            if live_only and (r[8] is not None or r[12] is not None):
+                continue
+            out.append({
+                "edge_id": r[0],
+                "source_context": r[1],
+                "created_at": r[2],
+                "weight": r[3],
+                "set_by": r[4],
+                "a": {"node_id": r[5], "label": r[6], "content": r[7],
+                      "invalidated_at": r[8]},
+                "b": {"node_id": r[9], "label": r[10], "content": r[11],
+                      "invalidated_at": r[12]},
+            })
+        return out
+
     # ── Edge CRUD ─────────────────────────────────────────
 
     def add_edge(self, edge: Edge) -> Edge:

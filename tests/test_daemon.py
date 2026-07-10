@@ -349,6 +349,58 @@ class TestEdgeEndpoint:
         assert "Invalid edge_type" in resp.json()["detail"]
 
 
+class TestTensionsEndpoint:
+    def _make_tension(self, client):
+        client.post("/v1/graph/import", json={
+            "nodes": [
+                {"node_type": "context", "label": "closeness",
+                 "content": "I want closeness with the people I love."},
+                {"node_type": "context", "label": "space",
+                 "content": "I want space to be alone with my thoughts."},
+            ],
+            "edges": [],
+        })
+        nodes = client.get("/v1/graph").json()["nodes"]
+        client.post("/v1/edges", json={
+            "edge_type": "conflicts_with",
+            "source_node_id": nodes[0]["node_id"],
+            "target_node_id": nodes[1]["node_id"],
+            "source_context": "tension_coexist",
+        })
+        return nodes
+
+    def test_tensions_view_lists_pairs(self, client):
+        self._make_tension(client)
+        resp = client.get("/v1/tensions")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        contents = {data["tensions"][0]["a"]["content"],
+                    data["tensions"][0]["b"]["content"]}
+        assert "I want closeness with the people I love." in contents
+
+    def test_tensions_view_empty_graph(self, client):
+        resp = client.get("/v1/tensions")
+        assert resp.status_code == 200
+        assert resp.json() == {"count": 0, "tensions": []}
+
+    def test_recall_include_tensions_passthrough(self, client):
+        # Flag-off responses must not carry the key at all (shape unchanged);
+        # flag-on responses carry it, even when a result has no tensions.
+        self._make_tension(client)
+        off = client.post("/v1/recall", json={
+            "query": "closeness", "top_n": 5, "include_context": True,
+        }).json()
+        for r in off["results"]:
+            assert "tensions" not in r
+        on = client.post("/v1/recall", json={
+            "query": "closeness", "top_n": 5, "include_context": True,
+            "include_tensions": True,
+        }).json()
+        for r in on["results"]:
+            assert "tensions" in r
+
+
 # ── Sync Endpoint ─────────────────────────────────────────
 
 class TestSyncEndpoint:

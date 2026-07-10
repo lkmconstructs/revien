@@ -227,3 +227,97 @@ class TestCoexistResolution:
         ops = GraphOperations(store)
         gov = ClaimGovernor(store, ops)
         assert gov.coexist_candidate(9999) is False
+
+
+# ── Tension surfacing (recall flag + tensions view) ───────
+
+def _tension_graph(store):
+    """Two live claims joined by a CONFLICTS_WITH edge, reachable from an
+    entity anchor (keyword search anchors on non-context nodes, so a
+    context-only graph is unreachable in graph-only mode — mirror the real
+    ingest shape: entity -> RELATED_TO -> context turns)."""
+    from revien.graph.schema import Edge
+    anchor = store.add_node(Node(
+        node_type=NodeType.ENTITY, label="Belonging",
+        content="closeness and space needs",
+    ))
+    a = store.add_node(Node(
+        node_type=NodeType.CONTEXT, label="closeness",
+        content="I want closeness with the people I love.",
+    ))
+    b = store.add_node(Node(
+        node_type=NodeType.CONTEXT, label="space",
+        content="I want space to be alone with my thoughts.",
+    ))
+    for target in (a, b):
+        store.add_edge(Edge(
+            edge_type=EdgeType.RELATED_TO,
+            source_node_id=anchor.node_id, target_node_id=target.node_id,
+            weight=0.5,
+        ))
+    store.add_edge(Edge(
+        edge_type=EdgeType.CONFLICTS_WITH,
+        source_node_id=a.node_id, target_node_id=b.node_id,
+        weight=0.8, source_context="tension_coexist",
+    ))
+    return a, b, anchor
+
+
+class TestTensionsView:
+    def test_live_pairs_listed_with_both_claims(self, store):
+        a, b, _ = _tension_graph(store)
+        pairs = store.list_tension_pairs()
+        assert len(pairs) == 1
+        contents = {pairs[0]["a"]["content"], pairs[0]["b"]["content"]}
+        assert a.content in contents and b.content in contents
+
+    def test_invalidated_side_hides_pair_unless_asked(self, store):
+        a, b, _ = _tension_graph(store)
+        ops = GraphOperations(store)
+        ops.invalidate_node(b.node_id, reason="test", construct_id="test")
+        assert store.list_tension_pairs() == []
+        history = store.list_tension_pairs(live_only=False)
+        assert len(history) == 1
+
+
+class TestRecallTensionSurfacing:
+    def test_flag_attaches_live_counterpart(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_SEMANTIC", "0")
+        from revien.retrieval.engine import RetrievalEngine
+        a, b, _ = _tension_graph(store)
+        engine = RetrievalEngine(store)
+        response = engine.recall(
+            "closeness people love", top_n=10,
+            include_context=True, include_tensions=True,
+        )
+        by_id = {r.node_id: r for r in response.results}
+        assert a.node_id in by_id
+        tensions = by_id[a.node_id].tensions
+        assert len(tensions) == 1
+        assert tensions[0]["node_id"] == b.node_id
+        assert "space" in tensions[0]["content"]
+
+    def test_flag_off_is_byte_identical(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_SEMANTIC", "0")
+        from revien.retrieval.engine import RetrievalEngine
+        a, _, _ = _tension_graph(store)
+        engine = RetrievalEngine(store)
+        response = engine.recall(
+            "closeness people love", top_n=10, include_context=True,
+        )
+        by_id = {r.node_id: r for r in response.results}
+        assert by_id[a.node_id].tensions == []
+
+    def test_invalidated_counterpart_not_surfaced(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_SEMANTIC", "0")
+        from revien.retrieval.engine import RetrievalEngine
+        a, b, _ = _tension_graph(store)
+        GraphOperations(store).invalidate_node(
+            b.node_id, reason="test", construct_id="test")
+        engine = RetrievalEngine(store)
+        response = engine.recall(
+            "closeness people love", top_n=10,
+            include_context=True, include_tensions=True,
+        )
+        by_id = {r.node_id: r for r in response.results}
+        assert by_id[a.node_id].tensions == []

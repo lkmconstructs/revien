@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 # — bench runs construct hundreds of engines and one warning is the message).
 _SEMANTIC_OFF_WARNED = False
 
-from revien.graph.schema import Node, NodeType, SourceType
+from revien.graph.schema import EdgeType, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 from revien.graph.clustering import CommunityDetector
@@ -55,6 +55,10 @@ class RetrievalResult:
     score: float
     score_breakdown: Dict[str, float]
     path: List[str]
+    # B1 tension surfacing: LIVE claims this node holds a CONFLICTS_WITH edge
+    # to — the other side of a recognized tension. Populated ONLY when
+    # recall(include_tensions=True); empty (and cost-free) otherwise.
+    tensions: List[Dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -209,6 +213,7 @@ class RetrievalEngine:
         now: Optional[datetime] = None,
         include_invalidated: bool = False,
         include_context: bool = False,
+        include_tensions: bool = False,
         debug: bool = False,
     ) -> RetrievalResponse:
         """
@@ -225,6 +230,10 @@ class RetrievalEngine:
                 are retained and recoverable, just hidden from default recall.
                 When no node is invalidated this flag changes nothing, so recall
                 is byte-identical to the pre-6a behavior.
+            include_tensions: When True, each result carries the live other
+                side of any CONFLICTS_WITH edge it holds (B1 tension
+                surfacing) in ``result.tensions``. Default False: zero extra
+                queries, response byte-identical.
             debug: When True, the response carries a ``diagnostics`` dict
                 (anchor sets by origin, walked node distances, per-node final
                 scores including sub-threshold ones, and filter reasons) so a
@@ -416,6 +425,13 @@ class RetrievalEngine:
             scored_results = self.reranker.rerank(query, scored_results)
         top_results = scored_results[:top_n]
 
+        # 5b. B1 tension surfacing (opt-in): attach the LIVE other side of any
+        # CONFLICTS_WITH edge a returned claim carries, so a caller sees "she
+        # said this — AND holds this opposing pull" in one response. Flag-off
+        # is a no-op: zero queries, response byte-identical.
+        if include_tensions and top_results:
+            self._attach_tensions(top_results)
+
         # 6. Touch retrieved nodes (update access tracking). Env-gated
         # (REVIEN_TOUCH_ON_RECALL=0 disables) because this is the frequency
         # feedback loop: being RETURNED bumps access_count, which raises the
@@ -471,6 +487,34 @@ class RetrievalEngine:
             semantic_note=self.semantic.inactive_reason(),
             diagnostics=diagnostics,
         )
+
+    def _attach_tensions(self, results: List[RetrievalResult]) -> None:
+        """Populate each result's `tensions` with the live counterpart of any
+        CONFLICTS_WITH edge it carries. One edges query + one bulk node fetch
+        per result that HAS such edges — tension edges are rare, so the
+        common case is the single get_edges_for_node lookup."""
+        for result in results:
+            counterpart_ids = []
+            for edge in self.store.get_edges_for_node(result.node_id):
+                if edge.edge_type is not EdgeType.CONFLICTS_WITH:
+                    continue
+                other = (edge.target_node_id
+                         if edge.source_node_id == result.node_id
+                         else edge.source_node_id)
+                counterpart_ids.append((other, edge.source_context))
+            if not counterpart_ids:
+                continue
+            nodes = self.store.get_nodes_bulk([nid for nid, _ in counterpart_ids])
+            for nid, context in counterpart_ids:
+                node = nodes.get(nid)
+                if node is None or node.invalidated_at is not None:
+                    continue  # a superseded claim's tension is history
+                result.tensions.append({
+                    "node_id": node.node_id,
+                    "label": node.label,
+                    "content": node.content,
+                    "source_context": context,
+                })
 
     def _effective_confidence(self, node: Node, now: datetime) -> float:
         """
