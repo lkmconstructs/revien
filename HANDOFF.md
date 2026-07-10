@@ -491,6 +491,40 @@ old-extractor). Same class as the checkpoint trap: code version isn't part of ei
 cache identity. Fold both into one fix when touched next (hash extractor/knob env into
 cache + checkpoint names).
 
+## B1 SHIPPED (July 10 2026) — COEXIST: tension as first-class memory (`702826e`)
+The identity-memory leg. Two AFFIRMATIVE claims pulling opposite directions ("I want
+closeness" / "I want space") now COEXIST: both live, nothing queued, nothing
+invalidated, tension drawn as a CONFLICTS_WITH edge (the type the morning patch
+`8164f28` introduced; edge is non-mutating by contract, idempotent per pair).
+
+- **Detection is recognizer territory, not rules** — the rule gate literally cannot see
+  affirmative-affirmative opposition (no flip, no negation, often no shared tokens).
+  `revien/tension.py` LLMTensionRecognizer mirrors + subclasses the sensitivity
+  recognizer's transport: REVIEN_TENSION_BACKEND (ollama local default), one-time cloud
+  disclosure, never raises, abstain on unavailable. ONLY a clean TENSION verdict draws
+  the edge; COMPATIBLE/UNSURE fall through to unchanged NO_CONFLICT.
+- **§7.2 mechanized as guards, all pinned by tests:** retraction keeps its supersession
+  path (a negation never reaches the hook); sentiment/similarity need the recognizer's
+  explicit TENSION to fire; single-valued types (identity/relationship/state/health)
+  are excluded — a value mismatch there is a real either/or and keeps human review.
+- **Human resolution surface:** ClaimGovernor.coexist_candidate(id) — resolve a queued
+  candidate as "both true": edge drawn, candidate resolved "coexist", claims intact.
+- **Own eval track built, NUMBER PENDING:** revien_bench/tension_eval.py + 24-pair
+  fixture (8 tension / 16 §7.2 controls). Reports coexist recall, false-fires (must be
+  0), and classifier-blocked separately — the RULE CLASSIFIER is the binding coverage
+  limit ("I want space to be alone with my thoughts" -> unclassified -> hook never
+  reached), the same known CSL bound, NOT recognizer quality. Needs a live backend
+  (ollama on the server, or OpenRouter — key is Lissa's); refuses to print a number
+  from a dead transport. **Run it server-side before any B1 claim.**
+- **Bench numbers cannot move** (double-gated: REVIEN_CSL off in benches AND tension
+  backend unwired by default; unwired gate byte-identical, pinned by test). Both-corpora
+  re-run therefore waived for this leg — the waiver reasoning recorded here on purpose.
+- Cost profile: the hook consults the recognizer on scoped-but-compatible tension-type
+  pairs — broader than Trigger 2's would-be-auto trigger. Wire LOCAL (default) or
+  accept per-pair cloud cost knowingly.
+- NEXT for identity memory: recall/lineage surfacing of tension edges (a "tensions"
+  view — who am I in conflict with myself about?), B2 bi-temporal validity.
+
 **Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
 - Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
   neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
