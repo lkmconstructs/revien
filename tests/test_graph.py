@@ -153,11 +153,37 @@ class TestEdgeCreation:
         result = store.add_edge(edge)
         assert result.edge_type == EdgeType.CONTRADICTS
 
+    def test_create_conflicts_with_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(
+            edge_type=EdgeType.CONFLICTS_WITH,
+            source_node_id=n1.node_id,
+            target_node_id=n2.node_id,
+            weight=0.9,
+            confidence=0.8,
+            source_context="parallel claims; neither should be superseded",
+        )
+        result = store.add_edge(edge)
+        stored = store.get_edge(result.edge_id)
+        assert stored is not None
+        assert stored.edge_type == EdgeType.CONFLICTS_WITH
+        assert stored.weight == 0.9
+        assert stored.confidence == 0.8
+        assert stored.source_context == "parallel claims; neither should be superseded"
+
     def test_all_edge_types_covered(self):
-        # 6 core relationship types + CORRECTS (confidence-layer audit edge)
-        # + DERIVED_FROM (provenance/lineage edge, leg 6a)
-        assert len(EdgeType) == 8
-        assert EdgeType.DERIVED_FROM in EdgeType
+        expected_edge_types = {
+            EdgeType.RELATED_TO,
+            EdgeType.DECIDED_IN,
+            EdgeType.MENTIONED_BY,
+            EdgeType.DEPENDS_ON,
+            EdgeType.FOLLOWED_BY,
+            EdgeType.CONTRADICTS,
+            EdgeType.CONFLICTS_WITH,
+            EdgeType.CORRECTS,
+            EdgeType.DERIVED_FROM,
+        }
+        assert expected_edge_types.issubset(set(EdgeType))
 
 
 # ── Update Operations ─────────────────────────────────────
@@ -248,6 +274,7 @@ class TestExportImport:
         n3 = store.add_node(Node(node_type=NodeType.CONTEXT, label="Session 1", content="Pricing discussion"))
         store.add_edge(Edge(edge_type=EdgeType.DECIDED_IN, source_node_id=n2.node_id, target_node_id=n3.node_id, weight=0.9))
         store.add_edge(Edge(edge_type=EdgeType.MENTIONED_BY, source_node_id=n2.node_id, target_node_id=n1.node_id, weight=0.7))
+        store.add_edge(Edge(edge_type=EdgeType.CONFLICTS_WITH, source_node_id=n1.node_id, target_node_id=n2.node_id, weight=0.6))
 
         # Export
         graph = store.export_graph()
@@ -263,7 +290,7 @@ class TestExportImport:
 
             # Verify integrity
             assert store2.count_nodes() == 3
-            assert store2.count_edges() == 2
+            assert store2.count_edges() == 3
 
             # Verify specific node data survived
             alice = store2.get_node(n1.node_id)
@@ -278,10 +305,12 @@ class TestExportImport:
 
             # Verify edges survived
             edges = store2.get_edges_for_node(n2.node_id)
-            assert len(edges) == 2
+            assert len(edges) == 3
             edge_types = {e.edge_type for e in edges}
             assert EdgeType.DECIDED_IN in edge_types
             assert EdgeType.MENTIONED_BY in edge_types
+            conflict_edges = store2.get_edges_for_node(n1.node_id)
+            assert EdgeType.CONFLICTS_WITH in {e.edge_type for e in conflict_edges}
         finally:
             store2.close()
             os.unlink(path2)

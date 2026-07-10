@@ -28,6 +28,9 @@ class EdgeType(str, Enum):
     DEPENDS_ON = "depends_on"
     FOLLOWED_BY = "followed_by"
     CONTRADICTS = "contradicts"
+    # Non-mutating contradiction: both claims remain live, but recall/lineage can
+    # surface the tension instead of silently superseding either side.
+    CONFLICTS_WITH = "conflicts_with"
     # Confidence audit
     CORRECTS = "corrects"
     # Provenance / lineage (leg 6a): target is derived FROM source.

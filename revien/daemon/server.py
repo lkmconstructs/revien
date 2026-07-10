@@ -4,6 +4,7 @@ Runs as local daemon on port 7437 or as hosted service.
 """
 
 import time
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -43,12 +44,37 @@ class RecallRequest(BaseModel):
     top_n: int = 5
     min_score: float = 0.01
     include_invalidated: bool = False
+    include_context: bool = False
 
 
 class NodeUpdateRequest(BaseModel):
     label: Optional[str] = None
     content: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+
+class EdgeCreateRequest(BaseModel):
+    edge_type: str
+    source_node_id: str
+    target_node_id: str
+    weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    confidence_set_by: str = ""
+    source_context: str = ""
+
+
+class EdgeResponse(BaseModel):
+    edge_id: str
+    edge_type: str
+    source_node_id: str
+    target_node_id: str
+    weight: float
+    created_at: str
+    metadata: Dict[str, Any]
+    confidence: float
+    confidence_set_by: str
+    source_context: str
 
 
 class NodeResponse(BaseModel):
@@ -78,8 +104,14 @@ class SyncResponse(BaseModel):
 
 # ── App Factory ───────────────────────────────────────────
 
-def create_app(db_path: str = "revien.db") -> FastAPI:
-    """Create and configure the FastAPI application."""
+def create_app(db_path: Optional[str] = None) -> FastAPI:
+    """Create and configure the FastAPI application.
+
+    Database path resolution is explicit argument > ``REVIEN_DB_PATH`` env var >
+    ``revien.db``. The CLI passes an explicit path, but honoring the env var
+    keeps direct ASGI/Docker usage from silently serving a fresh local database.
+    """
+    db_path = db_path or os.environ.get("REVIEN_DB_PATH", "revien.db")
 
     app = FastAPI(
         title="Revien",
@@ -155,6 +187,7 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
             top_n=request.top_n,
             min_score=request.min_score,
             include_invalidated=request.include_invalidated,
+            include_context=request.include_context,
         )
         return {
             "query": response.query,
@@ -244,6 +277,38 @@ def create_app(db_path: str = "revien.db") -> FastAPI:
         if not deleted:
             raise HTTPException(404, f"Node not found: {node_id}")
         return {"status": "deleted", "node_id": node_id}
+
+    # ── POST /v1/edges ─────────────────────────────────
+
+    @app.post("/v1/edges", response_model=EdgeResponse)
+    async def create_edge(request: EdgeCreateRequest):
+        """Create an explicit typed edge between two existing nodes.
+
+        Useful for human/agent adjudication edges like ``conflicts_with`` where
+        both claims should remain live while the tension becomes first-class.
+        """
+        try:
+            edge_type = EdgeType(request.edge_type)
+        except ValueError:
+            valid = ", ".join(e.value for e in EdgeType)
+            raise HTTPException(400, f"Invalid edge_type: {request.edge_type}. Valid: {valid}")
+
+        if store.get_node(request.source_node_id) is None:
+            raise HTTPException(404, f"Source node not found: {request.source_node_id}")
+        if store.get_node(request.target_node_id) is None:
+            raise HTTPException(404, f"Target node not found: {request.target_node_id}")
+
+        edge = store.add_edge(Edge(
+            edge_type=edge_type,
+            source_node_id=request.source_node_id,
+            target_node_id=request.target_node_id,
+            weight=request.weight,
+            metadata=request.metadata,
+            confidence=request.confidence,
+            confidence_set_by=request.confidence_set_by,
+            source_context=request.source_context,
+        ))
+        return _edge_to_response(edge)
 
     # ── GET /v1/graph ─────────────────────────────────
 
@@ -554,4 +619,19 @@ def _node_to_response(node: Node) -> NodeResponse:
         last_accessed=node.last_accessed.isoformat(),
         access_count=node.access_count,
         metadata=node.metadata,
+    )
+
+
+def _edge_to_response(edge: Edge) -> EdgeResponse:
+    return EdgeResponse(
+        edge_id=edge.edge_id,
+        edge_type=edge.edge_type.value,
+        source_node_id=edge.source_node_id,
+        target_node_id=edge.target_node_id,
+        weight=edge.weight,
+        created_at=edge.created_at.isoformat(),
+        metadata=edge.metadata,
+        confidence=edge.confidence,
+        confidence_set_by=edge.confidence_set_by,
+        source_context=edge.source_context,
     )

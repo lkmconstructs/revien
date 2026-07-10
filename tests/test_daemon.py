@@ -69,6 +69,29 @@ class TestHealthEndpoint:
         assert after["node_count"] > before["node_count"]
         assert after["edge_count"] > before["edge_count"]
 
+    def test_create_app_honors_revien_db_path_env_when_no_explicit_arg(self, monkeypatch):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            monkeypatch.setenv("REVIEN_DB_PATH", path)
+            app = create_app()
+            assert app.state.store.db_path == path
+        finally:
+            os.unlink(path)
+
+    def test_create_app_explicit_db_path_overrides_env(self, monkeypatch):
+        fd_env, env_path = tempfile.mkstemp(suffix=".db")
+        fd_explicit, explicit_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd_env)
+        os.close(fd_explicit)
+        try:
+            monkeypatch.setenv("REVIEN_DB_PATH", env_path)
+            app = create_app(db_path=explicit_path)
+            assert app.state.store.db_path == explicit_path
+        finally:
+            os.unlink(env_path)
+            os.unlink(explicit_path)
+
 
 # ── Ingest Endpoint ───────────────────────────────────────
 
@@ -146,6 +169,39 @@ class TestRecallEndpoint:
             for r in data["results"]
         )
         assert "499" in all_content or "pricing" in all_content or "enterprise" in all_content
+
+    def test_recall_can_include_context_nodes_when_requested(self, monkeypatch):
+        """API must expose engine.include_context so raw context can surface."""
+        monkeypatch.setenv("REVIEN_SEMANTIC", "1")
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            app = create_app(db_path=path)
+            with TestClient(app) as c:
+                c.post("/v1/ingest", json={
+                    "source_id": "context-recall-test",
+                    "content": "Atlas is the planning hub. Ledger is the private archive.",
+                    "content_type": "note",
+                })
+
+                without_context = c.post("/v1/recall", json={
+                    "query": "Atlas planning hub Ledger private archive",
+                    "top_n": 10,
+                }).json()
+                assert all(r["node_type"] != "context" for r in without_context["results"])
+
+                with_context = c.post("/v1/recall", json={
+                    "query": "Atlas planning hub Ledger private archive",
+                    "top_n": 10,
+                    "include_context": True,
+                }).json()
+                assert any(
+                    r["node_type"] == "context"
+                    and "atlas is the planning hub" in r["content"].lower()
+                    for r in with_context["results"]
+                )
+        finally:
+            os.unlink(path)
 
 
 # ── Nodes Endpoints ───────────────────────────────────────
@@ -251,6 +307,46 @@ class TestGraphEndpoints:
         # Verify
         health = seeded_client.get("/v1/health").json()
         assert health["node_count"] == original_count
+
+
+class TestEdgeEndpoint:
+    def test_create_conflicts_with_edge(self, client):
+        graph = client.post("/v1/graph/import", json={
+            "nodes": [
+                {"node_type": "context", "label": "Current claim", "content": "Atlas is the planning hub."},
+                {"node_type": "context", "label": "Stale claim", "content": "Ledger is the planning hub."},
+            ],
+            "edges": [],
+        })
+        assert graph.status_code == 200
+        nodes = client.get("/v1/graph").json()["nodes"]
+
+        resp = client.post("/v1/edges", json={
+            "edge_type": "conflicts_with",
+            "source_node_id": nodes[0]["node_id"],
+            "target_node_id": nodes[1]["node_id"],
+            "weight": 0.9,
+            "confidence": 0.95,
+            "confidence_set_by": "test",
+            "source_context": "Hub boundary correction",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["edge_type"] == "conflicts_with"
+        assert data["weight"] == 0.9
+        assert data["confidence"] == 0.95
+
+        edge_types = {edge["edge_type"] for edge in client.get("/v1/graph").json()["edges"]}
+        assert "conflicts_with" in edge_types
+
+    def test_create_edge_rejects_unknown_type(self, client):
+        resp = client.post("/v1/edges", json={
+            "edge_type": "not_a_real_edge",
+            "source_node_id": "missing-a",
+            "target_node_id": "missing-b",
+        })
+        assert resp.status_code == 400
+        assert "Invalid edge_type" in resp.json()["detail"]
 
 
 # ── Sync Endpoint ─────────────────────────────────────────
