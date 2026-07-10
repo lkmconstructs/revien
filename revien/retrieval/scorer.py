@@ -53,6 +53,17 @@ class ScoringConfig:
     proximity_decay_per_hop: float = 0.3  # Score reduction per hop
     proximity_max_depth: int = 3  # Maximum hops to consider
 
+    # Weighted walk (A1): how much of the proximity term comes from PATH
+    # STRENGTH (product of edge weights along the shortest-hop path — the
+    # walker's strengths dict) vs pure hop-count decay.
+    #   proximity = (1 - blend) * hop_decay + blend * path_strength
+    # 0.0 (default) is byte-identical to shipped hop-only behavior; 1.0 ranks
+    # entirely by how strong the connecting edges are. This is what finally
+    # READS the edge weights that mark_used() reinforcement and author-drawn
+    # vault edges (0.8) vs extractor co-occurrence guesses (0.3) have been
+    # writing. Override: REVIEN_EDGE_WEIGHT_BLEND.
+    edge_weight_blend: float = 0.0
+
     @classmethod
     def from_env(cls) -> "ScoringConfig":
         """Build a config with env overrides for the ranking knobs the miss
@@ -70,6 +81,9 @@ class ScoringConfig:
             ),
             proximity_decay_per_hop=_env_float(
                 "REVIEN_PROXIMITY_DECAY_PER_HOP", d.proximity_decay_per_hop
+            ),
+            edge_weight_blend=_env_float(
+                "REVIEN_EDGE_WEIGHT_BLEND", d.edge_weight_blend
             ),
         )
 
@@ -91,6 +105,7 @@ class ThreeFactorScorer:
         access_count: int,
         graph_distance: int,
         now: Optional[datetime] = None,
+        path_strength: float = 1.0,
     ) -> ScoreBreakdown:
         """
         Compute composite score for a candidate node.
@@ -104,6 +119,9 @@ class ThreeFactorScorer:
             access_count: How many times the node has been retrieved
             graph_distance: Shortest path distance from query anchor nodes (0 = anchor itself)
             now: Current time (defaults to UTC now)
+            path_strength: Product of edge strengths along the node's
+                shortest-hop path from the anchors (walker strengths dict;
+                anchors = 1.0). Inert unless edge_weight_blend > 0.
 
         Returns:
             ScoreBreakdown with individual factor scores and composite
@@ -113,7 +131,7 @@ class ThreeFactorScorer:
 
         recency = self._score_recency(timestamp, now)
         frequency = self._score_frequency(access_count)
-        proximity = self._score_proximity(graph_distance)
+        proximity = self._score_proximity(graph_distance, path_strength)
 
         composite = (
             self.config.recency_weight * recency
@@ -162,12 +180,20 @@ class ThreeFactorScorer:
         raw = math.log(1 + access_count) / math.log(1 + threshold)
         return min(raw, 1.0)
 
-    def _score_proximity(self, graph_distance: int) -> float:
+    def _score_proximity(
+        self, graph_distance: int, path_strength: float = 1.0
+    ) -> float:
         """
-        Graph distance decay.
+        Graph distance decay, optionally blended with path strength.
         Distance 0 (anchor node itself) = 1.0
-        Each hop reduces score by decay_per_hop.
-        Beyond max_depth = 0.0
+        Each hop reduces the hop term by decay_per_hop.
+        Beyond max_depth = 0.0 regardless of strength (reachability gates
+        stay hop-based; strength shapes ranking within reach).
+
+        With edge_weight_blend > 0:
+            proximity = (1 - blend) * hop_decay + blend * path_strength
+        At the default blend 0.0 this returns the hop term unchanged —
+        byte-identical to the pre-weighted-walk scorer.
         """
         if graph_distance < 0:
             return 0.0
@@ -175,4 +201,11 @@ class ThreeFactorScorer:
             return 0.0
 
         decay = self.config.proximity_decay_per_hop
-        return max(1.0 - (graph_distance * decay), 0.0)
+        hop = max(1.0 - (graph_distance * decay), 0.0)
+
+        blend = self.config.edge_weight_blend
+        if blend <= 0.0:
+            return hop
+        blend = min(blend, 1.0)
+        strength = min(max(path_strength, 0.0), 1.0)
+        return (1.0 - blend) * hop + blend * strength

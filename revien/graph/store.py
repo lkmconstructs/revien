@@ -563,6 +563,48 @@ class GraphStore:
         # De-duplicate while keeping it a plain list per node.
         return {nid: list(dict.fromkeys(neigh)) for nid, neigh in out.items()}
 
+    def get_neighbors_weighted_bulk(
+        self, node_ids, use_confidence: bool = False
+    ) -> dict:
+        """Neighbors WITH edge strength for many nodes at once:
+        {node_id: [(neighbor_id, strength), ...]}.
+
+        strength is the edge weight (0-1), optionally multiplied by the
+        edge-level confidence when use_confidence=True. Parallel edges between
+        the same pair keep the MAX strength — the strongest relationship is
+        the one the walk should credit. Same one-round-trip-per-BFS-level
+        shape as get_neighbors_bulk; the extra columns ride the same rows.
+        """
+        ids = [i for i in node_ids]
+        out: dict = {nid: {} for nid in ids}
+        if not ids:
+            return {}
+        conn = self._get_conn()
+        for i in range(0, len(ids), self._IN_CHUNK):
+            chunk = ids[i:i + self._IN_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT source_node_id, target_node_id, weight, confidence "
+                f"FROM edges "
+                f"WHERE source_node_id IN ({placeholders}) "
+                f"OR target_node_id IN ({placeholders})",
+                chunk + chunk,
+            ).fetchall()
+            wanted = set(chunk)
+            for src, tgt, weight, confidence in rows:
+                strength = weight if weight is not None else 0.5
+                if use_confidence:
+                    strength *= confidence if confidence is not None else 0.5
+                if src in wanted:
+                    prev = out[src].get(tgt)
+                    if prev is None or strength > prev:
+                        out[src][tgt] = strength
+                if tgt in wanted:
+                    prev = out[tgt].get(src)
+                    if prev is None or strength > prev:
+                        out[tgt][src] = strength
+        return {nid: list(neigh.items()) for nid, neigh in out.items()}
+
     # ── Distill manifest (editable-vault leg) ──────────────────────────
     def replace_distill_manifest(self, note_stem: str, rows: list) -> None:
         """Replace all manifest rows for a note (full regen at distill time).

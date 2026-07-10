@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from revien.graph.schema import NodeType
+from revien.graph.schema import Edge, EdgeType, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionPipeline, IngestionInput
 from revien.retrieval.scorer import ScoringConfig, ThreeFactorScorer
@@ -180,6 +180,157 @@ class TestGraphWalker:
             for node_id, path in paths.items():
                 assert len(path) >= 1
                 assert path[0] == all_nodes[0].node_id  # Starts at anchor
+
+
+# ── Weighted Walk Tests (A1) ──────────────────────────────
+
+def _entity(store, label):
+    return store.add_node(Node(
+        node_type=NodeType.ENTITY, label=label, content=f"about {label}",
+    ))
+
+
+def _link(store, a, b, weight, confidence=0.5):
+    return store.add_edge(Edge(
+        edge_type=EdgeType.RELATED_TO,
+        source_node_id=a.node_id,
+        target_node_id=b.node_id,
+        weight=weight,
+        confidence=confidence,
+    ))
+
+
+class TestWeightedWalker:
+    def test_anchor_strength_is_one_and_one_hop_is_edge_weight(self, store):
+        a = _entity(store, "Alpha")
+        b = _entity(store, "Beta")
+        _link(store, a, b, weight=0.7)
+
+        walker = GraphWalker(store, max_depth=3)
+        distances, _, strengths = walker.walk_full([a.node_id])
+        assert strengths[a.node_id] == 1.0
+        assert distances[b.node_id] == 1
+        assert abs(strengths[b.node_id] - 0.7) < 1e-9
+
+    def test_strength_multiplies_along_path(self, store):
+        a = _entity(store, "Alpha")
+        b = _entity(store, "Beta")
+        c = _entity(store, "Gamma")
+        _link(store, a, b, weight=0.9)
+        _link(store, b, c, weight=0.8)
+
+        _, _, strengths = GraphWalker(store, max_depth=3).walk_full([a.node_id])
+        assert abs(strengths[c.node_id] - 0.72) < 1e-9
+
+    def test_same_level_strongest_parent_wins(self, store):
+        # Diamond: two 2-hop routes to D. Strong route 0.9*0.8=0.72 must win
+        # over 0.2*0.9=0.18, and the explain-path must follow the winner.
+        a = _entity(store, "Alpha")
+        b = _entity(store, "Beta")
+        c = _entity(store, "Gamma")
+        d = _entity(store, "Delta")
+        _link(store, a, b, weight=0.9)
+        _link(store, a, c, weight=0.2)
+        _link(store, b, d, weight=0.8)
+        _link(store, c, d, weight=0.9)
+
+        distances, paths, strengths = GraphWalker(
+            store, max_depth=3
+        ).walk_full([a.node_id])
+        assert distances[d.node_id] == 2
+        assert abs(strengths[d.node_id] - 0.72) < 1e-9
+        assert paths[d.node_id] == [a.node_id, b.node_id, d.node_id]
+
+    def test_parallel_edges_keep_max_strength(self, store):
+        a = _entity(store, "Alpha")
+        b = _entity(store, "Beta")
+        _link(store, a, b, weight=0.3)
+        _link(store, a, b, weight=0.8)
+
+        _, _, strengths = GraphWalker(store, max_depth=3).walk_full([a.node_id])
+        assert abs(strengths[b.node_id] - 0.8) < 1e-9
+
+    def test_edge_confidence_multiplies_when_enabled(self, store):
+        a = _entity(store, "Alpha")
+        b = _entity(store, "Beta")
+        _link(store, a, b, weight=0.8, confidence=0.5)
+
+        _, _, plain = GraphWalker(store, max_depth=3).walk_full([a.node_id])
+        _, _, with_conf = GraphWalker(
+            store, max_depth=3, use_edge_confidence=True
+        ).walk_full([a.node_id])
+        assert abs(plain[b.node_id] - 0.8) < 1e-9
+        assert abs(with_conf[b.node_id] - 0.4) < 1e-9
+
+
+class TestWeightedProximityScoring:
+    def test_blend_zero_is_byte_identical_to_hop_decay(self):
+        # The shipped default. Whatever strength arrives, proximity must be
+        # exactly the old hop-only formula.
+        scorer = ThreeFactorScorer(ScoringConfig())
+        for distance in range(0, 4):
+            expected = max(1.0 - distance * 0.3, 0.0)
+            for strength in (0.0, 0.1, 0.9, 1.0):
+                got = scorer._score_proximity(distance, strength)
+                assert got == expected
+
+    def test_blend_one_is_pure_path_strength(self):
+        scorer = ThreeFactorScorer(ScoringConfig(edge_weight_blend=1.0))
+        assert abs(scorer._score_proximity(2, 0.72) - 0.72) < 1e-9
+        assert abs(scorer._score_proximity(1, 0.1) - 0.1) < 1e-9
+
+    def test_blend_mixes_hop_and_strength(self):
+        scorer = ThreeFactorScorer(ScoringConfig(edge_weight_blend=0.5))
+        # distance 1: hop = 0.7; strength 0.9 -> 0.5*0.7 + 0.5*0.9 = 0.8
+        assert abs(scorer._score_proximity(1, 0.9) - 0.8) < 1e-9
+
+    def test_beyond_max_depth_is_zero_regardless_of_strength(self):
+        scorer = ThreeFactorScorer(ScoringConfig(edge_weight_blend=1.0))
+        assert scorer._score_proximity(4, 1.0) == 0.0
+
+    def test_from_env_reads_blend(self, monkeypatch):
+        monkeypatch.setenv("REVIEN_EDGE_WEIGHT_BLEND", "0.75")
+        assert ScoringConfig.from_env().edge_weight_blend == 0.75
+        monkeypatch.delenv("REVIEN_EDGE_WEIGHT_BLEND")
+        assert ScoringConfig.from_env().edge_weight_blend == 0.0
+
+
+class TestWeightedWalkEndToEnd:
+    def _weighted_store(self, store):
+        """Anchor 'Zephyrbeam' with a strong edge to one node and a weak
+        edge to another — same hop distance, same recency, same frequency,
+        so edge strength is the only discriminating signal."""
+        anchor = _entity(store, "Zephyrbeam")
+        strong = _entity(store, "Strongside")
+        weak = _entity(store, "Weakside")
+        _link(store, anchor, strong, weight=0.9)
+        _link(store, anchor, weak, weight=0.1)
+        return anchor, strong, weak
+
+    def test_blend_ranks_strong_edge_first(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_SEMANTIC", "0")  # deterministic graph path
+        anchor, strong, weak = self._weighted_store(store)
+
+        engine = RetrievalEngine(
+            store, scoring_config=ScoringConfig(edge_weight_blend=1.0)
+        )
+        response = engine.recall("zephyrbeam", top_n=10)
+        by_id = {r.node_id: r for r in response.results}
+        assert strong.node_id in by_id and weak.node_id in by_id
+        assert by_id[strong.node_id].score > by_id[weak.node_id].score
+        assert by_id[strong.node_id].score_breakdown["path_strength"] == 0.9
+
+    def test_blend_zero_scores_equal_and_breakdown_unchanged(
+        self, store, monkeypatch
+    ):
+        monkeypatch.setenv("REVIEN_SEMANTIC", "0")
+        anchor, strong, weak = self._weighted_store(store)
+
+        engine = RetrievalEngine(store, scoring_config=ScoringConfig())
+        response = engine.recall("zephyrbeam", top_n=10)
+        by_id = {r.node_id: r for r in response.results}
+        assert by_id[strong.node_id].score == by_id[weak.node_id].score
+        assert "path_strength" not in by_id[strong.node_id].score_breakdown
 
 
 # ── Retrieval Engine Integration Tests ────────────────────

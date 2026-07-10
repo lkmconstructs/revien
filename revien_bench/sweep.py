@@ -17,6 +17,10 @@ Knobs (env, read by RetrievalEngine / ScoringConfig.from_env):
     REVIEN_FREQUENCY_WEIGHT /      pass a full set summing to 1.0
     REVIEN_PROXIMITY_WEIGHT
     REVIEN_RECENCY_HALF_LIFE_DAYS  recency decay half-life (7.0)
+    REVIEN_EDGE_WEIGHT_BLEND       path-strength share of the proximity term
+                                   (default 0.0 = hop-only, shipped)
+    REVIEN_EDGE_CONFIDENCE_IN_WALK multiply edge confidence into walk
+                                   strength (default 0)
 
 Usage:
     python -m revien_bench.sweep --limit 2 --db-cache <dir> --out <dir>
@@ -100,6 +104,25 @@ VARIANTS: Dict[str, Dict[str, str]] = {
         "REVIEN_RECENCY_WEIGHT": "0.15",
         "REVIEN_FREQUENCY_WEIGHT": "0.30",
         "REVIEN_PROXIMITY_WEIGHT": "0.55",
+    },
+    # ROUND 3 (weighted walk, July 10 2026). Edges have carried weight
+    # (author-drawn vault links 0.8, extractor co-occurrence guesses 0.3) and
+    # mark_used() reinforcement since leg 1 — and the BFS read none of it:
+    # hop count was the only proximity signal. The blend ladder mixes path
+    # strength (product of edge weights along the shortest-hop path) into
+    # proximity: (1-b)*hop_decay + b*strength. Hypothesis: wins come out of
+    # `outranked` (hub nodes reached over weak guess-edges lose rank to nodes
+    # reached over strong ones); `disconnected` must not move — strength
+    # shapes ranking, never reachability. ew*_conf multiplies edge confidence
+    # in: mostly-0.5 defaults predict it inert, but if CSL-set confidences
+    # separate at scale it's a free second signal.
+    "ew25": {"REVIEN_EDGE_WEIGHT_BLEND": "0.25"},
+    "ew50": {"REVIEN_EDGE_WEIGHT_BLEND": "0.5"},
+    "ew75": {"REVIEN_EDGE_WEIGHT_BLEND": "0.75"},
+    "ew100": {"REVIEN_EDGE_WEIGHT_BLEND": "1.0"},
+    "ew50_conf": {
+        "REVIEN_EDGE_WEIGHT_BLEND": "0.5",
+        "REVIEN_EDGE_CONFIDENCE_IN_WALK": "1",
     },
 }
 

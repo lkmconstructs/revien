@@ -128,7 +128,16 @@ class RetrievalEngine:
         # unset env == exact defaults). This is what lets the bench sweep ranking
         # knobs without code edits.
         self.scorer = ThreeFactorScorer(scoring_config or ScoringConfig.from_env())
-        self.walker = GraphWalker(store, max_depth=max_depth)
+        # Weighted walk (A1): edge strength = weight, optionally * edge
+        # confidence. The strength only moves scores when the scorer's
+        # edge_weight_blend knob (REVIEN_EDGE_WEIGHT_BLEND) is > 0.
+        self.walker = GraphWalker(
+            store,
+            max_depth=max_depth,
+            use_edge_confidence=os.environ.get(
+                "REVIEN_EDGE_CONFIDENCE_IN_WALK", "0"
+            ).strip().lower() in ("1", "true", "yes", "on"),
+        )
         self.max_depth = max_depth
         self.clustering = clustering
 
@@ -257,13 +266,16 @@ class RetrievalEngine:
                 self.clustering.get_communities_for_anchors(anchor_ids)
             )
 
-        # 3. Walk graph from anchors — ONE traversal yields both distances
-        # and paths (this used to be two full BFS passes per recall).
+        # 3. Walk graph from anchors — ONE traversal yields distances, paths,
+        # and path strengths (this used to be two full BFS passes per recall).
         if anchor_ids:
-            node_distances, node_paths = self.walker.walk_full(anchor_ids)
+            node_distances, node_paths, node_strengths = self.walker.walk_full(
+                anchor_ids
+            )
         else:
             node_distances = {}
             node_paths = {}
+            node_strengths = {}
 
         # 4. Score all reachable nodes. One bulk fetch for the whole walked
         # frontier — a SELECT per node here was a measured latency driver.
@@ -309,6 +321,7 @@ class RetrievalEngine:
                 access_count=node.access_count,
                 graph_distance=distance,
                 now=now,
+                path_strength=node_strengths.get(node_id, 1.0),
             )
 
             # Neural adjustment (opt-in). Pass-through when no trained model /
@@ -369,6 +382,12 @@ class RetrievalEngine:
             # enabled, so the disabled-path breakdown is byte-for-byte unchanged.
             if self.semantic.is_enabled:
                 score_breakdown["semantic_sim"] = sim if sim is not None else 0.0
+            # Same rule for path strength: only in the breakdown when the
+            # weighted-walk blend is actually shaping the score.
+            if self.scorer.config.edge_weight_blend > 0.0:
+                score_breakdown["path_strength"] = round(
+                    node_strengths.get(node_id, 1.0), 4
+                )
 
             scored_results.append(RetrievalResult(
                 node_id=node.node_id,
