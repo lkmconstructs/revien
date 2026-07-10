@@ -443,6 +443,54 @@ checkpoint identity — worth fixing someday (hash the knob env into the checkpo
 include_context passthrough + REVIEN_DB_PATH env fallback (Lissa's server patch,
 reviewed + pushed, `8164f28`) — B1's edge primitive now has an API.
 
+## A2 VERDICT (July 10 2026) — wide net under the rerank guard; extraction leg retired
+Same session as A1; read A1's mechanism first — A2's answer builds on it.
+
+**Newline entity-regex fix (`8fa95b4`): shipped, measured recall-INERT.** \\s in the
+multi-word entity pattern fused line-boundary words into phantom entities
+("Deployment\\nRuns") — now horizontal-only whitespace, quoted patterns single-line,
+regression-tested. Fixed-extractor rebuild reproduced every conversational number to 4
+decimals: the junk never sat on gold paths. Hygiene, not headline — do NOT expect recall
+from extractor cosmetics.
+
+**The `disconnected` bucket fell to a knob, not an extraction leg.** Definition
+(failure_analysis): gold unreachable from anchors even at depth 6 — i.e. below the
+semantic top-K cutoff AND no graph path. Every turn IS embedded, so net WIDTH is the
+direct lever: REVIEN_SEMANTIC_TOP_K 30->100. That was round-1's measured loser (weak
+sims flooded the ranking) — but that failure mode is exactly what the cross-encoder head
+now guards. Old loser, new bodyguard:
+- rerank_wide (k30 head): disconnected 71->33 subset at NO latency cost, but converts
+  land in `outranked` (the gazetteer lesson: reachability without ranking moves buckets).
+- **rerank_wide_k50 (the quality-mode shape): REVIEN_RERANK=1 REVIEN_SEMANTIC_TOP_K=100
+  REVIEN_RERANK_TOP_K=50. FULL SCALE (1,986 QA, fresh checkpoint, fixed extractor,
+  `results/20260710T202404Z_semantic.json`): recall@1 0.4175 (2.11x baseline), recall@5
+  0.6073, recall@10 0.6607 (+28.5% vs 0.5141), MRR 0.5514, nDCG 0.5583. Disconnected
+  479 -> 246 (-49%), walk_depth 4 -> 1. Latency p50 1,156ms / p90 1,902ms. Sovereignty
+  PASS, $0, network_calls=0.**
+- Vault same knobs + fixed extractor: recall@10 0.9419 -> 0.9535, cross_note 0.8667,
+  misses 4 (all outranked, ZERO disconnected). Both-corpora rule satisfied.
+- SIM_FLOOR 0.30->0.20 bound nothing (identical rows) — the floor is not the constraint
+  at top-100.
+
+**The ranking-mode menu (all env, all measured, defaults untouched pending Lissa):**
+  default        85ms p50   recall@10 0.5141   (shipped behavior, byte-identical)
+  rerank         593ms p50  recall@10 0.6370   (REVIEN_RERANK=1)
+  quality mode   1.16s p50  recall@10 0.6607   (+ SEMANTIC_TOP_K=100, RERANK_TOP_K=50)
+
+**What A2 retires and what it leaves:** the planned extraction-coverage leg for
+conversational recall is RETIRED — the wide net does the reaching cheaper than better
+extraction would (second measurement today to kill planned work; cheaper than building
+it). Still real: residual 246 disconnected + deep-buried outranked (median rank 69) are
+the aliasing/vocabulary class ("offline mode"->Roadmap 2026); never_extracted stays 9
+(ingest near-lossless, as banked July 2). Extraction work now only serves graph QUALITY
+(Track B / distill), not recall numbers.
+
+**Second cache trap logged:** the bench db cache is keyed by config+conv, NOT extractor
+version — post-regex measurements used a fresh dir (results/db_cache2; db_cache is
+old-extractor). Same class as the checkpoint trap: code version isn't part of either
+cache identity. Fold both into one fix when touched next (hash extractor/knob env into
+cache + checkpoint names).
+
 **Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
 - Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
   neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
