@@ -57,11 +57,14 @@ EVENT_PATTERNS = [
     r"(?:on |last |this )?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|week|month|yesterday),?\s*(?:we )?(.*?)(?:\.|$)",
 ]
 
-# Entity extraction — capitalized multi-word phrases, tech terms, quoted terms
+# Entity extraction — capitalized multi-word phrases, tech terms, quoted terms.
+# Whitespace inside a candidate is HORIZONTAL only ([ \t]) — \s matched
+# newlines, fusing the last word of one line with the first capitalized word
+# of the next into phantom entities ("Deployment\nRuns", "Marketing\nTeam").
 ENTITY_PATTERNS = [
-    r'"([A-Z][^"]{1,80})"',  # Quoted capitalized terms
-    r"'([A-Z][^']{1,80})'",  # Single-quoted capitalized terms
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b",  # Multi-word proper nouns
+    r'"([A-Z][^"\n]{1,80})"',  # Quoted capitalized terms
+    r"'([A-Z][^'\n]{1,80})'",  # Single-quoted capitalized terms
+    r"\b([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+)+)\b",  # Multi-word proper nouns
 ]
 
 # Known tech terms that should be extracted as entities

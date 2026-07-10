@@ -135,6 +135,25 @@ VARIANTS: Dict[str, Dict[str, str]] = {
     # recall_p50_ms pays the model cost — the sweep prices that trade.
     "rerank": {"REVIEN_RERANK": "1"},
     "rerank_k50": {"REVIEN_RERANK": "1", "REVIEN_RERANK_TOP_K": "50"},
+    # ROUND 4 (wide net under the rerank guard, July 10 2026 — A2). topk100
+    # was a round-1 LOSER (-0.04: weak sims flooded the ranking) — but that
+    # failure mode is exactly what the cross-encoder head now guards. Every
+    # gold context turn IS embedded, so the semantic net is the direct lever
+    # on `disconnected` (479 at full scale = gold below the sim-floor/top-K
+    # cutoff AND graph-unreachable). Hypothesis: disconnected shrinks, the
+    # extra candidates survive the head because the reranker — not raw sim —
+    # orders them; floor20 additionally lowers the admission bar.
+    "rerank_wide": {"REVIEN_RERANK": "1", "REVIEN_SEMANTIC_TOP_K": "100"},
+    "rerank_wide_k50": {
+        "REVIEN_RERANK": "1",
+        "REVIEN_SEMANTIC_TOP_K": "100",
+        "REVIEN_RERANK_TOP_K": "50",
+    },
+    "rerank_wide_floor20": {
+        "REVIEN_RERANK": "1",
+        "REVIEN_SEMANTIC_TOP_K": "100",
+        "REVIEN_SEMANTIC_SIM_FLOOR": "0.20",
+    },
 }
 
 

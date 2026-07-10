@@ -101,6 +101,23 @@ class TestRuleBasedExtractor:
         assert len(topics) >= 1, \
             f"Expected >= 1 topic, got {len(topics)}: {[n.label for n in topics]}"
 
+    def test_entities_never_span_newlines(self, extractor):
+        """A2 regression: \\s in the multi-word entity pattern fused the last
+        word of one line with the first capitalized word of the next
+        ("Deployment\\nRuns", "Marketing\\nTeam") into phantom entities."""
+        text = (
+            "The Deployment\nRuns every night. Check with Marketing\nTeam "
+            "before release. Sarah Chen approved the \"Atlas Server\" rollout."
+        )
+        result = extractor.extract(text, source_id="newline-junk")
+        entity_labels = [
+            n.label for n in result.nodes if n.node_type == NodeType.ENTITY
+        ]
+        for label in entity_labels:
+            assert "\n" not in label, f"entity spans a newline: {label!r}"
+        assert "Sarah Chen" in entity_labels  # real multi-word entity survives
+        assert "Atlas Server" in entity_labels  # quoted term survives
+
     def test_edges_connect_to_context(self, extractor):
         result = extractor.extract(SAMPLE_CONVERSATION)
         context_id = result.context_node.node_id
