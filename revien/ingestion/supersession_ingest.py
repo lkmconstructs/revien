@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from revien.graph.schema import Edge, EdgeType, Node, NodeType
@@ -149,7 +150,32 @@ class ClaimGovernor:
         return outcomes
 
     def _supersede(self, existing_node: Node, new_node: Node) -> None:
-        """Soft-invalidate the existing claim and record the supersession link."""
+        """Soft-invalidate the existing claim and record the supersession link.
+
+        B2 (bi-temporal): the supersession IS the transition — close the old
+        claim's validity window and open the new one's at the same instant T,
+        where T is the best available CONTENT time of the new claim
+        (event_time_start > recorded_at > now). The old claim's valid_from is
+        backfilled from its own content time when known, so "where did she
+        live in March?" reads a full [from, until) window, not just an end.
+        set_node_validity never overwrites an already-set bound, so a second
+        supersession cannot silently move a recorded transition."""
+        transition = (
+            new_node.event_time_start
+            or new_node.recorded_at
+            or datetime.now(timezone.utc)
+        )
+        self.store.set_node_validity(
+            existing_node.node_id,
+            valid_from=existing_node.event_time_start or existing_node.recorded_at,
+            valid_until=transition,
+            actor="csl_supersession",
+        )
+        self.store.set_node_validity(
+            new_node.node_id,
+            valid_from=transition,
+            actor="csl_supersession",
+        )
         self.ops.invalidate_node(
             existing_node.node_id,
             reason=f"superseded_by:{new_node.node_id}",

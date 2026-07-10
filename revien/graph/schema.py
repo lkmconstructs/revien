@@ -120,14 +120,21 @@ class Node(BaseModel):
     # year") is stored honestly as "sometime in 2025", never a guessed day.
     # `event_time_granularity` is the precision label; `event_time_confidence` the
     # resolver's confidence; `event_time_text` the raw expression, kept verbatim.
-    # valid_from/valid_until/last_verified_at are DEFERRED to L3 — they depend on
-    # claim durability (L2.5), not derivable from text alone.
     recorded_at: Optional[datetime] = None
     event_time_start: Optional[datetime] = None
     event_time_end: Optional[datetime] = None
     event_time_granularity: Optional[TemporalGranularity] = None
     event_time_confidence: Optional[float] = None
     event_time_text: str = ""
+
+    # Bi-temporal validity (B2 — the L3 the comment above used to defer):
+    # when this claim WAS TRUE, distinct from when it was said (recorded_at)
+    # or written (created_at). NULL = unbounded on that side. Supersession
+    # closes the old claim's window and opens the new one's at the same
+    # transition instant — which is what makes recall(as_of=...) able to
+    # answer "where did she live in March?" after June's fact replaced it.
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
 
 
 class Edge(BaseModel):

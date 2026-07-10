@@ -214,6 +214,7 @@ class RetrievalEngine:
         include_invalidated: bool = False,
         include_context: bool = False,
         include_tensions: bool = False,
+        as_of: Optional[datetime] = None,
         debug: bool = False,
     ) -> RetrievalResponse:
         """
@@ -234,6 +235,15 @@ class RetrievalEngine:
                 side of any CONFLICTS_WITH edge it holds (B1 tension
                 surfacing) in ``result.tensions``. Default False: zero extra
                 queries, response byte-identical.
+            as_of: Bi-temporal query time (B2) — "what was true AT this
+                time?". Nodes whose validity window excludes as_of are
+                filtered; a SUPERSEDED (invalidated) node whose closed window
+                COVERS as_of is deliberately included — recovering the old
+                truth is the point ("where did she live in March?").
+                Invalidated nodes with no window stay hidden (their validity
+                is unknown, not historical). When `now` is not given, recency
+                scores relative to as_of, so ranking is coherent with the
+                queried moment. Default None: byte-identical behavior.
             debug: When True, the response carries a ``diagnostics`` dict
                 (anchor sets by origin, walked node distances, per-node final
                 scores including sub-threshold ones, and filter reasons) so a
@@ -247,7 +257,11 @@ class RetrievalEngine:
         top_n = min(top_n, 20)
 
         if now is None:
-            now = datetime.now(timezone.utc)
+            # An as_of query ranks relative to the queried moment — recency
+            # scored from wall-clock now would bury the era being asked about.
+            now = as_of if as_of is not None else datetime.now(timezone.utc)
+        if as_of is not None and as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
 
         # 1. Parse query — extract entities and topics
         entity_anchor_ids = self._find_anchors(query)
@@ -320,9 +334,33 @@ class RetrievalEngine:
                     diag_filtered[node_id] = "context_excluded"
                 continue
 
+            # Bi-temporal filter (B2): with as_of set, validity windows decide.
+            # A closed-window SUPERSEDED node covering as_of comes BACK — that
+            # recovered old truth is what an as-of query exists for.
+            if as_of is not None:
+                vf, vu = node.valid_from, node.valid_until
+                if vf is not None and vf.tzinfo is None:
+                    vf = vf.replace(tzinfo=timezone.utc)
+                if vu is not None and vu.tzinfo is None:
+                    vu = vu.replace(tzinfo=timezone.utc)
+                if vf is not None and vf > as_of:
+                    if debug:
+                        diag_filtered[node_id] = "not_yet_valid"
+                    continue
+                if vu is not None and vu <= as_of:
+                    if debug:
+                        diag_filtered[node_id] = "no_longer_valid"
+                    continue
+                # Invalidated with NO closed window: validity unknown, not
+                # historical — keep the provenance default unless overridden.
+                if (node.invalidated_at is not None and vu is None
+                        and not include_invalidated):
+                    if debug:
+                        diag_filtered[node_id] = "invalidated"
+                    continue
             # Provenance (leg 6a): exclude soft-invalidated nodes by default.
             # No-op when nothing is invalidated, so recall stays byte-identical.
-            if node.invalidated_at is not None and not include_invalidated:
+            elif node.invalidated_at is not None and not include_invalidated:
                 if debug:
                     diag_filtered[node_id] = "invalidated"
                 continue

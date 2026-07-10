@@ -157,9 +157,15 @@ def connect(system: str, path: Optional[str]):
 @click.argument("query")
 @click.option("--top", default=5, help="Number of results to return")
 @click.option("--db", default=None, help="Database path")
+@click.option("--as-of", "as_of", default=None,
+              help="Bi-temporal query time (ISO-8601): what was true AT this "
+                   "time — superseded facts whose validity window covers it "
+                   "come back")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
-def recall(query: str, top: int, db: Optional[str], json_output: bool):
+def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
+           json_output: bool):
     """Query Revien memory from the command line."""
+    from datetime import datetime
     from revien.graph.store import GraphStore
     from revien.retrieval.engine import RetrievalEngine
 
@@ -170,11 +176,19 @@ def recall(query: str, top: int, db: Optional[str], json_output: bool):
         click.echo("No Revien database found. Run 'revien start' first.")
         return
 
+    as_of_dt = None
+    if as_of:
+        try:
+            as_of_dt = datetime.fromisoformat(as_of)
+        except ValueError:
+            click.echo(f"Invalid --as-of (ISO-8601 expected): {as_of}")
+            return
+
     store = GraphStore(db_path=db_path)
     engine = RetrievalEngine(store)
 
     try:
-        response = engine.recall(query, top_n=top)
+        response = engine.recall(query, top_n=top, as_of=as_of_dt)
 
         if json_output:
             output = {

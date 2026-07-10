@@ -93,7 +93,9 @@ class GraphStore:
                 event_time_end TEXT,
                 event_time_granularity TEXT,
                 event_time_confidence REAL,
-                event_time_text TEXT DEFAULT ''
+                event_time_text TEXT DEFAULT '',
+                valid_from TEXT,
+                valid_until TEXT
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -184,6 +186,7 @@ class GraphStore:
         self._migrate_add_modality_columns(conn)
         # Claim Sovereignty Layer (Leg 2): add temporal columns to older DBs.
         self._migrate_add_temporal_columns(conn)
+        self._migrate_add_validity_columns(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -318,6 +321,27 @@ class GraphStore:
                 conn.execute("ALTER TABLE nodes ADD COLUMN event_time_confidence REAL")
             if "event_time_text" not in columns:
                 conn.execute("ALTER TABLE nodes ADD COLUMN event_time_text TEXT DEFAULT ''")
+
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Column already exists or other migration issue — log but don't fail.
+            print(f"Migration note: {e}")
+
+    def _migrate_add_validity_columns(self, conn: sqlite3.Connection) -> None:
+        """Add bi-temporal validity columns (B2) to existing DBs.
+
+        Idempotent and no-op for fresh databases. Both columns are nullable
+        and backfill NULL (validity unbounded/unknown), so recall stays
+        byte-identical until a supersession closes a window or a caller
+        passes as_of."""
+        try:
+            cursor = conn.execute("PRAGMA table_info(nodes)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            if "valid_from" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN valid_from TEXT")
+            if "valid_until" not in columns:
+                conn.execute("ALTER TABLE nodes ADD COLUMN valid_until TEXT")
 
             conn.commit()
         except sqlite3.OperationalError as e:
@@ -462,9 +486,9 @@ class GraphStore:
                 invalidated_at, source_modality, answerable_by_text,
                 vision_processed, recorded_at, event_time_start,
                 event_time_end, event_time_granularity, event_time_confidence,
-                event_time_text)
+                event_time_text, valid_from, valid_until)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -492,6 +516,8 @@ class GraphStore:
                 node.event_time_granularity.value if node.event_time_granularity else None,
                 node.event_time_confidence,
                 node.event_time_text,
+                node.valid_from.isoformat() if node.valid_from else None,
+                node.valid_until.isoformat() if node.valid_until else None,
             ),
         )
         conn.commit()
@@ -885,6 +911,40 @@ class GraphStore:
             q += " WHERE resolved_at IS NULL"
         return conn.execute(q).fetchone()[0]
 
+    def set_node_validity(
+        self, node_id: str, valid_from=None, valid_until=None,
+        actor: str = "",
+    ) -> bool:
+        """Set a node's bi-temporal validity bounds (B2). Partial update:
+        only non-None arguments are written, and an ALREADY-SET bound is
+        never silently overwritten (a recorded transition is a fact — moving
+        it needs a deliberate audit story, not a second supersession racing
+        the first). Audited. Returns False for unknown node or no-op."""
+        node = self.get_node(node_id)
+        if node is None:
+            return False
+        updates, params = [], []
+        if valid_from is not None and node.valid_from is None:
+            updates.append("valid_from = ?")
+            params.append(valid_from.isoformat())
+        if valid_until is not None and node.valid_until is None:
+            updates.append("valid_until = ?")
+            params.append(valid_until.isoformat())
+        if not updates:
+            return False
+        conn = self._get_conn()
+        conn.execute(
+            f"UPDATE nodes SET {', '.join(updates)} WHERE node_id = ?",
+            params + [node_id],
+        )
+        conn.commit()
+        after = self.get_node(node_id)
+        self._record_node_audit(
+            node_id, "validity", actor=actor,
+            before_node=node, after_node=after,
+        )
+        return True
+
     def list_tension_pairs(self, live_only: bool = True) -> list[dict]:
         """The tensions view (B1): every CONFLICTS_WITH pair with both claims.
 
@@ -1056,6 +1116,10 @@ class GraphStore:
             event_time_granularity=TemporalGranularity(row[23]) if len(row) > 23 and row[23] else None,
             event_time_confidence=float(row[24]) if len(row) > 24 and row[24] is not None else None,
             event_time_text=row[25] if len(row) > 25 and row[25] else "",
+            # Bi-temporal validity (B2, columns 26-27): nullable — a pre-B2
+            # row reads back with an unbounded window.
+            valid_from=datetime.fromisoformat(row[26]) if len(row) > 26 and row[26] else None,
+            valid_until=datetime.fromisoformat(row[27]) if len(row) > 27 and row[27] else None,
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:

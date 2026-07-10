@@ -46,6 +46,8 @@ class RecallRequest(BaseModel):
     include_invalidated: bool = False
     include_context: bool = False
     include_tensions: bool = False
+    # Bi-temporal query time (B2), ISO-8601: "what was true AT this time?"
+    as_of: Optional[str] = None
 
 
 class NodeUpdateRequest(BaseModel):
@@ -88,6 +90,9 @@ class NodeResponse(BaseModel):
     last_accessed: str
     access_count: int
     metadata: Dict[str, Any]
+    # Bi-temporal validity (B2) — when the claim WAS TRUE. Null = unbounded.
+    valid_from: Optional[str] = None
+    valid_until: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -183,6 +188,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.post("/v1/recall")
     async def recall(request: RecallRequest):
         """Query memory. Returns ranked nodes by three-factor score."""
+        as_of = None
+        if request.as_of:
+            try:
+                as_of = datetime.fromisoformat(request.as_of)
+            except ValueError:
+                raise HTTPException(400, f"Invalid as_of (ISO-8601 expected): {request.as_of}")
+
         response = engine.recall(
             query=request.query,
             top_n=request.top_n,
@@ -190,6 +202,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             include_invalidated=request.include_invalidated,
             include_context=request.include_context,
             include_tensions=request.include_tensions,
+            as_of=as_of,
         )
         return {
             "query": response.query,
@@ -636,6 +649,8 @@ def _node_to_response(node: Node) -> NodeResponse:
         last_accessed=node.last_accessed.isoformat(),
         access_count=node.access_count,
         metadata=node.metadata,
+        valid_from=node.valid_from.isoformat() if node.valid_from else None,
+        valid_until=node.valid_until.isoformat() if node.valid_until else None,
     )
 
 
