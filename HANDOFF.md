@@ -392,6 +392,57 @@ that nothing draws/reads/closes them. The candidate queue already preserves both
 a contradiction. Confidence decay is already per-type-gated. The doc's items 1/2/4 are
 therefore smaller than specced; what it omitted (reranker) is the largest measured lever.
 
+## A1 VERDICT (July 10 2026) — weighted walk NULL, cross-encoder rerank is the lever
+Both halves built, swept, and full-scale confirmed in one session. Read this before
+touching ranking again.
+
+**Weighted walk: built, measured INERT — and the null is the finding.** The walker now
+tracks path strength (product of edge weights along the shortest-hop path, strongest
+same-level parent wins, same one-round-trip-per-level perf shape) and the scorer blends
+it into proximity behind REVIEN_EDGE_WEIGHT_BLEND (default 0.0 = byte-identical;
+REVIEN_EDGE_CONFIDENCE_IN_WALK multiplies edge confidence in). The full ew ladder
+(0.25/0.5/0.75/1.0/conf) came back IDENTICAL to baseline to 4 decimals on BOTH corpora.
+Measured mechanism (hand-verified against the cached bench db): with semantic-as-spine
+the entire top-20 is distance-0 semantic anchors, where path strength is definitionally
+1.0 — proximity (hop OR strength) is candidate-generation, not ranking. The `outranked`
+bucket is anchor-vs-anchor BI-ENCODER misranking; no graph-side knob can reach it. The
+knob ships (graph-only fallback + Track B edge-heavy flows want it); no default flip.
+
+**Cross-encoder head rerank: the champion.** revien/semantic/rerank.py — local ONNX
+cross-encoder (Xenova/ms-marco-MiniLM-L-6-v2, 80MB, fastembed TextCrossEncoder), OPT-IN
+via REVIEN_RERANK=1, rescores the top-K (REVIEN_RERANK_TOP_K, default 30) base-ranked
+results BEFORE the top_n slice, tail untouched, raw score in
+score_breakdown[rerank_score], base score never overwritten. Same discipline as the
+semantic spine: find_spec guard, offline-first load, self-disabling, loud degrade.
+- **FULL SCALE (1,986 QA, fresh checkpoint, `results/20260710T171258Z_semantic.json`):
+  recall@1 0.1974 -> 0.4036 (2.04x), recall@5 0.4128 -> 0.5851, recall@10 0.5141 ->
+  0.6370 (+24%), MRR 0.3231 -> 0.5341, nDCG@10 0.3562 -> 0.5397.** Taxonomy: outranked
+  1072 -> 733; disconnected EXACTLY 479, never_extracted 9, walk_depth 4 — all pinned
+  (mechanism confirmed to the item). Sovereignty PASS, $0, network_calls=0.
+- Vault corpus same knob: recall@1 0.5233 -> 0.7674, MRR 0.7378 -> 0.9593, recall@10
+  0.8837 -> 0.9419, single_note 1.0, attachment MRR 1.0, misses 9 -> 5 (all outranked).
+- k50 vs k30: +0.005 recall@10 at 2x rerank cost — k30 is the shape.
+- **The open trade — LATENCY (Lissa's call, default-flip gate):** recall p50 85ms ->
+  593ms, p90 250ms -> 1,097ms at full scale (cross-encoder cost is token-bound; vault's
+  shorter notes ran p50 ~573ms). Options if default-on is wanted: int8 quantized variant
+  of the same model (onnx/model_quantized.onnx exists upstream), content truncation cap,
+  or ship as documented "quality mode". Default stays OFF until her verdict.
+- Residual outranked (733) has median best rank 94 (was 33) — the reranker consumed its
+  own headroom; what remains is buried too deep for a bigger head. Next levers there are
+  extraction coverage (A2) and aliasing/vocabulary, NOT more reranking.
+- The old TF-IDF NeuralScorer stays as-is (real-usage signals, never fires in-bench);
+  "replace the neural scorer" is hereby satisfied by the cross-encoder path.
+
+**Bench trap logged:** the runner RESUMES from `.checkpoint_semantic_extractive.jsonl`
+even when env knobs changed — a first confirm run came back `ran=0 resumed=10` and
+silently replayed July's pre-rerank rows. ALWAYS read the `resume:` line before trusting
+a run; stale checkpoint moved to `.pre-rerank.jsonl.bak`. Env knobs are not part of the
+checkpoint identity — worth fixing someday (hash the knob env into the checkpoint name).
+
+**Also this session:** conflicts_with edge type + POST /v1/edges + recall
+include_context passthrough + REVIEN_DB_PATH env fallback (Lissa's server patch,
+reviewed + pushed, `8164f28`) — B1's edge primitive now has an API.
+
 **Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
 - Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
   neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
