@@ -88,6 +88,13 @@ class LLMSensitivityRecognizer:
         self.key_env = cfg["key_env"]
         self.api_key = os.environ.get(self.key_env, "") if self.key_env else ""
         self.is_cloud = backend in CLOUD_BACKENDS
+        # Subclass surface: a sibling recognizer (e.g. the tension
+        # recognizer) overrides these to reuse the transport unchanged.
+        self.system_prompt = SYSTEM_PROMPT
+        self.verdict_re = _VERDICT_RE
+        self.max_tokens = 4
+        self.disclosure_purpose = "judge its sensitivity"
+        self.backend_env = "REVIEN_SENSITIVITY_BACKEND"
         self._broken = False
         self.network_calls = 0
 
@@ -120,7 +127,7 @@ class LLMSensitivityRecognizer:
 
     def _classify(self, text: str) -> Optional[str]:
         if self.is_cloud:
-            _disclose_cloud(self.backend)
+            _disclose_cloud(self.backend, self.disclosure_purpose, self.backend_env)
         self.network_calls += 1
         if self.backend == "anthropic":
             raw = self._call_anthropic(text)
@@ -128,20 +135,20 @@ class LLMSensitivityRecognizer:
             raw = self._call_ollama(text)
         else:
             raw = self._call_openai_compatible(text)
-        m = _VERDICT_RE.search(raw or "")
+        m = self.verdict_re.search(raw or "")
         return m.group(1).upper() if m else None
 
     def _call_openai_compatible(self, text: str) -> str:
-        payload = {"model": self.model, "temperature": 0.0, "max_tokens": 4,
-                   "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+        payload = {"model": self.model, "temperature": 0.0, "max_tokens": self.max_tokens,
+                   "messages": [{"role": "system", "content": self.system_prompt},
                                 {"role": "user", "content": text}]}
         data = self._post(self.url, payload,
                           {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
         return data["choices"][0]["message"]["content"]
 
     def _call_anthropic(self, text: str) -> str:
-        payload = {"model": self.model, "max_tokens": 4, "temperature": 0.0,
-                   "system": SYSTEM_PROMPT, "messages": [{"role": "user", "content": text}]}
+        payload = {"model": self.model, "max_tokens": self.max_tokens, "temperature": 0.0,
+                   "system": self.system_prompt, "messages": [{"role": "user", "content": text}]}
         data = self._post(self.url, payload,
                           {"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
                            "Content-Type": "application/json"})
@@ -149,7 +156,7 @@ class LLMSensitivityRecognizer:
 
     def _call_ollama(self, text: str) -> str:
         payload = {"model": self.model, "stream": False, "options": {"temperature": 0.0},
-                   "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                   "messages": [{"role": "system", "content": self.system_prompt},
                                 {"role": "user", "content": text}]}
         data = self._post(self.url, payload, {"Content-Type": "application/json"})
         if isinstance(data.get("message"), dict):

@@ -62,6 +62,7 @@ class SupersessionAction(str, Enum):
     AUTO_SUPERSEDE = "auto_supersede"  # gate fully cleared — replace
     CANDIDATE = "candidate"            # conflict surfaced for human review
     VERSION_LOCKED = "version_locked"  # iron-grip: version on explicit instruction only
+    COEXIST = "coexist"                # genuine tension: BOTH live, edge drawn, nothing queued
 
 
 @dataclass
@@ -87,6 +88,16 @@ class SupersessionDecision:
 _SINGLE_VALUED = frozenset({
     ClaimType.RELATIONSHIP, ClaimType.IDENTITY, ClaimType.CURRENT_STATE,
     ClaimType.HEALTH_STATE,
+})
+
+# B1: types where two AFFIRMATIVE claims can pull in opposite directions and
+# BOTH stay true of the same person ("I want closeness" / "I want space") —
+# a tension to draw, not a conflict to resolve. Single-valued types are
+# deliberately excluded: a value mismatch there is a real either/or and keeps
+# its human-review/supersession handling.
+_TENSION_TYPES = frozenset({
+    ClaimType.PREFERENCE_HABIT, ClaimType.BELIEF_VALUE,
+    ClaimType.ASPIRATION_GOAL, ClaimType.EMOTION_STATE,
 })
 
 _RELATIONSHIP_STATUS = ("single", "married", "divorced", "engaged", "dating", "widowed")
@@ -149,9 +160,16 @@ class SupersessionGate:
     def __init__(self, protected_set: Set[ClaimType] = PROTECTED_DEFAULT,
                  new_conf_bar: float = NEW_CONF_BAR,
                  tripwire: Optional[DistrustTripwire] = None,
-                 recognizer=None):
+                 recognizer=None,
+                 tension_recognizer=None):
         self.protected_set = protected_set
         self.new_conf_bar = new_conf_bar
+        # B1 tension recognizer (opt-in, like Trigger 2): consulted ONLY on
+        # scoped-but-lexically-compatible pairs of tension-class types, where
+        # the rule contradiction check is blind to affirmative-affirmative
+        # opposition ("I want closeness" / "I want space"). None = the gate
+        # is byte-identical to pre-B1 behavior.
+        self.tension_recognizer = tension_recognizer
         # Trigger 2 semantic sensitive recognizer (primary recognition when set).
         # Opt-in: when None, the gate runs tripwire-only (interim, degraded-safety).
         # Production/launch wires a SemanticSensitivityRecognizer; the tripwire then
@@ -320,6 +338,31 @@ class SupersessionGate:
         contradiction = self._contradicts(existing, new)
         trace.append(f"contradiction={contradiction}")
         if not contradiction:
+            # ── B1 TENSION HOOK (opt-in) ──────────────────────────────────
+            # The rule check above is blind to affirmative-affirmative
+            # semantic opposition (no value flip, no negation, possibly no
+            # shared tokens). For tension-class types, ask the recognizer —
+            # a clean TENSION verdict means both claims stay live and the
+            # governor draws a CONFLICTS_WITH edge. COMPATIBLE/UNSURE/
+            # unavailable all fall through to the unchanged no-conflict path
+            # (§7.2: similarity is not opposition, sentiment is not
+            # contradiction — and a retraction carries a negation, so the
+            # affirmative-affirmative guard keeps it out by construction).
+            if (
+                self.tension_recognizer is not None
+                and existing.result.claim_type in _TENSION_TYPES
+                and _polarity(existing.text) == 1
+                and _polarity(new.text) == 1
+            ):
+                verdict = self.tension_recognizer.recognize_pair(
+                    existing.text, new.text
+                )
+                if verdict.is_tension:
+                    trace.append("tension_recognized")
+                    return SupersessionDecision(
+                        SupersessionAction.COEXIST, "tension_coexist",
+                        so, False, trace)
+                trace.append(f"tension_checked:{verdict.route.value}")
             return SupersessionDecision(
                 SupersessionAction.NO_CONFLICT, "scoped_but_compatible", so, False, trace)
 
@@ -417,6 +460,7 @@ class SupersessionMetrics:
     candidate: int = 0
     version_locked: int = 0
     no_conflict: int = 0
+    coexist: int = 0
     # SAFETY-relevant overlays (not dispositions). A floor catch has
     # action=NO_CONFLICT and a tripwire catch action=CANDIDATE, so without these
     # counters sensitive activity would blur into the ordinary disposition counts
@@ -439,6 +483,8 @@ class SupersessionMetrics:
             self.candidate += 1
         elif a is SupersessionAction.VERSION_LOCKED:
             self.version_locked += 1
+        elif a is SupersessionAction.COEXIST:
+            self.coexist += 1
         else:
             self.no_conflict += 1
         if "sensitive_floor:existing_not_classified" in decision.trace:
@@ -456,7 +502,8 @@ class SupersessionMetrics:
 
     @property
     def total(self) -> int:
-        return self.auto + self.candidate + self.version_locked + self.no_conflict
+        return (self.auto + self.candidate + self.version_locked
+                + self.no_conflict + self.coexist)
 
     @property
     def candidate_queue_depth(self) -> int:

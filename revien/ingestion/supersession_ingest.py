@@ -13,6 +13,10 @@ every ingested claim:
                                       new -CORRECTS-> old. The ONLY mutating path.
            -> CANDIDATE / VERSION_LOCKED : park the pair in the candidate queue
                                       for human review. Mutates NOTHING.
+           -> COEXIST (B1)          : genuine tension between two affirmative
+                                      claims — BOTH stay live, a CONFLICTS_WITH
+                                      edge makes the tension first-class.
+                                      Opt-in via REVIEN_TENSION_BACKEND.
            -> NO_CONFLICT           : leave both standing.
 
 Design choices:
@@ -117,6 +121,14 @@ class ClaimGovernor:
             if action is SupersessionAction.AUTO_SUPERSEDE:
                 self._supersede(existing_node, new_node)
                 effect = f"existing soft-invalidated (superseded_by {new_node.node_id})"
+            elif action is SupersessionAction.COEXIST:
+                # B1: genuine tension — BOTH claims stay live, nothing queued,
+                # nothing invalidated. The tension becomes first-class as a
+                # CONFLICTS_WITH edge (non-mutating by contract, schema.py) so
+                # recall/lineage can surface it. Additive-only, so the curated
+                # shield does not apply.
+                self._draw_tension(existing_node, new_node, reason)
+                effect = "tension drawn (conflicts_with edge); BOTH claims live"
             else:  # CANDIDATE or VERSION_LOCKED -> queue, mutate nothing
                 cid = self.store.add_candidate(
                     existing_node.node_id, new_node.node_id,
@@ -153,6 +165,52 @@ class ClaimGovernor:
         except Exception:  # noqa: BLE001 - the link is best-effort; invalidation is the fact
             pass
 
+    def _draw_tension(
+        self, existing_node: Node, new_node: Node, source_context: str
+    ) -> None:
+        """Draw the non-mutating tension edge between two live claims (B1).
+
+        Idempotent per pair: re-ingesting either side must not stack duplicate
+        tension edges (the governor re-compares every ingest)."""
+        for e in self.store.get_edges_for_node(existing_node.node_id):
+            if e.edge_type is EdgeType.CONFLICTS_WITH and (
+                {e.source_node_id, e.target_node_id}
+                == {existing_node.node_id, new_node.node_id}
+            ):
+                return
+        self.store.add_edge(Edge(
+            edge_type=EdgeType.CONFLICTS_WITH,
+            source_node_id=new_node.node_id,
+            target_node_id=existing_node.node_id,
+            weight=0.8,
+            confidence_set_by="csl_tension_gate",
+            source_context=source_context,
+        ))
+
+    def coexist_candidate(self, candidate_id: int) -> bool:
+        """Resolve a queued candidate as a COEXISTING tension (human's hands).
+
+        Draws the CONFLICTS_WITH edge between the pair and marks the candidate
+        resolved as "coexist". Mutates neither claim — both stay live. Returns
+        False when the candidate is unknown or already resolved.
+        """
+        row = next(
+            (c for c in self.store.list_candidates(unresolved_only=True)
+             if c["id"] == candidate_id),
+            None,
+        )
+        if row is None:
+            return False
+        existing_node = self.store.get_node(row["existing_node_id"])
+        new_node = self.store.get_node(row["new_node_id"])
+        if existing_node is None or new_node is None:
+            return False
+        self._draw_tension(
+            existing_node, new_node, f"coexist_resolution:candidate#{candidate_id}"
+        )
+        self.store.resolve_candidate(candidate_id, "coexist")
+        return True
+
 
 def _env_recognizer():
     """Build the Trigger-2 recognizer from env, or None (gate runs floor+tripwire).
@@ -171,11 +229,32 @@ def _env_recognizer():
         return None
 
 
-def build_governor(store, ops, recognizer="env") -> ClaimGovernor:
-    """Factory: a governor with the default-on tripwire and an optional recognizer.
+def _env_tension_recognizer():
+    """Build the B1 tension recognizer from env, or None (gate unchanged).
 
-    recognizer="env" (default) resolves it from env; pass an explicit recognizer
-    (or None) to override.
+    Wired when REVIEN_TENSION_BACKEND is set AND the backend is reachable.
+    Mirrors _env_recognizer: never raises; unavailable yields None.
+    """
+    if not os.environ.get("REVIEN_TENSION_BACKEND"):
+        return None
+    try:
+        from revien.tension import LLMTensionRecognizer
+        rec = LLMTensionRecognizer()
+        return rec if rec.is_available() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def build_governor(store, ops, recognizer="env", tension_recognizer="env") -> ClaimGovernor:
+    """Factory: a governor with the default-on tripwire and optional recognizers.
+
+    recognizer/tension_recognizer="env" (default) resolve from env; pass an
+    explicit recognizer (or None) to override either.
     """
     rec = _env_recognizer() if recognizer == "env" else recognizer
-    return ClaimGovernor(store, ops, gate=SupersessionGate(recognizer=rec))
+    trec = (_env_tension_recognizer() if tension_recognizer == "env"
+            else tension_recognizer)
+    return ClaimGovernor(
+        store, ops,
+        gate=SupersessionGate(recognizer=rec, tension_recognizer=trec),
+    )
