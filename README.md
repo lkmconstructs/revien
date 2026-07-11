@@ -6,7 +6,7 @@
 
 **Memory that returns.**
 
-Revien is a local-first, graph-based memory engine for AI systems. It gives any AI tool — local models, Claude Code, API assistants, agent frameworks — persistent memory across sessions. No GPU. No cloud account. No telemetry. Nothing is compacted away, and nothing you feed it leaves your machine.
+Revien is a local-first, graph-based memory engine for AI systems. It gives any AI tool — local models, Claude Code, Codex, Hermes Agent, API assistants, and other agent frameworks — persistent memory across sessions. No GPU. No cloud account. No telemetry. Nothing is compacted away, and nothing you feed it leaves your machine.
 
 ```bash
 pip install revien
@@ -24,7 +24,7 @@ That's it. Revien starts building persistent memory on disk, in a single SQLite 
 - **It stays yours.** Everything lives in one file on your own disk. No cloud account, no sign-up, nothing sent anywhere. It works offline.
 - **You can read it — and fix it.** Revien's memory isn't a black box. Point it at an [Obsidian](#obsidian-a-second-corpus-in-and-out) vault and it writes what it remembers as plain notes you can open, correct, or delete — and your edits become part of what it knows.
 - **Nothing gets thrown away.** It never compresses your history into a summary to save room. The whole record stays; when you ask, it returns just the relevant slice.
-- **It works with what you already use.** Claude Code, local models (Ollama), API assistants, LangChain, or any app that can reach a simple local endpoint.
+- **It works with what you already use.** Claude Code, Codex, Hermes Agent, local models (Ollama), API assistants, LangChain, or any app that can reach a simple local endpoint.
 
 ## Getting started
 
