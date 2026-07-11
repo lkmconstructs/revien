@@ -38,13 +38,26 @@ def _results(*contents):
 
 
 class TestRerankerUnit:
-    def test_disabled_by_default(self, monkeypatch):
+    def test_enabled_by_default_and_opt_out(self, monkeypatch):
+        # Shipped contract (July 11 2026): DEFAULT ON when fastembed is
+        # present; REVIEN_RERANK=0 opts out. (conftest pins =0 for the
+        # suite, so the true default needs the var removed.)
         monkeypatch.delenv("REVIEN_RERANK", raising=False)
+        assert CrossEncoderReranker().is_enabled
+
+        monkeypatch.setenv("REVIEN_RERANK", "0")
         rr = CrossEncoderReranker()
         assert not rr.is_enabled
-        assert "REVIEN_RERANK unset" in rr.inactive_reason()
+        assert "opted out" in rr.inactive_reason()
         results = _results("a", "b")
         assert rr.rerank("q", results) is results  # pure pass-through
+
+    def test_default_model_and_depth_are_the_measured_shape(self, monkeypatch):
+        monkeypatch.delenv("REVIEN_RERANK_MODEL", raising=False)
+        monkeypatch.delenv("REVIEN_RERANK_TOP_K", raising=False)
+        rr = CrossEncoderReranker()
+        assert rr.model_name == "revien/ms-marco-MiniLM-L-6-v2-int8"
+        assert rr.top_k == 20
 
     def test_injected_scorer_reorders_head(self):
         # Scorer prefers content "gold" — it must rise above base order.
@@ -126,9 +139,9 @@ class TestRerankerEngineIntegration:
             "plausible but wrong"
         )
 
-    def test_engine_without_reranker_is_unchanged(self, store, monkeypatch):
+    def test_engine_with_rerank_opted_out_is_unchanged(self, store, monkeypatch):
         monkeypatch.setenv("REVIEN_SEMANTIC", "0")
-        monkeypatch.delenv("REVIEN_RERANK", raising=False)
+        monkeypatch.setenv("REVIEN_RERANK", "0")
         self._seed(store)
         engine = RetrievalEngine(store)
         assert not engine.reranker.is_enabled

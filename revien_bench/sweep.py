@@ -58,11 +58,13 @@ _REPO_ROOT = _PKG_DIR.parent
 # knob is now live, and REVIEN_TOUCH_ON_RECALL=0 makes "honest frequency"
 # (only mark_used feeds access_count) measurable against "no frequency".
 VARIANTS: Dict[str, Dict[str, str]] = {
-    # Control: the SHIPPED defaults. As of the July 2 2026 ship call that's
-    # the round-2 champion itself — content recency at 365d half-life, no
-    # self-touch (mark_used-only frequency). Round-2 rows measured before the
-    # flip had baseline = content recency + 7d + self-touch.
+    # Control: the SHIPPED defaults. As of the July 11 2026 flip that
+    # INCLUDES the reranker (int8, depth 20) — "baseline" now means
+    # rerank-on. Rows measured before that flip had baseline = no rerank;
+    # use "no_rerank" to reproduce the old default path.
     "baseline": {},
+    # The pre-July-11 default (rerank opted out) — the 85ms p50 path.
+    "no_rerank": {"REVIEN_RERANK": "0"},
     # Round-1 champion re-run under content recency: freq amputated outright.
     "no_freq": {
         "REVIEN_RECENCY_WEIGHT": "0.5",

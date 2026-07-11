@@ -181,11 +181,13 @@ class RetrievalEngine:
         self.semantic = semantic if semantic is not None else SemanticIndex(store)
         self._warn_if_semantic_inactive()
 
-        # Cross-encoder head reranker (A1). OPT-IN via REVIEN_RERANK=1 —
-        # measured lever for the `outranked` bucket: with semantic-as-spine
-        # the top of the ranking is all distance-0 anchors, and only a model
-        # that reads query+candidate together can reorder them. Inert (empty
-        # pass-through) unless enabled; degrades loudly on runtime failure.
+        # Cross-encoder head reranker (A1). DEFAULT ON since July 11 2026
+        # ("smarter by default"): int8 model, depth 20 — measured lever for
+        # the `outranked` bucket: with semantic-as-spine the top of the
+        # ranking is all distance-0 anchors, and only a model that reads
+        # query+candidate together can reorder them. REVIEN_RERANK=0 opts
+        # out (pre-rerank path, byte-identical); degrades loudly on runtime
+        # failure.
         self.reranker = reranker if reranker is not None else CrossEncoderReranker()
 
     def _warn_if_semantic_inactive(self) -> None:

@@ -15,9 +15,11 @@ Contract (mirrors the semantic spine's discipline):
   * Imports stay GUARDED — availability is checked via find_spec WITHOUT
     importing fastembed at module load (a wedged hub endpoint once turned an
     import into a 23-minute hang; see semantic/index.py).
-  * ``REVIEN_RERANK`` gates activation. DEFAULT OFF — this ships as a knob
-    for the sweep to measure; the default flips only on a measured win, per
-    house rule. ``REVIEN_RERANK=1`` enables; anything else disables.
+  * ``REVIEN_RERANK`` gates activation. DEFAULT ON (July 11 2026, Lissa's
+    call — "smarter by default"): the measured default is the int8 model at
+    depth 20 — recall@10 0.5141 -> ~0.64, recall@1 doubled, ~200ms p50 —
+    per the round-5/5b depth+quantization profile. ``REVIEN_RERANK=0``
+    opts out and restores the pre-rerank 85ms path byte-identically.
   * Model load is OFFLINE-FIRST via the per-call ``local_files_only``
     parameter (warm cache = zero network), falling back to a one-time
     download on a cold cache — same rationale as FastEmbedProvider.
@@ -25,10 +27,12 @@ Contract (mirrors the semantic spine's discipline):
     continues un-reranked — degraded, never broken, never silent.
 
 Knobs:
-    REVIEN_RERANK          1 to enable (default 0)
-    REVIEN_RERANK_MODEL    cross-encoder model (default ms-marco-MiniLM-L-6-v2,
-                           ~80MB, CPU ONNX)
-    REVIEN_RERANK_TOP_K    how many head results to rescore (default 30)
+    REVIEN_RERANK          0 to opt out (default 1)
+    REVIEN_RERANK_MODEL    cross-encoder model (default: int8-quantized
+                           ms-marco-MiniLM-L-6-v2, 23MB CPU ONNX; set to
+                           Xenova/ms-marco-MiniLM-L-6-v2 for fp32)
+    REVIEN_RERANK_TOP_K    how many head results to rescore (default 20;
+                           30 + REVIEN_SEMANTIC_TOP_K=100 is quality mode)
 """
 
 import importlib.util
@@ -38,15 +42,20 @@ from typing import Callable, List, Optional, Sequence
 
 _FASTEMBED_AVAILABLE = importlib.util.find_spec("fastembed") is not None
 
-DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
-DEFAULT_RERANK_TOP_K = 30
+# The fp32 source repo — fastembed's registry entry, and the weights the
+# int8 variant quantizes. Selectable explicitly for parity checks.
+RERANK_SOURCE_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 
-# int8 sibling of the default reranker: SAME weights repo, quantized ONNX
-# file (23MB vs 87MB). Measured 1.38x faster on CPU with near-identical
-# ordering (spearman 0.99, top-5 exact on real turns). Not in fastembed's
-# registry, so it is registered as a custom model on first use. Select via
-# REVIEN_RERANK_MODEL=revien/ms-marco-MiniLM-L-6-v2-int8.
+# int8 sibling: SAME weights repo, quantized ONNX file (23MB vs 87MB).
+# Bench-verified parity with fp32 (recall@10 -0.0017, IDENTICAL miss
+# taxonomy) at 1.27-1.38x. Not in fastembed's registry, so it is registered
+# as a custom model on first use.
 INT8_RERANK_MODEL = "revien/ms-marco-MiniLM-L-6-v2-int8"
+
+# Shipped defaults (round-5/5b measured shape): int8 at depth 20 —
+# ~200ms p50 for +8pts recall@10 and doubled recall@1 over no-rerank.
+DEFAULT_RERANK_MODEL = INT8_RERANK_MODEL
+DEFAULT_RERANK_TOP_K = 20
 
 
 def _register_builtin_variants() -> None:
@@ -56,7 +65,7 @@ def _register_builtin_variants() -> None:
     try:
         TextCrossEncoder.add_custom_model(
             model=INT8_RERANK_MODEL,
-            sources=ModelSource(hf=DEFAULT_RERANK_MODEL),
+            sources=ModelSource(hf=RERANK_SOURCE_MODEL),
             model_file="onnx/model_quantized.onnx",
             size_in_gb=0.023,
         )
@@ -65,7 +74,9 @@ def _register_builtin_variants() -> None:
 
 
 def _rerank_enabled_by_env() -> bool:
-    return os.environ.get("REVIEN_RERANK", "0").strip().lower() in (
+    # DEFAULT ON — "smarter by default" (July 11 2026). REVIEN_RERANK=0
+    # opts out and restores the pre-rerank latency path byte-identically.
+    return os.environ.get("REVIEN_RERANK", "1").strip().lower() in (
         "1", "true", "yes", "on"
     )
 
@@ -113,7 +124,7 @@ class CrossEncoderReranker:
         if self._runtime_failure is not None:
             return f"disabled after runtime error: {self._runtime_failure}"
         if not _rerank_enabled_by_env() and self._scorer is None:
-            return "not enabled (REVIEN_RERANK unset)"
+            return "opted out (REVIEN_RERANK=0)"
         if not _FASTEMBED_AVAILABLE:
             return "fastembed not installed"
         return "disabled"

@@ -26,3 +26,16 @@ def _disable_semantic_by_default(monkeypatch):
     explicitly enables it via SemanticIndex(enabled=True)."""
     monkeypatch.setenv("REVIEN_SEMANTIC", "0")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _disable_rerank_by_default(monkeypatch):
+    """Same rationale for the cross-encoder reranker (DEFAULT ON in
+    production since July 11 2026): base-contract tests assert graph/scoring
+    behavior and must stay deterministic, fast, and offline — a default-on
+    reranker would add model inference (and a cold-cache download) to every
+    recall in the suite. Rerank tests exercise the layer explicitly via
+    injected scorers or monkeypatched env; the real-model path is measured
+    by the bench, not unit tests."""
+    monkeypatch.setenv("REVIEN_RERANK", "0")
+    yield
