@@ -3,6 +3,43 @@
 All notable changes to Revien are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.3.0] — 2026-07-11
+
+Smarter by default. Retrieval quality jumped for every user with zero config —
+and memory learned to hold tension and time.
+
+### Added
+- **Cross-encoder reranker, ON by default.** A local 23MB int8 model rescores the
+  top-20 candidates reading query and memory together. Full-scale verified:
+  conversational recall@10 0.514 → 0.593 (+15%), recall@1 0.197 → 0.386 (+95%),
+  MRR +57% at p50 261ms; vault recall@10 0.884 → 0.942, MRR 0.959. `REVIEN_RERANK=0`
+  opts out and restores the 85ms path byte-identically; fp32/deeper-head knobs reach
+  0.661 for latency-tolerant consumers. The whole latency-quality dial is measured,
+  banked, and documented — every point verified at full scale, $0, zero egress.
+- **Tension as first-class memory (COEXIST).** Two affirmative claims pulling in
+  opposite directions ("I want closeness" / "I want space") now BOTH stay live, with
+  the tension drawn as a `conflicts_with` edge instead of one claim silently
+  superseding the other. Opt-in recognizer (`REVIEN_TENSION_BACKEND`, local Ollama
+  default, cloud disclosed); human queue resolution ("both true") included. Surfaced
+  via `revien tensions`, `GET /v1/tensions`, and `include_tensions` on recall.
+- **Bi-temporal validity.** Supersession closes the old fact's validity window and
+  opens the new one's at the transition instant. `recall(as_of=...)` — also
+  `revien recall --as-of` and the REST `as_of` field — answers "what was true THEN":
+  a superseded fact whose window covers the queried moment comes back.
+- **`POST /v1/edges`** for explicit typed edges, `conflicts_with` edge type,
+  `include_context` on the recall API, `REVIEN_DB_PATH` env fallback for direct
+  ASGI/Docker use.
+- **Weighted graph walk** (path strength from edge weights, `REVIEN_EDGE_WEIGHT_BLEND`)
+  — measured inert for semantic-first ranking, shipped default-off for graph-only
+  and identity-memory flows.
+
+### Fixed
+- Entity extraction no longer fuses words across newlines into phantom entities
+  ("Deployment\nRuns").
+- Benchmark checkpoint and ingest-cache identity now include the env knobs and code
+  that produced them — a knob or code change can never silently resume or reuse
+  stale data (two real near-misses closed).
+
 ## [0.2.1] — 2026-07-07
 
 ### Fixed

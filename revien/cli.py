@@ -42,7 +42,7 @@ def _save_config(config: dict) -> None:
 
 
 @click.group()
-@click.version_option(version="0.2.1", prog_name="revien")
+@click.version_option(version="0.3.0", prog_name="revien")
 def main():
     """Revien — Memory that returns. Graph-based memory engine for AI systems."""
     pass

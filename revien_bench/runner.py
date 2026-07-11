@@ -21,6 +21,7 @@ p50/p90/p99, cost ($0), network_calls (0), sovereignty pass/fail, per-question r
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -92,9 +93,77 @@ def _sanitize(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "x"
 
 
+# ── Run-identity fingerprints ──────────────────────────────────────────────────
+# Two silent-staleness traps got walked into on July 10-11 2026 and are closed
+# here at the root: (1) the checkpoint resumed rows recorded under DIFFERENT
+# env knobs (`ran=0 resumed=10` replayed a pre-rerank baseline into a rerank
+# "confirm"); (2) the db cache served ingests built by an OLDER extractor
+# after a code fix. Neither cache identity included the state that actually
+# produced the data. Now it does: env + code fingerprints are part of the
+# checkpoint FILENAME (a knob/code change simply never sees the old file;
+# crash + relaunch with identical state resumes as before) and of the cache
+# META (mismatch = rebuild, same as a dataset-SHA change). Stale files are
+# left behind rather than deleted — they are small, and history is history.
+
+def _env_fingerprint(prefix_allowlist: Optional[tuple] = None) -> str:
+    """Fingerprint of the REVIEN_* environment (or an allowlisted subset)."""
+    items = sorted(
+        (k, v) for k, v in os.environ.items()
+        if k.startswith("REVIEN_")
+        and (prefix_allowlist is None or k in prefix_allowlist)
+    )
+    return hashlib.sha256(json.dumps(items).encode("utf-8")).hexdigest()[:8]
+
+
+def _code_fingerprint(*subpackages: str) -> str:
+    """Content hash of revien source subpackages (e.g. 'retrieval'). Catches
+    dev-tree edits that a version number cannot — the extractor-regex trap."""
+    import revien
+    root = Path(revien.__file__).resolve().parent
+    h = hashlib.sha256()
+    for sub in sorted(subpackages):
+        pkg = root / sub
+        if not pkg.is_dir():
+            continue
+        for py in sorted(pkg.rglob("*.py")):
+            h.update(str(py.relative_to(root)).encode("utf-8"))
+            h.update(py.read_bytes())
+    return h.hexdigest()[:8]
+
+
+# Env vars that change what an INGEST produces (extraction, embeddings, CSL).
+# Retrieval-only knobs (REVIEN_RERANK*, ranking weights, top-K) are DELIBERATELY
+# excluded: the whole point of the db cache is reusing identical ingests across
+# ranking-knob sweep variants. The code fingerprint is the backstop for
+# anything this list misses.
+_INGEST_ENV_KEYS = (
+    "REVIEN_CSL", "REVIEN_SEMANTIC", "REVIEN_EMBEDDER", "REVIEN_EMBED_MODEL",
+    "REVIEN_EXTRACTOR", "REVIEN_SENSITIVITY_BACKEND", "REVIEN_SENSITIVITY_MODEL",
+    "REVIEN_TENSION_BACKEND", "REVIEN_TENSION_MODEL", "REVIEN_INGEST_DENY",
+)
+
+
+def _ingest_fingerprint() -> str:
+    return (_env_fingerprint(_INGEST_ENV_KEYS)
+            + _code_fingerprint("ingestion", "graph", "semantic", "adapters"))
+
+
+def _run_fingerprint() -> str:
+    """Full run identity for checkpoints: ALL REVIEN_* env (ranking knobs
+    included — that's trap #1) + retrieval-affecting code."""
+    return (_env_fingerprint()
+            + _code_fingerprint("retrieval", "semantic", "graph",
+                                "ingestion", "neural"))
+
+
 def _checkpoint_path(out_dir: Path, config_name: str, answerer_name: str) -> Path:
-    """Stable checkpoint path for this exact config+answerer pair."""
-    return out_dir / f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}.jsonl"
+    """Checkpoint path for this exact (config, answerer, env, code) identity.
+    A knob or code change yields a different filename — the old checkpoint
+    can never falsely resume; an identical relaunch resumes exactly as before."""
+    return out_dir / (
+        f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}"
+        f"_{_run_fingerprint()}.jsonl"
+    )
 
 
 def _load_checkpoint(
@@ -158,7 +227,9 @@ def _cache_paths(db_cache: Path, config_name: str, conv_id: str) -> tuple:
 
 def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Dict]:
     """Meta for a cached DB, or None when absent/SHA-mismatched (never falsely
-    reuse a cache built from a different dataset)."""
+    reuse a cache built from a different dataset) or ingest-identity-mismatched
+    (never falsely reuse an ingest built by different code or ingest env —
+    the extractor-regex trap). Old metas without the fingerprint rebuild once."""
     if not meta_path.exists():
         return None
     try:
@@ -166,6 +237,8 @@ def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Di
     except (json.JSONDecodeError, OSError):
         return None
     if dataset_sha is not None and meta.get("dataset_sha") != dataset_sha:
+        return None
+    if meta.get("ingest_fp") != _ingest_fingerprint():
         return None
     return meta
 
@@ -423,6 +496,7 @@ def run_benchmark(
                             dst.close()
                         cache_meta_path.write_text(json.dumps({
                             "dataset_sha": dataset_sha,
+                            "ingest_fp": _ingest_fingerprint(),
                             "conv_id": conv.conv_id,
                             "turns_ingested": summary["turns_ingested"],
                             "nodes_created": summary["nodes_created"],

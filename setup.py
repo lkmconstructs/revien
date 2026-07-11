@@ -7,7 +7,7 @@ long_description = Path(__file__).parent.joinpath("README.md").read_text(encodin
 
 setup(
     name="revien",
-    version="0.2.1",
+    version="0.3.0",
     description="Local-first, graph-based memory engine for AI systems. Memory that returns.",
     long_description=long_description,
     long_description_content_type="text/markdown",

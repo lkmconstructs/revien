@@ -110,7 +110,11 @@ def test_checkpoint_written_per_conversation(patched_loader, monkeypatch):
         dataset_path=patched_loader / "ds.json", out_dir=out_dir, fresh=True,
     )
 
-    ckpt = R._checkpoint_path(out_dir, "graph_only", "extractive")
+    # The checkpoint path carries the run's env+code fingerprint, and the
+    # config's env is applied only INSIDE run_benchmark — so the path can't
+    # be recomputed out here. The report carries it (by design: it's the
+    # run's identity).
+    ckpt = Path(report["resume"]["checkpoint_path"])
     assert ckpt.exists()
     lines = [l for l in ckpt.read_text(encoding="utf-8").splitlines() if l.strip()]
     # One line per completed conversation.
@@ -142,7 +146,7 @@ def test_resume_skips_completed_and_aggregates_all(patched_loader, monkeypatch):
     assert rep1["n_questions"] == 1
     assert {q for q in spy1.asked} == {"What database for alpha?"}  # only D1 asked
 
-    ckpt = R._checkpoint_path(out_dir, "graph_only", "extractive")
+    ckpt = Path(rep1["resume"]["checkpoint_path"])
     assert ckpt.exists()
     assert len([l for l in ckpt.read_text().splitlines() if l.strip()]) == 1  # D1 only
 

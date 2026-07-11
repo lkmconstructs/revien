@@ -22,7 +22,7 @@ That's it. Revien starts building persistent memory on disk, in a single SQLite 
 
 Most memory systems ask you to trust that your data is handled well. Revien is built so you don't have to — every sovereignty claim below is enforced in code and checked by the benchmark suite on every run:
 
-- **$0, zero network egress on the default path.** Local extraction, local embeddings (`bge-small`, on-device), local SQLite. The benchmark asserts `network_calls == 0` and fails if anything phones home. Model files load offline-first — a warm install touches nothing.
+- **$0, zero network egress on the default path.** Local extraction, local embeddings (`bge-small`, on-device), a local 23MB reranker, local SQLite. The benchmark asserts `network_calls == 0` and fails if anything phones home. Model files download once on first install and load offline-first after — a warm install touches nothing.
 - **Zero telemetry.** Revien collects no usage data, no crash reports, no phone-home. See [TELEMETRY.md](TELEMETRY.md).
 - **Nothing compacted away.** The full graph is preserved. Retrieval is surgical — it returns only what's relevant — but it never summarizes your history into oblivion to save space.
 - **A non-destructive audit trail.** Every node creation, update, supersession, and merge is recorded. You can trace any fact back to the exact turn it came from, and review every automatic decision the engine made.
@@ -50,6 +50,7 @@ When you query Revien:
    - **Recency** — how recent is the memory's *content* (when it was actually said), decaying gently so old-but-true facts aren't buried.
    - **Frequency** — how often the memory has been *confirmed useful* (via explicit use, not merely returned — a retrieval popularity loop would just surface whatever it surfaced last).
    - **Proximity** — how many graph hops from the query's anchors.
+4. **A cross-encoder reranker** rescores the top candidates reading query and memory *together* — a fundamentally stronger relevance judgment than comparing embeddings computed apart. It's a local 23MB int8 model, on by default, and it's what nearly doubles recall@1. `REVIEN_RERANK=0` opts out and restores the fastest path.
 
 Only the top results come back. Your AI gets a lean, relevant context window instead of a dump.
 
@@ -63,27 +64,36 @@ Revien is measured on two separate corpora. **They are reported separately and n
 
 All numbers below are reproducible from a fresh checkout: local extraction, local `bge-small` embeddings, a zero-LLM extractive reader, **$0 and 0 network calls**. Each has a results JSON in `results/`.
 
-### Conversational recall — LoCoMo, 1,986 QA
+### Conversational recall — LoCoMo, 1,986 QA (shipped defaults)
 
 | Metric | Value |
 |--------|-------|
-| Recall@10 | **0.514** |
-| Recall@5 | 0.413 |
-| Recall@1 | 0.197 |
-| MRR | 0.323 |
-| nDCG@10 | 0.356 |
-| Recall latency (p50 / p90) | **85ms / 250ms** |
+| Recall@10 | **0.593** |
+| Recall@5 | 0.550 |
+| Recall@1 | 0.386 |
+| MRR | 0.507 |
+| nDCG@10 | 0.509 |
+| Recall latency (p50 / p90) | **261ms / 502ms** |
 | Cost / network calls | **$0 / 0** |
 | Sovereignty checks | **PASS** |
 
-### Vault recall — curated Obsidian corpus, 43 QA
+Latency and quality are a measured dial, not a fixed trade — every point on it verified at full scale:
+
+| Mode | Recall@10 | Recall@1 | p50 |
+|------|-----------|----------|-----|
+| `REVIEN_RERANK=0` (fastest) | 0.514 | 0.197 | 85ms |
+| **Default** (int8 reranker, depth 20) | **0.593** | **0.386** | 261ms |
+| Quality (`REVIEN_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2`, `REVIEN_RERANK_TOP_K=50`, `REVIEN_SEMANTIC_TOP_K=100`) | 0.661 | 0.418 | ~1.2s |
+
+### Vault recall — curated Obsidian corpus, 43 QA (shipped defaults)
 
 | Metric | Value |
 |--------|-------|
-| Recall@10 (overall) | **0.884** |
-| Single-note questions | 0.933 |
-| Cross-note (multi-hop) questions | 0.733 |
-| MRR | 0.738 |
+| Recall@10 (overall) | **0.942** |
+| Single-note questions | 1.000 |
+| Cross-note (multi-hop) questions | 0.833 |
+| MRR | 0.959 |
+| Recall latency (p50) | 160ms |
 
 **Attachment rate** — a vault-specific measure of whether a conversation about a known entity actually connects to it in the graph — is reported on its own line, with its known gap stated openly:
 
@@ -96,7 +106,7 @@ The one attachment miss is semantic aliasing ("offline mode" → the roadmap not
 
 - **These are retrieval numbers, not end-to-end answer quality.** The default reader is a zero-LLM extractive stub, chosen so the benchmark measures *retrieval* cleanly rather than a language model's fluency. End-to-end token-F1 with this stub is low by design (~0.06); swapping in a real LLM reader raises answer quality substantially — but that's the reader's contribution, not Revien's retrieval, so we don't headline it.
 - **The adversarial category is a trap for naive scoring.** A system that retrieves *nothing* scores a perfect 1.0 on "refuse to answer" questions, because an empty result correctly produces a refusal. So a broken retriever can post a *higher* adversarial score than a working one. We surface this rather than let it flatter the numbers — it's exactly the kind of metric artifact the honest-numbers discipline exists to catch.
-- **The remaining conversational gap is ranking, not coverage.** A per-query miss taxonomy (shipped in the bench) shows the answer is usually *found* — the graph walk reaches it and the scorer scores it — but it lands at a median rank of ~33, outside the top-10 we return. It's in the graph; it just isn't surfaced. Extraction and the walk are near-lossless; ranking is the next lever, and the taxonomy points to exactly where it leaks.
+- **The ranking lever has been pulled; what remains is vocabulary.** A per-query miss taxonomy (shipped in the bench) drove the reranker: pre-rerank, found-but-buried answers sat at a median rank of ~33, and rescoring that head is exactly what moved recall@10 from 0.514 to 0.593 and recall@1 from 0.20 to 0.39. The misses that remain are now either deeply buried (median rank ~70 — a bigger head won't reach them) or semantic-aliasing cases where a concept and its entity share no vocabulary. That's the next lever, and the taxonomy points at it the same way it pointed at ranking.
 
 ---
 
@@ -113,7 +123,7 @@ git clone https://github.com/lkmconstructs/revien
 cd revien
 pip install -e .
 
-# Optional extras: LangChain adapter, neural reranker, Leiden clustering
+# Optional extras: LangChain adapter, learned scorer, Leiden clustering
 pip install revien[langchain]
 pip install revien[all]
 ```
@@ -137,7 +147,7 @@ revien recall "What database did we decide to use?"
 
 ```
 Query: What database did we decide to use?
-Found 3 results (85.2ms, 14 nodes examined)
+Found 3 results (212.4ms, 14 nodes examined)
 
   [1] We decided to deploy the backend on PostgreSQL, not MySQL.
       Type: context | Score: 0.910
@@ -167,6 +177,28 @@ if not data["semantic_active"]:
 for r in data["results"]:
     print(f"[{r['node_type']}] {r['label']} ({r['score']:.2f})")
 ```
+
+---
+
+## Memory that holds tension — and time
+
+Two things human memory does that most AI memory flattens:
+
+**It holds contradictions that are both true.** "I want closeness" and "I want space" aren't a conflict to resolve — they're a tension to remember. When Revien's claim governance detects two affirmative claims pulling in opposite directions (opt-in, `REVIEN_TENSION_BACKEND` — local Ollama by default), *both stay live* and the tension becomes a first-class edge instead of one claim silently superseding the other. Ask what you're in tension with yourself about:
+
+```bash
+revien tensions
+```
+
+Or per-query: `POST /v1/recall` with `"include_tensions": true` returns each memory *with* its opposing pull. A queued contradiction can also be resolved by hand as "both true" — nothing is ever forced to lose.
+
+**It knows when things were true, not just that they changed.** When a new fact supersedes an old one, Revien closes the old fact's validity window and opens the new one's at the transition — so the old truth stays answerable *in its time*:
+
+```bash
+revien recall "where did she live?" --as-of 2026-03-01
+```
+
+March returns Boston; July returns Portland. The superseded fact isn't gone — it's historical, and history is queryable.
 
 ---
 
@@ -224,7 +256,9 @@ The daemon exposes a REST API on `localhost:7437`:
 | Method | Endpoint | Function |
 |--------|----------|----------|
 | POST | `/v1/ingest` | Ingest raw content into the graph |
-| POST | `/v1/recall` | Query memory (returns results + `semantic_active` / `semantic_note`) |
+| POST | `/v1/recall` | Query memory (supports `as_of` time travel and `include_tensions`) |
+| GET | `/v1/tensions` | Every recognized coexisting tension, both claims live |
+| POST | `/v1/edges` | Create an explicit typed edge (e.g. `conflicts_with`) |
 | GET | `/v1/nodes` | List nodes (filter by type, source) |
 | GET | `/v1/nodes/{id}` | Get a node with its edges |
 | PUT | `/v1/nodes/{id}` | Update a node |
@@ -240,7 +274,7 @@ Interactive docs at `http://localhost:7437/docs` when the daemon is running.
 
 **Node types:** `entity` · `topic` · `decision` · `fact` · `preference` · `event` · `context`
 
-**Edge types:** `related_to` · `decided_in` · `mentioned_by` · `depends_on` · `followed_by` · `contradicts` · `corrects` · `derived_from`
+**Edge types:** `related_to` · `decided_in` · `mentioned_by` · `depends_on` · `followed_by` · `contradicts` · `conflicts_with` · `corrects` · `derived_from`
 
 Every ingestion creates a `context` node holding the verbatim interaction; extracted nodes connect back to it. Any fact or decision traces to its origin.
 
@@ -253,6 +287,9 @@ Config lives at `~/.revien/config.json`, created on first run. Retrieval is also
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `REVIEN_SEMANTIC` | on | `0` disables semantic; `require` makes a broken layer fatal |
+| `REVIEN_RERANK` | on | `0` opts out of the cross-encoder reranker (fastest path: 85ms p50) |
+| `REVIEN_RERANK_TOP_K` | `20` | How many head candidates the reranker rescores (each ~16ms) |
+| `REVIEN_TENSION_BACKEND` | — | Enables tension recognition (`ollama` local, or a cloud backend, disclosed) |
 | `REVIEN_RECENCY_HALF_LIFE_DAYS` | `365` | Content-recency decay; long by default so old facts aren't buried |
 | `REVIEN_TOUCH_ON_RECALL` | off | On restores retrieval-driven frequency (a popularity loop; off by default) |
 | `REVIEN_RECENCY_WEIGHT` / `_FREQUENCY_WEIGHT` / `_PROXIMITY_WEIGHT` | `0.35 / 0.30 / 0.35` | Three-factor blend |
@@ -291,9 +328,8 @@ Any AI System / Obsidian vault
 
 ## Roadmap
 
-- Reranking to close the ranking gap (the largest remaining recall lever)
-- Broader extraction coverage for conversational memory
-- Alias/vocabulary resolution (the attachment holdout)
+- Alias/vocabulary resolution — the attachment holdout, and now the largest measured recall lever
+- Autonomous consolidation ("dream mode"): scheduled decay, retraining, and cleanup passes
 - Graph visualization and inspection tools
 
 ---
