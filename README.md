@@ -18,7 +18,39 @@ That's it. Revien starts building persistent memory on disk, in a single SQLite 
 
 ---
 
-## The wedge: sovereignty you can verify
+## What you get
+
+- **Your AI remembers.** Connect Revien once and your tools keep context across sessions — decisions, facts, preferences, the thread of what you've been working on — instead of starting cold every time.
+- **It stays yours.** Everything lives in one file on your own disk. No cloud account, no sign-up, nothing sent anywhere. It works offline.
+- **You can read it — and fix it.** Revien's memory isn't a black box. Point it at an [Obsidian](#obsidian-a-second-corpus-in-and-out) vault and it writes what it remembers as plain notes you can open, correct, or delete — and your edits become part of what it knows.
+- **Nothing gets thrown away.** It never compresses your history into a summary to save room. The whole record stays; when you ask, it returns just the relevant slice.
+- **It works with what you already use.** Claude Code, local models (Ollama), API assistants, LangChain, or any app that can reach a simple local endpoint.
+
+## Getting started
+
+Install Revien, connect a tool, and start the memory service:
+
+```bash
+pip install revien
+revien connect claude-code
+revien start
+```
+
+Then ask it what it remembers:
+
+```bash
+revien recall "What did we decide about the database?"
+```
+
+That's the whole loop — Revien runs quietly in the background, building memory as you work, and answers when you ask. Other tools (Ollama, an Obsidian vault, a watched folder) connect the same way; see [Adapters](#adapters).
+
+---
+
+> **Everything below is for developers, researchers, and the curious** — how retrieval works, honest benchmark numbers, the REST API, configuration, and the sovereignty guarantees that are enforced in code. If you are curious how it works, check out the info below.
+
+---
+
+## Privacy First: sovereignty you can verify
 
 Most memory systems ask you to trust that your data is handled well. Revien is built so you don't have to — every sovereignty claim below is enforced in code and checked by the benchmark suite on every run:
 
@@ -110,9 +142,7 @@ The one attachment miss is semantic aliasing ("offline mode" → the roadmap not
 
 ---
 
-## Quick start
-
-### Install
+## Install options
 
 ```bash
 # From PyPI (semantic layer included as a core dependency)
@@ -130,20 +160,7 @@ pip install revien[all]
 
 Semantic retrieval (`sqlite-vec` + `fastembed`) is a **core dependency**, not an extra — graph-only recall is a fraction as good, so it ships on by default. Set `REVIEN_SEMANTIC=0` to force it off, or `REVIEN_SEMANTIC=require` to make a missing/broken layer a hard error instead of a silent degrade.
 
-### Connect Claude Code and start
-
-```bash
-revien connect claude-code
-revien start
-```
-
-The daemon runs on `localhost:7437`, serving the REST API and auto-syncing connected adapters.
-
-### Recall from the terminal
-
-```bash
-revien recall "What database did we decide to use?"
-```
+The daemon runs on `localhost:7437`, serving the REST API and auto-syncing connected adapters. A terminal recall looks like this:
 
 ```
 Query: What database did we decide to use?
