@@ -423,10 +423,10 @@
     },
     {
       "dimension": "other ordinary facts (logistics)",
-      "old": "You can reach me at mjordan@gmail.com.",
-      "new": "I switched my main email to m.jordan@protonmail.com.",
+      "old": "You can reach me at mjordan@example.com.",
+      "new": "I switched my main email to m.jordan@example.org.",
       "change_style": "value-substitution",
-      "current_truth": "User's main email is m.jordan@protonmail.com."
+      "current_truth": "User's main email is m.jordan@example.org."
     },
     {
       "dimension": "other ordinary facts (logistics)",
