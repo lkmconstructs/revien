@@ -49,7 +49,7 @@ _REPO_ROOT = _PKG_DIR.parent
 # One hypothesis per variant, stated where the numbers will land.
 #
 # ROUND 1 (access-time recency, July 2 2026 AM) is settled — results in
-# results/sweep history + HANDOFF: no_freq won big (+19% recall@10, +89% @1,
+# results/sweep history: no_freq won big (+19% recall@10, +89% @1,
 # all from the outranked bucket); topk100/refine10 hurt; floor15 inert
 # (top-30 all clear 0.30); halflife365 inert because access-time recency was
 # CONSTANT in-bench — which exposed the recency-semantics bug.

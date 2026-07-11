@@ -22,7 +22,7 @@ never blended with the LoCoMo conversational-recall figures.
 
 Known v1 trade: like the file watcher, a re-edited note re-ingests as new
 CONTEXT units (mtime-gated, so only changed notes). Reconciling edited chunks
-against their prior version is future work (tracked in HANDOFF).
+against their prior version is future work.
 """
 
 import re
