@@ -559,6 +559,34 @@ after June's fact replaced it. Our own L3, as planned — not a Graphiti import.
   as-of eval fixtures. Next candidates: B3 dream-mode consolidation, the aliasing/
   vocabulary class from A2's residuals, or Lissa's launch items.
 
+## RERANK DEFAULT FLIP (July 11 2026 — "smarter by default", Lissa's call, `e0d5268`)
+The default/knob framing died under profiling (Mentat cut: the latency forcing the
+choice was an unprofiled curve, not a law). Four suspects checked: model was already
+MiniLM-class, batching already single-pass, no load leak in the daemon path,
+truncation inert on short turns. The one real dial is DEPTH (near-linear: 30 docs
+486ms -> 10 docs 96ms warm) and int8 discounts the whole curve ~1.3x with
+bench-verified fp32 parity (recall@10 -0.0017, IDENTICAL miss taxonomy).
+
+**Shipped defaults now: REVIEN_RERANK=1, int8 model, depth 20.**
+- **Conversational FULL SCALE (`results/20260711T124149Z_semantic.json`): recall@10
+  0.5141 -> 0.5930 (+15%), recall@1 0.1974 -> 0.3857 (+95%), MRR +57%, p50 261ms /
+  p90 502ms.** Vault: 0.8837 -> 0.9419, recall@1 0.7674, MRR 0.9593, p50 160ms.
+- REVIEN_RERANK=0 opts out -> pre-flip 85ms path, byte-identical. Quality tier via
+  knobs: fp32+k30 = 0.6370/593ms; +SEMANTIC_TOP_K=100, RERANK_TOP_K=50 = 0.6607/1.2s.
+- Depth curve banked (round 5): k10 keeps ~90% of the recall@1 win at +37ms and
+  cannot move recall@10 by construction; k20 = 73% of the recall@10 gain; every rank
+  of depth is ~16ms. int8 = same recoveries, 1.27-1.38x faster (round 5b).
+- Tests: conftest pins REVIEN_RERANK=0 for base-contract determinism (same pattern
+  as the REVIEN_SEMANTIC pin); sweep 'baseline' now MEANS rerank-on, 'no_rerank'
+  reproduces the old default.
+- **README/launch surface consequence (Lissa's voice-pass):** the headline numbers
+  are now 0.5930 conversational / 0.9419 vault BY DEFAULT, and the latency line
+  retells as ~260ms p50 default with an 85ms opt-out — the old 85ms headline is the
+  opt-out, not the default. First-run note: default recall now downloads the 23MB
+  int8 reranker once (offline-first thereafter), alongside the embedding model.
+- Server note (Asher): pull = smarter by default, zero env changes needed;
+  REVIEN_RERANK=0 for any latency-critical consumer.
+
 **Phase 4 — post-launch roadmap (NOT launch-blocking; keep out of scope creep's reach)**
 - Reranker / ranking headroom: 1,072 outranked, median rank 33, 316 in top-20. The
   neural scorer is trained on accumulated signals or replaced. Biggest recall lever left.
