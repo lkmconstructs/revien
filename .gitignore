@@ -49,6 +49,5 @@ Thumbs.db
 *.tar.gz
 *.whl
 
-# Internal ops doc — must never ship on the public repo (exposure scrub, July 11 2026)
-HANDOFF.md
-HANDOFF-internal.md
+# Internal working documents — never ship
+HANDOFF*

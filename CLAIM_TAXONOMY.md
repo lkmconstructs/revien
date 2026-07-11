@@ -210,7 +210,7 @@ project_status_plan:  an active, bounded undertaking with steps, deadlines,
 | utterance | behavior |
 |---|---|
 | "Theo has a cough today" | expires — ephemeral `health_state`-adjacent, not a protected standing claim |
-| "Mara has Hashimoto's" | not casually overwritten — `health_state`, protected |
+| "Mara has celiac disease" | not casually overwritten — `health_state`, protected |
 | "Mara is politically liberal" | not flipped by one sarcastic comment — `belief_value`, protected |
 | "Mara is married" | not superseded by "annoyed at Sam today" — `relationship` protected, and `emotion_state` cannot supersede it anyway |
 

@@ -87,7 +87,7 @@ def test_negative_sentiment_about_partner_is_emotion(clf):
 def test_chronic_health_durability_is_slow(clf):
     """Fix 3: a named chronic condition is a standing state -> slow_change,
     overriding health_state's fast prior."""
-    r = clf.classify("I have Hashimoto's.")
+    r = clf.classify("I have asthma.")
     assert r.claim_type is ClaimType.HEALTH_STATE
     assert r.durability is Durability.SLOW_CHANGE
 

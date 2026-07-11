@@ -122,7 +122,7 @@ def main() -> int:
          "contradiction is never detected -> preserved (SAFE, not erased)",
          ["I love being off the bottle.", "Honestly I don't love being off the bottle anymore."], PRESERVED),
         ("3. Protected claim not clobbered by frustration (acceptance #3)",
-         ["I have Hashimoto's.", "I'm so done with this."], PRESERVED),
+         ["I have asthma.", "I'm so done with this."], PRESERVED),
         ("3b. Protected claim, real status contradiction -> review, never auto",
          ["I'm married.", "I'm single now."], QUEUED),
         ("4. Plain neutral technical 'update' (acceptance #4)",
