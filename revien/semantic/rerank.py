@@ -41,6 +41,28 @@ _FASTEMBED_AVAILABLE = importlib.util.find_spec("fastembed") is not None
 DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANK_TOP_K = 30
 
+# int8 sibling of the default reranker: SAME weights repo, quantized ONNX
+# file (23MB vs 87MB). Measured 1.38x faster on CPU with near-identical
+# ordering (spearman 0.99, top-5 exact on real turns). Not in fastembed's
+# registry, so it is registered as a custom model on first use. Select via
+# REVIEN_RERANK_MODEL=revien/ms-marco-MiniLM-L-6-v2-int8.
+INT8_RERANK_MODEL = "revien/ms-marco-MiniLM-L-6-v2-int8"
+
+
+def _register_builtin_variants() -> None:
+    """Idempotently register revien's custom reranker variants with fastembed."""
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+    from fastembed.common.model_description import ModelSource
+    try:
+        TextCrossEncoder.add_custom_model(
+            model=INT8_RERANK_MODEL,
+            sources=ModelSource(hf=DEFAULT_RERANK_MODEL),
+            model_file="onnx/model_quantized.onnx",
+            size_in_gb=0.023,
+        )
+    except Exception:  # noqa: BLE001 - already registered (re-init) is fine
+        pass
+
 
 def _rerank_enabled_by_env() -> bool:
     return os.environ.get("REVIEN_RERANK", "0").strip().lower() in (
@@ -99,6 +121,7 @@ class CrossEncoderReranker:
     def _ensure_model(self) -> None:
         if self._model is not None or self._scorer is not None:
             return
+        _register_builtin_variants()
         from fastembed.rerank.cross_encoder import TextCrossEncoder
         # OFFLINE-FIRST via the per-call parameter, NOT HF_HUB_OFFLINE (which
         # is read into a module constant at import time and would permanently

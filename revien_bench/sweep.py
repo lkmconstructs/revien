@@ -154,6 +154,30 @@ VARIANTS: Dict[str, Dict[str, str]] = {
         "REVIEN_SEMANTIC_TOP_K": "100",
         "REVIEN_SEMANTIC_SIM_FLOOR": "0.20",
     },
+    # ROUND 5 (depth-vs-recall curve, July 10 2026 PM). Warm-inference
+    # microbench says rerank cost is ~linear in depth (30→486ms, 20→248ms,
+    # 15→177ms, 10→96ms on real turns) while truncation is nearly inert
+    # (LoCoMo turns are short). If recall@10 holds at depth 15-20, rerank
+    # fits inside a ~250ms budget and the default/knob debate evaporates —
+    # rerank becomes the default by right. Watch recall@1 hardest: the head
+    # reorder is where it lives. Pre-rerank taxonomy (median outrank 26,
+    # 316/1072 golds in top-20) predicts the knee sits near 20.
+    "rerank_k10": {"REVIEN_RERANK": "1", "REVIEN_RERANK_TOP_K": "10"},
+    "rerank_k15": {"REVIEN_RERANK": "1", "REVIEN_RERANK_TOP_K": "15"},
+    "rerank_k20": {"REVIEN_RERANK": "1", "REVIEN_RERANK_TOP_K": "20"},
+    # ROUND 5b: int8-quantized reranker (same weights, quantized ONNX;
+    # microbench 1.38x, spearman 0.99 vs fp32). If recall matches fp32 at
+    # the same depth, the latency curve just shifts down a gear — k20-int8
+    # projects ~180ms p50 with +8pts recall@10 over no-rerank.
+    "rerank_int8": {
+        "REVIEN_RERANK": "1",
+        "REVIEN_RERANK_MODEL": "revien/ms-marco-MiniLM-L-6-v2-int8",
+    },
+    "rerank_int8_k20": {
+        "REVIEN_RERANK": "1",
+        "REVIEN_RERANK_MODEL": "revien/ms-marco-MiniLM-L-6-v2-int8",
+        "REVIEN_RERANK_TOP_K": "20",
+    },
 }
 
 
