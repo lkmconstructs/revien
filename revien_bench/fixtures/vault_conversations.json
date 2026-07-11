@@ -1,0 +1,18 @@
+{
+  "description": "Conversation turns ingested BESIDE the fixture vault (AND-not-OR: second corpus). Each turn carries attachment ground truth: which vault entity the turn is about, and whether the current ingest path is EXPECTED to attach it (expect_attach=false rows are known-fragile label variants — lowercase, hyphenated, or indirect — measured honestly, not hidden).",
+  "conversation_id": "vaultconv",
+  "turns": [
+    {"id": "vaultconv:t1", "timestamp": "2026-06-02T14:00:00+00:00", "text": "User: We decided to upgrade the Atlas Server to 128GB of RAM after the OOM incident.", "intended_entity": "Atlas Server", "expect_attach": true},
+    {"id": "vaultconv:t2", "timestamp": "2026-06-02T14:05:00+00:00", "text": "User: Rate limiting for the Halcyon API is set to 60 requests per minute per device.", "intended_entity": "Halcyon API", "expect_attach": true},
+    {"id": "vaultconv:t3", "timestamp": "2026-06-03T09:15:00+00:00", "text": "User: Mira Chen approved the dark mode palette yesterday, so dark mode ships together with the onboarding redesign.", "intended_entity": "Mira Chen", "expect_attach": true},
+    {"id": "vaultconv:t4", "timestamp": "2026-06-04T10:00:00+00:00", "text": "User: the atlas-server needs a new case fan, I ordered a Noctua replacement today.", "intended_entity": "Atlas Server", "expect_attach": false},
+    {"id": "vaultconv:t5", "timestamp": "2026-06-04T10:02:00+00:00", "text": "User: we should bump the postgres cluster to version 17 in the fall maintenance window.", "intended_entity": "Postgres Cluster", "expect_attach": false},
+    {"id": "vaultconv:t6", "timestamp": "2026-06-05T16:30:00+00:00", "text": "Assistant: Noted - the Mesh VPN key rotation is moved from quarterly to monthly going forward.", "intended_entity": "Mesh VPN", "expect_attach": true},
+    {"id": "vaultconv:t7", "timestamp": "2026-06-06T11:00:00+00:00", "text": "User: Jonas Petrov quoted 12 hours for the connection pooling work on the database.", "intended_entity": "Jonas Petrov", "expect_attach": true},
+    {"id": "vaultconv:t8", "timestamp": "2026-06-09T13:45:00+00:00", "text": "User: Decided the annual plan for Halcyon will cost 60 dollars, ten months worth for twelve.", "intended_entity": "Halcyon", "expect_attach": true},
+    {"id": "vaultconv:t9", "timestamp": "2026-06-10T08:20:00+00:00", "text": "User: The Backup Policy drill failed this month, the restore took 3 hours because B2 throttled us.", "intended_entity": "Backup Policy", "expect_attach": true},
+    {"id": "vaultconv:t10", "timestamp": "2026-06-11T15:10:00+00:00", "text": "User: monitoring stack alert fatigue is getting bad, half the pages this week were disk noise.", "intended_entity": "Monitoring Stack", "expect_attach": false},
+    {"id": "vaultconv:t11", "timestamp": "2026-06-12T17:00:00+00:00", "text": "User: The Ops Runbook needs a section on certificate renewal, Caddy rotated the cert silently this time.", "intended_entity": "Ops Runbook", "expect_attach": true},
+    {"id": "vaultconv:t12", "timestamp": "2026-06-13T12:30:00+00:00", "text": "User: We are pushing offline mode from Q3 to early Q4, the sync conflict resolution is harder than expected.", "intended_entity": "Roadmap 2026", "expect_attach": false}
+  ]
+}

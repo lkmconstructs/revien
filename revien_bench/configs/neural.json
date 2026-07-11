@@ -1,0 +1,10 @@
+{
+  "name": "neural",
+  "description": "Graph + community clustering (Louvain, base dep) + opt-in neural rerank (TF-IDF + LogisticRegression, `pip install revien[neural]`) + semantic layer. Fully LOCAL/zero-egress. Neural/semantic degrade silently to base scoring when their extras are absent; clustering uses the base networkx Louvain backend.",
+  "env": {
+    "REVIEN_SEMANTIC": "1",
+    "REVIEN_EXTRACTOR": "rule",
+    "REVIEN_EMBEDDER": "fastembed"
+  },
+  "cluster": true
+}

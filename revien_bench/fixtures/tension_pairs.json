@@ -1,0 +1,32 @@
+{
+  "_comment": "B1 tension eval fixture. label=tension means the pair SHOULD coexist (both affirmative, opposing pulls). Controls per CLAIM_TAXONOMY 7.2: compatible (similarity is not opposition), retraction (an update, never coexist), sentiment (emotion is not contradiction). SHA-locked with the eval; do not casually edit.",
+  "pairs": [
+    {"existing": "I love working from home.", "new": "I love the energy of working in the office.", "label": "tension"},
+    {"existing": "I prefer planning everything in advance.", "new": "I prefer keeping my options open.", "label": "tension"},
+    {"existing": "I love being part of a big family.", "new": "I love having time that belongs only to me.", "label": "tension"},
+    {"existing": "I believe honesty matters more than comfort.", "new": "I believe kindness matters more than being right.", "label": "tension"},
+    {"existing": "I want to build something ambitious with my career.", "new": "I want a quiet life with plenty of rest.", "label": "tension"},
+    {"existing": "I love the excitement of new projects.", "new": "I love finishing what I already started.", "label": "tension"},
+    {"existing": "I prefer saving money for security.", "new": "I love spending on experiences while I am young.", "label": "tension"},
+    {"existing": "I believe people should be fully independent.", "new": "I believe we owe our communities real commitment.", "label": "tension"},
+
+    {"existing": "I prefer tea in the morning.", "new": "I prefer green tea when I wake up.", "label": "compatible"},
+    {"existing": "I love hiking in the mountains.", "new": "I love long walks in the forest.", "label": "compatible"},
+    {"existing": "I believe exercise keeps me sane.", "new": "I believe movement is good for my mind.", "label": "compatible"},
+    {"existing": "I prefer reading before bed.", "new": "I love a good novel at night.", "label": "compatible"},
+    {"existing": "I want to learn Spanish this year.", "new": "I want to practice Spanish every week.", "label": "compatible"},
+    {"existing": "I love cooking for friends.", "new": "I love hosting dinner parties.", "label": "compatible"},
+
+    {"existing": "I love working from home.", "new": "I don't love working from home anymore.", "label": "retraction"},
+    {"existing": "I prefer tea in the morning.", "new": "I don't drink tea anymore.", "label": "retraction"},
+    {"existing": "I love running every day.", "new": "I stopped running every day.", "label": "retraction"},
+    {"existing": "I believe cardio is the best exercise.", "new": "I no longer believe cardio is the best exercise.", "label": "retraction"},
+    {"existing": "I love my book club.", "new": "I quit my book club.", "label": "retraction"},
+
+    {"existing": "I love my job at the gallery.", "new": "I am so frustrated with my job today.", "label": "sentiment"},
+    {"existing": "I love working on the vault project.", "new": "The vault project is driving me crazy this week.", "label": "sentiment"},
+    {"existing": "I believe in this team.", "new": "I am annoyed with the team this morning.", "label": "sentiment"},
+    {"existing": "I love my garden.", "new": "I am too tired to deal with the garden today.", "label": "sentiment"},
+    {"existing": "I prefer city life.", "new": "The city noise is exhausting me this week.", "label": "sentiment"}
+  ]
+}

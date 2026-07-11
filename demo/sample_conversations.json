@@ -1,0 +1,674 @@
+[
+  {
+    "id": "conv_db_migration_2wks_ago",
+    "title": "Database migration: PostgreSQL vs MongoDB",
+    "create_time": 1710000000.0,
+    "update_time": 1710086400.0,
+    "mapping": {
+      "root_db_1": {
+        "id": "root_db_1",
+        "message": {
+          "id": "msg_db_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We're planning to migrate from MongoDB to PostgreSQL for our analytics database. What are the key trade-offs we should consider?"]},
+          "create_time": 1710000000.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_db_2"]
+      },
+      "node_db_2": {
+        "id": "node_db_2",
+        "message": {
+          "id": "msg_db_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Great question. Here are the key trade-offs:\n\nPostgreSQL:\n+ ACID transactions, data integrity\n+ Rich query language (complex JOINs)\n+ Better for structured data\n- Requires schema design upfront\n- Vertical scaling limitations\n\nMongoDB:\n+ Flexible schema, rapid iteration\n+ Horizontal scaling (sharding)\n+ Document-oriented (JSON-like)\n- Weaker transaction guarantees\n- Higher storage overhead\n\nFor analytics with relational data, PostgreSQL is typically better."]},
+          "create_time": 1710000100.0,
+          "metadata": {}
+        },
+        "parent": "root_db_1",
+        "children": ["node_db_3"]
+      },
+      "node_db_3": {
+        "id": "node_db_3",
+        "message": {
+          "id": "msg_db_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We have about 50GB of data. How long would migration take? Any gotchas with JSONB columns?"]},
+          "create_time": 1710000200.0,
+          "metadata": {}
+        },
+        "parent": "node_db_2",
+        "children": ["node_db_4"]
+      },
+      "node_db_4": {
+        "id": "node_db_4",
+        "message": {
+          "id": "msg_db_4",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["50GB is manageable. Timeline depends on:\n\nFactors:\n- Network bandwidth (1-5 hours typical for 50GB)\n- Downtime tolerance (can do zero-downtime with dual-write)\n- Data transformation complexity\n\nJSONB column gotchas:\n- Indexes on nested fields add storage\n- Queries slower than normalized tables\n- Consider denormalizing frequently-accessed paths\n- Use GIN indexes for nested JSON queries\n\nRecommended approach: dual-write for 2 weeks, validate, cut over."]},
+          "create_time": 1710000300.0,
+          "metadata": {}
+        },
+        "parent": "node_db_3",
+        "children": ["node_db_5"]
+      },
+      "node_db_5": {
+        "id": "node_db_5",
+        "message": {
+          "id": "msg_db_5",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Perfect. We'll go PostgreSQL with JSONB for flexibilty on the analytics side. Thanks."]},
+          "create_time": 1710000400.0,
+          "metadata": {}
+        },
+        "parent": "node_db_4",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_api_design",
+    "title": "API design: REST vs GraphQL",
+    "create_time": 1710259200.0,
+    "update_time": 1710345600.0,
+    "mapping": {
+      "root_api_1": {
+        "id": "root_api_1",
+        "message": {
+          "id": "msg_api_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We're starting a new API for mobile clients. Should we use REST or GraphQL?"]},
+          "create_time": 1710259200.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_api_2"]
+      },
+      "node_api_2": {
+        "id": "node_api_2",
+        "message": {
+          "id": "msg_api_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["REST vs GraphQL depends on your use case:\n\nREST:\n+ Simpler to cache (HTTP caching)\n+ Easier monitoring/debugging\n+ Better for CRUD operations\n+ Mature tooling\n- Over/under fetching\n\nGraphQL:\n+ Query exactly what you need\n+ Single endpoint\n+ Great for mobile (bandwidth)\n- N+1 query problem\n- Caching is harder\n- Steeper learning curve\n\nFor mobile, GraphQL excels if you have many different client types (iOS, Android, web)."]},
+          "create_time": 1710259300.0,
+          "metadata": {}
+        },
+        "parent": "root_api_1",
+        "children": ["node_api_3"]
+      },
+      "node_api_3": {
+        "id": "node_api_3",
+        "message": {
+          "id": "msg_api_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We have iOS, Android, and web. I think GraphQL is the way. Any recommended libraries?"]},
+          "create_time": 1710259400.0,
+          "metadata": {}
+        },
+        "parent": "node_api_2",
+        "children": ["node_api_4"]
+      },
+      "node_api_4": {
+        "id": "node_api_4",
+        "message": {
+          "id": "msg_api_4",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["For GraphQL, popular choices:\n\nBackend:\n- Apollo Server (Node.js)\n- Graphene (Python)\n- Strawberry (Python, modern)\n\nClient:\n- Apollo Client (all platforms)\n- Relay (if you need sophisticated caching)\n- urql (lighter weight)\n\nI'd recommend Apollo Server + Apollo Client for the ecosystem and community."]},
+          "create_time": 1710259500.0,
+          "metadata": {}
+        },
+        "parent": "node_api_3",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_deployment_kubernetes",
+    "title": "Deployment strategy: Docker and Kubernetes",
+    "create_time": 1710432000.0,
+    "update_time": 1710518400.0,
+    "mapping": {
+      "root_deploy_1": {
+        "id": "root_deploy_1",
+        "message": {
+          "id": "msg_deploy_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We're moving from VMs to containers. Kubernetes or managed services like ECS? We're AWS-based."]},
+          "create_time": 1710432000.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_deploy_2"]
+      },
+      "node_deploy_2": {
+        "id": "node_deploy_2",
+        "message": {
+          "id": "msg_deploy_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["On AWS, you have good options:\n\nECS (Elastic Container Service):\n+ AWS-native, minimal operational overhead\n+ Fargate serverless option\n+ Good if you're all-in on AWS\n- Less portable if you diversify\n\nEKS (Elastic Kubernetes Service):\n+ Kubernetes standard (portable)\n+ Better for multi-cloud future\n+ Rich ecosystem\n- Higher operational complexity\n- More expensive\n\nFor a growing startup, ECS/Fargate is often the right call. Simpler ops, lower cost. Switch to Kubernetes later if needed."]},
+          "create_time": 1710432100.0,
+          "metadata": {}
+        },
+        "parent": "root_deploy_1",
+        "children": ["node_deploy_3"]
+      },
+      "node_deploy_3": {
+        "id": "node_deploy_3",
+        "message": {
+          "id": "msg_deploy_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What about CI/CD? GitHub Actions vs CodePipeline vs Jenkins?"]},
+          "create_time": 1710432200.0,
+          "metadata": {}
+        },
+        "parent": "node_deploy_2",
+        "children": ["node_deploy_4"]
+      },
+      "node_deploy_4": {
+        "id": "node_deploy_4",
+        "message": {
+          "id": "msg_deploy_4",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["GitHub Actions is best for GitHub-hosted repos. It's tightly integrated, zero-config for pushes. CodePipeline if you want deep AWS integration. Jenkins if you need self-hosted with full control. I'd recommend GitHub Actions for speed and simplicity."]},
+          "create_time": 1710432300.0,
+          "metadata": {}
+        },
+        "parent": "node_deploy_3",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_debugging_session",
+    "title": "Debugging: Memory leak in production",
+    "create_time": 1710604800.0,
+    "update_time": 1710691200.0,
+    "mapping": {
+      "root_bug_1": {
+        "id": "root_bug_1",
+        "message": {
+          "id": "msg_bug_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Our Node.js service is leaking memory in production. Memory grows ~50MB/hour. Where do I start debugging?"]},
+          "create_time": 1710604800.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_bug_2"]
+      },
+      "node_bug_2": {
+        "id": "node_bug_2",
+        "message": {
+          "id": "msg_bug_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Memory leak debugging steps:\n\n1. Enable heap snapshots: `--inspect` flag\n2. Use Chrome DevTools or clinic.js\n3. Take snapshots every hour, compare\n4. Look for growing object counts\n5. Check for:\n   - Event listeners not unsubscribed\n   - Circular references in caches\n   - Timers not cleared\n   - Unclosed database connections\n\nMost common: event listeners and caches. Start there."]},
+          "create_time": 1710604900.0,
+          "metadata": {}
+        },
+        "parent": "root_bug_1",
+        "children": ["node_bug_3"]
+      },
+      "node_bug_3": {
+        "id": "node_bug_3",
+        "message": {
+          "id": "msg_bug_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Found it! We were accumulating event listeners in a WebSocket handler. Fixed by adding removeListener. Memory now stable."]},
+          "create_time": 1710605000.0,
+          "metadata": {}
+        },
+        "parent": "node_bug_2",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_project_planning",
+    "title": "Q2 roadmap planning",
+    "create_time": 1710777600.0,
+    "update_time": 1710864000.0,
+    "mapping": {
+      "root_plan_1": {
+        "id": "root_plan_1",
+        "message": {
+          "id": "msg_plan_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Let's outline Q2. We have 3 engineers. What are realistic goals?"]},
+          "create_time": 1710777600.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_plan_2"]
+      },
+      "node_plan_2": {
+        "id": "node_plan_2",
+        "message": {
+          "id": "msg_plan_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["With 3 engineers over 13 weeks, estimate:\n\n- ~39 engineer-weeks total\n- Reduce by 20% for meetings/planning: ~31 weeks capacity\n- Break into 2-3 major features + bug fixes\n\nRealistic Q2:\n1. Feature A (2 weeks design, 4 weeks build)\n2. Feature B (1 week design, 3 weeks build)\n3. Refactoring/debt (2 weeks)\n4. Buffer (3 weeks)\n\nI'd recommend 2 major features max, focus on ship quality."]},
+          "create_time": 1710777700.0,
+          "metadata": {}
+        },
+        "parent": "root_plan_1",
+        "children": ["node_plan_3"]
+      },
+      "node_plan_3": {
+        "id": "node_plan_3",
+        "message": {
+          "id": "msg_plan_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Good framing. We'll focus on the search feature and mobile optimization. Sounds solid."]},
+          "create_time": 1710777800.0,
+          "metadata": {}
+        },
+        "parent": "node_plan_2",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_code_review",
+    "title": "Code review: Auth refactoring",
+    "create_time": 1710950400.0,
+    "update_time": 1711036800.0,
+    "mapping": {
+      "root_review_1": {
+        "id": "root_review_1",
+        "message": {
+          "id": "msg_review_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Just refactored our auth middleware. Moved from passport to jsonwebtoken. Does the approach look sound?"]},
+          "create_time": 1710950400.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_review_2"]
+      },
+      "node_review_2": {
+        "id": "node_review_2",
+        "message": {
+          "id": "msg_review_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Going from Passport to JWT directly is a good move for microservices. Key checks:\n\n✓ Use RS256 (asymmetric), not HS256\n✓ Include exp, iat claims\n✓ Validate signature on every request\n✓ Short expiry (15min), use refresh tokens\n✓ Logout: maintain token blacklist or use revocation\n\nDo you have refresh token logic? That's often overlooked."]},
+          "create_time": 1710950500.0,
+          "metadata": {}
+        },
+        "parent": "root_review_1",
+        "children": ["node_review_3"]
+      },
+      "node_review_3": {
+        "id": "node_review_3",
+        "message": {
+          "id": "msg_review_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Yes, refresh tokens are in place. 15min access, 7-day refresh. Storing refresh tokens in Redis."]},
+          "create_time": 1710950600.0,
+          "metadata": {}
+        },
+        "parent": "node_review_2",
+        "children": ["node_review_4"]
+      },
+      "node_review_4": {
+        "id": "node_review_4",
+        "message": {
+          "id": "msg_review_4",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Perfect setup. One more thing: test token revocation on logout. Make sure Redis invalidation works end-to-end. Otherwise looks solid for merge!"]},
+          "create_time": 1710950700.0,
+          "metadata": {}
+        },
+        "parent": "node_review_3",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_weather_small",
+    "title": "Weather today",
+    "create_time": 1711123200.0,
+    "update_time": 1711123800.0,
+    "mapping": {
+      "root_w_1": {
+        "id": "root_w_1",
+        "message": {
+          "id": "msg_w_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Is it going to rain tomorrow?"]},
+          "create_time": 1711123200.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_w_2"]
+      },
+      "node_w_2": {
+        "id": "node_w_2",
+        "message": {
+          "id": "msg_w_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["I don't have access to real-time weather data or your location. Check weather.com or your local forecast."]},
+          "create_time": 1711123300.0,
+          "metadata": {}
+        },
+        "parent": "root_w_1",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_lunch_plans",
+    "title": "Lunch spot recommendations",
+    "create_time": 1711296000.0,
+    "update_time": 1711296600.0,
+    "mapping": {
+      "root_lunch_1": {
+        "id": "root_lunch_1",
+        "message": {
+          "id": "msg_lunch_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What are some good lunch spots near downtown?"]},
+          "create_time": 1711296000.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_lunch_2"]
+      },
+      "node_lunch_2": {
+        "id": "node_lunch_2",
+        "message": {
+          "id": "msg_lunch_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Depends on your budget and cuisine preference. Italian, Thai, burgers, sushi? Look up Yelp or Google Maps for your area."]},
+          "create_time": 1711296100.0,
+          "metadata": {}
+        },
+        "parent": "root_lunch_1",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_random_chat",
+    "title": "Random thoughts",
+    "create_time": 1711468800.0,
+    "update_time": 1711469400.0,
+    "mapping": {
+      "root_rand_1": {
+        "id": "root_rand_1",
+        "message": {
+          "id": "msg_rand_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What's your take on remote work?"]},
+          "create_time": 1711468800.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_rand_2"]
+      },
+      "node_rand_2": {
+        "id": "node_rand_2",
+        "message": {
+          "id": "msg_rand_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Remote work has trade-offs. Flexibility and autonomy are great, but collaboration and onboarding can be harder. Hybrid often works best."]},
+          "create_time": 1711468900.0,
+          "metadata": {}
+        },
+        "parent": "root_rand_1",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_performance_optimization",
+    "title": "Database query optimization",
+    "create_time": 1711123200.0,
+    "update_time": 1711209600.0,
+    "mapping": {
+      "root_perf_1": {
+        "id": "root_perf_1",
+        "message": {
+          "id": "msg_perf_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Our dashboard query is taking 8 seconds. Need to optimize. Table has 10M rows."]},
+          "create_time": 1711123200.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_perf_2"]
+      },
+      "node_perf_2": {
+        "id": "node_perf_2",
+        "message": {
+          "id": "msg_perf_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["First: EXPLAIN ANALYZE the query. Common wins:\n\n1. Missing indexes on WHERE/JOIN columns\n2. N+1 query problem\n3. SELECT * instead of needed columns\n4. No query limits\n5. Aggregation without GROUP BY optimization\n\nWith 10M rows, indexes are critical. What's your current schema?"]},
+          "create_time": 1711123300.0,
+          "metadata": {}
+        },
+        "parent": "root_perf_1",
+        "children": ["node_perf_3"]
+      },
+      "node_perf_3": {
+        "id": "node_perf_3",
+        "message": {
+          "id": "msg_perf_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Added indexes on user_id and created_at. Now 200ms. Much better!"]},
+          "create_time": 1711209600.0,
+          "metadata": {}
+        },
+        "parent": "node_perf_2",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_testing_strategy",
+    "title": "Testing strategy and coverage",
+    "create_time": 1710864000.0,
+    "update_time": 1710950400.0,
+    "mapping": {
+      "root_test_1": {
+        "id": "root_test_1",
+        "message": {
+          "id": "msg_test_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What's a good testing strategy? Unit, integration, e2e? We're not sure where to focus effort."]},
+          "create_time": 1710864000.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_test_2"]
+      },
+      "node_test_2": {
+        "id": "node_test_2",
+        "message": {
+          "id": "msg_test_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Pyramid approach:\n\nUnit (60%):\n- Fast, isolated\n- Business logic, helpers\n- Target 80%+ coverage\n\nIntegration (30%):\n- API routes, database\n- Mock external services\n- Test happy path + error cases\n\nE2E (10%):\n- Critical user flows only\n- Selenium/Cypress\n- Slow, avoid redundancy\n\nDon't aim for 100% coverage. Focus on high-value paths."]},
+          "create_time": 1710864100.0,
+          "metadata": {}
+        },
+        "parent": "root_test_1",
+        "children": ["node_test_3"]
+      },
+      "node_test_3": {
+        "id": "node_test_3",
+        "message": {
+          "id": "msg_test_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Clear breakdown. We'll start with unit tests and integration for the API. E2E can come later."]},
+          "create_time": 1710950400.0,
+          "metadata": {}
+        },
+        "parent": "node_test_2",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_scaling_concerns",
+    "title": "Scaling to 1M users",
+    "create_time": 1710518400.0,
+    "update_time": 1710604800.0,
+    "mapping": {
+      "root_scale_1": {
+        "id": "root_scale_1",
+        "message": {
+          "id": "msg_scale_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We're approaching 100K users. What architectural changes do we need for 1M?"]},
+          "create_time": 1710518400.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_scale_2"]
+      },
+      "node_scale_2": {
+        "id": "node_scale_2",
+        "message": {
+          "id": "msg_scale_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["100K to 1M requires architectural shifts:\n\nDatabase:\n- Horizontal sharding (user_id % N)\n- Read replicas\n- Caching layer (Redis)\n\nAPI:\n- Load balancing\n- Rate limiting\n- CDN for static assets\n\nOps:\n- Monitoring/alerting\n- Auto-scaling\n- Disaster recovery\n\nStart with caching and read replicas. Sharding is painful, delay if possible."]},
+          "create_time": 1710518500.0,
+          "metadata": {}
+        },
+        "parent": "root_scale_1",
+        "children": ["node_scale_3"]
+      },
+      "node_scale_3": {
+        "id": "node_scale_3",
+        "message": {
+          "id": "msg_scale_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Should we start sharding now or wait? We're still monolithic."]},
+          "create_time": 1710604800.0,
+          "metadata": {}
+        },
+        "parent": "node_scale_2",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_framework_choice",
+    "title": "Backend framework selection",
+    "create_time": 1710259200.0,
+    "update_time": 1710345600.0,
+    "mapping": {
+      "root_fw_1": {
+        "id": "root_fw_1",
+        "message": {
+          "id": "msg_fw_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["New backend service. Should we use FastAPI, Django, or Express?"]},
+          "create_time": 1710259200.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_fw_2"]
+      },
+      "node_fw_2": {
+        "id": "node_fw_2",
+        "message": {
+          "id": "msg_fw_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Express (Node):\n+ Lightweight, fast\n+ Large ecosystem\n- Less built-in features\n\nDjango (Python):\n+ Full batteries-included\n+ ORM, admin, auth\n- Heavier, less flexible\n\nFastAPI (Python):\n+ Modern async\n+ Great performance\n+ Type hints\n- Smaller ecosystem\n\nFor a microservice: FastAPI. For a full application: Django. For real-time: Express."]},
+          "create_time": 1710259300.0,
+          "metadata": {}
+        },
+        "parent": "root_fw_1",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_monitoring_alerts",
+    "title": "Monitoring and alerting setup",
+    "create_time": 1710691200.0,
+    "update_time": 1710777600.0,
+    "mapping": {
+      "root_mon_1": {
+        "id": "root_mon_1",
+        "message": {
+          "id": "msg_mon_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What's a good monitoring stack? Prometheus? Datadog?"]},
+          "create_time": 1710691200.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_mon_2"]
+      },
+      "node_mon_2": {
+        "id": "node_mon_2",
+        "message": {
+          "id": "msg_mon_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Self-hosted: Prometheus + Grafana + AlertManager. Cheap, works well at any scale.\n\nManaged: Datadog or New Relic. Expensive but includes APM, logs, dashboards.\n\nFor startups: Start with Prometheus. Move to Datadog when you have budget."]},
+          "create_time": 1710691300.0,
+          "metadata": {}
+        },
+        "parent": "root_mon_1",
+        "children": ["node_mon_3"]
+      },
+      "node_mon_3": {
+        "id": "node_mon_3",
+        "message": {
+          "id": "msg_mon_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["We'll go Prometheus. What metrics should we track?"]},
+          "create_time": 1710777600.0,
+          "metadata": {}
+        },
+        "parent": "node_mon_2",
+        "children": []
+      }
+    }
+  },
+  {
+    "id": "conv_security_best_practices",
+    "title": "Security best practices",
+    "create_time": 1710000000.0,
+    "update_time": 1710086400.0,
+    "mapping": {
+      "root_sec_1": {
+        "id": "root_sec_1",
+        "message": {
+          "id": "msg_sec_1",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["What security practices should we enforce in production?"]},
+          "create_time": 1710000000.0,
+          "metadata": {}
+        },
+        "parent": null,
+        "children": ["node_sec_2"]
+      },
+      "node_sec_2": {
+        "id": "node_sec_2",
+        "message": {
+          "id": "msg_sec_2",
+          "author": {"role": "assistant"},
+          "content": {"content_type": "text", "parts": ["Critical practices:\n\n1. API: rate limiting, input validation, CORS\n2. Database: encryption at rest, parameterized queries\n3. Secrets: never in code, use vaults\n4. HTTPS: always, HSTS header\n5. Dependencies: regular updates, CVE scanning\n6. Logging: no passwords/tokens\n\nStart with #1-4, add #5-6 later."]},
+          "create_time": 1710000100.0,
+          "metadata": {}
+        },
+        "parent": "root_sec_1",
+        "children": ["node_sec_3"]
+      },
+      "node_sec_3": {
+        "id": "node_sec_3",
+        "message": {
+          "id": "msg_sec_3",
+          "author": {"role": "user"},
+          "content": {"content_type": "text", "parts": ["Solid checklist. We'll implement these incrementally."]},
+          "create_time": 1710086400.0,
+          "metadata": {}
+        },
+        "parent": "node_sec_2",
+        "children": []
+      }
+    }
+  }
+]

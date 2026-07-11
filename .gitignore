@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/
+
+# Revien data
+~/.revien/
+*.db
+*.sqlite
+*.sqlite3
+revien_data/
+
+# Benchmark (dev-only) — LoCoMo dataset is fetched+checksummed, never vendored
+data/locomo10.json
+data/*.json
+results/
+revien_bench/DATASET.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.tar.gz
+*.whl
+
+# Internal working documents — never ship
+HANDOFF*

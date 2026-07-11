@@ -1,0 +1,704 @@
+"""
+Test 1: Graph CRUD
+Create nodes of every type. Create edges of every type. Update nodes.
+Delete nodes and verify edges are cleaned up. Export graph to JSON and
+reimport. Verify graph integrity after reimport.
+"""
+
+import json
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
+from revien.graph.store import GraphStore
+from revien.graph.operations import GraphOperations
+
+
+@pytest.fixture
+def store():
+    """Create a temporary GraphStore for each test."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    s = GraphStore(db_path=path)
+    yield s
+    s.close()
+    os.unlink(path)
+
+
+@pytest.fixture
+def ops(store):
+    return GraphOperations(store)
+
+
+# ── Confidence decay: demote, don't delete ───────────────
+
+class TestDecayDemotesNotDeletes:
+    """Decay floors at DECAY_FLOOR (demote); only correction deletes (0.0)."""
+
+    def test_aged_inferred_floors_not_zero(self, store, ops):
+        old = datetime.now(timezone.utc) - timedelta(weeks=300)
+        n = Node(node_type=NodeType.FACT, label="ancient", content="x",
+                 source_type=SourceType.INFERRED, confidence=0.7,
+                 last_referenced=old)
+        store.add_node(n)
+        decayed = ops._apply_decay(n)
+        assert decayed.confidence == GraphOperations.DECAY_FLOOR
+        assert decayed.confidence > 0.0  # demoted, never deleted
+
+    def test_correction_still_deletes_to_zero(self, store, ops):
+        n = Node(node_type=NodeType.FACT, label="wrong", content="x",
+                 source_type=SourceType.INFERRED, confidence=0.8)
+        store.add_node(n)
+        ops.correct_node(n.node_id)
+        got = store.get_node(n.node_id)
+        assert got.confidence == 0.0  # explicit correction bypasses the floor
+
+    def test_fresh_inferred_not_raised(self, store, ops):
+        n = Node(node_type=NodeType.FACT, label="recent", content="x",
+                 source_type=SourceType.INFERRED, confidence=0.6,
+                 last_referenced=datetime.now(timezone.utc))
+        store.add_node(n)
+        decayed = ops._apply_decay(n)
+        assert decayed.confidence == 0.6  # no meaningful decay; floor never raises
+
+
+# ── Node Creation (every type) ────────────────────────────
+
+class TestNodeCreation:
+    def test_create_entity_node(self, store):
+        node = Node(node_type=NodeType.ENTITY, label="Alice", content="Project lead")
+        result = store.add_node(node)
+        assert result.node_id == node.node_id
+        assert result.node_type == NodeType.ENTITY
+
+    def test_create_topic_node(self, store):
+        node = Node(node_type=NodeType.TOPIC, label="pricing strategy", content="Discussion about tier pricing")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.TOPIC
+
+    def test_create_decision_node(self, store):
+        node = Node(node_type=NodeType.DECISION, label="Enterprise tier at $499/mo", content="We decided on $499/month with 20% annual discount")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.DECISION
+
+    def test_create_fact_node(self, store):
+        node = Node(node_type=NodeType.FACT, label="PostgreSQL for DB", content="Database layer uses PostgreSQL, not MySQL")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.FACT
+
+    def test_create_preference_node(self, store):
+        node = Node(node_type=NodeType.PREFERENCE, label="Prefers Python", content="Prefers Python over JavaScript for backend")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.PREFERENCE
+
+    def test_create_event_node(self, store):
+        node = Node(node_type=NodeType.EVENT, label="Deployed PatternWall v4.3", content="Deployed PatternWall v4.3 on Feb 16")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.EVENT
+
+    def test_create_context_node(self, store):
+        node = Node(node_type=NodeType.CONTEXT, label="Pricing session", content="Session where we scoped enterprise pricing")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.CONTEXT
+
+    def test_all_node_types_covered(self):
+        """Verify we test every NodeType."""
+        assert len(NodeType) == 7
+
+
+# ── Edge Creation (every type) ────────────────────────────
+
+class TestEdgeCreation:
+    def _make_two_nodes(self, store):
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="Node A", content="A"))
+        n2 = store.add_node(Node(node_type=NodeType.ENTITY, label="Node B", content="B"))
+        return n1, n2
+
+    def test_create_related_to_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(edge_type=EdgeType.RELATED_TO, source_node_id=n1.node_id, target_node_id=n2.node_id)
+        result = store.add_edge(edge)
+        assert result.edge_type == EdgeType.RELATED_TO
+
+    def test_create_decided_in_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(edge_type=EdgeType.DECIDED_IN, source_node_id=n1.node_id, target_node_id=n2.node_id)
+        result = store.add_edge(edge)
+        assert result.edge_type == EdgeType.DECIDED_IN
+
+    def test_create_mentioned_by_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(edge_type=EdgeType.MENTIONED_BY, source_node_id=n1.node_id, target_node_id=n2.node_id)
+        result = store.add_edge(edge)
+        assert result.edge_type == EdgeType.MENTIONED_BY
+
+    def test_create_depends_on_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(edge_type=EdgeType.DEPENDS_ON, source_node_id=n1.node_id, target_node_id=n2.node_id)
+        result = store.add_edge(edge)
+        assert result.edge_type == EdgeType.DEPENDS_ON
+
+    def test_create_followed_by_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(edge_type=EdgeType.FOLLOWED_BY, source_node_id=n1.node_id, target_node_id=n2.node_id)
+        result = store.add_edge(edge)
+        assert result.edge_type == EdgeType.FOLLOWED_BY
+
+    def test_create_contradicts_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(edge_type=EdgeType.CONTRADICTS, source_node_id=n1.node_id, target_node_id=n2.node_id)
+        result = store.add_edge(edge)
+        assert result.edge_type == EdgeType.CONTRADICTS
+
+    def test_create_conflicts_with_edge(self, store):
+        n1, n2 = self._make_two_nodes(store)
+        edge = Edge(
+            edge_type=EdgeType.CONFLICTS_WITH,
+            source_node_id=n1.node_id,
+            target_node_id=n2.node_id,
+            weight=0.9,
+            confidence=0.8,
+            source_context="parallel claims; neither should be superseded",
+        )
+        result = store.add_edge(edge)
+        stored = store.get_edge(result.edge_id)
+        assert stored is not None
+        assert stored.edge_type == EdgeType.CONFLICTS_WITH
+        assert stored.weight == 0.9
+        assert stored.confidence == 0.8
+        assert stored.source_context == "parallel claims; neither should be superseded"
+
+    def test_all_edge_types_covered(self):
+        expected_edge_types = {
+            EdgeType.RELATED_TO,
+            EdgeType.DECIDED_IN,
+            EdgeType.MENTIONED_BY,
+            EdgeType.DEPENDS_ON,
+            EdgeType.FOLLOWED_BY,
+            EdgeType.CONTRADICTS,
+            EdgeType.CONFLICTS_WITH,
+            EdgeType.CORRECTS,
+            EdgeType.DERIVED_FROM,
+        }
+        assert expected_edge_types.issubset(set(EdgeType))
+
+
+# ── Update Operations ─────────────────────────────────────
+
+class TestNodeUpdate:
+    def test_update_label(self, store):
+        node = store.add_node(Node(node_type=NodeType.FACT, label="Old label", content="Content"))
+        updated = store.update_node(node.node_id, label="New label")
+        assert updated.label == "New label"
+        assert updated.content == "Content"  # unchanged
+
+    def test_update_content(self, store):
+        node = store.add_node(Node(node_type=NodeType.FACT, label="Label", content="Old content"))
+        updated = store.update_node(node.node_id, content="New content")
+        assert updated.content == "New content"
+
+    def test_update_access_count(self, store):
+        node = store.add_node(Node(node_type=NodeType.ENTITY, label="Test", content="Test"))
+        updated = store.update_node(node.node_id, access_count=5)
+        assert updated.access_count == 5
+
+    def test_update_metadata(self, store):
+        node = store.add_node(Node(node_type=NodeType.ENTITY, label="Test", content="Test"))
+        updated = store.update_node(node.node_id, metadata={"tool": "claude-code"})
+        assert updated.metadata == {"tool": "claude-code"}
+
+    def test_update_nonexistent_returns_none(self, store):
+        result = store.update_node("nonexistent-id", label="Nope")
+        assert result is None
+
+
+# ── Delete Operations ─────────────────────────────────────
+
+class TestNodeDeletion:
+    def test_delete_node(self, store):
+        node = store.add_node(Node(node_type=NodeType.ENTITY, label="Doomed", content="Gone soon"))
+        assert store.delete_node(node.node_id) is True
+        assert store.get_node(node.node_id) is None
+
+    def test_delete_cleans_up_edges(self, store):
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="A", content="A"))
+        n2 = store.add_node(Node(node_type=NodeType.ENTITY, label="B", content="B"))
+        edge = store.add_edge(Edge(
+            edge_type=EdgeType.RELATED_TO,
+            source_node_id=n1.node_id,
+            target_node_id=n2.node_id,
+        ))
+        store.delete_node(n1.node_id)
+        # Edge should be gone
+        assert store.get_edge(edge.edge_id) is None
+        # n2 should have no edges
+        assert len(store.get_edges_for_node(n2.node_id)) == 0
+
+    def test_delete_nonexistent_returns_false(self, store):
+        assert store.delete_node("fake-id") is False
+
+    def test_no_orphaned_edges_after_deletion(self, store):
+        """Create a hub node with multiple edges, delete it, verify zero orphans."""
+        hub = store.add_node(Node(node_type=NodeType.TOPIC, label="Hub", content="Hub"))
+        spokes = []
+        for i in range(5):
+            n = store.add_node(Node(node_type=NodeType.ENTITY, label=f"Spoke {i}", content=f"S{i}"))
+            spokes.append(n)
+            store.add_edge(Edge(
+                edge_type=EdgeType.RELATED_TO,
+                source_node_id=hub.node_id,
+                target_node_id=n.node_id,
+            ))
+        assert store.count_edges() == 5
+        store.delete_node(hub.node_id)
+        assert store.count_edges() == 0
+
+
+# ── Export/Import ─────────────────────────────────────────
+
+class TestExportImport:
+    def test_export_produces_valid_graph(self, store):
+        store.add_node(Node(node_type=NodeType.ENTITY, label="A", content="A"))
+        store.add_node(Node(node_type=NodeType.TOPIC, label="B", content="B"))
+        graph = store.export_graph()
+        assert len(graph.nodes) == 2
+        assert graph.version == "1.0"
+
+    def test_export_import_roundtrip(self, store):
+        # Build a graph
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="Alice", content="Project lead"))
+        n2 = store.add_node(Node(node_type=NodeType.DECISION, label="$499/mo", content="Enterprise pricing"))
+        n3 = store.add_node(Node(node_type=NodeType.CONTEXT, label="Session 1", content="Pricing discussion"))
+        store.add_edge(Edge(edge_type=EdgeType.DECIDED_IN, source_node_id=n2.node_id, target_node_id=n3.node_id, weight=0.9))
+        store.add_edge(Edge(edge_type=EdgeType.MENTIONED_BY, source_node_id=n2.node_id, target_node_id=n1.node_id, weight=0.7))
+        store.add_edge(Edge(edge_type=EdgeType.CONFLICTS_WITH, source_node_id=n1.node_id, target_node_id=n2.node_id, weight=0.6))
+
+        # Export
+        graph = store.export_graph()
+        graph_json = graph.model_dump_json()
+
+        # Reimport into fresh store
+        fd, path2 = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        store2 = GraphStore(db_path=path2)
+        try:
+            reimported = Graph.model_validate_json(graph_json)
+            store2.import_graph(reimported)
+
+            # Verify integrity
+            assert store2.count_nodes() == 3
+            assert store2.count_edges() == 3
+
+            # Verify specific node data survived
+            alice = store2.get_node(n1.node_id)
+            assert alice is not None
+            assert alice.label == "Alice"
+            assert alice.node_type == NodeType.ENTITY
+
+            decision = store2.get_node(n2.node_id)
+            assert decision is not None
+            assert decision.label == "$499/mo"
+            assert decision.content == "Enterprise pricing"
+
+            # Verify edges survived
+            edges = store2.get_edges_for_node(n2.node_id)
+            assert len(edges) == 3
+            edge_types = {e.edge_type for e in edges}
+            assert EdgeType.DECIDED_IN in edge_types
+            assert EdgeType.MENTIONED_BY in edge_types
+            conflict_edges = store2.get_edges_for_node(n1.node_id)
+            assert EdgeType.CONFLICTS_WITH in {e.edge_type for e in conflict_edges}
+        finally:
+            store2.close()
+            os.unlink(path2)
+
+    def test_import_clears_existing_data(self, store):
+        store.add_node(Node(node_type=NodeType.ENTITY, label="Old", content="Old"))
+        assert store.count_nodes() == 1
+
+        new_graph = Graph(
+            nodes=[Node(node_type=NodeType.FACT, label="New", content="New")],
+            edges=[],
+        )
+        store.import_graph(new_graph, clear_existing=True)
+        assert store.count_nodes() == 1
+        nodes = store.list_nodes()
+        assert nodes[0].label == "New"
+
+
+# ── Operations Layer ──────────────────────────────────────
+
+class TestGraphOperations:
+    def test_find_node_by_label(self, store, ops):
+        store.add_node(Node(node_type=NodeType.ENTITY, label="Alice", content="Project lead"))
+        store.add_node(Node(node_type=NodeType.ENTITY, label="Bob", content="Engineer"))
+        result = ops.find_node_by_label("alice")  # case-insensitive
+        assert result is not None
+        assert result.label == "Alice"
+
+    def test_find_node_fuzzy(self, store, ops):
+        store.add_node(Node(node_type=NodeType.ENTITY, label="PostgreSQL", content="Database"))
+        results = ops.find_nodes_by_label_fuzzy("Postgres")  # distance ~3
+        assert len(results) >= 1
+
+    def test_touch_node_increments(self, store, ops):
+        node = store.add_node(Node(node_type=NodeType.ENTITY, label="Test", content="Test"))
+        assert node.access_count == 0
+        touched = ops.touch_node(node.node_id)
+        assert touched.access_count == 1
+        touched2 = ops.touch_node(node.node_id)
+        assert touched2.access_count == 2
+
+    def test_connect_nodes(self, store, ops):
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="A", content="A"))
+        n2 = store.add_node(Node(node_type=NodeType.TOPIC, label="B", content="B"))
+        edge = ops.connect_nodes(n1.node_id, n2.node_id, EdgeType.RELATED_TO, weight=0.8)
+        assert edge.weight == 0.8
+        assert store.count_edges() == 1
+
+    def test_get_node_with_edges(self, store, ops):
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="Center", content="Hub"))
+        n2 = store.add_node(Node(node_type=NodeType.TOPIC, label="Spoke", content="Spoke"))
+        ops.connect_nodes(n1.node_id, n2.node_id, EdgeType.RELATED_TO)
+        result = ops.get_node_with_edges(n1.node_id)
+        assert result is not None
+        assert len(result["connected_nodes"]) == 1
+        assert result["connected_nodes"][0]["label"] == "Spoke"
+
+    def test_get_subgraph(self, store, ops):
+        # Chain: A -> B -> C -> D
+        a = store.add_node(Node(node_type=NodeType.ENTITY, label="A", content="A"))
+        b = store.add_node(Node(node_type=NodeType.ENTITY, label="B", content="B"))
+        c = store.add_node(Node(node_type=NodeType.ENTITY, label="C", content="C"))
+        d = store.add_node(Node(node_type=NodeType.ENTITY, label="D", content="D"))
+        ops.connect_nodes(a.node_id, b.node_id, EdgeType.FOLLOWED_BY)
+        ops.connect_nodes(b.node_id, c.node_id, EdgeType.FOLLOWED_BY)
+        ops.connect_nodes(c.node_id, d.node_id, EdgeType.FOLLOWED_BY)
+
+        # Depth 1 from A should get A, B
+        sub = ops.get_subgraph(a.node_id, max_depth=1)
+        labels = {n.label for n in sub.nodes}
+        assert "A" in labels
+        assert "B" in labels
+
+        # Depth 2 from A should get A, B, C
+        sub2 = ops.get_subgraph(a.node_id, max_depth=2)
+        labels2 = {n.label for n in sub2.nodes}
+        assert "A" in labels2
+        assert "B" in labels2
+        assert "C" in labels2
+
+
+# ── Listing and Counting ──────────────────────────────────
+
+class TestListingAndCounting:
+    def test_list_nodes_by_type(self, store):
+        store.add_node(Node(node_type=NodeType.ENTITY, label="E1", content="E1"))
+        store.add_node(Node(node_type=NodeType.ENTITY, label="E2", content="E2"))
+        store.add_node(Node(node_type=NodeType.TOPIC, label="T1", content="T1"))
+        entities = store.list_nodes(node_type=NodeType.ENTITY)
+        assert len(entities) == 2
+        topics = store.list_nodes(node_type=NodeType.TOPIC)
+        assert len(topics) == 1
+
+    def test_count_nodes(self, store):
+        assert store.count_nodes() == 0
+        store.add_node(Node(node_type=NodeType.ENTITY, label="X", content="X"))
+        assert store.count_nodes() == 1
+
+    def test_count_edges(self, store):
+        assert store.count_edges() == 0
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="A", content="A"))
+        n2 = store.add_node(Node(node_type=NodeType.ENTITY, label="B", content="B"))
+        store.add_edge(Edge(edge_type=EdgeType.RELATED_TO, source_node_id=n1.node_id, target_node_id=n2.node_id))
+        assert store.count_edges() == 1
+
+    def test_get_neighbors(self, store):
+        n1 = store.add_node(Node(node_type=NodeType.ENTITY, label="A", content="A"))
+        n2 = store.add_node(Node(node_type=NodeType.ENTITY, label="B", content="B"))
+        n3 = store.add_node(Node(node_type=NodeType.ENTITY, label="C", content="C"))
+        store.add_edge(Edge(edge_type=EdgeType.RELATED_TO, source_node_id=n1.node_id, target_node_id=n2.node_id))
+        store.add_edge(Edge(edge_type=EdgeType.RELATED_TO, source_node_id=n1.node_id, target_node_id=n3.node_id))
+        neighbors = store.get_neighbors(n1.node_id)
+        assert len(neighbors) == 2
+        assert n2.node_id in neighbors
+        assert n3.node_id in neighbors
+
+
+# ── Provenance Layer (leg 6a): audit, lineage, soft-invalidation ──
+
+class TestAuditLog:
+    """Append-only audit trail. Records create/reinforce/correct/invalidate;
+    access via mark_used. Audit-write failures never break the underlying op."""
+
+    def test_create_records_audit(self, store):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        hist = store.get_node_audit(n.node_id)
+        assert [e["op"] for e in hist] == ["create"]
+        assert hist[0]["before"] is None
+        assert hist[0]["after"]["node_id"] == n.node_id
+
+    def test_reinforce_correct_invalidate_recorded_in_order(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x",
+                                source_type=SourceType.INFERRED, confidence=0.5))
+        ops.reinforce_node(n.node_id, construct_id="bash")
+        ops.correct_node(n.node_id, correction_context="wrong", construct_id="bash")
+        ops.invalidate_node(n.node_id, reason="superseded", construct_id="bash")
+        ops_seen = [e["op"] for e in store.get_node_audit(n.node_id)]
+        assert ops_seen == ["create", "reinforce", "correct", "invalidate"]
+
+    def test_decay_records_audit(self, store, ops):
+        old = datetime.now(timezone.utc) - timedelta(weeks=100)
+        n = store.add_node(Node(node_type=NodeType.FACT, label="aged", content="x",
+                                source_type=SourceType.INFERRED, confidence=0.9,
+                                last_referenced=old))
+        ops._apply_decay(n)
+        ops_seen = [e["op"] for e in store.get_node_audit(n.node_id)]
+        assert "decay" in ops_seen
+
+    def test_recent_audit_newest_first(self, store):
+        a = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        b = store.add_node(Node(node_type=NodeType.FACT, label="b", content="y"))
+        recent = store.get_recent_audit(limit=10)
+        assert recent[0]["node_id"] == b.node_id  # newest first
+        assert {r["node_id"] for r in recent} == {a.node_id, b.node_id}
+
+    def test_audit_failure_never_breaks_op(self, store, monkeypatch):
+        # Simulate an audit-write failure: make record_audit raise (e.g. a DB
+        # error inside the INSERT). The guarded _record_node_audit wrapper used
+        # by add_node must swallow it so the underlying op still succeeds.
+        def boom(*a, **k):
+            raise RuntimeError("audit boom")
+        monkeypatch.setattr(store, "record_audit", boom)
+        try:
+            n = store.add_node(Node(node_type=NodeType.FACT, label="z", content="x"))
+        except RuntimeError:
+            pytest.fail("audit-write failure must not break add_node")
+        # Underlying op succeeded; the audit row is simply absent (write failed),
+        # which is the acceptable degraded outcome.
+        assert store.get_node(n.node_id) is not None
+
+
+class TestLineage:
+    """DERIVED_FROM trace: ancestor chain, bounded depth, cycle-safe."""
+
+    def _n(self, store, label):
+        return store.add_node(Node(node_type=NodeType.FACT, label=label, content=label))
+
+    def test_simple_chain(self, store, ops):
+        a = self._n(store, "a"); b = self._n(store, "b"); c = self._n(store, "c")
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(c.node_id, b.node_id, EdgeType.DERIVED_FROM)
+        lin = ops.get_lineage(c.node_id)
+        anc = [x["node_id"] for x in lin["ancestors"]]
+        assert anc == [b.node_id, a.node_id]
+        assert lin["truncated"] is False
+
+    def test_no_ancestors(self, store, ops):
+        a = self._n(store, "a")
+        assert ops.get_lineage(a.node_id)["ancestors"] == []
+
+    def test_depth_bounded(self, store, ops):
+        a = self._n(store, "a"); b = self._n(store, "b"); c = self._n(store, "c")
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(c.node_id, b.node_id, EdgeType.DERIVED_FROM)
+        lin = ops.get_lineage(c.node_id, max_depth=1)
+        assert [x["node_id"] for x in lin["ancestors"]] == [b.node_id]
+        assert lin["truncated"] is True
+
+    def test_cycle_safe(self, store, ops):
+        a = self._n(store, "a"); b = self._n(store, "b")
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(a.node_id, b.node_id, EdgeType.DERIVED_FROM)  # cycle
+        lin = ops.get_lineage(b.node_id)  # must terminate
+        assert len(lin["ancestors"]) <= 2
+
+
+class TestSoftInvalidation:
+    """invalidate_node marks stale, retains content, is idempotent."""
+
+    def test_invalidate_sets_timestamp_retains_content(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="keepme"))
+        ops.invalidate_node(n.node_id, reason="archived")
+        got = store.get_node(n.node_id)
+        assert got is not None                  # NOT deleted
+        assert got.content == "keepme"          # content RETAINED
+        assert got.invalidated_at is not None
+
+    def test_invalidate_idempotent(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        first = ops.invalidate_node(n.node_id).invalidated_at
+        second = ops.invalidate_node(n.node_id).invalidated_at
+        assert first == second                  # original timestamp preserved
+
+    def test_invalidate_missing_node(self, store, ops):
+        assert ops.invalidate_node("nope") is None
+
+    def test_invalidated_at_persists_roundtrip(self, store, ops):
+        n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        ops.invalidate_node(n.node_id)
+        reloaded = store.get_node(n.node_id)
+        assert isinstance(reloaded.invalidated_at, datetime)
+
+
+# ── Governance Layer (leg 6b): retention, forget, export, ingest policy ──
+
+def _aged(store, label, days, **kw):
+    """Helper: add a node whose freshness clock is `days` in the past."""
+    old = datetime.now(timezone.utc) - timedelta(days=days)
+    return store.add_node(Node(
+        node_type=NodeType.FACT, label=label, content=label.upper(),
+        created_at=old, last_referenced=old, **kw,
+    ))
+
+
+class TestRetentionKeep:
+    """keep mode is a pure no-op — nothing removed, nothing invalidated."""
+
+    def test_keep_removes_nothing(self, store, ops):
+        n = _aged(store, "stale", 500)
+        r = ops.apply_retention(mode="keep", days=90)
+        assert r["archived"] == 0 and r["expired"] == 0
+        got = store.get_node(n.node_id)
+        assert got is not None and got.invalidated_at is None
+
+
+class TestRetentionArchive:
+    """archive soft-invalidates stale unpinned nodes (recoverable, content kept)."""
+
+    def test_stale_archived_recoverable(self, store, ops):
+        stale = _aged(store, "stale", 200)
+        r = ops.apply_retention(mode="archive", days=90)
+        assert r["archived"] == 1
+        got = store.get_node(stale.node_id)
+        assert got is not None                       # NOT deleted
+        assert got.content == "STALE"                # content RETAINED
+        assert got.invalidated_at is not None        # recoverable via include_invalidated
+
+    def test_pinned_immune(self, store, ops):
+        pinned = _aged(store, "pin", 200, pinned=True)
+        ops.apply_retention(mode="archive", days=90)
+        assert store.get_node(pinned.node_id).invalidated_at is None
+
+    def test_fresh_survives(self, store, ops):
+        fresh = store.add_node(Node(node_type=NodeType.FACT, label="f", content="F"))
+        ops.apply_retention(mode="archive", days=90)
+        assert store.get_node(fresh.node_id).invalidated_at is None
+
+    def test_already_archived_not_recounted(self, store, ops):
+        _aged(store, "stale", 200)
+        first = ops.apply_retention(mode="archive", days=90)
+        second = ops.apply_retention(mode="archive", days=90)
+        assert first["archived"] == 1 and second["archived"] == 0
+
+
+class TestRetentionExpire:
+    """expire HARD-deletes stale unpinned nodes (+content-free tombstone audit)."""
+
+    def test_stale_hard_deleted_with_tombstone(self, store, ops):
+        stale = _aged(store, "stale", 200)
+        r = ops.apply_retention(mode="expire", days=90)
+        assert r["expired"] == 1
+        assert store.get_node(stale.node_id) is None       # HARD deleted
+        forget_entries = [a for a in store.get_node_audit(stale.node_id)
+                          if a["op"] == "forget"]
+        assert len(forget_entries) == 1
+        assert forget_entries[0]["before"] is None          # no forgotten content
+        assert forget_entries[0]["after"]["reason"] == "retention_expire"
+
+    def test_pinned_and_fresh_survive_expire(self, store, ops):
+        pinned = _aged(store, "pin", 200, pinned=True)
+        fresh = store.add_node(Node(node_type=NodeType.FACT, label="f", content="F"))
+        ops.apply_retention(mode="expire", days=90)
+        assert store.get_node(pinned.node_id) is not None
+        assert store.get_node(fresh.node_id) is not None
+
+
+class TestForget:
+    """Right-to-forget: hard-delete content, tombstone, lineage re-point, cascade."""
+
+    def _chain(self, store, ops):
+        # A <- B <- C  (B derived_from A; C derived_from B)
+        a = store.add_node(Node(node_type=NodeType.FACT, label="A", content="secretA"))
+        b = store.add_node(Node(node_type=NodeType.FACT, label="B", content="B"))
+        c = store.add_node(Node(node_type=NodeType.FACT, label="C", content="C"))
+        ops.connect_nodes(b.node_id, a.node_id, EdgeType.DERIVED_FROM)
+        ops.connect_nodes(c.node_id, b.node_id, EdgeType.DERIVED_FROM)
+        return a, b, c
+
+    def test_forget_hard_deletes_and_tombstones(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        res = ops.forget_node(a.node_id, reason="gdpr")
+        assert res["count"] == 1
+        assert store.get_node(a.node_id) is None            # content GONE
+        ts = [x for x in store.get_node_audit(a.node_id) if x["op"] == "forget"]
+        assert len(ts) == 1 and ts[0]["before"] is None     # content-free tombstone
+        assert "secretA" not in str(ts[0])
+
+    def test_forget_repoints_child_lineage(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        ops.forget_node(a.node_id, reason="gdpr")
+        labels = [x["label"] for x in ops.get_lineage(b.node_id)["ancestors"]]
+        assert labels == ["[forgotten node]"]               # no orphan, points to gravestone
+        tomb = store.get_node(ops._tombstone_id(a.node_id))
+        assert tomb is not None and tomb.pinned and tomb.content == ""
+        assert tomb.node_type == NodeType.CONTEXT           # excluded from recall
+
+    def test_forget_preview_lists_subtree(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        prev = ops.forget_preview(a.node_id)
+        assert prev["exists"] and prev["count"] == 3
+        assert set(prev["node_ids"]) == {a.node_id, b.node_id, c.node_id}
+
+    def test_forget_cascade_removes_chain(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        res = ops.forget_node(a.node_id, cascade=True, reason="gdpr")
+        assert res["count"] == 3
+        assert store.get_node(a.node_id) is None
+        assert store.get_node(b.node_id) is None
+        assert store.get_node(c.node_id) is None
+
+    def test_forget_missing_node(self, store, ops):
+        assert ops.forget_node("nope")["status"] == "not_found"
+
+    def test_forget_refuses_tombstone(self, store, ops):
+        a, b, c = self._chain(store, ops)
+        ops.forget_node(a.node_id, reason="gdpr")
+        tid = ops._tombstone_id(a.node_id)
+        assert ops.forget_node(tid)["status"] == "skipped"
+
+
+class TestExportEverything:
+    """export_everything returns graph (nodes+edges) + audit."""
+
+    def test_export_shape(self, store, ops):
+        store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
+        exp = ops.export_everything()
+        assert "graph" in exp and "audit" in exp
+        assert "nodes" in exp["graph"] and "edges" in exp["graph"]
+        assert len(exp["graph"]["nodes"]) == 1
+        assert len(exp["audit"]) >= 1                       # at least the create entry
+
+
+class TestRetentionConfig:
+    """Env-driven mode/window resolution with safe fallbacks."""
+
+    def test_default_mode_is_keep(self, monkeypatch):
+        from revien.graph.operations import get_retention_mode, get_retention_days
+        monkeypatch.delenv("REVIEN_RETENTION", raising=False)
+        monkeypatch.delenv("REVIEN_RETENTION_DAYS", raising=False)
+        assert get_retention_mode() == "keep"
+        assert get_retention_days() == 90
+
+    def test_unknown_mode_falls_back_to_keep(self, monkeypatch):
+        from revien.graph.operations import get_retention_mode
+        monkeypatch.setenv("REVIEN_RETENTION", "nonsense")
+        assert get_retention_mode() == "keep"
+
+    def test_bad_days_falls_back(self, monkeypatch):
+        from revien.graph.operations import get_retention_days
+        monkeypatch.setenv("REVIEN_RETENTION_DAYS", "-5")
+        assert get_retention_days() == 90
