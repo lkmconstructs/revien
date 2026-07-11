@@ -643,7 +643,7 @@ class GraphOperations:
     ) -> Optional[Node]:
         """Find a node by NORMALIZED label match, optionally filtered by type.
 
-        Normalized, not raw-lowercase: 'Providence-Core' and 'Providence Core'
+        Normalized, not raw-lowercase: 'Fernweh-Core' and 'Fernweh Core'
         are the same entity in different surface forms, and this lookup is
         where dedup, anchor selection, and link resolution all meet. The
         entity-fragmentation this closes was the top cause of unattached

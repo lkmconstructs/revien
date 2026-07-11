@@ -218,7 +218,7 @@ class TestHybridWiringWithMock:
         pipeline.ingest(IngestionInput(
             source_id="s1",
             content=(
-                "User: We decided to deploy PostgreSQL on the Hetzner server. "
+                "User: We decided to deploy PostgreSQL on the Fernweh server. "
                 "Acme Corp signed the contract."
             ),
         ))

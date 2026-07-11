@@ -1,6 +1,6 @@
 """Claim Sovereignty Layer — Trigger 2: measure semantic sensitive recognition.
 
-Scores the recognizer against the acceptance bar (Lissa's spec):
+Scores the recognizer against the acceptance bar (acceptance spec):
   * 100% candidate routing on sensitive fixtures (seeded-domain AND unseeded).
   * 0 confident-neutral on sensitive fixtures (the unsafe outcome).
   * measured FALSE-POSITIVE rate on neutral controls + everyday neutrals.

@@ -1,7 +1,7 @@
 """
 Revien label normalization — ONE definition of "same name, different surface."
 
-"Providence-Core", "providence core", and "Providence Core" are the same
+"Fernweh-Core", "fernweh core", and "Fernweh Core" are the same
 entity wearing three outfits. Every place labels meet (dedup, lookups, anchor
 matching, link resolution, mention linking) normalizes through this function,
 so surface-form equivalence has exactly one definition to test, tune, or blame.

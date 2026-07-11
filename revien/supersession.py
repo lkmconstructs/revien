@@ -25,7 +25,7 @@ The gate (auto-supersede requires ALL):
 MVP honesty: contradiction detection is rule-based and CONSERVATIVE. It catches
 single-valued status changes (relationship/location), favorite-value changes, and
 polarity flips on a shared object. It does NOT yet reason about cross-subject
-implication ("I'm nursing" vs "Silas weaned") — those are missed, which is SAFE
+implication ("I'm nursing" vs "Theo weaned") — those are missed, which is SAFE
 (a missed contradiction leaves the old claim standing, caught later) rather than
 dangerous (a wrong supersession silently corrupts memory). Defense-in-depth is a
 backstop, not a license: the gate's primary checks must be right on their own.

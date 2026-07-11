@@ -104,7 +104,7 @@ class TestVaultScan:
         (vault / "Postgres Decision.md").write_text(
             "---\ntags: [infra]\ndate: 2026-04-01\n---\n"
             "We picked [[PostgreSQL]] over [[MySQL|the other one]].\n"
-            "## Rationale\nBecause of [[Hetzner Server#specs]] and #performance.\n",
+            "## Rationale\nBecause of [[Fernweh Server#specs]] and #performance.\n",
             encoding="utf-8",
         )
         items = _fetch(ObsidianVaultAdapter(str(vault)))
@@ -118,7 +118,7 @@ class TestVaultScan:
         assert pre["timestamp"].startswith("2026-04-01")  # frontmatter beats mtime
 
         assert rat["metadata"]["heading"] == "Rationale"
-        assert "Hetzner Server" in rat["links"]  # #heading anchor stripped
+        assert "Fernweh Server" in rat["links"]  # #heading anchor stripped
         assert "performance" in rat["metadata"]["tags"]  # inline tag
         assert "infra" in rat["metadata"]["tags"]  # frontmatter tag rides all chunks
 

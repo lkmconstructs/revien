@@ -28,7 +28,7 @@ def _c(clf, text, lock=Lock.NORMAL):
 
 def test_scope_guard_emotion_cannot_touch_relationship(clf, gate):
     """Invariant: negative sentiment (emotion) can't supersede a relationship claim."""
-    d = gate.evaluate(_c(clf, "I'm married."), _c(clf, "I'm so annoyed at Jesse today."))
+    d = gate.evaluate(_c(clf, "I'm married."), _c(clf, "I'm so annoyed at Sam today."))
     assert d.action is SupersessionAction.NO_CONFLICT
     assert d.scope_overlap < 1.0
 

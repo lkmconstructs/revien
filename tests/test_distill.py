@@ -75,7 +75,7 @@ def _seed_entity(store, label="PostgreSQL"):
                  recorded=datetime(2026, 4, 1, tzinfo=timezone.utc))
     decision = _node(store, NodeType.DECISION, "jsonb",
                      "Decided to use JSONB columns for flexible metadata.")
-    related = _node(store, NodeType.ENTITY, "Hetzner Server")
+    related = _node(store, NodeType.ENTITY, "Fernweh Server")
     _edge(store, fact, entity)
     _edge(store, decision, entity)
     _edge(store, entity, related)
@@ -94,7 +94,7 @@ class TestRendering:
         assert "We chose PostgreSQL over MySQL." in note
         assert "2026-04-01" in note                      # content date rendered
         assert "confidence 0.90" in note                 # trust rendered
-        assert "[[Hetzner Server]]" in note              # threads into the graph pane
+        assert "[[Fernweh Server]]" in note              # threads into the graph pane
         # Index note generated and links the entity.
         index = (vault / "Revien" / "_Revien Index.md").read_text(encoding="utf-8")
         assert "[[PostgreSQL]]" in index
@@ -132,7 +132,7 @@ class TestRendering:
         note = (vault / "Revien" / "PostgreSQL.md").read_text(encoding="utf-8")
         assert "[[Deployment" not in note
         assert "bad [[label]]" not in note
-        assert "[[Hetzner Server]]" in note  # clean links still render
+        assert "[[Fernweh Server]]" in note  # clean links still render
 
 
 class TestSafetyRails:

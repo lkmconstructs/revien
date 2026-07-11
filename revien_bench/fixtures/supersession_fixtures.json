@@ -23,7 +23,7 @@
   {"existing": "That painting symbolizes hope.", "existing_lock": "normal", "new": "That painting doesn't symbolize hope to me now.", "expected": "candidate", "contradiction": true, "tags": ["stable", "semantic_fact", "non_protected"]},
 
   {"existing": "Revien is my company.", "existing_lock": "normal", "new": "I'm so frustrated with Revien today.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "key"]},
-  {"existing": "I'm married.", "existing_lock": "normal", "new": "I'm so annoyed at Jesse today.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "invariant", "key"]},
+  {"existing": "I'm married.", "existing_lock": "normal", "new": "I'm so annoyed at Sam today.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "invariant", "key"]},
   {"existing": "I'm politically liberal.", "existing_lock": "normal", "new": "I'm so frustrated with politics lately.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard", "invariant"]},
   {"existing": "I founded the nonprofit.", "existing_lock": "normal", "new": "I'm exhausted from the nonprofit work.", "expected": "no_conflict", "contradiction": false, "tags": ["scope_guard"]},
 
@@ -33,6 +33,6 @@
   {"existing": "I love painting.", "existing_lock": "normal", "new": "yeah, not really my thing these days.", "expected": "no_conflict", "contradiction": false, "tags": ["precond2", "new_unclassified"]},
   {"existing": "I'm single.", "existing_lock": "normal", "new": "it's complicated, honestly.", "expected": "no_conflict", "contradiction": false, "tags": ["precond2", "new_unclassified"]},
 
-  {"existing": "I'm nursing my newborn.", "existing_lock": "normal", "new": "Silas weaned this week.", "expected": "candidate", "contradiction": true, "tags": ["known_miss", "cross_subject", "implication"]},
+  {"existing": "I'm nursing my newborn.", "existing_lock": "normal", "new": "Theo weaned this week.", "expected": "candidate", "contradiction": true, "tags": ["known_miss", "cross_subject", "implication"]},
   {"existing": "I'm politically liberal.", "existing_lock": "normal", "new": "I've become pretty conservative.", "expected": "candidate", "contradiction": true, "tags": ["known_miss", "belief", "value_no_polarity"]}
 ]

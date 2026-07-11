@@ -15,8 +15,8 @@ Contract (mirrors the semantic spine's discipline):
   * Imports stay GUARDED — availability is checked via find_spec WITHOUT
     importing fastembed at module load (a wedged hub endpoint once turned an
     import into a 23-minute hang; see semantic/index.py).
-  * ``REVIEN_RERANK`` gates activation. DEFAULT ON (July 11 2026, Lissa's
-    call — "smarter by default"): the measured default is the int8 model at
+  * ``REVIEN_RERANK`` gates activation. DEFAULT ON (July 11 2026 —
+    "smarter by default"): the measured default is the int8 model at
     depth 20 — recall@10 0.5141 -> ~0.64, recall@1 doubled, ~200ms p50 —
     per the round-5/5b depth+quantization profile. ``REVIEN_RERANK=0``
     opts out and restores the pre-rerank 85ms path byte-identically.

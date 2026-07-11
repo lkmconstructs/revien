@@ -80,7 +80,7 @@ MOCK_FILE_CONTENT = """# Meeting Notes - Sprint 14
 - Backend uses Strawberry (Python GraphQL library)
 
 ## Action Items
-- Jesse: Set up GraphQL schema by Friday
+- Sam: Set up GraphQL schema by Friday
 - Alice: Update API documentation
 - Deploy to staging by end of week
 """

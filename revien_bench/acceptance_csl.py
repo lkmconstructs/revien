@@ -111,21 +111,21 @@ def main() -> int:
 
     scenarios = [
         # (name, [claims in order], expected category for claim 1)
-        ("1. Happy path — literal preference 'update' (Lissa #1)",
+        ("1. Happy path — literal preference 'update' (acceptance #1)",
          ["I like tea.", "I prefer coffee now."], PRESERVED),
         ("1b. Happy path — single-valued favourite flip (auto-supersede SHOULD fire)",
          ["My favourite drink is tea.", "My favourite drink is coffee."], SUPERSEDED),
-        ("2. Coded disclosure survives — residual recognizer-miss (Lissa #2)",
+        ("2. Coded disclosure survives — residual recognizer-miss (acceptance #2)",
          ["I finally crossed the carpet last Sunday and they read my name out from the platform.",
           "Actually I'm heading back to the hall this Sunday."], PRESERVED),
         ("2b. NEGATION GAP — 'I don't love X anymore' is unclassified, so the "
          "contradiction is never detected -> preserved (SAFE, not erased)",
          ["I love being off the bottle.", "Honestly I don't love being off the bottle anymore."], PRESERVED),
-        ("3. Protected claim not clobbered by frustration (Lissa #3)",
+        ("3. Protected claim not clobbered by frustration (acceptance #3)",
          ["I have Hashimoto's.", "I'm so done with this."], PRESERVED),
         ("3b. Protected claim, real status contradiction -> review, never auto",
          ["I'm married.", "I'm single now."], QUEUED),
-        ("4. Plain neutral technical 'update' (Lissa #4)",
+        ("4. Plain neutral technical 'update' (acceptance #4)",
          ["the build passed.", "the build failed."], PRESERVED),
         ("4b. NEGATION GAP — 'I'm not swamped anymore' is unclassified, so the "
          "flip is never detected -> preserved (SAFE, but supersede stays dormant)",

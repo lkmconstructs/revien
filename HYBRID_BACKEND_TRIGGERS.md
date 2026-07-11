@@ -193,7 +193,7 @@ the LLM holds 0 leaks at ~20% abstention because it reasons about meaning.
 zero-cloud production path (local ollama) is built but UNVERIFIED — needs the same
 batteries run against the chosen local model; a cloud recognizer egresses possibly-
 sensitive claims and is the verified *reference*, not the sovereign default. (2)
-Lissa's ruling on whether this clears her closing criterion.
+The maintainer's ruling on whether this clears the closing criterion.
 
 **Demotion path (the only way the tripwire retires):** ship it → instrument
 catches (`SupersessionMetrics.tripwire_caught` / `tripwire_by_domain`) + queue +

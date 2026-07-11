@@ -6,7 +6,7 @@ about vault entities) through the REAL ingest + recall paths. This produces
 the VAULT number. It is a different corpus, a different gold space, and a
 different results namespace (results/vault/) from the conversational LoCoMo
 figures — the two are never averaged, compared side-by-side in one table, or
-blended into a single headline. Publishing rule (Lissa's gate): no public
+blended into a single headline. Publishing rule (maintainer's gate): no public
 Obsidian claim without this eval's output attached.
 
 Tracks:
@@ -20,7 +20,7 @@ Tracks:
     did the machine-side claim actually connect to the vault entity it is
     about? expect_attach=false rows are known-fragile label variants —
     reported separately, never dropped. This is the cross-corpus number the
-    distill leg exposed ("Providence-Core" != "Providence Core").
+    distill leg exposed ("Fernweh-Core" != "Fernweh Core").
 
 Zero LLM, zero network on the default path. Extractive answering is out of
 scope on purpose — retrieval is the claim being gated.

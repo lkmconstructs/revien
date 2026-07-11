@@ -99,7 +99,7 @@ def test_queue_metrics_track_depth_and_rate(clf):
         ("I love painting.", "I don't like painting anymore."),   # auto
         ("My favorite food is sushi.", "My favorite food is ramen now."),  # auto
         ("I'm single.", "I'm married now."),                      # candidate (protected)
-        ("I'm married.", "I'm so annoyed at Jesse today."),       # no_conflict (scope)
+        ("I'm married.", "I'm so annoyed at Sam today."),       # no_conflict (scope)
     ]
     for e, n in pairs:
         m.record(gate.evaluate(Claim(e, clf.classify(e)), Claim(n, clf.classify(n))))

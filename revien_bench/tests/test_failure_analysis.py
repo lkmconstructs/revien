@@ -208,7 +208,7 @@ class TestEngineDiagnostics:
 
     def test_debug_diagnostics_shape(self, store):
         a = _node(store, "postgres", dia="D1:1")
-        b = _node(store, "hetzner", dia="D1:2")
+        b = _node(store, "fernweh", dia="D1:2")
         _edge(store, a, b)
         eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
 

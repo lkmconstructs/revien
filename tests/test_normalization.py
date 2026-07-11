@@ -49,8 +49,8 @@ def _pipeline(store):
 
 class TestNormalizeLabel:
     def test_surface_forms_collapse(self):
-        forms = ["Providence-Core", "providence core", "Providence Core",
-                 "Providence_Core", "PROVIDENCE.CORE"]
+        forms = ["Fernweh-Core", "fernweh core", "Fernweh Core",
+                 "Fernweh_Core", "FERNWEH.CORE"]
         assert len({normalize_label(f) for f in forms}) == 1
 
     def test_possessive_and_punctuation(self):
@@ -69,9 +69,9 @@ class TestNormalizeLabel:
 
 class TestNormalizedLookup:
     def test_find_node_by_label_across_surface_forms(self, store):
-        node = _entity(store, "Providence Core")
+        node = _entity(store, "Fernweh Core")
         ops = GraphOperations(store)
-        for form in ("Providence-Core", "providence_core", "PROVIDENCE CORE"):
+        for form in ("Fernweh-Core", "fernweh_core", "FERNWEH CORE"):
             found = ops.find_node_by_label(form, node_type=NodeType.ENTITY)
             assert found is not None and found.node_id == node.node_id
 
@@ -166,7 +166,7 @@ class TestMentionLinking:
         assert len(keys) == len(edges)
 
     def test_distinct_entities_never_merge_on_substring(self, store):
-        """Asher's Lincoln case: normalization is exact-equality on canonical
+        """The Lincoln case (adversarial review): normalization is exact-equality on canonical
         forms, never substring — 'Lincoln' and 'Lincoln Elementary' stay
         distinct nodes forever."""
         a = _entity(store, "Lincoln")

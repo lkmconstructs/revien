@@ -88,7 +88,7 @@
   {"text": "I want to be the kind of person who helps others.", "type": "aspiration_goal", "durability": "slow_change", "compound": false, "tags": ["boundary"]},
   {"text": "I'm planning to apply to grad school next fall.", "type": "project_status_plan", "durability": "fast_change", "compound": false, "tags": ["boundary"]},
 
-  {"text": "Lissa is married.", "type": "relationship", "durability": "slow_change", "compound": false, "tags": ["protected", "third_person"]},
+  {"text": "Mara is married.", "type": "relationship", "durability": "slow_change", "compound": false, "tags": ["protected", "third_person"]},
   {"text": "I'm politically liberal.", "type": "belief_value", "durability": "slow_change", "compound": false, "tags": ["protected"]},
   {"text": "I'm a Christian.", "type": "belief_value", "durability": "slow_change", "compound": false, "tags": ["protected", "boundary"]},
 
@@ -97,7 +97,7 @@
   {"text": "I love hiking, and last week I finally climbed Mount Rainier.", "type": null, "durability": "unknown", "compound": true, "tags": ["compound"]},
   {"text": "Politically I'm liberal, and I'm planning to volunteer next month.", "type": null, "durability": "unknown", "compound": true, "tags": ["compound", "protected"]},
 
-  {"text": "I'm so annoyed at Jesse today.", "type": "emotion_state", "durability": "fast_change", "compound": false, "tags": ["trap", "invariant_negative_sentiment"]},
+  {"text": "I'm so annoyed at Sam today.", "type": "emotion_state", "durability": "fast_change", "compound": false, "tags": ["trap", "invariant_negative_sentiment"]},
   {"text": "Ugh, my partner is driving me crazy lately.", "type": "emotion_state", "durability": "fast_change", "compound": false, "tags": ["trap", "invariant_negative_sentiment"]},
   {"text": "I'm frustrated with how the adoption process is going.", "type": "emotion_state", "durability": "fast_change", "compound": false, "tags": ["trap", "invariant_negative_sentiment"]},
   {"text": "Honestly I don't even like painting that much anymore.", "type": "preference_habit", "durability": "slow_change", "compound": false, "tags": ["trap"]},

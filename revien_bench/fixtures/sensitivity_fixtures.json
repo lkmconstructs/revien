@@ -1,5 +1,5 @@
 {
-  "_note": "Trigger 2 acceptance fixtures (Lissa's spec). sensitive_* MUST route candidate (sensitive or abstain); neutral_controls MUST be confident_neutral. The bar: 100% candidate on sensitive, 0 unsafe, measured FP on neutral.",
+  "_note": "Trigger 2 acceptance fixtures (acceptance spec). sensitive_* MUST route candidate (sensitive or abstain); neutral_controls MUST be confident_neutral. The bar: 100% candidate on sensitive, 0 unsafe, measured FP on neutral.",
   "sensitive_no_lexeme": [
     "I love being off the bottle.",
     "I'm a former smoker.",

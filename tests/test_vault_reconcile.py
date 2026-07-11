@@ -2,7 +2,7 @@
 Tests for the editable-vault leg: reconciling edits to distilled notes back
 into the graph. The three gestures (correct / delete / add) and the safety
 properties that justify the manifest — idempotency (no echo), no-false-reject
-(the Mentat catch: a claim ingested after the user last saw the note must not
+(the adversarial-review catch: a claim ingested after the user last saw the note must not
 be forgotten), and round-trip stability.
 """
 
@@ -192,7 +192,7 @@ class TestReconcileSafety:
         assert (rec["corrected"], rec["added"], rec["forgotten"]) == (0, 0, 0)
 
     def test_no_false_reject_of_unseen_claims(self, store, vault):
-        """The Mentat catch: a claim ingested AFTER the user last saw the note
+        """The adversarial-review catch: a claim ingested AFTER the user last saw the note
         must not be forgotten when they reconcile the unedited note. The
         manifest (what was shown), not the live graph, is the delete referent."""
         ent, fact, dec = _entity_with_claims(store)
