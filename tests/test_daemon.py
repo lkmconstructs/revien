@@ -401,6 +401,25 @@ class TestTensionsEndpoint:
             assert "tensions" in r
 
 
+class TestConsolidateEndpoint:
+    def test_consolidate_returns_full_report(self, client):
+        resp = client.post("/v1/consolidate", json={})
+        assert resp.status_code == 200
+        d = resp.json()
+        for key in ("decay", "recluster", "reindex", "orphans", "duration_ms"):
+            assert key in d
+        assert d["decay"]["ran"] is True
+        assert d["reindex"]["ran"] is False   # backfill stays opt-in
+        assert d["orphans"]["invalidated"] == 0  # report-only by default
+
+    def test_consolidate_passes_are_toggleable(self, client):
+        d = client.post("/v1/consolidate", json={
+            "decay": False, "recluster": False,
+        }).json()
+        assert d["decay"]["ran"] is False
+        assert d["recluster"]["ran"] is False
+
+
 # ── Sync Endpoint ─────────────────────────────────────────
 
 class TestSyncEndpoint:

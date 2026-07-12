@@ -79,6 +79,39 @@ class RevienDaemon:
         # Start scheduler (non-blocking)
         self._scheduler.start()
 
+        # Dream-mode cadence (B3.1) — STRICTLY OPT-IN: unset env means the
+        # consolidation pass never runs unattended. Manual-first was the
+        # design gate; this is the second step, and every scheduled run
+        # logs its full report (never silent). Reindex and orphan
+        # invalidation are NOT available on the schedule — those stay
+        # manual decisions.
+        dream_hours = os.environ.get("REVIEN_DREAM_INTERVAL_HOURS", "").strip()
+        if dream_hours:
+            try:
+                interval = float(dream_hours)
+            except ValueError:
+                logger.warning(
+                    "REVIEN_DREAM_INTERVAL_HOURS=%r is not a number; "
+                    "dream mode NOT scheduled", dream_hours)
+                interval = 0.0
+            if interval > 0:
+                from revien.consolidate import Consolidator
+
+                app_state = self._app.state
+
+                def _dream() -> None:
+                    consolidator = Consolidator(
+                        app_state.store, app_state.ops,
+                        semantic=app_state.semantic,
+                        clustering=app_state.clustering,
+                    )
+                    report = consolidator.run()  # decay + recluster only
+                    logger.info("dream pass: %s", report.to_dict())
+
+                self._scheduler.add_interval_job(
+                    "dream_consolidation", _dream, hours=interval,
+                )
+
         # Start uvicorn (blocking)
         uvicorn.run(
             self._app,

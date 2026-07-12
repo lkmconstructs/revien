@@ -945,6 +945,19 @@ class GraphStore:
         )
         return True
 
+    def list_orphan_node_ids(self) -> list[str]:
+        """Node ids with NO edges in either direction (B3 dream pass).
+
+        One set-difference query instead of a per-node edge lookup — the
+        consolidation sweep runs this over the whole graph."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT node_id FROM nodes WHERE node_id NOT IN "
+            "(SELECT source_node_id FROM edges) "
+            "AND node_id NOT IN (SELECT target_node_id FROM edges)"
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def list_tension_pairs(self, live_only: bool = True) -> list[dict]:
         """The tensions view (B1): every CONFLICTS_WITH pair with both claims.
 

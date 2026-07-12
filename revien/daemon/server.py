@@ -39,6 +39,15 @@ class IngestResponse(BaseModel):
     total_edges_in_graph: int
 
 
+class ConsolidateRequest(BaseModel):
+    """Dream-mode pass (B3.1). Reindex is a backfill, off by default;
+    orphan invalidation is soft/reversible and strictly opt-in."""
+    decay: bool = True
+    recluster: bool = True
+    reindex: bool = False
+    invalidate_orphans: bool = False
+
+
 class RecallRequest(BaseModel):
     query: str
     top_n: int = 5
@@ -327,6 +336,27 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             source_context=request.source_context,
         ))
         return _edge_to_response(edge)
+
+    # ── POST /v1/consolidate ──────────────────────────
+
+    @app.post("/v1/consolidate")
+    async def consolidate(request: ConsolidateRequest):
+        """Run the dream-mode maintenance pass (B3.1): persist confidence
+        decay, refresh clustering, optionally backfill the semantic index,
+        and report orphaned nodes. Returns the full consolidation report —
+        a dream you can't inspect is a black box, so there is no silent
+        variant of this endpoint."""
+        from revien.consolidate import Consolidator
+        consolidator = Consolidator(
+            store, ops, semantic=semantic, clustering=clustering,
+        )
+        report = consolidator.run(
+            decay=request.decay,
+            recluster=request.recluster,
+            reindex=request.reindex,
+            invalidate_orphans=request.invalidate_orphans,
+        )
+        return report.to_dict()
 
     # ── GET /v1/tensions ──────────────────────────────
 

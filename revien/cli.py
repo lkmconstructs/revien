@@ -272,6 +272,64 @@ def tensions(db: Optional[str], include_history: bool, json_output: bool):
 
 
 @main.command()
+@click.option("--db", default=None, help="Database path")
+@click.option("--reindex", is_flag=True,
+              help="Also backfill the semantic index (recovery, not routine)")
+@click.option("--invalidate-orphans", "invalidate_orphans", is_flag=True,
+              help="Soft-invalidate edgeless nodes (reversible; default is report-only)")
+@click.option("--json-output", is_flag=True, help="Output the full report as JSON")
+def dream(db: Optional[str], reindex: bool, invalidate_orphans: bool,
+          json_output: bool):
+    """Run the consolidation pass ("dream mode"): persist confidence decay,
+    refresh communities, and report orphaned memories. Nothing is deleted;
+    every change is audited and reported."""
+    import json as _json
+    from revien.consolidate import Consolidator
+    from revien.graph.clustering import CommunityDetector
+    from revien.graph.store import GraphStore
+    from revien.semantic.index import SemanticIndex
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        clustering = CommunityDetector(db_path=db_path)
+        semantic = SemanticIndex(store)
+        report = Consolidator(
+            store, semantic=semantic, clustering=clustering,
+        ).run(reindex=reindex, invalidate_orphans=invalidate_orphans)
+
+        if json_output:
+            click.echo(_json.dumps(report.to_dict(), indent=2))
+            return
+
+        d = report.to_dict()
+        click.echo(f"\nDream pass complete ({d['duration_ms']:.0f}ms, "
+                   f"{d['nodes_examined']} nodes examined)\n")
+        click.echo(f"  decay     : {d['decay']['nodes_decayed']} node(s) decayed")
+        for item in d["decay"]["sample"][:5]:
+            click.echo(f"              {item['label'][:50]}: "
+                       f"{item['before']} -> {item['after']}")
+        click.echo(f"  clusters  : {d['recluster']['communities']} communities"
+                   if d["recluster"]["ran"] else "  clusters  : skipped")
+        click.echo(f"  reindex   : {d['reindex']['result']}"
+                   if d["reindex"]["ran"] else "  reindex   : skipped (use --reindex)")
+        click.echo(f"  orphans   : {d['orphans']['found']} found, "
+                   f"{d['orphans']['invalidated']} invalidated"
+                   + ("" if invalidate_orphans else " (report-only; "
+                      "--invalidate-orphans to act)"))
+        for item in d["orphans"]["sample"][:5]:
+            click.echo(f"              [{item['node_type']}] {item['label'][:50]}")
+        click.echo()
+    finally:
+        store.close()
+
+
+@main.command()
 @click.argument("content")
 @click.option("--source", default="cli", help="Source identifier")
 @click.option("--db", default=None, help="Database path")
