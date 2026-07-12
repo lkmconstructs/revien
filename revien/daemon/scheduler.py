@@ -20,6 +20,11 @@ class SyncScheduler:
     Each adapter is polled at a configurable interval (default: 6 hours).
     """
 
+    # Deferred-embed idle sweep (capture leg): how often the daemon checks the
+    # pending-embed queue. The check is one COUNT on an empty/absent table when
+    # idle — the sweep only pays anything when captures are actually waiting.
+    EMBED_DRAIN_INTERVAL_SECONDS = 30
+
     def __init__(
         self,
         pipeline: "IngestionPipeline",
@@ -117,6 +122,19 @@ class SyncScheduler:
         logger.info(f"Synced {name}: {ingested} items ingested")
         return {"status": "ok", "adapter": name, "items_ingested": ingested}
 
+    async def drain_pending_embeds(self) -> int:
+        """Idle sweep for the deferred-embed queue (capture leg): embed
+        anything a defer_embed ingest left behind. Runs on the event loop —
+        the store's single shared connection stays single-threaded. Returns
+        count embedded (0 on empty queue or disabled layer)."""
+        semantic = getattr(self.pipeline, "semantic", None)
+        if semantic is None or not semantic.is_enabled:
+            return 0
+        drained = semantic.drain_pending()
+        if drained:
+            logger.info(f"Embedded {drained} deferred capture(s) (idle sweep)")
+        return drained
+
     def start(self) -> None:
         """Start the background scheduler."""
         try:
@@ -127,6 +145,12 @@ class SyncScheduler:
                 "interval",
                 hours=self.interval_hours,
                 id="revien_auto_sync",
+            )
+            self._scheduler.add_job(
+                self.drain_pending_embeds,
+                "interval",
+                seconds=self.EMBED_DRAIN_INTERVAL_SECONDS,
+                id="revien_embed_drain",
             )
             self._scheduler.start()
             self._running = True

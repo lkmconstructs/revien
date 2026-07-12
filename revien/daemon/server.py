@@ -8,7 +8,9 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import secrets
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
@@ -28,6 +30,10 @@ class IngestRequest(BaseModel):
     content_type: str = "conversation"
     timestamp: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Capture path: persist now, embed later — the response returns before any
+    # embedding-model load. Queued nodes are keyword-recallable immediately and
+    # semantic-recallable once the queue drains (idle sweep or next recall).
+    defer_embed: bool = False
 
 
 class IngestResponse(BaseModel):
@@ -117,6 +123,39 @@ class SyncResponse(BaseModel):
     message: str
 
 
+# ── Capture auth (P3: remote capture is opt-in, token-gated) ─────────
+
+# starlette's TestClient reports host "testclient"; it exercises the same
+# in-process path as a local adapter, so it counts as loopback.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient", ""}
+
+
+def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
+    """Gate for /v1/ingest. Raises HTTPException on refusal.
+
+    Loopback callers are never gated — the local adapter path is unchanged
+    whether or not a token is configured. A remote caller is refused outright
+    unless ``REVIEN_CAPTURE_TOKEN`` is set (remote capture is opt-in), and
+    with it set must present ``Authorization: Bearer <token>``. Comparison is
+    constant-time.
+    """
+    host = (client_host or "").strip().lower()
+    if host in _LOOPBACK_HOSTS:
+        return
+    token = os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(
+            403,
+            "Remote capture is disabled. Set REVIEN_CAPTURE_TOKEN on the "
+            "daemon and send 'Authorization: Bearer <token>' to enable it.",
+        )
+    expected = f"Bearer {token}"
+    if not secrets.compare_digest(
+        (auth_header or "").strip().encode(), expected.encode()
+    ):
+        raise HTTPException(401, "Invalid or missing capture token.")
+
+
 # ── App Factory ───────────────────────────────────────────
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
@@ -161,8 +200,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/ingest ───────────────────────────────
 
     @app.post("/v1/ingest", response_model=IngestResponse)
-    async def ingest(request: IngestRequest):
+    async def ingest(request: IngestRequest, http_request: Request):
         """Ingest raw content. Builds graph nodes and edges."""
+        check_capture_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         ts = None
         if request.timestamp:
             try:
@@ -176,6 +219,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             content_type=request.content_type,
             timestamp=ts,
             metadata=request.metadata,
+            defer_embed=request.defer_embed,
         )
         result = pipeline.ingest(input_data)
 
