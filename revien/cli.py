@@ -74,6 +74,31 @@ def start(host: str, port: int, db: Optional[str], sync_interval: float):
 
 
 @main.command()
+@click.option("--db", default=None, help="Database path (default: ~/.revien/revien.db)")
+def mcp(db: Optional[str]):
+    """Run the Revien MCP server over stdio (for Claude Code, Codex, Cursor,
+    and other MCP clients that spawn local servers).
+
+    Own process, own connection — SQLite WAL lets it coexist with a running
+    daemon on the same database. Requires the mcp extra:
+    pip install revien[mcp]
+    """
+    from revien.mcp_server import MCP_AVAILABLE, build_mcp_server
+
+    if not MCP_AVAILABLE:
+        click.echo("The MCP SDK is not installed. Install with: pip install revien[mcp]")
+        sys.exit(1)
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    # stdout is the protocol channel on stdio — anything human goes to stderr.
+    click.echo(f"Revien MCP server (stdio) — database: {db_path}", err=True)
+    server = build_mcp_server(db_path=db_path)
+    server.run(transport="stdio")
+
+
+@main.command()
 @click.argument("system")
 @click.option("--path", default=None, help="Custom path for the adapter")
 def connect(system: str, path: Optional[str]):
