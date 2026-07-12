@@ -524,7 +524,12 @@ class RetrievalEngine:
             retrieval_time_ms=round(elapsed_ms, 2),
             neural_active=self.neural_scorer.is_neural,
             semantic_active=self.semantic.is_enabled,
-            semantic_note=self.semantic.inactive_reason(),
+            # Active layer: note deferred-capture state (drained N at search
+            # time / M still pending) when there is any — None otherwise, so
+            # the response shape is unchanged for the common case.
+            semantic_note=(
+                self.semantic.inactive_reason() or self.semantic.pending_note()
+            ),
             diagnostics=diagnostics,
         )
 

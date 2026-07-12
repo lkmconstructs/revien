@@ -52,6 +52,7 @@ import os
 import sqlite3
 import struct
 import sys
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 
@@ -300,6 +301,14 @@ class SemanticIndex:
     """
 
     TABLE = "vec_nodes"
+    # Deferred-embed queue (capture leg): plain SQLite table in the SAME db,
+    # so queued work survives a daemon restart. Rows are node_ids only — label/
+    # content are re-read from the store at drain time, so an edit made while
+    # a node waits in the queue is embedded in its CURRENT form, never stale.
+    PENDING_TABLE = "pending_embeds"
+    # Per-search drain bound: keeps a pathological backlog from turning one
+    # recall into a bulk reindex. Normal capture volume drains in one batch.
+    PENDING_DRAIN_BATCH = 256
 
     def __init__(
         self,
@@ -314,6 +323,10 @@ class SemanticIndex:
         self._dim: Optional[int] = None
         self._broken = False  # set if extension load fails at runtime
         self._broken_reason: Optional[str] = None
+        self._pending_table_ready = False
+        # How many deferred captures the MOST RECENT search() embedded —
+        # surfaced on the recall response so a drain is visible, not silent.
+        self._last_search_drained = 0
 
         # Resolve enablement: explicit arg wins, else env gate.
         if enabled is None:
@@ -520,6 +533,128 @@ class SemanticIndex:
             self._safe_disable(e)
             return 0
 
+    # ── Deferred embedding (capture leg: persist now, embed later) ────
+    def _ensure_pending_table(self) -> None:
+        """Plain table — no vec extension, no embedder. Creating it must work
+        on a cold process where the model has never loaded: that is the point."""
+        if self._pending_table_ready:
+            return
+        conn = self.store._get_conn()
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {self.PENDING_TABLE} "
+            f"(node_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL)"
+        )
+        conn.commit()
+        self._pending_table_ready = True
+
+    def defer_nodes(self, nodes: Sequence[Tuple[str, str, str]]) -> int:
+        """Queue (node_id, label, content) tuples for later embedding instead
+        of embedding now. The capture path uses this so an interactive ingest
+        never blocks on a cold model load. Returns count queued.
+
+        Only ids are stored; drain re-reads the node from the store, so the
+        freshest label/content wins. No-op (0) when the layer is disabled —
+        a disabled layer will never drain, and pretending to queue would
+        promise semantic recall that can never arrive.
+        """
+        if not self.is_enabled or not nodes:
+            return 0
+        try:
+            self._ensure_pending_table()
+            conn = self.store._get_conn()
+            now = datetime.now(timezone.utc).isoformat()
+            for node_id, _label, _content in nodes:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {self.PENDING_TABLE} "
+                    f"(node_id, queued_at) VALUES (?, ?)",
+                    (node_id, now),
+                )
+            conn.commit()
+            return len(nodes)
+        except Exception as e:  # noqa: BLE001 - queueing must not break ingest
+            self._safe_disable(e)
+            return 0
+
+    def pending_count(self) -> int:
+        """Deferred captures not yet embedded. 0 when disabled or none queued."""
+        if not self.is_enabled:
+            return 0
+        try:
+            conn = self.store._get_conn()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name=?",
+                (self.PENDING_TABLE,),
+            ).fetchone()
+            if not row or not row[0]:
+                return 0
+            self._pending_table_ready = True
+            return int(
+                conn.execute(f"SELECT COUNT(*) FROM {self.PENDING_TABLE}").fetchone()[0]
+            )
+        except Exception as e:  # noqa: BLE001
+            self._safe_disable(e)
+            return 0
+
+    def drain_pending(self, limit: Optional[int] = None) -> int:
+        """Embed queued nodes and clear them from the queue. Returns count
+        embedded. Rows whose node has since been deleted are dropped; rows are
+        removed only after the embed batch succeeds, so a failure (which
+        self-disables the layer) leaves the queue intact for a later process.
+        """
+        if not self.is_enabled:
+            return 0
+        if self.pending_count() == 0:
+            return 0
+        try:
+            conn = self.store._get_conn()
+            n = int(limit) if limit else self.PENDING_DRAIN_BATCH
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT node_id FROM {self.PENDING_TABLE} "
+                    f"ORDER BY queued_at LIMIT ?",
+                    (n,),
+                ).fetchall()
+            ]
+            if not ids:
+                return 0
+            nodes = self.store.get_nodes_bulk(ids)
+            batch = [
+                (nid, nodes[nid].label, nodes[nid].content)
+                for nid in ids
+                if nid in nodes
+            ]
+            embedded = self.index_nodes(batch) if batch else 0
+            if self._broken:
+                return embedded  # embed failed — keep the queue for later
+            # Clear every fetched row: embedded ones, deleted-node ghosts, and
+            # empty-text skips alike. Anything left behind would re-drain forever.
+            conn.executemany(
+                f"DELETE FROM {self.PENDING_TABLE} WHERE node_id = ?",
+                [(nid,) for nid in ids],
+            )
+            conn.commit()
+            return embedded
+        except Exception as e:  # noqa: BLE001
+            self._safe_disable(e)
+            return 0
+
+    def pending_note(self) -> Optional[str]:
+        """One-line recall-response note about deferred captures, or None when
+        there is nothing to say (the common case — response shape unchanged)."""
+        parts = []
+        if self._last_search_drained:
+            parts.append(
+                f"embedded {self._last_search_drained} deferred capture(s) at search time"
+            )
+        remaining = self.pending_count()
+        if remaining:
+            parts.append(
+                f"{remaining} capture(s) pending embedding (keyword-recallable only)"
+            )
+        return "; ".join(parts) if parts else None
+
     def reindex_all(self, batch_size: int = 256) -> Dict:
         """Backfill: embed every non-context node currently in the graph.
 
@@ -556,6 +691,13 @@ class SemanticIndex:
         sqlite-vec's L2 distance, so higher = closer.
         """
         if not self.is_enabled or not query.strip():
+            return []
+        # Drain deferred captures FIRST so this very recall can see them —
+        # "capture on the phone, ask at the desk" must not need two queries.
+        # The model loads once either way (query embed needs it warm), and the
+        # per-search batch bound keeps a backlog from stalling one recall.
+        self._last_search_drained = self.drain_pending()
+        if not self.is_enabled:  # drain failure self-disabled the layer
             return []
         try:
             embedder = self._get_embedder()

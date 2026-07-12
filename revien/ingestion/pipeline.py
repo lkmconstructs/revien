@@ -57,6 +57,12 @@ class IngestionInput:
     # a machine claim silently supersede it (candidate queue instead).
     links: List[str] = field(default_factory=list)
     curated: bool = False
+    # Capture leg: persist now, embed later. Interactive capture (bookmarklet,
+    # phone shortcut) must never block on a cold embedding model — with this
+    # set, new nodes go to the semantic index's pending queue instead of being
+    # embedded inline. Keyword-recallable immediately; semantic-recallable
+    # after the queue drains (daemon idle sweep or the next semantic recall).
+    defer_embed: bool = False
 
 
 @dataclass
@@ -362,7 +368,12 @@ class IngestionPipeline:
         # disabled; index_nodes self-disables on any failure rather than
         # breaking ingestion.
         if self.semantic.is_enabled and newly_created:
-            self.semantic.index_nodes(newly_created)
+            if input_data.defer_embed:
+                # Capture path: queue instead of embed so the caller gets its
+                # 200 back before any model load. See IngestionInput.defer_embed.
+                self.semantic.defer_nodes(newly_created)
+            else:
+                self.semantic.index_nodes(newly_created)
 
         # 4. Get context node ID from mapping
         context_id = id_map.get(
