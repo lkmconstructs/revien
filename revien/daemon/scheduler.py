@@ -135,6 +135,18 @@ class SyncScheduler:
             logger.warning("APScheduler not installed. Auto-sync disabled.")
             logger.warning("Install with: pip install apscheduler")
 
+    def add_interval_job(self, job_id: str, func, hours: float) -> bool:
+        """Register an extra periodic job (e.g. the dream-mode consolidation
+        pass). Returns False when the scheduler isn't running (APScheduler
+        absent) — callers must treat that as 'the job will never fire', not
+        an error."""
+        if self._scheduler is None or not self._running:
+            logger.warning("Scheduler not running; job %r not registered", job_id)
+            return False
+        self._scheduler.add_job(func, "interval", hours=hours, id=job_id)
+        logger.info("Registered job %r (interval: %sh)", job_id, hours)
+        return True
+
     def stop(self) -> None:
         """Stop the background scheduler."""
         if self._scheduler and self._running:
