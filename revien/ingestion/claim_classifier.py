@@ -131,6 +131,18 @@ _TYPE_PATTERNS: Dict[ClaimType, List[Tuple[str, float]]] = {
     ClaimType.ASPIRATION_GOAL: [
         (r"\bi want to (?:be|become)\b", _STRONG),
         (r"\bi want to [a-z]+\b", _MEDIUM),  # "want to <anything>" is desire/goal-shaped
+        # Desire for a life-STATE, not an action: "I want a quiet life",
+        # "I long for financial freedom". Scoped to state nouns so "I want
+        # a sandwich" stays out — an appetite is not an aspiration. (B1
+        # eval's classifier-blocked pair: verb-directed wants matched,
+        # noun-phrase state wants fell to unclassified, never reached
+        # the tension gate.)
+        # STRONG is earned by the noun scoping (precision lives in the state-
+        # noun list), unlike the want-to-verb catch-all above where "I want
+        # to eat lunch" forces MEDIUM conservatism.
+        (r"\bi (?:want|long for|wish for|dream of) (?:a|an|the)?\s*"
+         r"(?:\w+\s+){0,3}?(?:life|lifestyle|future|career|family|home|"
+         r"retirement|marriage|freedom|stability|independence)\b", _STRONG),
         (r"\bi (?:hope|dream|aspire|aim) to\b", _STRONG),
         (r"\bmy (?:goal|dream|ambition) is\b", _STRONG),
         (r"\bsomeday i(?:'d| would| want| hope)\b", _STRONG),
