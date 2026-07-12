@@ -60,8 +60,9 @@ class IngestionInput:
     # Capture leg: persist now, embed later. Interactive capture (bookmarklet,
     # phone shortcut) must never block on a cold embedding model — with this
     # set, new nodes go to the semantic index's pending queue instead of being
-    # embedded inline. Keyword-recallable immediately; semantic-recallable
-    # after the queue drains (daemon idle sweep or the next semantic recall).
+    # embedded inline. Recallable at the next semantic recall (search drains
+    # the queue first) or the daemon's ~30s idle sweep. A verbatim-only capture
+    # is NOT keyword-anchorable in the gap (keyword anchors exclude CONTEXT).
     defer_embed: bool = False
 
 

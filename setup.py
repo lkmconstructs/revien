@@ -57,6 +57,10 @@ setup(
     extras_require={
         "dev": ["pytest>=7.4.0", "pytest-asyncio>=0.21.0"],
         "langchain": ["langchain-core>=0.1.0"],
+        # MCP surface (LEG P5): `revien mcp` (stdio) and the daemon's /mcp
+        # mount (REVIEN_MCP_HTTP=1). Peer dependency — revien imports of the
+        # SDK are guarded, so the core install stays lean without it.
+        "mcp": ["mcp>=1.28.1"],
         # Opt-in Leiden community-detection backend. Compiled deps — not
         # installed by default. Enable with: pip install revien[leiden]
         "leiden": ["leidenalg>=0.10.0", "python-igraph>=0.11.0"],
@@ -73,6 +77,7 @@ setup(
         "semantic": ["sqlite-vec>=0.1.0", "fastembed>=0.3.0"],
         "all": [
             "langchain-core>=0.1.0",
+            "mcp>=1.28.1",
             "leidenalg>=0.10.0",
             "python-igraph>=0.11.0",
             "scikit-learn>=1.3.0",
