@@ -3,9 +3,12 @@ Capture leg (P3): deferred embedding + remote-capture token gate.
 
 defer_embed contract: an interactive capture (bookmarklet, phone shortcut)
 persists immediately and NEVER waits on a cold embedding model. Queued nodes
-are keyword-recallable in the gap, semantic-recallable after the queue drains
-(idle sweep or the next semantic recall), and the recall response says what
-happened (semantic_note) instead of silently doing background work.
+become recallable at the next semantic recall (search drains the queue first)
+or the ~30s idle sweep, and the recall response says what happened
+(semantic_note) instead of silently doing background work. NOTE: a verbatim-
+only capture is NOT keyword-anchorable in the gap — keyword anchor search
+excludes CONTEXT nodes (engine._keyword_search, exclude_context=True); the
+drain-at-search path is what closes the gap, not the keyword path.
 
 Auth contract: loopback capture is unchanged; remote capture is refused
 outright unless REVIEN_CAPTURE_TOKEN is configured AND presented as a bearer.
