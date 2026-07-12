@@ -651,7 +651,8 @@ class SemanticIndex:
         remaining = self.pending_count()
         if remaining:
             parts.append(
-                f"{remaining} capture(s) pending embedding (keyword-recallable only)"
+                f"{remaining} capture(s) pending embedding "
+                f"(queued for the idle sweep / next recall)"
             )
         return "; ".join(parts) if parts else None
 
