@@ -296,12 +296,17 @@ class TestCodexAdapter:
 
 @pytest.fixture
 def cli_env(monkeypatch, mock_codex_home):
-    """Temp HOME (for ~/.revien) + CODEX_HOME pointed at the mock."""
+    """Temp HOME (for ~/.revien) + CODEX_HOME pointed at the mock. The MCP
+    command resolver is pinned to the bare name so the config.toml assertions
+    are deterministic and machine-independent (its real behavior — resolving an
+    absolute exe path — is unit-tested separately in TestResolveRevienCommand)."""
+    import revien.cli as _cli
     with tempfile.TemporaryDirectory() as tmpdir:
         fake_home = Path(tmpdir) / "home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
         monkeypatch.setenv("CODEX_HOME", str(mock_codex_home))
+        monkeypatch.setattr(_cli, "_resolve_revien_command", lambda: "revien")
         yield fake_home
 
 
@@ -332,7 +337,8 @@ class TestConnectCodex:
         text = config_toml.read_text(encoding="utf-8")
         assert text.count("[mcp_servers.revien]") == 1, "Append must be idempotent"
         assert text.startswith('model = "gpt-5"'), "Existing config must survive untouched"
-        assert 'command = "revien"' in text
+        # TOML literal string (single quotes) — resolver pinned to bare name here.
+        assert "command = 'revien'" in text
         assert 'args = ["mcp"]' in text
         assert "already present" in second.output
 
@@ -404,6 +410,32 @@ class TestConnectCodex:
         assert result.exit_code == 0, result.output
         assert config_toml.read_bytes() == before, "Non-UTF-8 file must be untouched"
         assert "[mcp_servers.revien]" in result.output, "Block printed for pasting"
+
+
+class TestResolveRevienCommand:
+    """The MCP command an installer writes for a client (Codex) to spawn. A
+    user-site pip install often leaves revien.exe off PATH, so the resolver
+    must find the absolute path rather than emit a bare name that won't spawn."""
+
+    def test_prefers_which_when_on_path(self, monkeypatch):
+        import revien.cli as cli
+        monkeypatch.setattr(cli.shutil, "which", lambda n: r"C:\bin\revien.exe")
+        assert cli._resolve_revien_command() == r"C:\bin\revien.exe"
+
+    def test_finds_scripts_dir_when_not_on_path(self, monkeypatch):
+        import revien.cli as cli
+        monkeypatch.setattr(cli.shutil, "which", lambda n: None)
+        name = "revien.exe" if os.name == "nt" else "revien"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / name).write_text("", encoding="utf-8")
+            monkeypatch.setattr(cli.sysconfig, "get_path", lambda p, s=None: tmpdir)
+            assert cli._resolve_revien_command() == str(Path(tmpdir) / name)
+
+    def test_falls_back_to_bare_name(self, monkeypatch):
+        import revien.cli as cli
+        monkeypatch.setattr(cli.shutil, "which", lambda n: None)
+        monkeypatch.setattr(cli.sysconfig, "get_path", lambda p, s=None: "/nonexistent")
+        assert cli._resolve_revien_command() == "revien"
 
 
 # ── connect → start actually syncs (the registry) ──────────
