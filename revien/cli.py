@@ -7,7 +7,10 @@ Three lines to persistent memory:
 """
 
 import json
+import os
+import shutil
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +25,40 @@ def _default_db_path() -> str:
     revien_dir = Path.home() / ".revien"
     revien_dir.mkdir(parents=True, exist_ok=True)
     return str(revien_dir / "revien.db")
+
+
+def _resolve_revien_command() -> str:
+    """Absolute path to the ``revien`` launcher when resolvable, else the bare
+    name. An MCP client (Codex, etc.) spawns this command to start the stdio
+    server; a user-site pip install often lands ``revien.exe`` in a Scripts dir
+    that is NOT on PATH, so a bare ``revien`` fails to spawn. An absolute path
+    is PATH-independent AND immune to a stale sibling ``revien`` package on the
+    spawn cwd — the two failure modes a bare name hits on a dev box.
+    """
+    found = shutil.which("revien")
+    if found:
+        return found
+    name = "revien.exe" if os.name == "nt" else "revien"
+    seen = set()
+    # This interpreter's script dirs — user scheme first (where --user installs
+    # land), then the base scheme.
+    schemes = []
+    user_scheme = f"{os.name}_user"
+    if user_scheme in sysconfig.get_scheme_names():
+        schemes.append(user_scheme)
+    schemes.append(sysconfig.get_default_scheme())
+    for scheme in schemes:
+        try:
+            scripts = sysconfig.get_path("scripts", scheme)
+        except (KeyError, ValueError):
+            continue
+        if not scripts or scripts in seen:
+            continue
+        seen.add(scripts)
+        cand = Path(scripts) / name
+        if cand.exists():
+            return str(cand)
+    return "revien"  # last resort: trust the user's PATH
 
 
 def _get_config_path() -> Path:
@@ -174,9 +211,12 @@ def connect(system: str, path: Optional[str]):
 
         # MCP client config: append to ~/.codex/config.toml — never overwrite,
         # never create. If the file isn't there, hand over the block instead.
+        # command is a TOML literal string (single quotes) so a resolved
+        # absolute Windows path with backslashes needs no escaping.
+        revien_cmd = _resolve_revien_command()
         mcp_block = (
             "\n[mcp_servers.revien]\n"
-            'command = "revien"\n'
+            f"command = '{revien_cmd}'\n"
             'args = ["mcp"]\n'
         )
         config_toml = codex_home / "config.toml"
