@@ -103,7 +103,8 @@ def mcp(db: Optional[str]):
 @click.argument("system")
 @click.option("--path", default=None, help="Custom path for the adapter")
 def connect(system: str, path: Optional[str]):
-    """Connect an AI system to Revien. Supported: claude-code, codex, file-watcher, api, obsidian."""
+    """Connect an AI system to Revien. Supported: claude-code, codex,
+    cursor, windsurf, cline, continue, vscode, file-watcher, api, obsidian."""
     config = _load_config()
 
     if system == "claude-code":
@@ -131,6 +132,19 @@ def connect(system: str, path: Optional[str]):
         _save_config(config)
         click.echo(f"Connected Claude Code adapter.")
         click.echo(f"Session directory: {session_dir}")
+
+        # CLAUDE.md snippet — printed, never written into a repo (mirror of
+        # the codex branch's AGENTS.md snippet). Makes the agent an ACTIVE
+        # memory user instead of a passive one.
+        click.echo("Suggested CLAUDE.md snippet (add to your project's "
+                   "CLAUDE.md or ~/.claude/CLAUDE.md):")
+        click.echo(
+            "\n## Memory (Revien)\n"
+            "This machine runs Revien, a persistent memory engine.\n"
+            "- At conversation start, call `revien_recall` with the task topic to load prior context.\n"
+            "- When a decision is made or a fact is established, store it with `revien_store` — silently, no announcement.\n"
+            "- Prefer Revien recall over built-in memory for cross-session context.\n"
+        )
         click.echo("Run 'revien start' to begin syncing.")
 
     elif system == "codex":
@@ -219,6 +233,33 @@ def connect(system: str, path: Optional[str]):
         )
         click.echo("Run 'revien start' to begin syncing.")
 
+    elif system in ("cursor", "windsurf", "cline", "continue", "vscode"):
+        # MCP client installers (LEG P4): write the Revien MCP server entry
+        # into the tool's own config at its documented location. Same
+        # discipline as the codex config.toml append above — merge, never
+        # clobber; refuse with a paste-block instead of guessing.
+        from revien.mcp_install import DISPLAY_NAMES, install_mcp_client
+
+        out = install_mcp_client(
+            system, override_path=Path(path) if path else None
+        )
+        name = DISPLAY_NAMES[system]
+        if out.status == "created":
+            click.echo(f"Created {out.path} with the Revien MCP entry.")
+        elif out.status == "merged":
+            click.echo(f"Added the Revien MCP entry to {out.path} "
+                       f"(existing entries preserved).")
+        elif out.status == "already":
+            click.echo(f"Revien MCP entry already present in {out.path} "
+                       f"— left untouched.")
+        else:
+            click.echo(f"Did not modify {out.path}: {out.detail}.")
+            click.echo("Add this yourself:")
+            click.echo("\n" + out.snippet)
+        if out.status in ("created", "merged"):
+            click.echo(f"Restart {name} to load the Revien MCP server "
+                       f"(requires: pip install revien[mcp]).")
+
     elif system == "file-watcher":
         if not path:
             click.echo("File watcher requires a path: revien connect file-watcher --path /watch/dir")
@@ -262,7 +303,8 @@ def connect(system: str, path: Optional[str]):
 
     else:
         click.echo(f"Unknown system: {system}")
-        click.echo("Supported: claude-code, codex, file-watcher, api, obsidian")
+        click.echo("Supported: claude-code, codex, cursor, windsurf, cline, "
+                   "continue, vscode, file-watcher, api, obsidian")
 
 
 @main.command()
@@ -723,27 +765,163 @@ def status(db: Optional[str]):
 
 
 @main.command()
-@click.option("--output", "-o", default=None, help="Output file path")
+@click.argument("file", required=False, type=click.Path())
+@click.option("--output", "-o", default=None,
+              help="Output file path (same as FILE; kept for compatibility)")
 @click.option("--db", default=None, help="Database path")
-def export(output: Optional[str], db: Optional[str]):
-    """Export the full graph as JSON."""
+def export(file: Optional[str], output: Optional[str], db: Optional[str]):
+    """Export the full graph as portable JSON: revien export graph.json
+
+    Same schema and code path as GET /v1/graph — the file `revien import`
+    (and POST /v1/graph/import) accepts. No FILE prints to stdout.
+    """
     from revien.graph.store import GraphStore
 
     config = _load_config()
     db_path = db or config.get("db_path", _default_db_path())
 
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        sys.exit(1)
+
+    target = file or output
     store = GraphStore(db_path=db_path)
     try:
         graph = store.export_graph()
         json_str = graph.model_dump_json(indent=2)
 
-        if output:
-            Path(output).write_text(json_str)
-            click.echo(f"Graph exported to {output}")
+        if target:
+            Path(target).write_text(json_str, encoding="utf-8")
+            click.echo(f"Exported {len(graph.nodes)} nodes, "
+                       f"{len(graph.edges)} edges to {target}")
         else:
             click.echo(json_str)
     finally:
         store.close()
+
+
+@main.command(name="import")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--merge", is_flag=True,
+              help="Import into a non-empty database; nodes/edges whose IDs "
+                   "already exist are skipped, never overwritten")
+def import_(file: str, db: Optional[str], merge: bool):
+    """Import a graph exported by `revien export`: revien import graph.json
+
+    Same schema and code path as POST /v1/graph/import. Refuses a non-empty
+    target database unless --merge — an import must never silently eat an
+    existing graph.
+    """
+    from revien.graph.schema import Graph
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    try:
+        data = json.loads(Path(file).read_text(encoding="utf-8-sig"))
+        graph = Graph.model_validate(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        click.echo(f"Not a JSON graph file: {e}")
+        sys.exit(1)
+    except Exception as e:  # pydantic ValidationError — schema mismatch
+        click.echo(f"Invalid graph data: {e}")
+        sys.exit(1)
+
+    store = GraphStore(db_path=db_path)
+    try:
+        existing_nodes = store.count_nodes()
+        existing_edges = store.count_edges()
+
+        if (existing_nodes or existing_edges) and not merge:
+            click.echo(
+                f"Target database is not empty ({existing_nodes} nodes, "
+                f"{existing_edges} edges): {db_path}"
+            )
+            click.echo("Use --merge to import on top of it, or --db to "
+                       "point at a fresh file.")
+            sys.exit(1)
+
+        if merge and (existing_nodes or existing_edges):
+            added_n = skipped_n = added_e = skipped_e = 0
+            for node in graph.nodes:
+                if store.get_node(node.node_id) is not None:
+                    skipped_n += 1
+                else:
+                    store.add_node(node)
+                    added_n += 1
+            for edge in graph.edges:
+                if store.get_edge(edge.edge_id) is not None:
+                    skipped_e += 1
+                else:
+                    store.add_edge(edge)
+                    added_e += 1
+            click.echo(f"Merged {added_n} nodes, {added_e} edges "
+                       f"(skipped {skipped_n} existing nodes, "
+                       f"{skipped_e} existing edges).")
+        else:
+            # Empty target: the same code path the daemon's import uses.
+            store.import_graph(graph, clear_existing=False)
+            click.echo(f"Imported {len(graph.nodes)} nodes, "
+                       f"{len(graph.edges)} edges into {db_path}")
+
+        click.echo(f"Graph total: {store.count_nodes()} nodes, "
+                   f"{store.count_edges()} edges")
+    finally:
+        store.close()
+
+
+@main.command()
+@click.option("--db", default=None, help="Database path")
+@click.option("--interval", default=60.0, show_default=True,
+              help="Minutes between snapshots")
+@click.option("--keep", default=10, show_default=True,
+              help="Snapshots retained; oldest pruned first")
+@click.option("--gzip", "use_gzip", is_flag=True,
+              help="Compress snapshots (.db.gz)")
+def watch(db: Optional[str], interval: float, keep: int, use_gzip: bool):
+    """Snapshot the database on an interval — the local backup loop.
+
+    Copies the live db via SQLite's backup API (consistent even mid-write)
+    to <db>.snapshots/<timestamp>.db, keeping the newest --keep. Runs in the
+    foreground until Ctrl+C.
+    """
+    import time
+    from datetime import datetime
+
+    from revien.watch import prune_snapshots, snapshot_db, snapshot_dir_for
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        sys.exit(1)
+    if keep < 1:
+        click.echo("--keep must be at least 1.")
+        sys.exit(1)
+    if interval <= 0:
+        click.echo("--interval must be positive.")
+        sys.exit(1)
+
+    snap_dir = snapshot_dir_for(db_path)
+    click.echo(f"Watching {db_path}")
+    click.echo(f"Snapshots: {snap_dir} — every {interval:g} min, "
+               f"keeping {keep}{', gzipped' if use_gzip else ''}. "
+               f"Ctrl+C to stop.")
+    try:
+        while True:
+            snap = snapshot_db(db_path, use_gzip=use_gzip)
+            pruned = prune_snapshots(snap_dir, keep=keep)
+            stamp = datetime.now().strftime("%H:%M:%S")
+            msg = f"[{stamp}] snapshot {snap.name}"
+            if pruned:
+                msg += f" (pruned {pruned} old)"
+            click.echo(msg)
+            time.sleep(interval * 60)
+    except KeyboardInterrupt:
+        click.echo("\nStopped.")
 
 
 if __name__ == "__main__":
