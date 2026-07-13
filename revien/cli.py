@@ -104,7 +104,8 @@ def mcp(db: Optional[str]):
 @click.option("--path", default=None, help="Custom path for the adapter")
 def connect(system: str, path: Optional[str]):
     """Connect an AI system to Revien. Supported: claude-code, codex,
-    cursor, windsurf, cline, continue, vscode, file-watcher, api, obsidian."""
+    cursor, windsurf, cline, continue, vscode, hermes, file-watcher, api,
+    obsidian."""
     config = _load_config()
 
     if system == "claude-code":
@@ -233,6 +234,91 @@ def connect(system: str, path: Optional[str]):
         )
         click.echo("Run 'revien start' to begin syncing.")
 
+    elif system == "hermes":
+        # Hermes Agent (NousResearch) memory-provider install. Hermes discovers
+        # provider plugins from ~/.hermes/plugins/memory/<name>/ — the VERIFIED
+        # layout (developer-guide memory-provider-plugin.md, hermes-agent
+        # v0.18.2). We drop that plugin dir here. (A pip entry-point discovery
+        # path was considered but their docs name only filesystem discovery and
+        # the loader source was unreachable to confirm one — so it is not
+        # advertised.)
+        #
+        # Same discipline as the codex config.toml append: idempotent, and never
+        # clobber a file we didn't write. Our generated files carry a marker; a
+        # foreign __init__.py gets the paste-block, not an overwrite.
+        marker = "# revien connect hermes"
+        version = "0.3.0"
+        init_py = (
+            f"{marker} (generated) — Hermes memory-provider plugin for Revien.\n"
+            "# Re-exports the provider + entry point from the installed revien package,\n"
+            "# so the thin plugin dir tracks the library and needs no edits on upgrade.\n"
+            "from revien.hermes_provider import RevienMemoryProvider, register\n\n"
+            '__all__ = ["RevienMemoryProvider", "register"]\n'
+        )
+        plugin_yaml = (
+            f"{marker} (generated)\n"
+            "name: revien\n"
+            f"version: {version}\n"
+            "description: >-\n"
+            "  Revien persistent memory graph as a Hermes memory provider —\n"
+            "  local-first, single SQLite file, zero network egress.\n"
+            "hooks:\n"
+            "  - prefetch\n"
+            "  - sync_turn\n"
+            "  - on_session_end\n"
+            "  - system_prompt_block\n"
+        )
+        readme_md = (
+            "# Revien memory provider for Hermes Agent\n\n"
+            "Backs Hermes' automatic external memory with an in-process Revien\n"
+            "stack over `~/.revien/revien.db` (override with `REVIEN_DB`).\n\n"
+            "Requires: `pip install revien[hermes]` and `hermes-agent`.\n"
+            "Tested against hermes-agent v0.18.2 (2026.7.7.2).\n\n"
+            "Activate:  `hermes memory setup`  then select `revien`.\n"
+        )
+        files = {
+            "__init__.py": init_py,
+            "plugin.yaml": plugin_yaml,
+            "README.md": readme_md,
+        }
+
+        hermes_home = Path(path) if path else (Path.home() / ".hermes")
+        plugin_dir = hermes_home / "plugins" / "memory" / "revien"
+
+        existing_init = plugin_dir / "__init__.py"
+        foreign = False
+        if existing_init.exists():
+            # Ours to refresh only if it carries our marker — else it's a user
+            # file and we touch nothing.
+            try:
+                foreign = marker not in existing_init.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                foreign = True
+
+        if foreign:
+            click.echo(
+                f"A plugin already exists at {plugin_dir} and was not written by "
+                f"'revien connect hermes' — left untouched."
+            )
+            click.echo("To install manually, create these files yourself:")
+            for fname, body in files.items():
+                click.echo(f"\n----- {plugin_dir / fname} -----")
+                click.echo(body)
+        else:
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            for fname, body in files.items():
+                (plugin_dir / fname).write_text(body, encoding="utf-8")
+            click.echo(f"Installed Revien Hermes memory provider -> {plugin_dir}")
+            click.echo("  wrote: __init__.py, plugin.yaml, README.md")
+
+        # The plugin dir re-exports the provider, which needs the SDK-guarded
+        # module importable. Point the user at activation + the dependency.
+        click.echo(
+            "\nThen activate in Hermes:  hermes memory setup  (select 'revien').\n"
+            "Requires: pip install revien[hermes]  and  hermes-agent "
+            "(tested: v0.18.2)."
+        )
+
     elif system in ("cursor", "windsurf", "cline", "continue", "vscode"):
         # MCP client installers (LEG P4): write the Revien MCP server entry
         # into the tool's own config at its documented location. Same
@@ -304,7 +390,7 @@ def connect(system: str, path: Optional[str]):
     else:
         click.echo(f"Unknown system: {system}")
         click.echo("Supported: claude-code, codex, cursor, windsurf, cline, "
-                   "continue, vscode, file-watcher, api, obsidian")
+                   "continue, vscode, hermes, file-watcher, api, obsidian")
 
 
 @main.command()
