@@ -69,6 +69,7 @@ def start(host: str, port: int, db: Optional[str], sync_interval: float):
         port=port,
         db_path=db_path,
         sync_interval_hours=sync_interval,
+        adapters=config.get("adapters", {}),
     )
     daemon.start()
 
@@ -102,7 +103,7 @@ def mcp(db: Optional[str]):
 @click.argument("system")
 @click.option("--path", default=None, help="Custom path for the adapter")
 def connect(system: str, path: Optional[str]):
-    """Connect an AI system to Revien. Supported: claude-code, file-watcher, api, obsidian."""
+    """Connect an AI system to Revien. Supported: claude-code, codex, file-watcher, api, obsidian."""
     config = _load_config()
 
     if system == "claude-code":
@@ -130,6 +131,92 @@ def connect(system: str, path: Optional[str]):
         _save_config(config)
         click.echo(f"Connected Claude Code adapter.")
         click.echo(f"Session directory: {session_dir}")
+        click.echo("Run 'revien start' to begin syncing.")
+
+    elif system == "codex":
+        from revien.adapters.codex import default_codex_home
+
+        codex_home = default_codex_home()
+
+        if path:
+            session_dir = path
+        else:
+            sessions = codex_home / "sessions"
+            session_dir = str(sessions) if sessions.exists() else None
+
+        if session_dir is None:
+            click.echo("Could not auto-detect Codex session directory.")
+            click.echo("Specify manually: revien connect codex --path /path/to/.codex/sessions")
+            return
+
+        config["adapters"]["codex"] = {
+            "type": "codex",
+            "session_dir": session_dir,
+        }
+        _save_config(config)
+        click.echo("Connected Codex adapter.")
+        click.echo(f"Session directory: {session_dir}")
+
+        # MCP client config: append to ~/.codex/config.toml — never overwrite,
+        # never create. If the file isn't there, hand over the block instead.
+        mcp_block = (
+            "\n[mcp_servers.revien]\n"
+            'command = "revien"\n'
+            'args = ["mcp"]\n'
+        )
+        config_toml = codex_home / "config.toml"
+        if config_toml.exists():
+            # Foreign file: tolerate BOMs and PowerShell's UTF-16 default —
+            # an unreadable file gets the paste-block, never a traceback.
+            existing = None
+            read_enc = None
+            for enc in ("utf-8-sig", "utf-16"):
+                try:
+                    existing = config_toml.read_text(encoding=enc)
+                    read_enc = enc
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            # Present = an ACTIVE table header line, not substring containment:
+            # a commented-out block or [mcp_servers.revien-staging] must not
+            # block the append.
+            present = existing is not None and any(
+                line.strip() == "[mcp_servers.revien]"
+                for line in existing.splitlines()
+            )
+            if present:
+                click.echo(f"MCP entry already present in {config_toml} — left untouched.")
+            elif existing is None or read_enc != "utf-8-sig":
+                # Unreadable OR non-UTF-8 (appending UTF-8 to a UTF-16 file
+                # would corrupt it) — hand over the block, touch nothing.
+                click.echo(
+                    f"Not appending to {config_toml} "
+                    f"({'unrecognized encoding' if existing is None else 'file is not UTF-8'}) "
+                    f"— left untouched. Add this block yourself:"
+                )
+                click.echo(mcp_block)
+            else:
+                with open(config_toml, "a", encoding="utf-8") as f:
+                    if existing and not existing.endswith("\n"):
+                        f.write("\n")
+                    f.write(mcp_block)
+                click.echo(f"Appended to {config_toml}:")
+                click.echo(mcp_block)
+        else:
+            click.echo(f"No config.toml found at {config_toml}.")
+            click.echo("To give Codex live recall/store tools, add this to your Codex config.toml:")
+            click.echo(mcp_block)
+
+        # AGENTS.md snippet — printed, never written into a repo. That's the
+        # user's call.
+        click.echo("Suggested AGENTS.md snippet (add to your repo root or ~/.codex/AGENTS.md):")
+        click.echo(
+            "\n## Memory (Revien)\n"
+            "This machine runs Revien, a persistent memory engine.\n"
+            "- At session start, call `revien_recall` with the task topic to load prior context.\n"
+            "- When a decision is made or a fact is established, store it with `revien_store` — silently, no announcement.\n"
+            "- Prefer Revien recall over asking the user to repeat past decisions.\n"
+        )
         click.echo("Run 'revien start' to begin syncing.")
 
     elif system == "file-watcher":
@@ -175,7 +262,7 @@ def connect(system: str, path: Optional[str]):
 
     else:
         click.echo(f"Unknown system: {system}")
-        click.echo("Supported: claude-code, file-watcher, api, obsidian")
+        click.echo("Supported: claude-code, codex, file-watcher, api, obsidian")
 
 
 @main.command()

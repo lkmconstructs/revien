@@ -27,11 +27,17 @@ class RevienDaemon:
         port: int = 7437,
         db_path: Optional[str] = None,
         sync_interval_hours: float = 6.0,
+        adapters: Optional[dict] = None,
     ):
         self.host = host
         self.port = port
         self.db_path = db_path or self._default_db_path()
         self.sync_interval_hours = sync_interval_hours
+        # config.json's "adapters" dict ({name: {type, ...}}). These get
+        # registered LIVE on the sync scheduler at start() — without this,
+        # `revien connect` wrote config nothing ever read and the "begin
+        # syncing" promise was false.
+        self.adapters = adapters or {}
         self._app = None
         self._scheduler = None
 
@@ -65,6 +71,26 @@ class RevienDaemon:
             interval_hours=self.sync_interval_hours,
         )
         self._app.state.scheduler = self._scheduler
+
+        # Register connected adapters (config.json "adapters") on the
+        # scheduler so `connect` -> `start` actually syncs. Malformed or
+        # unknown entries are logged and skipped, never fatal.
+        from revien.adapters import build_adapter_from_config
+
+        for name, entry in self.adapters.items():
+            adapter = build_adapter_from_config(entry)
+            if adapter is None:
+                logger.warning(
+                    f"Skipping adapter {name!r}: unknown or malformed entry "
+                    f"(type={entry.get('type') if isinstance(entry, dict) else entry!r})"
+                )
+                continue
+            self._scheduler.register_adapter(name, adapter)
+        if self._scheduler.list_adapters():
+            logger.info(
+                f"Live adapters: {', '.join(self._scheduler.list_adapters())} "
+                f"(sync every {self.sync_interval_hours}h)"
+            )
 
         # Register shutdown handler
         def _shutdown(signum, frame):
