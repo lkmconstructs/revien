@@ -274,8 +274,14 @@ def connect(system: str, path: Optional[str]):
                    "time — superseded facts whose validity window covers it "
                    "come back")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.option("--format", "output_format", type=click.Choice(["json", "toon"]),
+              default="json", show_default=True,
+              help="Wire format: 'toon' prints the full recall payload as "
+                   "TOON (Token-Oriented Object Notation — same data, fewer "
+                   "tokens for a consuming LLM); 'json' keeps the existing "
+                   "behavior (human-readable, or JSON with --json-output)")
 def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
-           json_output: bool):
+           json_output: bool, output_format: str):
     """Query Revien memory from the command line."""
     from datetime import datetime
     from revien.graph.store import GraphStore
@@ -302,7 +308,37 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
     try:
         response = engine.recall(query, top_n=top, as_of=as_of_dt)
 
-        if json_output:
+        if output_format == "toon":
+            if json_output:
+                click.echo(
+                    "note: --json-output is ignored with --format toon",
+                    err=True,
+                )
+            # Same shape as POST /v1/recall — the payload a consuming LLM
+            # ingests — serialized as TOON (LEG P2).
+            from revien.toon import serialize_recall
+
+            payload = {
+                "query": response.query,
+                "results": [
+                    {
+                        "node_id": r.node_id,
+                        "node_type": r.node_type,
+                        "label": r.label,
+                        "content": r.content,
+                        "score": r.score,
+                        "score_breakdown": r.score_breakdown,
+                        "path": r.path,
+                    }
+                    for r in response.results
+                ],
+                "nodes_examined": response.nodes_examined,
+                "retrieval_time_ms": response.retrieval_time_ms,
+                "semantic_active": response.semantic_active,
+                "semantic_note": response.semantic_note,
+            }
+            click.echo(serialize_recall(payload))
+        elif json_output:
             output = {
                 "query": response.query,
                 "results": [

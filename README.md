@@ -285,6 +285,8 @@ The daemon exposes a REST API on `localhost:7437`:
 
 Interactive docs at `http://localhost:7437/docs` when the daemon is running.
 
+recall supports TOON output (`format: "toon"` on `/v1/recall`, `--format toon` on the CLI) — measured −25% tokens vs compact JSON, −46% vs 2-space JSON (tiktoken cl100k_base, lossless round-trip verified; `revien_bench/measure_toon.py`).
+
 ---
 
 ## Graph schema
