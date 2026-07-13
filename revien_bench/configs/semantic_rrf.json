@@ -1,0 +1,11 @@
+{
+  "name": "semantic_rrf",
+  "description": "LEG P1 experiment arm: the `semantic` config plus REVIEN_HYBRID=rrf — anchor selection replaced by Reciprocal Rank Fusion (k=60 unless REVIEN_RRF_K) of the keyword-ranked and semantic-ranked candidate lists. Walk/scoring/rerank unchanged. Ingest is identical to `semantic` (the fusion is retrieval-only), so db-cache snapshots are interchangeable.",
+  "env": {
+    "REVIEN_SEMANTIC": "1",
+    "REVIEN_EXTRACTOR": "rule",
+    "REVIEN_EMBEDDER": "fastembed",
+    "REVIEN_HYBRID": "rrf"
+  },
+  "cluster": false
+}
