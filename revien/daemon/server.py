@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import secrets
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
@@ -58,6 +58,10 @@ class RecallRequest(BaseModel):
     include_tensions: bool = False
     # Bi-temporal query time (B2), ISO-8601: "what was true AT this time?"
     as_of: Optional[str] = None
+    # Wire format (LEG P2): "json" (default, unchanged response) or "toon"
+    # — Token-Oriented Object Notation, the same payload serialized for
+    # fewer tokens in a consuming LLM's context window (see revien/toon.py).
+    format: str = "json"
 
 
 class NodeUpdateRequest(BaseModel):
@@ -355,6 +359,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.post("/v1/recall")
     async def recall(request: RecallRequest):
         """Query memory. Returns ranked nodes by three-factor score."""
+        if request.format not in ("json", "toon"):
+            raise HTTPException(400, f"Invalid format (json|toon expected): {request.format}")
         as_of = None
         if request.as_of:
             try:
@@ -371,7 +377,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             include_tensions=request.include_tensions,
             as_of=as_of,
         )
-        return {
+        payload = {
             "query": response.query,
             "results": [
                 {
@@ -396,6 +402,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             "semantic_active": response.semantic_active,
             "semantic_note": response.semantic_note,
         }
+        if request.format == "toon":
+            # Same payload, TOON wire format (LEG P2). text/toon is the
+            # spec's provisional media type. The json path above is
+            # untouched — byte-identical to pre-P2.
+            from revien.toon import serialize_recall
+
+            return PlainTextResponse(
+                serialize_recall(payload), media_type="text/toon; charset=utf-8"
+            )
+        return payload
 
     # ── GET /v1/nodes ─────────────────────────────────
 
