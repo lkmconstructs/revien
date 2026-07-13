@@ -221,6 +221,19 @@ class TestCodexAdapter:
             "codex:unknown:rollout-2026-07-02T09-00-00-def456"
         )
 
+    def test_cwd_basename_is_cross_platform(self):
+        """Regression (CI, 2026-07-13): session_meta cwd is stored in the
+        session's NATIVE format, so a Windows cwd (C:\\...) must extract on a
+        Linux host and vice-versa. Path(cwd).name is host-native and got the
+        whole string on the wrong OS — split on both separators instead."""
+        from revien.adapters.codex import _basename_cross_platform as b
+        assert b("C:\\Users\\dev\\my-codex-project") == "my-codex-project"
+        assert b("/home/user/my-project") == "my-project"
+        assert b("C:\\proj\\") == "proj"      # trailing sep
+        assert b("/srv/app/") == "app"
+        assert b("D:/mixed/sep/proj") == "proj"  # forward slashes on Windows drive
+        assert b("") == ""
+
     def test_produces_valid_ingestion_content(self, mock_codex_home, epoch):
         """Adapter output should have all required fields for ingestion."""
         adapter = CodexAdapter(session_dir=str(mock_codex_home / "sessions"))

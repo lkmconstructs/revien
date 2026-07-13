@@ -6,11 +6,26 @@ CLI sessions only; the unified desktop app's session storage is undocumented.
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .base import RevienAdapter
+
+
+_PATH_SEP_RE = re.compile(r"[\\/]+")
+
+
+def _basename_cross_platform(raw: str) -> str:
+    """Last path component of a cwd that may be Windows- OR POSIX-style, on
+    ANY host OS. Codex records ``cwd`` in the session's native format; the
+    adapter (and CI) may run on a different OS, so ``Path(cwd).name`` is wrong
+    — on Linux it can't split a ``C:\\...`` path and returns the whole string.
+    Split on both separators instead."""
+    cleaned = raw.strip().rstrip("\\/")
+    parts = [p for p in _PATH_SEP_RE.split(cleaned) if p]
+    return parts[-1] if parts else ""
 
 
 def default_codex_home() -> Path:
@@ -130,7 +145,9 @@ class CodexAdapter(RevienAdapter):
                     if line_type == "session_meta":
                         payload = obj.get("payload")
                         if isinstance(payload, dict) and payload.get("cwd"):
-                            project_name = Path(str(payload["cwd"])).name or None
+                            project_name = _basename_cross_platform(
+                                str(payload["cwd"])
+                            ) or None
                         continue
 
                     # Envelope shape: {"type": "response_item", "payload": {...}}
