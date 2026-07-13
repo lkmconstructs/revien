@@ -45,6 +45,30 @@ from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
 
 
+def rrf_fuse(
+    ranked_lists: List[List[str]],
+    k: float = 60.0,
+    top_n: Optional[int] = None,
+) -> List[str]:
+    """Reciprocal Rank Fusion (LEG P1): fuse ranked candidate lists into one.
+
+        rrf_score(item) = Σ_lists 1 / (k + rank_in_list)     # rank is 1-based
+
+    k=60 is the canonical default; smaller k sharpens the head (top ranks
+    dominate), larger k flattens toward consensus. Items appearing in several
+    lists sum their contributions — that consensus is the whole point. Ties
+    break deterministically by item id so a fused anchor set is stable
+    across runs.
+    """
+    scores: Dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked, start=1):
+            scores[item] = scores.get(item, 0.0) + 1.0 / (k + rank)
+    fused = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    ids = [item for item, _ in fused]
+    return ids[:top_n] if top_n is not None else ids
+
+
 @dataclass
 class RetrievalResult:
     """A single node result with its score and path."""
@@ -115,6 +139,9 @@ class RetrievalEngine:
     # top-K nearest, so relative rank — not an absolute threshold — carries the
     # signal.
     SEMANTIC_SIM_FLOOR = 0.30
+    # RRF fusion constant (LEG P1, active only under REVIEN_HYBRID=rrf).
+    # Canonical default 60; REVIEN_RRF_K overrides for the sweep.
+    RRF_K = 60.0
 
     def __init__(
         self,
@@ -157,6 +184,13 @@ class RetrievalEngine:
         )
         self.graph_refine = _env_float("REVIEN_GRAPH_REFINE", self.GRAPH_REFINE)
         self.community_boost = _env_float("REVIEN_COMMUNITY_BOOST", self.COMMUNITY_BOOST)
+        # LEG P1 — RRF hybrid fusion gate (EXPERIMENTAL, default off). When
+        # REVIEN_HYBRID=rrf, anchor selection is replaced by Reciprocal Rank
+        # Fusion of the keyword-ranked and semantic-ranked candidate lists;
+        # everything downstream (walk, scoring, rerank) is untouched. Unset
+        # or any other value: the shipped anchor path runs byte-identical.
+        self.hybrid_mode = os.environ.get("REVIEN_HYBRID", "").strip().lower()
+        self.rrf_k = _env_float("REVIEN_RRF_K", self.RRF_K)
         # Frequency feedback-loop gate — DEFAULT OFF (sweep-shipped July 2026):
         # recall() touching its own results made access_count a popularity
         # prior contaminated by the engine's own behavior (being returned →
@@ -265,33 +299,61 @@ class RetrievalEngine:
         if as_of is not None and as_of.tzinfo is None:
             as_of = as_of.replace(tzinfo=timezone.utc)
 
-        # 1. Parse query — extract entities and topics
-        entity_anchor_ids = self._find_anchors(query)
-        anchor_ids = list(entity_anchor_ids)
-
-        # 2. If no anchors found, try keyword search across all nodes
+        entity_anchor_ids: List[str] = []
         keyword_anchor_ids: List[str] = []
-        if not anchor_ids:
-            keyword_anchor_ids = self._keyword_search(query)
-            anchor_ids = list(keyword_anchor_ids)
-
-        # 2a. Hybrid semantic anchors (opt-in). When the semantic layer is
-        # enabled, embed the query, pull the nearest stored nodes, and UNION
-        # them into the anchor set. This is what lets a keyword-less query
-        # (no entity/keyword overlap with any node) still find relevant nodes.
-        # When the layer is disabled, semantic_sims is empty and the anchor set
-        # is byte-for-byte what it was before this leg.
         semantic_sims: Dict[str, float] = {}
-        if self.semantic.is_enabled:
-            for node_id, sim in self.semantic.search(query, top_k=self.semantic_top_k):
-                # Only nodes that clear the floor act as semantic anchors. This
-                # is what lets a keyword-less query reach a genuinely-close node
-                # without near-uniform mild similarity reshuffling keyword hits.
-                if sim < self.semantic_sim_floor:
-                    continue
-                semantic_sims[node_id] = sim
-                if node_id not in anchor_ids:
-                    anchor_ids.append(node_id)
+
+        if self.hybrid_mode == "rrf":
+            # LEG P1 — RRF hybrid fusion (REVIEN_HYBRID=rrf, experimental).
+            # Replaces the entity → keyword-fallback → semantic-union anchor
+            # composition wholesale: keyword search runs ALWAYS (not as a
+            # fallback) as one ranked list, the semantic top-K (same floor as
+            # the shipped path) is the other, and the RRF-fused top-N IS the
+            # anchor set. The walk + scoring + rerank pipeline downstream is
+            # unchanged — this experiment moves anchor selection only.
+            keyword_anchor_ids = self._keyword_search(
+                query, limit=self.semantic_top_k
+            )
+            semantic_ranked: List[str] = []
+            if self.semantic.is_enabled:
+                for node_id, sim in self.semantic.search(
+                    query, top_k=self.semantic_top_k
+                ):
+                    if sim < self.semantic_sim_floor:
+                        continue
+                    semantic_sims[node_id] = sim
+                    semantic_ranked.append(node_id)
+            anchor_ids = rrf_fuse(
+                [keyword_anchor_ids, semantic_ranked],
+                k=self.rrf_k,
+                top_n=self.semantic_top_k,
+            )
+        else:
+            # 1. Parse query — extract entities and topics
+            entity_anchor_ids = self._find_anchors(query)
+            anchor_ids = list(entity_anchor_ids)
+
+            # 2. If no anchors found, try keyword search across all nodes
+            if not anchor_ids:
+                keyword_anchor_ids = self._keyword_search(query)
+                anchor_ids = list(keyword_anchor_ids)
+
+            # 2a. Hybrid semantic anchors (opt-in). When the semantic layer is
+            # enabled, embed the query, pull the nearest stored nodes, and UNION
+            # them into the anchor set. This is what lets a keyword-less query
+            # (no entity/keyword overlap with any node) still find relevant nodes.
+            # When the layer is disabled, semantic_sims is empty and the anchor set
+            # is byte-for-byte what it was before this leg.
+            if self.semantic.is_enabled:
+                for node_id, sim in self.semantic.search(query, top_k=self.semantic_top_k):
+                    # Only nodes that clear the floor act as semantic anchors. This
+                    # is what lets a keyword-less query reach a genuinely-close node
+                    # without near-uniform mild similarity reshuffling keyword hits.
+                    if sim < self.semantic_sim_floor:
+                        continue
+                    semantic_sims[node_id] = sim
+                    if node_id not in anchor_ids:
+                        anchor_ids.append(node_id)
 
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
@@ -609,10 +671,13 @@ class RetrievalEngine:
 
         return anchor_ids
 
-    def _keyword_search(self, query: str) -> List[str]:
+    def _keyword_search(self, query: str, limit: int = 10) -> List[str]:
         """
         Fallback: search node labels and content for query keywords.
-        Used when entity extraction finds no anchors.
+        Used when entity extraction finds no anchors — and, under
+        REVIEN_HYBRID=rrf (LEG P1), ALWAYS, as the keyword-ranked fusion
+        list (with limit widened to match the semantic list length).
+        Default limit=10 keeps the shipped fallback path byte-identical.
         """
         words = set(query.lower().split())
         # Remove very common words
@@ -631,10 +696,10 @@ class RetrievalEngine:
 
         # SQL-side substring search (same semantics as the old Python scan:
         # any-keyword hit on label+content, newest first, CONTEXT excluded,
-        # capped at 10 anchors). The old list_nodes(limit=999999) full scan
-        # was the single biggest recall latency driver (OPEN 2).
+        # capped at `limit` anchors). The old list_nodes(limit=999999) full
+        # scan was the single biggest recall latency driver (OPEN 2).
         matches = self.store.search_nodes_keyword(
-            keywords, limit=10, exclude_context=True
+            keywords, limit=limit, exclude_context=True
         )
         return [n.node_id for n in matches]
 
