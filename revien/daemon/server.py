@@ -5,10 +5,14 @@ Runs as local daemon on port 7437 or as hosted service.
 
 import time
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import secrets
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
@@ -28,6 +32,12 @@ class IngestRequest(BaseModel):
     content_type: str = "conversation"
     timestamp: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Capture path: persist now, embed later — the response returns before any
+    # embedding-model load. Queued nodes become recallable at the next semantic
+    # recall (search drains the queue first) or the ~30s idle sweep. NOTE: a
+    # verbatim-only capture is not keyword-anchorable in the gap (keyword
+    # anchors exclude CONTEXT nodes) — drain-at-search is the guarantee.
+    defer_embed: bool = False
 
 
 class IngestResponse(BaseModel):
@@ -57,6 +67,10 @@ class RecallRequest(BaseModel):
     include_tensions: bool = False
     # Bi-temporal query time (B2), ISO-8601: "what was true AT this time?"
     as_of: Optional[str] = None
+    # Wire format (LEG P2): "json" (default, unchanged response) or "toon"
+    # — Token-Oriented Object Notation, the same payload serialized for
+    # fewer tokens in a consuming LLM's context window (see revien/toon.py).
+    format: str = "json"
 
 
 class NodeUpdateRequest(BaseModel):
@@ -117,6 +131,107 @@ class SyncResponse(BaseModel):
     message: str
 
 
+# ── Capture auth (P3: remote capture is opt-in, token-gated) ─────────
+
+# starlette's TestClient reports host "testclient"; it exercises the same
+# in-process path as a local adapter, so it counts as loopback.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient", ""}
+
+
+def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
+    """Gate for /v1/ingest. Raises HTTPException on refusal.
+
+    Loopback callers are never gated — the local adapter path is unchanged
+    whether or not a token is configured. A remote caller is refused outright
+    unless ``REVIEN_CAPTURE_TOKEN`` is set (remote capture is opt-in), and
+    with it set must present ``Authorization: Bearer <token>``. Comparison is
+    constant-time.
+    """
+    host = (client_host or "").strip().lower()
+    if host in _LOOPBACK_HOSTS:
+        return
+    token = os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(
+            403,
+            "Remote capture is disabled. Set REVIEN_CAPTURE_TOKEN on the "
+            "daemon and send 'Authorization: Bearer <token>' to enable it.",
+        )
+    expected = f"Bearer {token}"
+    if not secrets.compare_digest(
+        (auth_header or "").strip().encode(), expected.encode()
+    ):
+        raise HTTPException(401, "Invalid or missing capture token.")
+
+
+class _CaptureAuthASGI:
+    """ASGI wrapper applying check_capture_auth to a whole mount (P5: /mcp).
+
+    MCP traffic bypasses the FastAPI route layer, so the ingest endpoint's
+    dependency can't cover it — this re-applies the exact same gate at the
+    ASGI boundary for EVERYTHING under the mount (recall-ish and ingest-ish
+    alike: a recall response leaks memory just as surely as ingest writes it).
+    Loopback exempt, remote needs Bearer REVIEN_CAPTURE_TOKEN — unchanged
+    semantics, one source of truth.
+
+    Browser gate: any request carrying an Origin header is refused unless
+    that origin is allowlisted via REVIEN_MCP_ALLOWED_ORIGINS. The loopback
+    exemption exists for LOCAL PROCESSES; a DNS-rebinding/CSRF page running
+    in the user's browser is also loopback, and without this check its JS
+    could call revien_recall and exfiltrate the whole graph. Native MCP
+    clients (Claude, Codex, anything non-browser) send no Origin, so they
+    are unaffected; browsers always send one on cross-origin POST.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    def _allowed_origins() -> set:
+        raw = os.environ.get("REVIEN_MCP_ALLOWED_ORIGINS", "")
+        return {o.strip().lower() for o in raw.split(",") if o.strip()}
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            client = scope.get("client")
+            host = client[0] if client else ""
+            auth = ""
+            origin = ""
+            for key, value in scope.get("headers", []):
+                if key == b"authorization":
+                    auth = value.decode("latin-1")
+                elif key == b"origin":
+                    origin = value.decode("latin-1")
+            try:
+                if origin and origin.strip().lower() not in self._allowed_origins():
+                    # Name the refused origin so a legitimate non-browser
+                    # client that unexpectedly sends one can be allowlisted
+                    # from the error alone.
+                    raise HTTPException(
+                        403,
+                        f"Browser-origin requests to the MCP endpoint are "
+                        f"refused (origin: {origin!r}). Set "
+                        f"REVIEN_MCP_ALLOWED_ORIGINS to allow a specific "
+                        f"origin.",
+                    )
+                check_capture_auth(host, auth)
+            except HTTPException as exc:
+                response = JSONResponse(
+                    {"detail": exc.detail}, status_code=exc.status_code
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _mcp_http_enabled() -> bool:
+    """REVIEN_MCP_HTTP gate — default OFF; the shipped REST surface is
+    byte-identical when unset."""
+    return os.environ.get("REVIEN_MCP_HTTP", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # ── App Factory ───────────────────────────────────────────
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
@@ -128,13 +243,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     """
     db_path = db_path or os.environ.get("REVIEN_DB_PATH", "revien.db")
 
-    app = FastAPI(
-        title="Revien",
-        description="Graph-based memory engine for AI systems. Memory that returns.",
-        version="0.1.0",
-    )
-
-    # Shared state
+    # Shared state — built before the FastAPI app so the optional MCP mount
+    # (below) can ride the same engine/pipeline instead of opening a second
+    # stack over the same database.
     store = GraphStore(db_path=db_path)
     ops = GraphOperations(store)
     # One shared semantic index (opt-in). Self-disables without the `semantic`
@@ -150,6 +261,61 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     if not clustering.load_from_db():
         clustering.run()
 
+    # ── Optional MCP surface (P5) ─────────────────────
+    # Mounted only when the SDK is importable AND REVIEN_MCP_HTTP is set.
+    # Default off: with the gate unset, the app carries no /mcp route and a
+    # no-op lifespan — the shipped REST surface is unchanged.
+    mcp_server = None
+    if _mcp_http_enabled():
+        from revien.mcp_server import MCP_AVAILABLE, build_mcp_server
+
+        if MCP_AVAILABLE:
+            mcp_server = build_mcp_server(engine=engine, pipeline=pipeline)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # The MCP session manager needs a running task group for the life of
+        # the app. Mounted sub-app lifespans don't run under Starlette, so it
+        # is wired here. No-op when MCP is off.
+        if mcp_server is not None:
+            async with mcp_server.session_manager.run():
+                yield
+        else:
+            yield
+
+    app = FastAPI(
+        title="Revien",
+        description="Graph-based memory engine for AI systems. Memory that returns.",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    if mcp_server is not None:
+        from starlette.routing import Route as _StarletteRoute
+
+        # streamable_http_app() is called for its side effect: it lazily
+        # creates the session manager the lifespan above runs. Its wrapper
+        # Starlette app is NOT mounted — a Mount("/mcp") + inner Route("/")
+        # 307-redirects the bare POST /mcp to /mcp/, which not every MCP
+        # client follows. Streamable HTTP is a single-endpoint transport
+        # (POST/GET/DELETE on one path), so an exact Route serves /mcp with
+        # no redirect. Capture auth wraps the whole surface — recall AND
+        # store get the /v1/ingest gate.
+        mcp_server.streamable_http_app()
+
+        class _MCPEndpoint:
+            """ASGI face over the session manager (class instance, so
+            Starlette treats it as an ASGI app, not a request handler)."""
+
+            async def __call__(self, scope, receive, send):
+                await mcp_server.session_manager.handle_request(
+                    scope, receive, send
+                )
+
+        app.router.routes.append(
+            _StarletteRoute("/mcp", endpoint=_CaptureAuthASGI(_MCPEndpoint()))
+        )
+
     # Store references on app for access by daemon/scheduler
     app.state.store = store
     app.state.ops = ops
@@ -161,8 +327,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/ingest ───────────────────────────────
 
     @app.post("/v1/ingest", response_model=IngestResponse)
-    async def ingest(request: IngestRequest):
+    async def ingest(request: IngestRequest, http_request: Request):
         """Ingest raw content. Builds graph nodes and edges."""
+        check_capture_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         ts = None
         if request.timestamp:
             try:
@@ -176,6 +346,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             content_type=request.content_type,
             timestamp=ts,
             metadata=request.metadata,
+            defer_embed=request.defer_embed,
         )
         result = pipeline.ingest(input_data)
 
@@ -197,6 +368,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.post("/v1/recall")
     async def recall(request: RecallRequest):
         """Query memory. Returns ranked nodes by three-factor score."""
+        if request.format not in ("json", "toon"):
+            raise HTTPException(400, f"Invalid format (json|toon expected): {request.format}")
         as_of = None
         if request.as_of:
             try:
@@ -213,7 +386,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             include_tensions=request.include_tensions,
             as_of=as_of,
         )
-        return {
+        payload = {
             "query": response.query,
             "results": [
                 {
@@ -238,6 +411,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             "semantic_active": response.semantic_active,
             "semantic_note": response.semantic_note,
         }
+        if request.format == "toon":
+            # Same payload, TOON wire format (LEG P2). text/toon is the
+            # spec's provisional media type. The json path above is
+            # untouched — byte-identical to pre-P2.
+            from revien.toon import serialize_recall
+
+            return PlainTextResponse(
+                serialize_recall(payload), media_type="text/toon; charset=utf-8"
+            )
+        return payload
 
     # ── GET /v1/nodes ─────────────────────────────────
 
@@ -440,12 +623,27 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/v1/sync", response_model=SyncResponse)
     async def sync():
-        """Trigger manual sync with connected AI systems."""
-        # In MVP, sync is a no-op until adapters are connected
-        # Phase 4 will wire this to the scheduler
+        """Trigger manual sync with connected AI systems.
+
+        Runs the scheduler's sync_all inline when a scheduler with live
+        adapters is attached (the daemon attaches it at startup). Without
+        one (bare create_app, e.g. tests/ASGI), reports that honestly
+        instead of pretending a sync happened.
+        """
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler is None or not scheduler.list_adapters():
+            return SyncResponse(
+                status="ok",
+                message="No adapters registered — nothing to sync. "
+                "Run 'revien connect <system>' then restart the daemon.",
+            )
+        results = await scheduler.sync_all()
+        ingested = sum(
+            r.get("items_ingested", 0) for r in results.values() if isinstance(r, dict)
+        )
         return SyncResponse(
             status="ok",
-            message="Manual sync triggered. Adapters will process on next cycle.",
+            message=f"Synced {len(results)} adapter(s), {ingested} item(s) ingested.",
         )
 
     # ── POST /v1/mark_used ─────────────────────────────

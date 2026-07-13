@@ -58,6 +58,8 @@ Most memory systems ask you to trust that your data is handled well. Revien is b
 - **Zero telemetry.** Revien collects no usage data, no crash reports, no phone-home. See [TELEMETRY.md](TELEMETRY.md).
 - **Nothing compacted away.** The full graph is preserved. Retrieval is surgical — it returns only what's relevant — but it never summarizes your history into oblivion to save space.
 - **A non-destructive audit trail.** Every node creation, update, supersession, and merge is recorded. You can trace any fact back to the exact turn it came from, and review every automatic decision the engine made.
+- **Your memory is portable.** `revien export graph.json` / `revien import graph.json` round-trip the whole graph as plain JSON — the migration path between machines, with no lock-in (import refuses a non-empty database unless you say `--merge`).
+- **Backups are one command.** `revien watch` snapshots the live database on an interval (`--interval` minutes, `--keep` N retained, `--gzip` optional) via SQLite's backup API — safe while the daemon is running.
 - **Consent is enforced, not requested.** A per-source deny list stops capture at the door. Soft-invalidation is reversible. Nothing is hard-deleted behind your back.
 - **Your curated knowledge outranks the machine's.** If you connect an Obsidian vault, a machine-extracted claim can never silently overwrite something you wrote by hand — contradictions go to a review queue, not a destructive merge.
 - **Memory you can open — and change.** Most AI memory is a black box: the agent decides what to remember, what's true, what to forget, and you never see it. Revien's memory is markdown files in your own vault. You don't have to trust it's right — you can open the file, correct a claim, delete one, or add your own, and your edits reconcile back into the graph.
@@ -242,7 +244,8 @@ revien distill-vault
 
 | Adapter | What it does | Interface |
 |---------|-------------|-----------|
-| **Claude Code** | Reads Claude Code session logs (JSONL), auto-syncs on schedule | `revien connect claude-code` |
+| **Claude Code** | Reads Claude Code session logs (JSONL), auto-syncs on schedule; prints a recommended CLAUDE.md instruction block that makes the agent recall at conversation start and store decisions silently | `revien connect claude-code` |
+| **Cursor / Windsurf / Cline / Continue / VS Code** | Writes the Revien MCP server entry into the tool's own MCP config at its documented location (merged non-destructively, never clobbered) | `revien connect cursor` (or `windsurf` / `cline` / `continue` / `vscode`) |
 | **Obsidian** | Ingests a vault chunked by heading; distills editable memory back out (correct / delete / add) | `revien connect obsidian` |
 | **File Watcher** | Watches a directory for new/changed files | `revien connect file-watcher --path DIR` |
 | **Generic API** | Pulls conversation data from a REST endpoint | `revien connect api --path URL` |
@@ -284,6 +287,8 @@ The daemon exposes a REST API on `localhost:7437`:
 | GET | `/v1/health` | Health check |
 
 Interactive docs at `http://localhost:7437/docs` when the daemon is running.
+
+recall supports TOON output (`format: "toon"` on `/v1/recall`, `--format toon` on the CLI) — measured −25% tokens vs compact JSON, −46% vs 2-space JSON (tiktoken cl100k_base, lossless round-trip verified; `revien_bench/measure_toon.py`).
 
 ---
 

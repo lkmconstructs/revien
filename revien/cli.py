@@ -7,7 +7,10 @@ Three lines to persistent memory:
 """
 
 import json
+import os
+import shutil
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +25,40 @@ def _default_db_path() -> str:
     revien_dir = Path.home() / ".revien"
     revien_dir.mkdir(parents=True, exist_ok=True)
     return str(revien_dir / "revien.db")
+
+
+def _resolve_revien_command() -> str:
+    """Absolute path to the ``revien`` launcher when resolvable, else the bare
+    name. An MCP client (Codex, etc.) spawns this command to start the stdio
+    server; a user-site pip install often lands ``revien.exe`` in a Scripts dir
+    that is NOT on PATH, so a bare ``revien`` fails to spawn. An absolute path
+    is PATH-independent AND immune to a stale sibling ``revien`` package on the
+    spawn cwd — the two failure modes a bare name hits on a dev box.
+    """
+    found = shutil.which("revien")
+    if found:
+        return found
+    name = "revien.exe" if os.name == "nt" else "revien"
+    seen = set()
+    # This interpreter's script dirs — user scheme first (where --user installs
+    # land), then the base scheme.
+    schemes = []
+    user_scheme = f"{os.name}_user"
+    if user_scheme in sysconfig.get_scheme_names():
+        schemes.append(user_scheme)
+    schemes.append(sysconfig.get_default_scheme())
+    for scheme in schemes:
+        try:
+            scripts = sysconfig.get_path("scripts", scheme)
+        except (KeyError, ValueError):
+            continue
+        if not scripts or scripts in seen:
+            continue
+        seen.add(scripts)
+        cand = Path(scripts) / name
+        if cand.exists():
+            return str(cand)
+    return "revien"  # last resort: trust the user's PATH
 
 
 def _get_config_path() -> Path:
@@ -69,15 +106,43 @@ def start(host: str, port: int, db: Optional[str], sync_interval: float):
         port=port,
         db_path=db_path,
         sync_interval_hours=sync_interval,
+        adapters=config.get("adapters", {}),
     )
     daemon.start()
+
+
+@main.command()
+@click.option("--db", default=None, help="Database path (default: ~/.revien/revien.db)")
+def mcp(db: Optional[str]):
+    """Run the Revien MCP server over stdio (for Claude Code, Codex, Cursor,
+    and other MCP clients that spawn local servers).
+
+    Own process, own connection — SQLite WAL lets it coexist with a running
+    daemon on the same database. Requires the mcp extra:
+    pip install revien[mcp]
+    """
+    from revien.mcp_server import MCP_AVAILABLE, build_mcp_server
+
+    if not MCP_AVAILABLE:
+        click.echo("The MCP SDK is not installed. Install with: pip install revien[mcp]")
+        sys.exit(1)
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    # stdout is the protocol channel on stdio — anything human goes to stderr.
+    click.echo(f"Revien MCP server (stdio) — database: {db_path}", err=True)
+    server = build_mcp_server(db_path=db_path)
+    server.run(transport="stdio")
 
 
 @main.command()
 @click.argument("system")
 @click.option("--path", default=None, help="Custom path for the adapter")
 def connect(system: str, path: Optional[str]):
-    """Connect an AI system to Revien. Supported: claude-code, file-watcher, api, obsidian."""
+    """Connect an AI system to Revien. Supported: claude-code, codex,
+    cursor, windsurf, cline, continue, vscode, hermes, file-watcher, api,
+    obsidian."""
     config = _load_config()
 
     if system == "claude-code":
@@ -105,7 +170,221 @@ def connect(system: str, path: Optional[str]):
         _save_config(config)
         click.echo(f"Connected Claude Code adapter.")
         click.echo(f"Session directory: {session_dir}")
+
+        # CLAUDE.md snippet — printed, never written into a repo (mirror of
+        # the codex branch's AGENTS.md snippet). Makes the agent an ACTIVE
+        # memory user instead of a passive one.
+        click.echo("Suggested CLAUDE.md snippet (add to your project's "
+                   "CLAUDE.md or ~/.claude/CLAUDE.md):")
+        click.echo(
+            "\n## Memory (Revien)\n"
+            "This machine runs Revien, a persistent memory engine.\n"
+            "- At conversation start, call `revien_recall` with the task topic to load prior context.\n"
+            "- When a decision is made or a fact is established, store it with `revien_store` — silently, no announcement.\n"
+            "- Prefer Revien recall over built-in memory for cross-session context.\n"
+        )
         click.echo("Run 'revien start' to begin syncing.")
+
+    elif system == "codex":
+        from revien.adapters.codex import default_codex_home
+
+        codex_home = default_codex_home()
+
+        if path:
+            session_dir = path
+        else:
+            sessions = codex_home / "sessions"
+            session_dir = str(sessions) if sessions.exists() else None
+
+        if session_dir is None:
+            click.echo("Could not auto-detect Codex session directory.")
+            click.echo("Specify manually: revien connect codex --path /path/to/.codex/sessions")
+            return
+
+        config["adapters"]["codex"] = {
+            "type": "codex",
+            "session_dir": session_dir,
+        }
+        _save_config(config)
+        click.echo("Connected Codex adapter.")
+        click.echo(f"Session directory: {session_dir}")
+
+        # MCP client config: append to ~/.codex/config.toml — never overwrite,
+        # never create. If the file isn't there, hand over the block instead.
+        # command is a TOML literal string (single quotes) so a resolved
+        # absolute Windows path with backslashes needs no escaping.
+        revien_cmd = _resolve_revien_command()
+        mcp_block = (
+            "\n[mcp_servers.revien]\n"
+            f"command = '{revien_cmd}'\n"
+            'args = ["mcp"]\n'
+        )
+        config_toml = codex_home / "config.toml"
+        if config_toml.exists():
+            # Foreign file: tolerate BOMs and PowerShell's UTF-16 default —
+            # an unreadable file gets the paste-block, never a traceback.
+            existing = None
+            read_enc = None
+            for enc in ("utf-8-sig", "utf-16"):
+                try:
+                    existing = config_toml.read_text(encoding=enc)
+                    read_enc = enc
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            # Present = an ACTIVE table header line, not substring containment:
+            # a commented-out block or [mcp_servers.revien-staging] must not
+            # block the append.
+            present = existing is not None and any(
+                line.strip() == "[mcp_servers.revien]"
+                for line in existing.splitlines()
+            )
+            if present:
+                click.echo(f"MCP entry already present in {config_toml} — left untouched.")
+            elif existing is None or read_enc != "utf-8-sig":
+                # Unreadable OR non-UTF-8 (appending UTF-8 to a UTF-16 file
+                # would corrupt it) — hand over the block, touch nothing.
+                click.echo(
+                    f"Not appending to {config_toml} "
+                    f"({'unrecognized encoding' if existing is None else 'file is not UTF-8'}) "
+                    f"— left untouched. Add this block yourself:"
+                )
+                click.echo(mcp_block)
+            else:
+                with open(config_toml, "a", encoding="utf-8") as f:
+                    if existing and not existing.endswith("\n"):
+                        f.write("\n")
+                    f.write(mcp_block)
+                click.echo(f"Appended to {config_toml}:")
+                click.echo(mcp_block)
+        else:
+            click.echo(f"No config.toml found at {config_toml}.")
+            click.echo("To give Codex live recall/store tools, add this to your Codex config.toml:")
+            click.echo(mcp_block)
+
+        # AGENTS.md snippet — printed, never written into a repo. That's the
+        # user's call.
+        click.echo("Suggested AGENTS.md snippet (add to your repo root or ~/.codex/AGENTS.md):")
+        click.echo(
+            "\n## Memory (Revien)\n"
+            "This machine runs Revien, a persistent memory engine.\n"
+            "- At session start, call `revien_recall` with the task topic to load prior context.\n"
+            "- When a decision is made or a fact is established, store it with `revien_store` — silently, no announcement.\n"
+            "- Prefer Revien recall over asking the user to repeat past decisions.\n"
+        )
+        click.echo("Run 'revien start' to begin syncing.")
+
+    elif system == "hermes":
+        # Hermes Agent (NousResearch) memory-provider install. Hermes discovers
+        # provider plugins from ~/.hermes/plugins/memory/<name>/ — the VERIFIED
+        # layout (developer-guide memory-provider-plugin.md, hermes-agent
+        # v0.18.2). We drop that plugin dir here. (A pip entry-point discovery
+        # path was considered but their docs name only filesystem discovery and
+        # the loader source was unreachable to confirm one — so it is not
+        # advertised.)
+        #
+        # Same discipline as the codex config.toml append: idempotent, and never
+        # clobber a file we didn't write. Our generated files carry a marker; a
+        # foreign __init__.py gets the paste-block, not an overwrite.
+        marker = "# revien connect hermes"
+        version = "0.3.0"
+        init_py = (
+            f"{marker} (generated) — Hermes memory-provider plugin for Revien.\n"
+            "# Re-exports the provider + entry point from the installed revien package,\n"
+            "# so the thin plugin dir tracks the library and needs no edits on upgrade.\n"
+            "from revien.hermes_provider import RevienMemoryProvider, register\n\n"
+            '__all__ = ["RevienMemoryProvider", "register"]\n'
+        )
+        plugin_yaml = (
+            f"{marker} (generated)\n"
+            "name: revien\n"
+            f"version: {version}\n"
+            "description: >-\n"
+            "  Revien persistent memory graph as a Hermes memory provider —\n"
+            "  local-first, single SQLite file, zero network egress.\n"
+            "hooks:\n"
+            "  - prefetch\n"
+            "  - sync_turn\n"
+            "  - on_session_end\n"
+            "  - system_prompt_block\n"
+        )
+        readme_md = (
+            "# Revien memory provider for Hermes Agent\n\n"
+            "Backs Hermes' automatic external memory with an in-process Revien\n"
+            "stack over `~/.revien/revien.db` (override with `REVIEN_DB`).\n\n"
+            "Requires: `pip install revien[hermes]` and `hermes-agent`.\n"
+            "Tested against hermes-agent v0.18.2 (2026.7.7.2).\n\n"
+            "Activate:  `hermes memory setup`  then select `revien`.\n"
+        )
+        files = {
+            "__init__.py": init_py,
+            "plugin.yaml": plugin_yaml,
+            "README.md": readme_md,
+        }
+
+        hermes_home = Path(path) if path else (Path.home() / ".hermes")
+        plugin_dir = hermes_home / "plugins" / "memory" / "revien"
+
+        existing_init = plugin_dir / "__init__.py"
+        foreign = False
+        if existing_init.exists():
+            # Ours to refresh only if it carries our marker — else it's a user
+            # file and we touch nothing.
+            try:
+                foreign = marker not in existing_init.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                foreign = True
+
+        if foreign:
+            click.echo(
+                f"A plugin already exists at {plugin_dir} and was not written by "
+                f"'revien connect hermes' — left untouched."
+            )
+            click.echo("To install manually, create these files yourself:")
+            for fname, body in files.items():
+                click.echo(f"\n----- {plugin_dir / fname} -----")
+                click.echo(body)
+        else:
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            for fname, body in files.items():
+                (plugin_dir / fname).write_text(body, encoding="utf-8")
+            click.echo(f"Installed Revien Hermes memory provider -> {plugin_dir}")
+            click.echo("  wrote: __init__.py, plugin.yaml, README.md")
+
+        # The plugin dir re-exports the provider, which needs the SDK-guarded
+        # module importable. Point the user at activation + the dependency.
+        click.echo(
+            "\nThen activate in Hermes:  hermes memory setup  (select 'revien').\n"
+            "Requires: pip install revien[hermes]  and  hermes-agent "
+            "(tested: v0.18.2)."
+        )
+
+    elif system in ("cursor", "windsurf", "cline", "continue", "vscode"):
+        # MCP client installers (LEG P4): write the Revien MCP server entry
+        # into the tool's own config at its documented location. Same
+        # discipline as the codex config.toml append above — merge, never
+        # clobber; refuse with a paste-block instead of guessing.
+        from revien.mcp_install import DISPLAY_NAMES, install_mcp_client
+
+        out = install_mcp_client(
+            system, override_path=Path(path) if path else None
+        )
+        name = DISPLAY_NAMES[system]
+        if out.status == "created":
+            click.echo(f"Created {out.path} with the Revien MCP entry.")
+        elif out.status == "merged":
+            click.echo(f"Added the Revien MCP entry to {out.path} "
+                       f"(existing entries preserved).")
+        elif out.status == "already":
+            click.echo(f"Revien MCP entry already present in {out.path} "
+                       f"— left untouched.")
+        else:
+            click.echo(f"Did not modify {out.path}: {out.detail}.")
+            click.echo("Add this yourself:")
+            click.echo("\n" + out.snippet)
+        if out.status in ("created", "merged"):
+            click.echo(f"Restart {name} to load the Revien MCP server "
+                       f"(requires: pip install revien[mcp]).")
 
     elif system == "file-watcher":
         if not path:
@@ -150,7 +429,8 @@ def connect(system: str, path: Optional[str]):
 
     else:
         click.echo(f"Unknown system: {system}")
-        click.echo("Supported: claude-code, file-watcher, api, obsidian")
+        click.echo("Supported: claude-code, codex, cursor, windsurf, cline, "
+                   "continue, vscode, hermes, file-watcher, api, obsidian")
 
 
 @main.command()
@@ -162,8 +442,14 @@ def connect(system: str, path: Optional[str]):
                    "time — superseded facts whose validity window covers it "
                    "come back")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
+@click.option("--format", "output_format", type=click.Choice(["json", "toon"]),
+              default="json", show_default=True,
+              help="Wire format: 'toon' prints the full recall payload as "
+                   "TOON (Token-Oriented Object Notation — same data, fewer "
+                   "tokens for a consuming LLM); 'json' keeps the existing "
+                   "behavior (human-readable, or JSON with --json-output)")
 def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
-           json_output: bool):
+           json_output: bool, output_format: str):
     """Query Revien memory from the command line."""
     from datetime import datetime
     from revien.graph.store import GraphStore
@@ -190,7 +476,37 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
     try:
         response = engine.recall(query, top_n=top, as_of=as_of_dt)
 
-        if json_output:
+        if output_format == "toon":
+            if json_output:
+                click.echo(
+                    "note: --json-output is ignored with --format toon",
+                    err=True,
+                )
+            # Same shape as POST /v1/recall — the payload a consuming LLM
+            # ingests — serialized as TOON (LEG P2).
+            from revien.toon import serialize_recall
+
+            payload = {
+                "query": response.query,
+                "results": [
+                    {
+                        "node_id": r.node_id,
+                        "node_type": r.node_type,
+                        "label": r.label,
+                        "content": r.content,
+                        "score": r.score,
+                        "score_breakdown": r.score_breakdown,
+                        "path": r.path,
+                    }
+                    for r in response.results
+                ],
+                "nodes_examined": response.nodes_examined,
+                "retrieval_time_ms": response.retrieval_time_ms,
+                "semantic_active": response.semantic_active,
+                "semantic_note": response.semantic_note,
+            }
+            click.echo(serialize_recall(payload))
+        elif json_output:
             output = {
                 "query": response.query,
                 "results": [
@@ -575,27 +891,163 @@ def status(db: Optional[str]):
 
 
 @main.command()
-@click.option("--output", "-o", default=None, help="Output file path")
+@click.argument("file", required=False, type=click.Path())
+@click.option("--output", "-o", default=None,
+              help="Output file path (same as FILE; kept for compatibility)")
 @click.option("--db", default=None, help="Database path")
-def export(output: Optional[str], db: Optional[str]):
-    """Export the full graph as JSON."""
+def export(file: Optional[str], output: Optional[str], db: Optional[str]):
+    """Export the full graph as portable JSON: revien export graph.json
+
+    Same schema and code path as GET /v1/graph — the file `revien import`
+    (and POST /v1/graph/import) accepts. No FILE prints to stdout.
+    """
     from revien.graph.store import GraphStore
 
     config = _load_config()
     db_path = db or config.get("db_path", _default_db_path())
 
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        sys.exit(1)
+
+    target = file or output
     store = GraphStore(db_path=db_path)
     try:
         graph = store.export_graph()
         json_str = graph.model_dump_json(indent=2)
 
-        if output:
-            Path(output).write_text(json_str)
-            click.echo(f"Graph exported to {output}")
+        if target:
+            Path(target).write_text(json_str, encoding="utf-8")
+            click.echo(f"Exported {len(graph.nodes)} nodes, "
+                       f"{len(graph.edges)} edges to {target}")
         else:
             click.echo(json_str)
     finally:
         store.close()
+
+
+@main.command(name="import")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--merge", is_flag=True,
+              help="Import into a non-empty database; nodes/edges whose IDs "
+                   "already exist are skipped, never overwritten")
+def import_(file: str, db: Optional[str], merge: bool):
+    """Import a graph exported by `revien export`: revien import graph.json
+
+    Same schema and code path as POST /v1/graph/import. Refuses a non-empty
+    target database unless --merge — an import must never silently eat an
+    existing graph.
+    """
+    from revien.graph.schema import Graph
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    try:
+        data = json.loads(Path(file).read_text(encoding="utf-8-sig"))
+        graph = Graph.model_validate(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        click.echo(f"Not a JSON graph file: {e}")
+        sys.exit(1)
+    except Exception as e:  # pydantic ValidationError — schema mismatch
+        click.echo(f"Invalid graph data: {e}")
+        sys.exit(1)
+
+    store = GraphStore(db_path=db_path)
+    try:
+        existing_nodes = store.count_nodes()
+        existing_edges = store.count_edges()
+
+        if (existing_nodes or existing_edges) and not merge:
+            click.echo(
+                f"Target database is not empty ({existing_nodes} nodes, "
+                f"{existing_edges} edges): {db_path}"
+            )
+            click.echo("Use --merge to import on top of it, or --db to "
+                       "point at a fresh file.")
+            sys.exit(1)
+
+        if merge and (existing_nodes or existing_edges):
+            added_n = skipped_n = added_e = skipped_e = 0
+            for node in graph.nodes:
+                if store.get_node(node.node_id) is not None:
+                    skipped_n += 1
+                else:
+                    store.add_node(node)
+                    added_n += 1
+            for edge in graph.edges:
+                if store.get_edge(edge.edge_id) is not None:
+                    skipped_e += 1
+                else:
+                    store.add_edge(edge)
+                    added_e += 1
+            click.echo(f"Merged {added_n} nodes, {added_e} edges "
+                       f"(skipped {skipped_n} existing nodes, "
+                       f"{skipped_e} existing edges).")
+        else:
+            # Empty target: the same code path the daemon's import uses.
+            store.import_graph(graph, clear_existing=False)
+            click.echo(f"Imported {len(graph.nodes)} nodes, "
+                       f"{len(graph.edges)} edges into {db_path}")
+
+        click.echo(f"Graph total: {store.count_nodes()} nodes, "
+                   f"{store.count_edges()} edges")
+    finally:
+        store.close()
+
+
+@main.command()
+@click.option("--db", default=None, help="Database path")
+@click.option("--interval", default=60.0, show_default=True,
+              help="Minutes between snapshots")
+@click.option("--keep", default=10, show_default=True,
+              help="Snapshots retained; oldest pruned first")
+@click.option("--gzip", "use_gzip", is_flag=True,
+              help="Compress snapshots (.db.gz)")
+def watch(db: Optional[str], interval: float, keep: int, use_gzip: bool):
+    """Snapshot the database on an interval — the local backup loop.
+
+    Copies the live db via SQLite's backup API (consistent even mid-write)
+    to <db>.snapshots/<timestamp>.db, keeping the newest --keep. Runs in the
+    foreground until Ctrl+C.
+    """
+    import time
+    from datetime import datetime
+
+    from revien.watch import prune_snapshots, snapshot_db, snapshot_dir_for
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        sys.exit(1)
+    if keep < 1:
+        click.echo("--keep must be at least 1.")
+        sys.exit(1)
+    if interval <= 0:
+        click.echo("--interval must be positive.")
+        sys.exit(1)
+
+    snap_dir = snapshot_dir_for(db_path)
+    click.echo(f"Watching {db_path}")
+    click.echo(f"Snapshots: {snap_dir} — every {interval:g} min, "
+               f"keeping {keep}{', gzipped' if use_gzip else ''}. "
+               f"Ctrl+C to stop.")
+    try:
+        while True:
+            snap = snapshot_db(db_path, use_gzip=use_gzip)
+            pruned = prune_snapshots(snap_dir, keep=keep)
+            stamp = datetime.now().strftime("%H:%M:%S")
+            msg = f"[{stamp}] snapshot {snap.name}"
+            if pruned:
+                msg += f" (pruned {pruned} old)"
+            click.echo(msg)
+            time.sleep(interval * 60)
+    except KeyboardInterrupt:
+        click.echo("\nStopped.")
 
 
 if __name__ == "__main__":

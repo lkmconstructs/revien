@@ -698,7 +698,7 @@ def _aggregate(
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Revien LoCoMo benchmark (headline track)")
     ap.add_argument("--config", default="graph_only",
-                    choices=["graph_only", "semantic", "neural"])
+                    choices=["graph_only", "semantic", "neural", "semantic_rrf"])
     ap.add_argument("--answerer", default="extractive",
                     help="reader spec: extractive | ollama:<model> | "
                          "openai:<model> | openrouter:<model> | together:<model> | "

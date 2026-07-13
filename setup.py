@@ -57,6 +57,17 @@ setup(
     extras_require={
         "dev": ["pytest>=7.4.0", "pytest-asyncio>=0.21.0"],
         "langchain": ["langchain-core>=0.1.0"],
+        # MCP surface (LEG P5): `revien mcp` (stdio) and the daemon's /mcp
+        # mount (REVIEN_MCP_HTTP=1). Peer dependency — revien imports of the
+        # SDK are guarded, so the core install stays lean without it.
+        "mcp": ["mcp>=1.28.1"],
+        # Hermes Agent memory provider (LEG P6). Peer dependency — revien
+        # imports of the Hermes SDK are guarded (HERMES_AVAILABLE), so the core
+        # install stays lean without it. `hermes-agent` ships the MemoryProvider
+        # ABC this integrates against. Pinned to the verified line (>=0.18.2,
+        # 2026.7.7.2). Pre-1.0: the adapter is thin so an ABC bump is a small
+        # edit, but pin conservatively.
+        "hermes": ["hermes-agent>=0.18.2"],
         # Opt-in Leiden community-detection backend. Compiled deps — not
         # installed by default. Enable with: pip install revien[leiden]
         "leiden": ["leidenalg>=0.10.0", "python-igraph>=0.11.0"],
@@ -73,6 +84,7 @@ setup(
         "semantic": ["sqlite-vec>=0.1.0", "fastembed>=0.3.0"],
         "all": [
             "langchain-core>=0.1.0",
+            "mcp>=1.28.1",
             "leidenalg>=0.10.0",
             "python-igraph>=0.11.0",
             "scikit-learn>=1.3.0",
@@ -85,5 +97,11 @@ setup(
         "console_scripts": [
             "revien=revien.cli:main",
         ],
+        # NOTE: a `hermes_agent.plugins` pip entry-point group was considered for
+        # Hermes provider discovery, but Hermes' developer guide documents ONLY
+        # filesystem discovery (~/.hermes/plugins/memory/<name>/) and the loader
+        # source could not be reached to confirm an entry-point group exists.
+        # `revien connect hermes` installs the verified filesystem plugin dir;
+        # the entry-point path stays out until it's confirmed against their loader.
     },
 )
