@@ -191,11 +191,15 @@ class _CaptureAuthASGI:
                     origin = value.decode("latin-1")
             try:
                 if origin and origin.strip().lower() not in self._allowed_origins():
+                    # Name the refused origin so a legitimate non-browser
+                    # client that unexpectedly sends one can be allowlisted
+                    # from the error alone.
                     raise HTTPException(
                         403,
-                        "Browser-origin requests to the MCP endpoint are "
-                        "refused. Set REVIEN_MCP_ALLOWED_ORIGINS to allow a "
-                        "specific origin.",
+                        f"Browser-origin requests to the MCP endpoint are "
+                        f"refused (origin: {origin!r}). Set "
+                        f"REVIEN_MCP_ALLOWED_ORIGINS to allow a specific "
+                        f"origin.",
                     )
                 check_capture_auth(host, auth)
             except HTTPException as exc:
@@ -573,12 +577,27 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/v1/sync", response_model=SyncResponse)
     async def sync():
-        """Trigger manual sync with connected AI systems."""
-        # In MVP, sync is a no-op until adapters are connected
-        # Phase 4 will wire this to the scheduler
+        """Trigger manual sync with connected AI systems.
+
+        Runs the scheduler's sync_all inline when a scheduler with live
+        adapters is attached (the daemon attaches it at startup). Without
+        one (bare create_app, e.g. tests/ASGI), reports that honestly
+        instead of pretending a sync happened.
+        """
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler is None or not scheduler.list_adapters():
+            return SyncResponse(
+                status="ok",
+                message="No adapters registered — nothing to sync. "
+                "Run 'revien connect <system>' then restart the daemon.",
+            )
+        results = await scheduler.sync_all()
+        ingested = sum(
+            r.get("items_ingested", 0) for r in results.values() if isinstance(r, dict)
+        )
         return SyncResponse(
             status="ok",
-            message="Manual sync triggered. Adapters will process on next cycle.",
+            message=f"Synced {len(results)} adapter(s), {ingested} item(s) ingested.",
         )
 
     # ── POST /v1/mark_used ─────────────────────────────
