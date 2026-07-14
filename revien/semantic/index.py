@@ -24,8 +24,11 @@ This layer is SPINE, not an extra: sqlite-vec + fastembed are CORE dependencies
     makes any missing dep or runtime failure a HARD ERROR instead of a degrade.
 
   * Embeddings stay in sync: the index registers a content listener on the
-    store, so node label/content updates re-embed immediately and deletes drop
-    the vector (no more stale-until-manual-reindex).
+    store, so node label/content updates are QUEUED for re-embed (drained by
+    the next search / idle sweep — never inline under the store lock) and
+    deletes drop the vector immediately (cheap SQL). No more
+    stale-until-manual-reindex; freshness at query time is unchanged because
+    search drains the queue first.
 
 =========================== ARCHITECTURE ===========================
 Storage  — sqlite-vec loadable extension (``sqlite_vec.load(conn)``) creates a
@@ -52,6 +55,7 @@ import os
 import sqlite3
 import struct
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
@@ -344,9 +348,12 @@ class SemanticIndex:
 
         # Keep embeddings in sync with node edits/deletes. Without this, an
         # updated node kept its STALE vector until a manual reindex_all() —
-        # vector search would keep matching the old content. Registration is
-        # keyed, so the newest index over a store replaces the previous one
-        # (they share the same vec table, so any live instance can serve).
+        # vector search would keep matching the old content. Edits QUEUE a
+        # re-embed (drained at next search — listeners run under the store
+        # lock, so no model inference inline); deletes drop the vector
+        # immediately. Registration is keyed, so the newest index over a
+        # store replaces the previous one (they share the same vec table, so
+        # any live instance can serve).
         if self._enabled:
             self._register_store_listener()
 
@@ -397,6 +404,16 @@ class SemanticIndex:
             return "force-disabled via REVIEN_SEMANTIC"
         return "disabled at construction (enabled=False)"
 
+    def _db(self):
+        """The store's connection lock, held for each execute/commit block.
+
+        The index rides the store's SHARED connection — an unlocked commit
+        from the ingest thread would flush another thread's half-done store
+        transaction (the audited-mutation guarantee). Embedding (model
+        inference) stays OUTSIDE these blocks so the lock is never held for
+        an embed. nullcontext keeps bare/mock stores working."""
+        return getattr(self.store, "_lock", None) or nullcontext()
+
     # ── Lazy wiring ────────────────────────────────────────
     def _get_embedder(self) -> EmbeddingProvider:
         if self._embedder is None:
@@ -414,18 +431,19 @@ class SemanticIndex:
         """Create the vec0 virtual table once, sized to the embedder dim."""
         if self._table_ready:
             return
-        conn = self.store._get_conn()
-        self._load_extension(conn)
-        # Cosine distance: bge-small (and most sentence embedders) are trained
-        # for cosine similarity. The default L2 metric compresses every pair
-        # into a narrow band on these dense vectors, killing discrimination;
-        # cosine separates the genuinely-relevant node from the rest.
-        conn.execute(
-            f"CREATE VIRTUAL TABLE IF NOT EXISTS {self.TABLE} "
-            f"USING vec0(node_id TEXT PRIMARY KEY, "
-            f"embedding float[{dim}] distance_metric=cosine)"
-        )
-        conn.commit()
+        with self._db():
+            conn = self.store._get_conn()
+            self._load_extension(conn)
+            # Cosine distance: bge-small (and most sentence embedders) are trained
+            # for cosine similarity. The default L2 metric compresses every pair
+            # into a narrow band on these dense vectors, killing discrimination;
+            # cosine separates the genuinely-relevant node from the rest.
+            conn.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS {self.TABLE} "
+                f"USING vec0(node_id TEXT PRIMARY KEY, "
+                f"embedding float[{dim}] distance_metric=cosine)"
+            )
+            conn.commit()
         self._dim = dim
         self._table_ready = True
 
@@ -452,8 +470,15 @@ class SemanticIndex:
         sys.stderr.flush()
 
     def _on_node_content_change(self, node_id: str, label: str, content: str) -> None:
-        """Store listener: a node's label/content changed — refresh its vector."""
-        self.index_node(node_id, label, content)
+        """Store listener: a node's label/content changed — QUEUE a re-embed.
+
+        Queue, not embed: listeners fire while the store lock is held, and
+        embedding means model inference (a cold fastembed load can hang for
+        minutes) — inline it and every store consumer stalls behind one
+        edit. The pending queue is a cheap INSERT; search() drains it before
+        querying, so vector search sees the new content by the next recall
+        (drain re-reads the node, so the freshest edit wins)."""
+        self.defer_nodes([(node_id, label, content)])
 
     def remove_node(self, node_id: str) -> None:
         """Store listener: node deleted — drop its vector so search can't
@@ -461,9 +486,10 @@ class SemanticIndex:
         if not self.is_enabled or not self._table_ready:
             return
         try:
-            conn = self.store._get_conn()
-            conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (node_id,))
-            conn.commit()
+            with self._db():
+                conn = self.store._get_conn()
+                conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (node_id,))
+                conn.commit()
         except Exception as e:  # noqa: BLE001 - cleanup must not break deletes
             self._safe_disable(e)
 
@@ -493,14 +519,22 @@ class SemanticIndex:
             embedder = self._get_embedder()
             vec = embedder.embed([text])[0]
             self._ensure_table(len(vec))
-            conn = self.store._get_conn()
-            # vec0 has no UPSERT; delete-then-insert keeps one row per node.
-            conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (node_id,))
-            conn.execute(
-                f"INSERT INTO {self.TABLE}(node_id, embedding) VALUES (?, ?)",
-                (node_id, _serialize_f32(vec)),
-            )
-            conn.commit()
+            with self._db():
+                conn = self.store._get_conn()
+                # Re-check the node still exists — embedding ran outside the
+                # lock, and a delete in that window must not leave a ghost
+                # vector search would keep returning.
+                if conn.execute(
+                    "SELECT 1 FROM nodes WHERE node_id = ?", (node_id,)
+                ).fetchone() is None:
+                    return False
+                # vec0 has no UPSERT; delete-then-insert keeps one row per node.
+                conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (node_id,))
+                conn.execute(
+                    f"INSERT INTO {self.TABLE}(node_id, embedding) VALUES (?, ?)",
+                    (node_id, _serialize_f32(vec)),
+                )
+                conn.commit()
             return True
         except Exception as e:  # noqa: BLE001 - optional layer must not break core
             self._safe_disable(e)
@@ -520,15 +554,25 @@ class SemanticIndex:
             if not vectors:
                 return 0
             self._ensure_table(len(vectors[0]))
-            conn = self.store._get_conn()
-            for (nid, _t), vec in zip(keep, vectors):
-                conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (nid,))
-                conn.execute(
-                    f"INSERT INTO {self.TABLE}(node_id, embedding) VALUES (?, ?)",
-                    (nid, _serialize_f32(vec)),
-                )
-            conn.commit()
-            return len(keep)
+            indexed = 0
+            with self._db():
+                conn = self.store._get_conn()
+                for (nid, _t), vec in zip(keep, vectors):
+                    # Re-check the node still exists — embedding ran outside
+                    # the lock, and a delete in that window (drain's TOCTOU)
+                    # must not resurrect a ghost vector.
+                    if conn.execute(
+                        "SELECT 1 FROM nodes WHERE node_id = ?", (nid,)
+                    ).fetchone() is None:
+                        continue
+                    conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (nid,))
+                    conn.execute(
+                        f"INSERT INTO {self.TABLE}(node_id, embedding) VALUES (?, ?)",
+                        (nid, _serialize_f32(vec)),
+                    )
+                    indexed += 1
+                conn.commit()
+            return indexed
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
             return 0
@@ -539,12 +583,13 @@ class SemanticIndex:
         on a cold process where the model has never loaded: that is the point."""
         if self._pending_table_ready:
             return
-        conn = self.store._get_conn()
-        conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {self.PENDING_TABLE} "
-            f"(node_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL)"
-        )
-        conn.commit()
+        with self._db():
+            conn = self.store._get_conn()
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.PENDING_TABLE} "
+                f"(node_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL)"
+            )
+            conn.commit()
         self._pending_table_ready = True
 
     def defer_nodes(self, nodes: Sequence[Tuple[str, str, str]]) -> int:
@@ -561,15 +606,16 @@ class SemanticIndex:
             return 0
         try:
             self._ensure_pending_table()
-            conn = self.store._get_conn()
-            now = datetime.now(timezone.utc).isoformat()
-            for node_id, _label, _content in nodes:
-                conn.execute(
-                    f"INSERT OR REPLACE INTO {self.PENDING_TABLE} "
-                    f"(node_id, queued_at) VALUES (?, ?)",
-                    (node_id, now),
-                )
-            conn.commit()
+            with self._db():
+                conn = self.store._get_conn()
+                now = datetime.now(timezone.utc).isoformat()
+                for node_id, _label, _content in nodes:
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO {self.PENDING_TABLE} "
+                        f"(node_id, queued_at) VALUES (?, ?)",
+                        (node_id, now),
+                    )
+                conn.commit()
             return len(nodes)
         except Exception as e:  # noqa: BLE001 - queueing must not break ingest
             self._safe_disable(e)
@@ -580,18 +626,19 @@ class SemanticIndex:
         if not self.is_enabled:
             return 0
         try:
-            conn = self.store._get_conn()
-            row = conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master "
-                "WHERE type='table' AND name=?",
-                (self.PENDING_TABLE,),
-            ).fetchone()
-            if not row or not row[0]:
-                return 0
-            self._pending_table_ready = True
-            return int(
-                conn.execute(f"SELECT COUNT(*) FROM {self.PENDING_TABLE}").fetchone()[0]
-            )
+            with self._db():
+                conn = self.store._get_conn()
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table' AND name=?",
+                    (self.PENDING_TABLE,),
+                ).fetchone()
+                if not row or not row[0]:
+                    return 0
+                self._pending_table_ready = True
+                return int(
+                    conn.execute(f"SELECT COUNT(*) FROM {self.PENDING_TABLE}").fetchone()[0]
+                )
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
             return 0
@@ -607,16 +654,17 @@ class SemanticIndex:
         if self.pending_count() == 0:
             return 0
         try:
-            conn = self.store._get_conn()
             n = int(limit) if limit else self.PENDING_DRAIN_BATCH
-            ids = [
-                r[0]
-                for r in conn.execute(
-                    f"SELECT node_id FROM {self.PENDING_TABLE} "
-                    f"ORDER BY queued_at LIMIT ?",
-                    (n,),
-                ).fetchall()
-            ]
+            with self._db():
+                conn = self.store._get_conn()
+                ids = [
+                    r[0]
+                    for r in conn.execute(
+                        f"SELECT node_id FROM {self.PENDING_TABLE} "
+                        f"ORDER BY queued_at LIMIT ?",
+                        (n,),
+                    ).fetchall()
+                ]
             if not ids:
                 return 0
             nodes = self.store.get_nodes_bulk(ids)
@@ -630,11 +678,13 @@ class SemanticIndex:
                 return embedded  # embed failed — keep the queue for later
             # Clear every fetched row: embedded ones, deleted-node ghosts, and
             # empty-text skips alike. Anything left behind would re-drain forever.
-            conn.executemany(
-                f"DELETE FROM {self.PENDING_TABLE} WHERE node_id = ?",
-                [(nid,) for nid in ids],
-            )
-            conn.commit()
+            with self._db():
+                conn = self.store._get_conn()
+                conn.executemany(
+                    f"DELETE FROM {self.PENDING_TABLE} WHERE node_id = ?",
+                    [(nid,) for nid in ids],
+                )
+                conn.commit()
             return embedded
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
@@ -706,12 +756,13 @@ class SemanticIndex:
             # Nothing indexed yet -> table may not exist -> ensure it (sized to
             # the query dim) and return empty rather than erroring.
             self._ensure_table(len(qvec))
-            conn = self.store._get_conn()
-            rows = conn.execute(
-                f"SELECT node_id, distance FROM {self.TABLE} "
-                f"WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                (_serialize_f32(qvec), int(top_k)),
-            ).fetchall()
+            with self._db():
+                conn = self.store._get_conn()
+                rows = conn.execute(
+                    f"SELECT node_id, distance FROM {self.TABLE} "
+                    f"WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (_serialize_f32(qvec), int(top_k)),
+                ).fetchall()
             return [(nid, 1.0 / (1.0 + float(dist))) for nid, dist in rows]
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)

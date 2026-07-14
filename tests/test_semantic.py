@@ -323,10 +323,13 @@ class TestRealSemanticExtra:
 # ── Spine behavior: embeddings stay in sync with node edits/deletes ────
 
 class TestAutoReindexOnUpdate:
-    def test_content_update_refreshes_vector(self, store):
+    def test_content_update_queues_reembed_drained_before_search(self, store):
         """The stale-vector bug: before the content listener, an edited node
         kept matching its OLD content in vector search until a manual
-        reindex_all(). Now update_node(content=...) re-embeds immediately."""
+        reindex_all(). Now update_node(content=...) QUEUES a re-embed —
+        listeners fire under the store lock, so no model inference runs
+        inline — and the pending queue drains before the next search
+        (drain re-reads the node, so the freshest edit wins)."""
         node = _add_fact(store, "pet", "A friendly dog at the park.")
         sem = _InMemoryVectorIndex(store, _MockEmbedder())
         sem.reindex_all()
@@ -336,13 +339,18 @@ class TestAutoReindexOnUpdate:
 
         # Edit the node so it is no longer about dogs at all.
         store.update_node(node.node_id, content="A sourdough bread recipe.")
+        # The edit queues; the vector refreshes at drain (what the real
+        # search() does first), not inline under the lock.
+        assert sem.pending_count() == 1
+        sem.drain_pending()
+        assert sem.pending_count() == 0
 
         assert node.node_id not in dict(sem.search("dog"))
         assert node.node_id in dict(sem.search("bread recipe"))
 
     def test_metadata_only_update_does_not_reembed(self, store):
         """Metadata/access updates are the hot path (the bench tags every node
-        after every turn) — they must NOT trigger an embed."""
+        after every turn) — they must NOT trigger an embed OR a queue entry."""
         node = _add_fact(store, "pet", "A friendly dog at the park.")
         sem = _InMemoryVectorIndex(store, _MockEmbedder())
         sem.reindex_all()
@@ -359,6 +367,7 @@ class TestAutoReindexOnUpdate:
         store.update_node(node.node_id, metadata={"dia_id": "D1:3"})
         store.update_node(node.node_id, access_count=5)
         assert calls["n"] == 0
+        assert sem.pending_count() == 0
         assert sem._vectors[node.node_id] == before
 
     def test_delete_drops_vector(self, store):

@@ -282,7 +282,7 @@ class TestGraphEndpoints:
         assert len(data["nodes"]) > 0
         assert len(data["edges"]) > 0
 
-    def test_import_graph(self, client):
+    def test_import_graph_default_refuses_nonempty(self, client):
         # First ingest, then export
         client.post("/v1/ingest", json={
             "source_id": "test",
@@ -291,18 +291,26 @@ class TestGraphEndpoints:
         exported = client.get("/v1/graph").json()
         node_count = len(exported["nodes"])
 
-        # Now import into a "fresh" state
+        # Default mode=refuse: a non-empty database 409s untouched — an import
+        # must never silently eat an existing graph (the old shape hardcoded
+        # a wipe).
         resp = client.post("/v1/graph/import", json=exported)
+        assert resp.status_code == 409
+        assert len(client.get("/v1/graph").json()["nodes"]) == node_count
+
+        # mode=replace swaps the graph wholesale.
+        resp = client.post("/v1/graph/import?mode=replace", json=exported)
         assert resp.status_code == 200
         assert resp.json()["nodes"] == node_count
 
     def test_export_import_roundtrip(self, seeded_client):
-        """Export graph, reimport, verify data survives."""
+        """Export graph, reimport (mode=replace), verify data survives."""
         exported = seeded_client.get("/v1/graph").json()
         original_count = len(exported["nodes"])
 
         # Reimport (clears and restores)
-        seeded_client.post("/v1/graph/import", json=exported)
+        resp = seeded_client.post("/v1/graph/import?mode=replace", json=exported)
+        assert resp.status_code == 200
 
         # Verify
         health = seeded_client.get("/v1/health").json()

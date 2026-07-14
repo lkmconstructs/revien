@@ -387,22 +387,24 @@ class GraphOperations:
                         ))
                         self.store.delete_edge(edge.edge_id)
 
-        # 2. Tombstone audit FIRST (content-free), so provenance survives even if
-        #    the row delete races. Records the gravestone fact, never content.
-        self.store.record_audit(
-            node_id, "forget", actor=construct_id,
-            before=None,  # NO content snapshot — it is being forgotten
-            after={
-                "_tombstone": True,
-                "original_node_id": node_id,
-                "deleted_at": now.isoformat(),
-                "reason": reason,
-            },
-            ts=now,
-        )
+        # 2+3. Tombstone audit (content-free) + hard delete in ONE transaction:
+        #    the row can never vanish without its gravestone, and a failed
+        #    audit write aborts the delete instead of losing provenance.
+        with self.store.transaction():
+            self.store.record_audit(
+                node_id, "forget", actor=construct_id,
+                before=None,  # NO content snapshot — it is being forgotten
+                after={
+                    "_tombstone": True,
+                    "original_node_id": node_id,
+                    "deleted_at": now.isoformat(),
+                    "reason": reason,
+                },
+                ts=now,
+            )
 
-        # 3. Hard-delete the node row + its remaining edges. Content is GONE.
-        return self.store.delete_node(node_id)
+            # Hard-delete the node row + its remaining edges. Content is GONE.
+            return self.store.delete_node(node_id)
 
     def forget_node(
         self, node_id: str, cascade: bool = False, reason: str = "",

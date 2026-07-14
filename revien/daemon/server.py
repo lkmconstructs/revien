@@ -564,18 +564,35 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/graph/import ─────────────────────────
 
     @app.post("/v1/graph/import")
-    async def import_graph(graph_data: Dict[str, Any]):
-        """Import a graph from JSON. For restore/migration."""
+    async def import_graph(graph_data: Dict[str, Any], mode: str = Query("refuse")):
+        """Import a graph from JSON. For restore/migration.
+
+        mode=refuse (default) 409s against a non-empty database — an import
+        must never silently eat an existing graph (the old shape hardcoded a
+        wipe). mode=merge skips colliding IDs; mode=replace swaps the whole
+        graph in one transaction (any failure leaves the original intact).
+        """
+        from revien.graph.store import ImportRefusedError, ImportValidationError
+
+        if mode not in ("refuse", "merge", "replace"):
+            raise HTTPException(400, f"Invalid mode {mode!r}: use refuse, merge or replace")
         try:
             graph = Graph.model_validate(graph_data)
-            store.import_graph(graph, clear_existing=True)
-            return {
-                "status": "imported",
-                "nodes": len(graph.nodes),
-                "edges": len(graph.edges),
-            }
         except Exception as e:
             raise HTTPException(400, f"Invalid graph data: {str(e)}")
+        try:
+            result = store.import_graph(graph, mode=mode, semantic=semantic)
+        except ImportRefusedError as e:
+            raise HTTPException(409, str(e))
+        except ImportValidationError as e:
+            raise HTTPException(400, f"Invalid graph data: {str(e)}")
+        return {
+            "status": "imported",
+            "mode": mode,
+            "nodes": result["nodes_added"],
+            "edges": result["edges_added"],
+            **result,
+        }
 
     # ── POST /v1/cluster ─────────────────────────────
 
