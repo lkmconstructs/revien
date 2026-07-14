@@ -36,6 +36,10 @@ class SyncScheduler:
         self._last_sync: Dict[str, datetime] = {}
         self._scheduler = None
         self._running = False
+        # Jobs registered before start() — the daemon wires its extra jobs
+        # (dream consolidation) before the lifespan startup starts the
+        # scheduler inside uvicorn's running loop. Flushed by start().
+        self._pending_jobs: List[tuple] = []
 
     def register_adapter(self, name: str, adapter: "RevienAdapter") -> None:
         """Register an adapter for periodic sync."""
@@ -155,18 +159,30 @@ class SyncScheduler:
             self._scheduler.start()
             self._running = True
             logger.info(f"Scheduler started (interval: {self.interval_hours}h)")
+            # Flush jobs queued before start (the daemon registers the dream
+            # job before the lifespan starts us inside uvicorn's loop).
+            for job_id, func, hours in self._pending_jobs:
+                self._scheduler.add_job(func, "interval", hours=hours, id=job_id)
+                logger.info("Registered job %r (interval: %sh)", job_id, hours)
+            self._pending_jobs = []
         except ImportError:
             logger.warning("APScheduler not installed. Auto-sync disabled.")
             logger.warning("Install with: pip install apscheduler")
 
     def add_interval_job(self, job_id: str, func, hours: float) -> bool:
         """Register an extra periodic job (e.g. the dream-mode consolidation
-        pass). Returns False when the scheduler isn't running (APScheduler
-        absent) — callers must treat that as 'the job will never fire', not
-        an error."""
+        pass). Called before start(), the job is queued and registered when
+        the scheduler starts — the daemon wires its jobs before the lifespan
+        startup starts the scheduler inside uvicorn's loop. Returns True in
+        both cases; when APScheduler is absent start() logs the miss and
+        queued jobs never fire, same as auto-sync itself."""
         if self._scheduler is None or not self._running:
-            logger.warning("Scheduler not running; job %r not registered", job_id)
-            return False
+            self._pending_jobs.append((job_id, func, hours))
+            logger.info(
+                "Queued job %r until scheduler start (interval: %sh)",
+                job_id, hours,
+            )
+            return True
         self._scheduler.add_job(func, "interval", hours=hours, id=job_id)
         logger.info("Registered job %r (interval: %sh)", job_id, hours)
         return True

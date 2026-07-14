@@ -64,21 +64,51 @@ def build_mcp_server(
             "The MCP SDK is not installed. Install with: pip install revien[mcp]"
         )
 
-    if engine is None or pipeline is None:
-        # Own stack — same wiring as create_app minus clustering (community
-        # boosts are a daemon-side refinement; the engine runs fine without).
-        from revien.graph.store import GraphStore
-        from revien.ingestion.pipeline import IngestionPipeline
-        from revien.retrieval.engine import RetrievalEngine
-        from revien.semantic.index import SemanticIndex
+    # Own-stack mode opens a GraphStore this module is responsible for handing
+    # back — it rides on the returned server object and close_mcp_server() is
+    # the deterministic release (the CLI's try/finally, tests' teardown).
+    # Ride-along mode attaches None: the daemon owns that store's lifecycle.
+    owned_store = None
+    try:
+        if engine is None or pipeline is None:
+            # Own stack — same wiring as create_app minus clustering
+            # (community boosts are a daemon-side refinement; the engine
+            # runs fine without).
+            from revien.graph.store import GraphStore
+            from revien.ingestion.pipeline import IngestionPipeline
+            from revien.retrieval.engine import RetrievalEngine
+            from revien.semantic.index import SemanticIndex
 
-        store = GraphStore(db_path=db_path or "revien.db")
-        semantic = SemanticIndex(store)
-        if pipeline is None:
-            pipeline = IngestionPipeline(store, semantic=semantic)
-        if engine is None:
-            engine = RetrievalEngine(store, semantic=semantic)
+            store = GraphStore(db_path=db_path or "revien.db")
+            owned_store = store
+            semantic = SemanticIndex(store)
+            if pipeline is None:
+                pipeline = IngestionPipeline(store, semantic=semantic)
+            if engine is None:
+                engine = RetrievalEngine(store, semantic=semantic)
 
+        server = _build_server(engine, pipeline)
+    except BaseException:
+        # Anything after the own-stack store opened — semantic/pipeline/
+        # engine wiring, FastMCP construction, tool registration — failed:
+        # close the store before propagating, or the handle leaks (and on
+        # Windows keeps the db file locked). Ride-along mode owns nothing.
+        if owned_store is not None:
+            owned_store.close()
+        raise
+
+    # The store the own-stack branch opened (None in ride-along mode). The
+    # sqlite connection's own finalizer at GC is the only fallback — callers
+    # that opened a stack close it via close_mcp_server().
+    server._revien_store = owned_store
+    return server
+
+
+def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
+    """FastMCP construction + tool registration over an existing stack.
+
+    Split out of build_mcp_server so the factory can close an own-stack
+    store when anything in here raises."""
     # streamable_http_path="/": the daemon routes /mcp itself (exact Route,
     # see daemon/server.py) — this only matters if someone runs the SDK's own
     # wrapper app, where "/" keeps the endpoint at the served root.
@@ -221,3 +251,16 @@ def build_mcp_server(
         }
 
     return server
+
+
+def close_mcp_server(server: Any) -> None:
+    """Release the GraphStore an own-stack ``build_mcp_server`` opened.
+
+    No-op for ride-along servers (engine/pipeline were injected — the daemon
+    owns that store) and safe to call twice: GraphStore.close is idempotent.
+    ``revien mcp`` calls this in a try/finally around ``server.run()`` so the
+    db file handle is released deterministically, not at interpreter exit.
+    """
+    store = getattr(server, "_revien_store", None)
+    if store is not None:
+        store.close()

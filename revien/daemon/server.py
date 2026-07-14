@@ -274,14 +274,38 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Startup: start the scheduler INSIDE uvicorn's running loop when the
+        # daemon attached one (RevienDaemon sets app.state.scheduler before
+        # uvicorn.run). AsyncIOScheduler.start() needs the running event
+        # loop — started before uvicorn.run, as the daemon used to, it
+        # either raises RuntimeError outright (apscheduler 3.11 + py3.13) or
+        # binds a loop that never runs, so sync/drain/dream jobs never fired.
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler is not None and not scheduler.is_running:
+            scheduler.start()
         # The MCP session manager needs a running task group for the life of
         # the app. Mounted sub-app lifespans don't run under Starlette, so it
         # is wired here. No-op when MCP is off.
-        if mcp_server is not None:
-            async with mcp_server.session_manager.run():
+        try:
+            if mcp_server is not None:
+                async with mcp_server.session_manager.run():
+                    yield
+            else:
                 yield
-        else:
-            yield
+        finally:
+            # Shutdown, innermost-out. The MCP session manager (above) has
+            # already exited by the time this runs. Stop the scheduler first
+            # if the daemon attached one (its jobs write through the store),
+            # then close the store — the ONE sqlite connection every layer
+            # rides, semantic index included. Everything here is idempotent,
+            # so a second teardown is a no-op. This is also what releases
+            # the db file handle when a TestClient exits: without it, the
+            # connection create_app opened lived until GC and Windows
+            # refused the temp-db unlink (WinError 32).
+            scheduler = getattr(app.state, "scheduler", None)
+            if scheduler is not None:
+                scheduler.stop()
+            store.close()
 
     app = FastAPI(
         title="Revien",

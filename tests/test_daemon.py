@@ -72,11 +72,16 @@ class TestHealthEndpoint:
     def test_create_app_honors_revien_db_path_env_when_no_explicit_arg(self, monkeypatch):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
+        app = None
         try:
             monkeypatch.setenv("REVIEN_DB_PATH", path)
             app = create_app()
             assert app.state.store.db_path == path
         finally:
+            # No TestClient here, so no lifespan teardown ran — close the
+            # store directly or the unlink below fails on Windows.
+            if app is not None:
+                app.state.store.close()
             os.unlink(path)
 
     def test_create_app_explicit_db_path_overrides_env(self, monkeypatch):
@@ -84,11 +89,16 @@ class TestHealthEndpoint:
         fd_explicit, explicit_path = tempfile.mkstemp(suffix=".db")
         os.close(fd_env)
         os.close(fd_explicit)
+        app = None
         try:
             monkeypatch.setenv("REVIEN_DB_PATH", env_path)
             app = create_app(db_path=explicit_path)
             assert app.state.store.db_path == explicit_path
         finally:
+            # No lifespan ran (no TestClient) — release the explicit-path
+            # store before unlinking. env_path was never opened.
+            if app is not None:
+                app.state.store.close()
             os.unlink(env_path)
             os.unlink(explicit_path)
 

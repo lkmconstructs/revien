@@ -121,7 +121,7 @@ def mcp(db: Optional[str]):
     daemon on the same database. Requires the mcp extra:
     pip install revien[mcp]
     """
-    from revien.mcp_server import MCP_AVAILABLE, build_mcp_server
+    from revien.mcp_server import MCP_AVAILABLE, build_mcp_server, close_mcp_server
 
     if not MCP_AVAILABLE:
         click.echo("The MCP SDK is not installed. Install with: pip install revien[mcp]")
@@ -133,7 +133,12 @@ def mcp(db: Optional[str]):
     # stdout is the protocol channel on stdio — anything human goes to stderr.
     click.echo(f"Revien MCP server (stdio) — database: {db_path}", err=True)
     server = build_mcp_server(db_path=db_path)
-    server.run(transport="stdio")
+    try:
+        server.run(transport="stdio")
+    finally:
+        # The own-stack GraphStore this process opened closes with it —
+        # deterministically, not whenever GC gets around to the connection.
+        close_mcp_server(server)
 
 
 @main.command()

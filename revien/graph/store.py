@@ -50,6 +50,11 @@ class GraphStore:
     def __init__(self, db_path: str = "revien.db"):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        # Terminal-close flag: close() sets it and _get_conn refuses to
+        # reopen. Without it a post-close call silently resurrected the
+        # connection and re-locked the db file — the unlink guarantee has to
+        # be structural, not "hope nobody calls us after close".
+        self._closed = False
         # Serializes ALL access to the shared connection (see _locked).
         self._lock = threading.RLock()
         # transaction() nesting depth. >0 means per-method commits are
@@ -429,6 +434,17 @@ class GraphStore:
                 raise
 
     def _get_conn(self) -> sqlite3.Connection:
+        if self._closed:
+            # Closed is closed. Reopening here would re-lock the db file
+            # after the owner already released it — on Windows the unlink
+            # the close existed FOR then fails. Late callers (a straggling
+            # scheduler job, an adapter used after its `with` block, an MCP
+            # call racing shutdown) get a loud error their own error
+            # handling absorbs, not a silent resurrection.
+            raise RuntimeError(
+                f"GraphStore is closed (db: {self.db_path}). "
+                "Construct a new GraphStore to reopen the database."
+            )
         if self._conn is None:
             self._conn = sqlite3.connect(
                 self.db_path, check_same_thread=False
@@ -439,6 +455,14 @@ class GraphStore:
 
     @_locked
     def close(self) -> None:
+        """Close the connection and mark the store terminally closed.
+
+        Idempotent (a second close is a no-op) and thread-safe: it takes the
+        store lock, so a close racing another thread's method waits for that
+        method to finish instead of yanking the connection mid-statement.
+        After close, any use raises RuntimeError — see _get_conn.
+        """
+        self._closed = True
         if self._conn:
             self._conn.close()
             self._conn = None
