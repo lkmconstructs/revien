@@ -1,6 +1,6 @@
 """
 Revien Ingestion Extractor — Rule-based NLP extraction of nodes and edges.
-Extracts entities, topics, decisions, facts, preferences, and events from raw text.
+Extracts entities, topics, decisions, actions, facts, preferences, and events from raw text.
 No GPU. No external models. Pure pattern matching for MVP.
 """
 
@@ -39,6 +39,18 @@ PREFERENCE_PATTERNS = [
     r"(?:I |we )?don'?t (?:like|want|use) (.{5,200}?)(?:\.|$)",
     r"(?:I |we )?(?:like|love|enjoy) (?:using |to use )?(.{5,200}?)(?:\.|$)",
     r"(?:never|avoid) (?:use |using )?(.{5,200}?)(?:\.|$)",
+]
+
+# Action markers — commitments to future work (DECISION's forward-looking
+# sibling). Deliberately conservative: bare futures ("it will rain") and
+# hypotheticals don't match; the patterns require a first-person commitment,
+# an imperative task marker, or an explicit to-do label.
+ACTION_PATTERNS = [
+    r"(?:I|we)(?:'ll| will| need to| have to| still need to) (.{10,200}?)(?:\.|$)",
+    r"(?:I'?m|we'?re) going to (.{10,200}?)(?:\.|$)",
+    r"(?:TODO|To-?do|Action item|Follow[- ]?up)[.:]\s*(.{5,200}?)(?:\.|$)",
+    r"(?:remind me to|don'?t forget to|remember to) (.{5,200}?)(?:\.|$)",
+    r"(?:next step(?:s)? (?:is|are)|the next step is) (?:to )?(.{10,200}?)(?:\.|$)",
 ]
 
 # Fact patterns — specific data points, config values, requirements
@@ -117,6 +129,7 @@ class RuleBasedExtractor:
 
     def _compile_patterns(self):
         self._decision_re = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in DECISION_PATTERNS]
+        self._action_re = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in ACTION_PATTERNS]
         self._preference_re = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in PREFERENCE_PATTERNS]
         self._fact_re = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in FACT_PATTERNS]
         self._event_re = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in EVENT_PATTERNS]
@@ -164,6 +177,16 @@ class RuleBasedExtractor:
             result.nodes.append(node)
             result.edges.append(self._make_edge(
                 node.node_id, context_node.node_id, EdgeType.DECIDED_IN
+            ))
+
+        # 3b. Extract actions (committed future work). Same edge shape as
+        # decisions minus the dedicated edge type — RELATED_TO keeps the edge
+        # taxonomy unchanged; the node type carries the meaning.
+        actions = self._extract_actions(content, source_id, now)
+        for node in actions:
+            result.nodes.append(node)
+            result.edges.append(self._make_edge(
+                node.node_id, context_node.node_id, EdgeType.RELATED_TO
             ))
 
         # 4. Extract facts
@@ -289,6 +312,26 @@ class RuleBasedExtractor:
                         last_accessed=now,
                     ))
         return decisions
+
+    def _extract_actions(self, content: str, source_id: str, now: datetime) -> List[Node]:
+        actions = []
+        seen = set()
+        for pattern in self._action_re:
+            for match in pattern.finditer(content):
+                text = match.group(0).strip()
+                captured = match.group(1).strip() if match.lastindex else text
+                label = captured[:200]
+                if label.lower() not in seen and len(label) > 5:
+                    seen.add(label.lower())
+                    actions.append(Node(
+                        node_type=NodeType.ACTION,
+                        label=label,
+                        content=text,
+                        source_id=source_id,
+                        created_at=now,
+                        last_accessed=now,
+                    ))
+        return actions
 
     def _extract_facts(self, content: str, source_id: str, now: datetime) -> List[Node]:
         facts = []

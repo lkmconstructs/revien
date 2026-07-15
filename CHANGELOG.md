@@ -6,6 +6,7 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `action` node type — committed future work (to-dos, follow-ups, "I'll X"), DECISION's forward-looking sibling. Extracted by both the rule extractor (conservative commitment patterns) and the LLM extractor, and distilled to an "Actions" section in vault notes.
 - **Persistent adapter-sync cursors** (`sync_cursors` table). The first-ever sync of an
   adapter starts at epoch, so everything from before the daemon existed is ingested; a
   daemon restart resumes from the last successful sync instead of resetting to now()

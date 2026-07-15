@@ -104,9 +104,14 @@ class TestNodeCreation:
         result = store.add_node(node)
         assert result.node_type == NodeType.CONTEXT
 
+    def test_create_action_node(self, store):
+        node = Node(node_type=NodeType.ACTION, label="Update the architecture doc", content="I'll update the architecture doc after the pricing call")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.ACTION
+
     def test_all_node_types_covered(self):
         """Verify we test every NodeType."""
-        assert len(NodeType) == 7
+        assert len(NodeType) == 8
 
 
 # ── Edge Creation (every type) ────────────────────────────

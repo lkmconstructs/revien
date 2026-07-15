@@ -19,6 +19,11 @@ class NodeType(str, Enum):
     PREFERENCE = "preference"
     EVENT = "event"
     CONTEXT = "context"
+    # A committed-to future act (to-do, follow-up, "I'll X") — DECISION's
+    # forward-looking sibling: a decision records a choice made, an action
+    # records work still owed. Same lifecycle as every claim type
+    # (dedup/recall/supersession apply unchanged).
+    ACTION = "action"
 
 
 class EdgeType(str, Enum):
