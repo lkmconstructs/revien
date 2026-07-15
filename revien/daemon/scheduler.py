@@ -13,6 +13,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("revien.scheduler")
 
+# First-ever sync position (repair leg R3): an adapter with NO persisted
+# cursor starts here, so everything that existed before the daemon ever ran
+# is ingested on the first sync (the old register-time now() stamp silently
+# skipped all pre-daemon history). Timezone-aware so adapters can call
+# .timestamp() on it — aware arithmetic is pure math, no OS range limits.
+EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
 
 class SyncScheduler:
     """
@@ -33,20 +40,31 @@ class SyncScheduler:
         self.pipeline = pipeline
         self.interval_hours = interval_hours
         self._adapters: Dict[str, "RevienAdapter"] = {}
-        self._last_sync: Dict[str, datetime] = {}
+        # Sync cursors live in the STORE (sync_cursors table), not here —
+        # a memory-only dict reset to now() on every restart, so offline-
+        # window changes were skipped forever (repair leg R3).
         self._scheduler = None
         self._running = False
+        # Jobs registered before start() — the daemon wires its extra jobs
+        # (dream consolidation) before the lifespan startup starts the
+        # scheduler inside uvicorn's running loop. Flushed by start().
+        self._pending_jobs: List[tuple] = []
 
     def register_adapter(self, name: str, adapter: "RevienAdapter") -> None:
-        """Register an adapter for periodic sync."""
+        """Register an adapter for periodic sync.
+
+        Registration does NOT stamp a cursor. The sync position is read from
+        the store at sync time: no persisted row means first sync EVER, which
+        starts at EPOCH so pre-daemon history is ingested; a restart resumes
+        from wherever the last successful sync left off.
+        """
         self._adapters[name] = adapter
-        self._last_sync[name] = datetime.now(timezone.utc)
         logger.info(f"Registered adapter: {name}")
 
     def unregister_adapter(self, name: str) -> None:
-        """Remove an adapter from sync rotation."""
+        """Remove an adapter from sync rotation. The persisted cursor is
+        kept — re-registering resumes instead of re-ingesting history."""
         self._adapters.pop(name, None)
-        self._last_sync.pop(name, None)
         logger.info(f"Unregistered adapter: {name}")
 
     def list_adapters(self) -> List[str]:
@@ -76,10 +94,27 @@ class SyncScheduler:
         return await self._sync_adapter(name, adapter)
 
     async def _sync_adapter(self, name: str, adapter: "RevienAdapter") -> dict:
-        """Sync a single adapter: fetch new content and ingest it."""
+        """Sync a single adapter: fetch new content and ingest it.
+
+        Cursor discipline (repair leg R3):
+          * The position is read from the store — no row (first sync EVER)
+            means EPOCH, so pre-daemon history lands on the first sync.
+          * Stamp-before-fetch: the NEW cursor is captured before the fetch
+            runs and persisted only after a fully successful sync. Content
+            landing between fetch and stamp falls after the captured instant
+            and is caught by the next window (the old post-fetch now() stamp
+            skipped it forever).
+          * A failed/unhealthy sync never advances the cursor.
+        """
         from revien.ingestion.pipeline import IngestionInput
 
-        since = self._last_sync.get(name, datetime.now(timezone.utc))
+        store = self.pipeline.store
+        since = store.get_sync_cursor(name)
+        if since is None:
+            since = EPOCH
+
+        # Captured BEFORE the fetch; becomes the persisted cursor on success.
+        sync_started = datetime.now(timezone.utc)
 
         # Health check first
         healthy = await adapter.health_check()
@@ -89,7 +124,7 @@ class SyncScheduler:
         # Fetch new content
         new_content = await adapter.fetch_new_content(since)
         if not new_content:
-            self._last_sync[name] = datetime.now(timezone.utc)
+            store.set_sync_cursor(name, sync_started)
             return {"status": "ok", "adapter": name, "items_ingested": 0}
 
         # Ingest each piece of content
@@ -113,12 +148,18 @@ class SyncScheduler:
                 metadata=item.get("metadata", {}),
                 links=item.get("links", []) or [],
                 curated=bool(item.get("curated", False)),
+                # Stable re-ingest identity (R3): adapters that re-fetch a
+                # whole growing unit (claude_code/codex sessions) emit this so
+                # the pipeline refreshes ONE context node instead of stacking
+                # duplicates every sync. Absent = append-forever, unchanged.
+                ingest_key=item.get("ingest_key"),
             )
             if input_data.content.strip():
                 self.pipeline.ingest(input_data)
                 ingested += 1
 
-        self._last_sync[name] = datetime.now(timezone.utc)
+        # Success: persist the pre-fetch stamp as the new cursor.
+        store.set_sync_cursor(name, sync_started)
         logger.info(f"Synced {name}: {ingested} items ingested")
         return {"status": "ok", "adapter": name, "items_ingested": ingested}
 
@@ -145,6 +186,12 @@ class SyncScheduler:
                 "interval",
                 hours=self.interval_hours,
                 id="revien_auto_sync",
+                # Immediate first sync (R3): fire once at startup, then every
+                # interval. A daemon that starts with adapters connected syncs
+                # within seconds instead of waiting out the first 6h window.
+                # start() runs inside the lifespan startup (R2), so this lands
+                # on uvicorn's running loop.
+                next_run_time=datetime.now(timezone.utc),
             )
             self._scheduler.add_job(
                 self.drain_pending_embeds,
@@ -155,18 +202,30 @@ class SyncScheduler:
             self._scheduler.start()
             self._running = True
             logger.info(f"Scheduler started (interval: {self.interval_hours}h)")
+            # Flush jobs queued before start (the daemon registers the dream
+            # job before the lifespan starts us inside uvicorn's loop).
+            for job_id, func, hours in self._pending_jobs:
+                self._scheduler.add_job(func, "interval", hours=hours, id=job_id)
+                logger.info("Registered job %r (interval: %sh)", job_id, hours)
+            self._pending_jobs = []
         except ImportError:
             logger.warning("APScheduler not installed. Auto-sync disabled.")
             logger.warning("Install with: pip install apscheduler")
 
     def add_interval_job(self, job_id: str, func, hours: float) -> bool:
         """Register an extra periodic job (e.g. the dream-mode consolidation
-        pass). Returns False when the scheduler isn't running (APScheduler
-        absent) — callers must treat that as 'the job will never fire', not
-        an error."""
+        pass). Called before start(), the job is queued and registered when
+        the scheduler starts — the daemon wires its jobs before the lifespan
+        startup starts the scheduler inside uvicorn's loop. Returns True in
+        both cases; when APScheduler is absent start() logs the miss and
+        queued jobs never fire, same as auto-sync itself."""
         if self._scheduler is None or not self._running:
-            logger.warning("Scheduler not running; job %r not registered", job_id)
-            return False
+            self._pending_jobs.append((job_id, func, hours))
+            logger.info(
+                "Queued job %r until scheduler start (interval: %sh)",
+                job_id, hours,
+            )
+            return True
         self._scheduler.add_job(func, "interval", hours=hours, id=job_id)
         logger.info("Registered job %r (interval: %sh)", job_id, hours)
         return True

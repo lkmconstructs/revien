@@ -432,7 +432,9 @@ class TestListingAndCounting:
 
 class TestAuditLog:
     """Append-only audit trail. Records create/reinforce/correct/invalidate;
-    access via mark_used. Audit-write failures never break the underlying op."""
+    access via mark_used. Provenance is a required invariant: a mutation and
+    its audit row land in one commit, and an audit failure rolls the mutation
+    back rather than leaving a row the trail can't account for."""
 
     def test_create_records_audit(self, store):
         n = store.add_node(Node(node_type=NodeType.FACT, label="a", content="x"))
@@ -466,20 +468,25 @@ class TestAuditLog:
         assert recent[0]["node_id"] == b.node_id  # newest first
         assert {r["node_id"] for r in recent} == {a.node_id, b.node_id}
 
-    def test_audit_failure_never_breaks_op(self, store, monkeypatch):
+    def test_audit_failure_rolls_back_mutation(self, store, monkeypatch):
         # Simulate an audit-write failure: make record_audit raise (e.g. a DB
-        # error inside the INSERT). The guarded _record_node_audit wrapper used
-        # by add_node must swallow it so the underlying op still succeeds.
+        # error inside the INSERT). Provenance is REQUIRED — the mutation must
+        # roll back with it, never land as a stand-alone row the trail can't
+        # account for.
+        node = Node(node_type=NodeType.FACT, label="z", content="x")
+
         def boom(*a, **k):
             raise RuntimeError("audit boom")
         monkeypatch.setattr(store, "record_audit", boom)
-        try:
-            n = store.add_node(Node(node_type=NodeType.FACT, label="z", content="x"))
-        except RuntimeError:
-            pytest.fail("audit-write failure must not break add_node")
-        # Underlying op succeeded; the audit row is simply absent (write failed),
-        # which is the acceptable degraded outcome.
+        with pytest.raises(RuntimeError, match="audit boom"):
+            store.add_node(node)
+        assert store.get_node(node.node_id) is None, "mutation must roll back"
+
+        # Store stays usable once the audit path recovers.
+        monkeypatch.undo()
+        n = store.add_node(node)
         assert store.get_node(n.node_id) is not None
+        assert [e["op"] for e in store.get_node_audit(n.node_id)] == ["create"]
 
 
 class TestLineage:

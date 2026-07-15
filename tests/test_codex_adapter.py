@@ -512,18 +512,19 @@ class TestAdapterWiring:
             adapter = build_adapter_from_config(
                 {"type": "codex", "session_dir": str(mock_codex_home / "sessions")}
             )
-            # Backdate last-sync so the mock sessions count as new.
+            # No backdating needed: a never-synced adapter (no persisted
+            # cursor) starts at EPOCH, so the mock sessions count as new (R3).
             scheduler.register_adapter("codex", adapter)
-            scheduler._last_sync["codex"] = datetime(2020, 1, 1, tzinfo=timezone.utc)
             app.state.scheduler = scheduler
 
             with TestClient(app) as client:
-                before = client.get("/v1/health").json()["node_count"]
                 resp = client.post("/v1/sync")
                 assert resp.status_code == 200
-                assert "item(s) ingested" in resp.json()["message"]
+                assert resp.json()["status"] == "ok"
+                # The content may land via the manual sync OR the immediate
+                # startup sync (R3) — either way it must be in the graph.
                 after = client.get("/v1/health").json()["node_count"]
-                assert after > before, "sync must ingest the adapter's content"
+                assert after > 0, "sync must ingest the adapter's content"
         finally:
             try:
                 os.unlink(db)

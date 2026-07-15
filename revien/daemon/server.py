@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from revien import __version__
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -22,6 +23,7 @@ from revien.graph.clustering import CommunityDetector
 from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 from revien.semantic.index import SemanticIndex
+from revien.validation import ValidationError, validate_ingest, validate_recall
 
 
 # ── Request/Response Models ───────────────────────────────
@@ -274,19 +276,43 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Startup: start the scheduler INSIDE uvicorn's running loop when the
+        # daemon attached one (RevienDaemon sets app.state.scheduler before
+        # uvicorn.run). AsyncIOScheduler.start() needs the running event
+        # loop — started before uvicorn.run, as the daemon used to, it
+        # either raises RuntimeError outright (apscheduler 3.11 + py3.13) or
+        # binds a loop that never runs, so sync/drain/dream jobs never fired.
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler is not None and not scheduler.is_running:
+            scheduler.start()
         # The MCP session manager needs a running task group for the life of
         # the app. Mounted sub-app lifespans don't run under Starlette, so it
         # is wired here. No-op when MCP is off.
-        if mcp_server is not None:
-            async with mcp_server.session_manager.run():
+        try:
+            if mcp_server is not None:
+                async with mcp_server.session_manager.run():
+                    yield
+            else:
                 yield
-        else:
-            yield
+        finally:
+            # Shutdown, innermost-out. The MCP session manager (above) has
+            # already exited by the time this runs. Stop the scheduler first
+            # if the daemon attached one (its jobs write through the store),
+            # then close the store — the ONE sqlite connection every layer
+            # rides, semantic index included. Everything here is idempotent,
+            # so a second teardown is a no-op. This is also what releases
+            # the db file handle when a TestClient exits: without it, the
+            # connection create_app opened lived until GC and Windows
+            # refused the temp-db unlink (WinError 32).
+            scheduler = getattr(app.state, "scheduler", None)
+            if scheduler is not None:
+                scheduler.stop()
+            store.close()
 
     app = FastAPI(
         title="Revien",
         description="Graph-based memory engine for AI systems. Memory that returns.",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
 
@@ -333,12 +359,19 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             http_request.client.host if http_request.client else "",
             http_request.headers.get("authorization", ""),
         )
-        ts = None
-        if request.timestamp:
-            try:
-                ts = datetime.fromisoformat(request.timestamp)
-            except ValueError:
-                pass
+        # Shared validation core (revien/validation.py) — same rules as the
+        # MCP and Hermes faces. An unparseable timestamp is a 400 now, not a
+        # silent drop; blank content/source_id and unknown content_type are
+        # refused before they create empty memories.
+        try:
+            ts = validate_ingest(
+                content=request.content,
+                source_id=request.source_id,
+                content_type=request.content_type,
+                timestamp=request.timestamp,
+            )
+        except ValidationError as e:
+            raise HTTPException(400, str(e))
 
         input_data = IngestionInput(
             source_id=request.source_id,
@@ -370,6 +403,17 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         """Query memory. Returns ranked nodes by three-factor score."""
         if request.format not in ("json", "toon"):
             raise HTTPException(400, f"Invalid format (json|toon expected): {request.format}")
+        # Shared validation core — blank query, out-of-range top_n (reject,
+        # don't clamp: the engine's internal clamp stays as belt), and
+        # negative min_score are 400s.
+        try:
+            validate_recall(
+                query=request.query,
+                top_n=request.top_n,
+                min_score=request.min_score,
+            )
+        except ValidationError as e:
+            raise HTTPException(400, str(e))
         as_of = None
         if request.as_of:
             try:
@@ -564,18 +608,35 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/graph/import ─────────────────────────
 
     @app.post("/v1/graph/import")
-    async def import_graph(graph_data: Dict[str, Any]):
-        """Import a graph from JSON. For restore/migration."""
+    async def import_graph(graph_data: Dict[str, Any], mode: str = Query("refuse")):
+        """Import a graph from JSON. For restore/migration.
+
+        mode=refuse (default) 409s against a non-empty database — an import
+        must never silently eat an existing graph (the old shape hardcoded a
+        wipe). mode=merge skips colliding IDs; mode=replace swaps the whole
+        graph in one transaction (any failure leaves the original intact).
+        """
+        from revien.graph.store import ImportRefusedError, ImportValidationError
+
+        if mode not in ("refuse", "merge", "replace"):
+            raise HTTPException(400, f"Invalid mode {mode!r}: use refuse, merge or replace")
         try:
             graph = Graph.model_validate(graph_data)
-            store.import_graph(graph, clear_existing=True)
-            return {
-                "status": "imported",
-                "nodes": len(graph.nodes),
-                "edges": len(graph.edges),
-            }
         except Exception as e:
             raise HTTPException(400, f"Invalid graph data: {str(e)}")
+        try:
+            result = store.import_graph(graph, mode=mode, semantic=semantic)
+        except ImportRefusedError as e:
+            raise HTTPException(409, str(e))
+        except ImportValidationError as e:
+            raise HTTPException(400, f"Invalid graph data: {str(e)}")
+        return {
+            "status": "imported",
+            "mode": mode,
+            "nodes": result["nodes_added"],
+            "edges": result["edges_added"],
+            **result,
+        }
 
     # ── POST /v1/cluster ─────────────────────────────
 
@@ -616,7 +677,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             node_count=store.count_nodes(),
             edge_count=store.count_edges(),
             uptime_seconds=round(time.time() - start_time, 2),
-            version="0.1.0",
+            version=__version__,
         )
 
     # ── POST /v1/sync ─────────────────────────────────

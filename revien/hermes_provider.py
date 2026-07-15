@@ -105,6 +105,13 @@ from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine
 from revien.semantic.index import SemanticIndex
+from revien.validation import (
+    TOP_N_MAX,
+    TOP_N_MIN,
+    ValidationError,
+    validate_ingest,
+    validate_recall,
+)
 
 
 # Turn-conversation provenance, per the scoping note's sync_turn-volume risk:
@@ -379,17 +386,65 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
         wants text).
         """
         self._ensure_stack()
-        args = args or {}
-        if tool_name == "revien_recall":
-            payload = self._tool_recall(
-                query=args.get("query", ""),
-                top_n=int(args.get("top_n", _PREFETCH_TOP_N)),
-            )
-        elif tool_name == "revien_store":
-            payload = self._tool_store(content=args.get("content", ""))
-        else:
-            payload = {"error": f"unknown tool: {tool_name}"}
+        # Shared validation core (revien/validation.py) — same rules as
+        # POST /v1/recall|/v1/ingest and the MCP tools. ANY failure —
+        # validation, malformed args, or an engine/pipeline exception —
+        # comes back in the payload shape this face already uses for errors
+        # ({"error": ...}, json.dumps'd), never as an exception into Hermes.
+        try:
+            if args is None:
+                args = {}
+            elif not isinstance(args, dict):
+                raise ValidationError(
+                    f"Invalid args (object expected): {type(args).__name__}"
+                )
+            if tool_name == "revien_recall":
+                top_n = self._coerce_top_n(args.get("top_n", _PREFETCH_TOP_N))
+                query = args.get("query", "")
+                validate_recall(query=query, top_n=top_n)
+                payload = self._tool_recall(query=query, top_n=top_n)
+            elif tool_name == "revien_store":
+                content = args.get("content", "")
+                validate_ingest(
+                    content=content,
+                    source_id=_HERMES_SOURCE_ID,
+                    content_type="note",
+                )
+                payload = self._tool_store(content=content)
+            else:
+                payload = {"error": f"unknown tool: {tool_name}"}
+        except ValidationError as e:
+            payload = {"error": str(e)}
+        except Exception as e:  # noqa: BLE001 - never raise into Hermes
+            payload = {
+                "error": f"revien internal error ({type(e).__name__}): {e}"
+            }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _coerce_top_n(raw: Any) -> int:
+        """Coerce a Hermes-supplied top_n under the same honesty rules as the
+        other faces (pydantic/FastMCP schema coercion): an int passes, an
+        int-valued float or int-string coerces ("5" / 5.0 -> 5), a bool is
+        refused (True is not "1 result"), and a fractional float is refused
+        rather than silently truncated (5.9 must not become 5)."""
+        message = (
+            f"Invalid top_n (integer {TOP_N_MIN}..{TOP_N_MAX} expected): {raw!r}"
+        )
+        if isinstance(raw, bool):
+            raise ValidationError(message)
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, float):
+            if raw.is_integer():
+                return int(raw)
+            raise ValidationError(message)
+        if isinstance(raw, str):
+            try:
+                return int(raw.strip())
+            except ValueError:
+                raise ValidationError(message)
+        raise ValidationError(message)
 
     def _tool_recall(self, query: str, top_n: int = _PREFETCH_TOP_N) -> Dict[str, Any]:
         assert self._engine is not None

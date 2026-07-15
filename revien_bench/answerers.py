@@ -275,7 +275,14 @@ def load_answer_prompt() -> str:
     """
     if not _PROMPT_PATH.exists():
         raise FileNotFoundError(f"answer prompt missing at {_PROMPT_PATH}")
-    raw = _PROMPT_PATH.read_bytes()
+    # Normalize line endings BEFORE hashing (and before use): git's autocrlf
+    # smudges LF->CRLF on Windows checkouts, which changed the raw bytes and
+    # tripped the freeze on every Windows CI leg while the PROMPT was
+    # untouched. The frozen thing is the prompt's content, not its checkout's
+    # line-ending convention — so both the digest and the returned template
+    # are computed over the LF form. (.gitattributes also pins the file to
+    # eol=lf as belt; this stays as suspenders for any checkout config.)
+    raw = _PROMPT_PATH.read_bytes().replace(b"\r\n", b"\n")
     digest = hashlib.sha256(raw).hexdigest()
     if digest != ANSWER_PROMPT_SHA256:
         raise ValueError(

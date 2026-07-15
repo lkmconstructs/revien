@@ -20,6 +20,10 @@ except ImportError:
     print("Click is required: pip install click")
     sys.exit(1)
 
+# Single version source (R4): revien.__version__ feeds the CLI banner, the
+# FastAPI app metadata, /v1/health, and the hermes plugin manifest alike.
+from revien import __version__
+
 
 def _default_db_path() -> str:
     revien_dir = Path.home() / ".revien"
@@ -79,7 +83,7 @@ def _save_config(config: dict) -> None:
 
 
 @click.group()
-@click.version_option(version="0.3.0", prog_name="revien")
+@click.version_option(version=__version__, prog_name="revien")
 def main():
     """Revien — Memory that returns. Graph-based memory engine for AI systems."""
     pass
@@ -121,7 +125,7 @@ def mcp(db: Optional[str]):
     daemon on the same database. Requires the mcp extra:
     pip install revien[mcp]
     """
-    from revien.mcp_server import MCP_AVAILABLE, build_mcp_server
+    from revien.mcp_server import MCP_AVAILABLE, build_mcp_server, close_mcp_server
 
     if not MCP_AVAILABLE:
         click.echo("The MCP SDK is not installed. Install with: pip install revien[mcp]")
@@ -133,7 +137,12 @@ def mcp(db: Optional[str]):
     # stdout is the protocol channel on stdio — anything human goes to stderr.
     click.echo(f"Revien MCP server (stdio) — database: {db_path}", err=True)
     server = build_mcp_server(db_path=db_path)
-    server.run(transport="stdio")
+    try:
+        server.run(transport="stdio")
+    finally:
+        # The own-stack GraphStore this process opened closes with it —
+        # deterministically, not whenever GC gets around to the connection.
+        close_mcp_server(server)
 
 
 @main.command()
@@ -287,7 +296,7 @@ def connect(system: str, path: Optional[str]):
         # clobber a file we didn't write. Our generated files carry a marker; a
         # foreign __init__.py gets the paste-block, not an overwrite.
         marker = "# revien connect hermes"
-        version = "0.3.0"
+        version = __version__
         init_py = (
             f"{marker} (generated) — Hermes memory-provider plugin for Revien.\n"
             "# Re-exports the provider + entry point from the installed revien package,\n"
@@ -875,7 +884,7 @@ def status(db: Optional[str]):
     try:
         node_count = store.count_nodes()
         edge_count = store.count_edges()
-        click.echo(f"Revien Memory Engine v0.1.0")
+        click.echo(f"Revien Memory Engine v{__version__}")
         click.echo(f"Database: {db_path}")
         click.echo(f"Nodes: {node_count}")
         click.echo(f"Edges: {edge_count}")
@@ -932,15 +941,25 @@ def export(file: Optional[str], output: Optional[str], db: Optional[str]):
 @click.option("--merge", is_flag=True,
               help="Import into a non-empty database; nodes/edges whose IDs "
                    "already exist are skipped, never overwritten")
-def import_(file: str, db: Optional[str], merge: bool):
+@click.option("--replace", "replace", is_flag=True,
+              help="Replace the existing graph wholesale — delete + insert in "
+                   "one transaction (a failure leaves the original intact)")
+def import_(file: str, db: Optional[str], merge: bool, replace: bool):
     """Import a graph exported by `revien export`: revien import graph.json
 
     Same schema and code path as POST /v1/graph/import. Refuses a non-empty
-    target database unless --merge — an import must never silently eat an
-    existing graph.
+    target database unless --merge or --replace — an import must never
+    silently eat an existing graph.
     """
     from revien.graph.schema import Graph
-    from revien.graph.store import GraphStore
+    from revien.graph.store import (
+        GraphStore, ImportRefusedError, ImportValidationError,
+    )
+    from revien.semantic.index import SemanticIndex
+
+    if merge and replace:
+        click.echo("--merge and --replace are mutually exclusive.")
+        sys.exit(1)
 
     config = _load_config()
     db_path = db or config.get("db_path", _default_db_path())
@@ -955,42 +974,44 @@ def import_(file: str, db: Optional[str], merge: bool):
         click.echo(f"Invalid graph data: {e}")
         sys.exit(1)
 
+    mode = "replace" if replace else ("merge" if merge else "refuse")
+
     store = GraphStore(db_path=db_path)
     try:
         existing_nodes = store.count_nodes()
         existing_edges = store.count_edges()
+        semantic = SemanticIndex(store)
 
-        if (existing_nodes or existing_edges) and not merge:
+        try:
+            result = store.import_graph(graph, mode=mode, semantic=semantic)
+        except ImportRefusedError:
             click.echo(
                 f"Target database is not empty ({existing_nodes} nodes, "
                 f"{existing_edges} edges): {db_path}"
             )
-            click.echo("Use --merge to import on top of it, or --db to "
-                       "point at a fresh file.")
+            click.echo("Use --merge to import on top of it, --replace to "
+                       "overwrite it, or --db to point at a fresh file.")
+            sys.exit(1)
+        except ImportValidationError as e:
+            click.echo(f"Invalid graph data: {e}")
             sys.exit(1)
 
-        if merge and (existing_nodes or existing_edges):
-            added_n = skipped_n = added_e = skipped_e = 0
-            for node in graph.nodes:
-                if store.get_node(node.node_id) is not None:
-                    skipped_n += 1
-                else:
-                    store.add_node(node)
-                    added_n += 1
-            for edge in graph.edges:
-                if store.get_edge(edge.edge_id) is not None:
-                    skipped_e += 1
-                else:
-                    store.add_edge(edge)
-                    added_e += 1
-            click.echo(f"Merged {added_n} nodes, {added_e} edges "
-                       f"(skipped {skipped_n} existing nodes, "
-                       f"{skipped_e} existing edges).")
+        if mode == "merge" and (existing_nodes or existing_edges):
+            click.echo(f"Merged {result['nodes_added']} nodes, "
+                       f"{result['edges_added']} edges "
+                       f"(skipped {result['skipped_nodes']} existing nodes, "
+                       f"{result['skipped_edges']} existing edges).")
+        elif mode == "replace" and (existing_nodes or existing_edges):
+            click.echo(f"Replaced existing graph ({result['removed_nodes']} nodes, "
+                       f"{result['removed_edges']} edges removed).")
+            click.echo(f"Imported {result['nodes_added']} nodes, "
+                       f"{result['edges_added']} edges into {db_path}")
         else:
-            # Empty target: the same code path the daemon's import uses.
-            store.import_graph(graph, clear_existing=False)
-            click.echo(f"Imported {len(graph.nodes)} nodes, "
-                       f"{len(graph.edges)} edges into {db_path}")
+            click.echo(f"Imported {result['nodes_added']} nodes, "
+                       f"{result['edges_added']} edges into {db_path}")
+
+        if result["semantic_rebuild"] != "skipped (disabled)":
+            click.echo(f"Semantic index: {result['semantic_rebuild']}")
 
         click.echo(f"Graph total: {store.count_nodes()} nodes, "
                    f"{store.count_edges()} edges")

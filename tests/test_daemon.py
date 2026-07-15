@@ -57,7 +57,10 @@ class TestHealthEndpoint:
         assert "node_count" in data
         assert "edge_count" in data
         assert "uptime_seconds" in data
-        assert data["version"] == "0.1.0"
+        # Single version source (R4): health reports revien.__version__,
+        # never a hardcoded string that can drift from setup.py/CLI.
+        import revien
+        assert data["version"] == revien.__version__
 
     def test_health_counts_increase_after_ingest(self, client):
         before = client.get("/v1/health").json()
@@ -72,11 +75,16 @@ class TestHealthEndpoint:
     def test_create_app_honors_revien_db_path_env_when_no_explicit_arg(self, monkeypatch):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
+        app = None
         try:
             monkeypatch.setenv("REVIEN_DB_PATH", path)
             app = create_app()
             assert app.state.store.db_path == path
         finally:
+            # No TestClient here, so no lifespan teardown ran — close the
+            # store directly or the unlink below fails on Windows.
+            if app is not None:
+                app.state.store.close()
             os.unlink(path)
 
     def test_create_app_explicit_db_path_overrides_env(self, monkeypatch):
@@ -84,11 +92,16 @@ class TestHealthEndpoint:
         fd_explicit, explicit_path = tempfile.mkstemp(suffix=".db")
         os.close(fd_env)
         os.close(fd_explicit)
+        app = None
         try:
             monkeypatch.setenv("REVIEN_DB_PATH", env_path)
             app = create_app(db_path=explicit_path)
             assert app.state.store.db_path == explicit_path
         finally:
+            # No lifespan ran (no TestClient) — release the explicit-path
+            # store before unlinking. env_path was never opened.
+            if app is not None:
+                app.state.store.close()
             os.unlink(env_path)
             os.unlink(explicit_path)
 
@@ -282,7 +295,7 @@ class TestGraphEndpoints:
         assert len(data["nodes"]) > 0
         assert len(data["edges"]) > 0
 
-    def test_import_graph(self, client):
+    def test_import_graph_default_refuses_nonempty(self, client):
         # First ingest, then export
         client.post("/v1/ingest", json={
             "source_id": "test",
@@ -291,18 +304,26 @@ class TestGraphEndpoints:
         exported = client.get("/v1/graph").json()
         node_count = len(exported["nodes"])
 
-        # Now import into a "fresh" state
+        # Default mode=refuse: a non-empty database 409s untouched — an import
+        # must never silently eat an existing graph (the old shape hardcoded
+        # a wipe).
         resp = client.post("/v1/graph/import", json=exported)
+        assert resp.status_code == 409
+        assert len(client.get("/v1/graph").json()["nodes"]) == node_count
+
+        # mode=replace swaps the graph wholesale.
+        resp = client.post("/v1/graph/import?mode=replace", json=exported)
         assert resp.status_code == 200
         assert resp.json()["nodes"] == node_count
 
     def test_export_import_roundtrip(self, seeded_client):
-        """Export graph, reimport, verify data survives."""
+        """Export graph, reimport (mode=replace), verify data survives."""
         exported = seeded_client.get("/v1/graph").json()
         original_count = len(exported["nodes"])
 
         # Reimport (clears and restores)
-        seeded_client.post("/v1/graph/import", json=exported)
+        resp = seeded_client.post("/v1/graph/import?mode=replace", json=exported)
+        assert resp.status_code == 200
 
         # Verify
         health = seeded_client.get("/v1/health").json()

@@ -268,8 +268,28 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
         except Exception:
             pass
 
+    def close(self) -> None:
+        """
+        Explicitly close the underlying graph store.
+
+        Prefer this (or the context-manager form) over relying on __del__:
+        finalizer timing is up to the garbage collector, and on Windows an
+        open SQLite handle keeps the database file locked until it runs.
+        Safe to call more than once — a repeat close is a no-op.
+        """
+        if self._store:
+            self._store.close()
+
+    def __enter__(self) -> "RevienMemory":
+        """Enter a context-manager scope. Returns the memory itself."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit a context-manager scope. Closes the graph store."""
+        self.close()
+
     def __del__(self) -> None:
-        """Clean up database connection on deletion."""
+        """Fallback cleanup on garbage collection — close() is the real path."""
         if self._store:
             try:
                 self._store.close()

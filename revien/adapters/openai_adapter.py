@@ -246,6 +246,36 @@ class OpenAIAdapter:
             observer.stop()
             observer.join()
 
+    def close(self) -> None:
+        """
+        Close the underlying graph store (and its SQLite connection).
+
+        Call this when done with the adapter — or use the adapter as a
+        context manager — so the database file is released promptly. On
+        Windows an open SQLite handle keeps the file locked, so relying on
+        garbage collection means the file may be undeletable until the
+        interpreter exits. Safe to call more than once; a repeat close is
+        a no-op.
+        """
+        self.store.close()
+
+    def __enter__(self) -> "OpenAIAdapter":
+        """
+        Enter a context-manager scope.
+
+        Returns:
+            The adapter itself, ready for ingestion.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        Exit a context-manager scope. Closes the graph store.
+
+        Exceptions raised in the block propagate unchanged.
+        """
+        self.close()
+
     # ──────────────────────────────────────────────────────────────────────
     # Private Implementation
     # ──────────────────────────────────────────────────────────────────────

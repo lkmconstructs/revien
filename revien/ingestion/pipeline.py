@@ -3,6 +3,7 @@ Revien Ingestion Pipeline — Orchestrates extraction, deduplication, and storag
 The main entry point for feeding content into the graph.
 """
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -64,6 +65,21 @@ class IngestionInput:
     # the queue first) or the daemon's ~30s idle sweep. A verbatim-only capture
     # is NOT keyword-anchorable in the gap (keyword anchors exclude CONTEXT).
     defer_embed: bool = False
+    # Stable re-ingest identity (repair leg R3). A caller that re-fetches a
+    # WHOLE growing unit on every change (claude_code/codex adapters re-read
+    # the full session file on mtime bump) sets this to the unit's stable id
+    # (their per-session source_id). With a key, re-ingest is idempotent:
+    # unchanged content is a no-op, grown/changed content REFRESHES the one
+    # existing context node (re-extraction + dedup + only-missing edges)
+    # instead of stacking a duplicate whole-session context node every sync.
+    # None (default) = today's append-forever behavior, byte-identical.
+    # HONESTY NOTE: refresh never REMOVES previously extracted claims — a
+    # unit whose content is edited (not just appended to) leaves stale
+    # extracted nodes/edges behind. The key is intended for append-only
+    # units (growing session logs); mutable-content callers inherit that
+    # stale-claim risk. Contradictions are supersession/CSL territory, not
+    # refresh's.
+    ingest_key: Optional[str] = None
 
 
 @dataclass
@@ -210,6 +226,64 @@ class IngestionPipeline:
                 total_edges_in_graph=self.store.count_edges(),
             )
 
+        # 0b. Stable ingestion key (repair leg R3). With a key, look for the
+        #     context node a previous ingest of this same unit stamped:
+        #     unchanged content is a clean NO-OP; grown/changed content
+        #     REFRESHES that node instead of creating a second one. No key,
+        #     or no prior node: fall through to the normal append path (which
+        #     stamps the key for next time).
+        ingest_key = (input_data.ingest_key or "").strip() or None
+        content_hash = None
+        if ingest_key:
+            content_hash = hashlib.sha256(
+                input_data.content.encode("utf-8")
+            ).hexdigest()
+            existing_ctx = self.store.find_context_node_by_ingest_key(ingest_key)
+            adopted = False
+            if existing_ctx is None:
+                # Adoption fallback (pre-R3 upgrade path): historical syncs
+                # appended UNKEYED whole-session context nodes under the same
+                # stable source_id. Adopt the newest one instead of appending
+                # yet another copy on the first post-upgrade sync.
+                existing_ctx = self._find_adoptable_context(input_data.source_id)
+                adopted = existing_ctx is not None
+            if existing_ctx is not None:
+                prior_hash = (existing_ctx.metadata or {}).get(
+                    "ingest_content_hash"
+                )
+                if prior_hash is None and adopted:
+                    # An adopted pre-R3 node carries no stamp — hash its
+                    # stored content so an unchanged session is still a no-op.
+                    prior_hash = hashlib.sha256(
+                        existing_ctx.content.encode("utf-8")
+                    ).hexdigest()
+                if prior_hash == content_hash:
+                    if adopted:
+                        # Same bytes, but stamp the key so every future
+                        # ingest of this unit finds it directly.
+                        self.store.update_node(
+                            existing_ctx.node_id,
+                            _audit_op="ingest_adopt",
+                            _audit_actor=ingest_key,
+                            metadata={
+                                **(existing_ctx.metadata or {}),
+                                "ingest_key": ingest_key,
+                                "ingest_content_hash": content_hash,
+                            },
+                        )
+                    # Same unit, same bytes: nothing new — zero counts.
+                    return IngestionOutput(
+                        context_node_id=existing_ctx.node_id,
+                        nodes_created=0,
+                        nodes_deduplicated=0,
+                        edges_created=0,
+                        total_nodes_in_graph=self.store.count_nodes(),
+                        total_edges_in_graph=self.store.count_edges(),
+                    )
+                return self._refresh_keyed(
+                    input_data, ingest_key, content_hash, existing_ctx
+                )
+
         # 1. Extract nodes and edges
         extraction = self.extractor.extract(
             content=input_data.content,
@@ -232,6 +306,14 @@ class IngestionPipeline:
             node.recorded_at = input_data.timestamp
             if node.node_id == ctx_id:
                 node.answerable_by_text = input_data.answerable_by_text
+                # Stamp the ingest key + content hash (R3) so the NEXT ingest
+                # of this same unit finds and refreshes this node.
+                if ingest_key:
+                    node.metadata = {
+                        **(node.metadata or {}),
+                        "ingest_key": ingest_key,
+                        "ingest_content_hash": content_hash,
+                    }
             # Curated provenance: human-curated content is ground truth —
             # full confidence, and the `curated` metadata flag is what the
             # CSL gate checks before allowing any auto-supersession.
@@ -398,6 +480,230 @@ class IngestionPipeline:
 
         return IngestionOutput(
             context_node_id=context_id,
+            nodes_created=nodes_created,
+            nodes_deduplicated=nodes_deduped,
+            edges_created=edges_created,
+            total_nodes_in_graph=self.store.count_nodes(),
+            total_edges_in_graph=self.store.count_edges(),
+            governance=governance,
+        )
+
+    def _find_adoptable_context(self, source_id: str) -> Optional[Node]:
+        """Adoption fallback for the pre-R3 upgrade path.
+
+        Before ingest keys existed, every sync of a growing session appended
+        another UNKEYED whole-session context node — all under the same
+        stable per-session source_id (claude-code:<project>:<stem> /
+        codex:<project>:<stem>). When the keyed lookup misses, adopt the
+        NEWEST unkeyed one (sessions grow, so newest = most complete): stamp
+        and refresh IT instead of appending yet another duplicate. Nodes
+        already stamped with a (different) key belong to that key and are
+        never adopted.
+
+        KNOWN LIMITATION: the OLDER pre-R3 duplicates stay in the graph —
+        retroactive merge is deliberately out of scope (risky enough to be
+        its own leg); the dream/consolidate pass is the future home for that
+        cleanup.
+        """
+        if not source_id:
+            return None
+        # list_nodes returns newest first (created_at DESC).
+        for node in self.store.list_nodes(
+            node_type=NodeType.CONTEXT, source_id=source_id, limit=999999,
+        ):
+            if "ingest_key" not in (node.metadata or {}):
+                return node
+        return None
+
+    def _refresh_keyed(
+        self,
+        input_data: IngestionInput,
+        ingest_key: str,
+        content_hash: str,
+        existing_ctx: Node,
+    ) -> IngestionOutput:
+        """Refresh path (repair leg R3): this unit was ingested before under
+        the same key and its content changed (typically a session that GREW).
+
+        The ONE existing context node is updated in place — content, label,
+        recorded_at, hash — never duplicated. update_node's content listener
+        queues the semantic re-embed automatically (post-commit). The new
+        content is re-extracted; extracted nodes run the normal dedup (nodes
+        from the unchanged prefix merge into their existing selves), and only
+        missing edges are added. Atomic: everything rides one transaction().
+
+        HONESTY NOTE: refresh only ever ADDS — claims extracted from a
+        previous version whose text was edited away are NOT removed or
+        detached. Correct for append-only units (growing session logs), the
+        intended callers; mutable-content callers inherit that stale-claim
+        risk. Handling the contradiction is supersession/CSL's job, not
+        refresh's.
+        """
+        ctx_id = existing_ctx.node_id
+
+        # Re-extract from the full new content.
+        extraction = self.extractor.extract(
+            content=input_data.content,
+            source_id=input_data.source_id,
+        )
+        extraction_ctx_id = (
+            extraction.context_node.node_id if extraction.context_node else None
+        )
+
+        # Temporal re-resolution (best-effort, same contract as ingest()).
+        event_updates: Dict = {}
+        try:
+            res = resolve_event_time(input_data.content, input_data.timestamp)
+        except Exception:  # noqa: BLE001 - temporal resolution is best-effort
+            res = None
+        if res is not None:
+            event_updates = {
+                "event_time_start": res.start,
+                "event_time_end": res.end,
+                "event_time_granularity": res.granularity,
+                "event_time_confidence": res.confidence,
+                "event_time_text": res.text,
+            }
+
+        nodes_created = 0
+        nodes_deduped = 0
+        edges_created = 0
+        newly_created: List[tuple] = []
+
+        with self.store.transaction():
+            # 1. Refresh the existing context node in place. The content
+            #    listener fire is deferred to post-commit by the store, so
+            #    the re-embed queue only ever sees committed state.
+            ctx_updates: Dict = {
+                "content": input_data.content,
+                "label": (
+                    extraction.context_node.label
+                    if extraction.context_node is not None
+                    else existing_ctx.label
+                ),
+                "metadata": {
+                    **(existing_ctx.metadata or {}),
+                    "ingest_key": ingest_key,
+                    "ingest_content_hash": content_hash,
+                },
+                **event_updates,
+            }
+            if input_data.timestamp is not None:
+                # Keep the previous recorded_at when the caller has none —
+                # a refresh must never NULL a known content time.
+                ctx_updates["recorded_at"] = input_data.timestamp
+            self.store.update_node(
+                ctx_id,
+                _audit_op="ingest_refresh",
+                _audit_actor=ingest_key,
+                **ctx_updates,
+            )
+
+            # 2. Envelope-stamp + dedup the extracted (non-context) nodes.
+            #    The extraction's own context node is discarded — its id maps
+            #    to the refreshed existing node.
+            id_map = {}
+            if extraction_ctx_id is not None:
+                id_map[extraction_ctx_id] = ctx_id
+            for candidate_node in extraction.nodes:
+                if candidate_node.node_id == extraction_ctx_id:
+                    continue
+                candidate_node.source_modality = input_data.source_modality
+                candidate_node.vision_processed = input_data.vision_processed
+                candidate_node.recorded_at = input_data.timestamp
+                if input_data.curated:
+                    candidate_node.confidence = 1.0
+                    candidate_node.metadata = {
+                        **(candidate_node.metadata or {}), "curated": True,
+                    }
+                old_id = candidate_node.node_id
+                actual_node, is_new = self.dedup.deduplicate_node(candidate_node)
+                id_map[old_id] = actual_node.node_id
+                if is_new:
+                    nodes_created += 1
+                    self._register_entity(actual_node)
+                    newly_created.append(
+                        (actual_node.node_id, actual_node.label,
+                         actual_node.content)
+                    )
+                else:
+                    nodes_deduped += 1
+
+            # 3. Only-missing edges, remapped onto the existing context node.
+            for edge in extraction.edges:
+                remapped_source = id_map.get(edge.source_node_id, edge.source_node_id)
+                remapped_target = id_map.get(edge.target_node_id, edge.target_node_id)
+                if remapped_source == remapped_target:
+                    continue
+                if self._edge_exists(remapped_source, remapped_target, edge.edge_type):
+                    continue
+                self.store.add_edge(Edge(
+                    edge_type=edge.edge_type,
+                    source_node_id=remapped_source,
+                    target_node_id=remapped_target,
+                    weight=edge.weight,
+                ))
+                edges_created += 1
+
+            # 3b. Declared links (same semantics as ingest(); _edge_exists
+            #     keeps re-ingested links idempotent).
+            seen_links = set()
+            for raw_label in input_data.links or []:
+                label = (raw_label or "").strip()
+                if not label or label.lower() in seen_links:
+                    continue
+                seen_links.add(label.lower())
+                target = self.ops.find_node_by_label(label, node_type=NodeType.ENTITY)
+                if target is None:
+                    target = self.store.add_node(Node(
+                        node_type=NodeType.ENTITY,
+                        label=label,
+                        content=label,
+                        source_id=input_data.source_id,
+                        source_type=SourceType.EXTRACTED,
+                        confidence=1.0 if input_data.curated else 0.8,
+                        recorded_at=input_data.timestamp,
+                        metadata={"curated": True} if input_data.curated else {},
+                    ))
+                    nodes_created += 1
+                    self._register_entity(target)
+                    newly_created.append(
+                        (target.node_id, target.label, target.content)
+                    )
+                if target.node_id == ctx_id:
+                    continue
+                if not self._edge_exists(ctx_id, target.node_id, EdgeType.RELATED_TO):
+                    self.store.add_edge(Edge(
+                        edge_type=EdgeType.RELATED_TO,
+                        source_node_id=ctx_id,
+                        target_node_id=target.node_id,
+                        weight=0.8,
+                    ))
+                    edges_created += 1
+
+            # 3c. Known-entity mention linking over the new content.
+            edges_created += self._link_known_mentions(ctx_id, input_data.content)
+
+        # Post-commit: semantic indexing for the NEW extracted nodes (the
+        # refreshed context node re-embeds via the store's content listener).
+        if self.semantic.is_enabled and newly_created:
+            if input_data.defer_embed:
+                self.semantic.defer_nodes(newly_created)
+            else:
+                self.semantic.index_nodes(newly_created)
+
+        # Governance parity with ingest(): best-effort, never breaks ingest.
+        governance: List = []
+        if self.csl is not None:
+            refreshed = self.store.get_node(ctx_id)
+            if refreshed is not None:
+                try:
+                    governance = self.csl.govern(refreshed)
+                except Exception:  # noqa: BLE001 - governance never breaks ingest
+                    governance = []
+
+        return IngestionOutput(
+            context_node_id=ctx_id,
             nodes_created=nodes_created,
             nodes_deduplicated=nodes_deduped,
             edges_created=edges_created,

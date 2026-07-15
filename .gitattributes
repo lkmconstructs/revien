@@ -1,0 +1,5 @@
+# Content-hashed files must checkout byte-identical on every OS — git's
+# autocrlf smudging LF->CRLF on Windows changed the frozen answer-prompt's
+# bytes and tripped its sha256 freeze on CI (the loader also normalizes
+# before hashing, as suspenders to this belt).
+revien_bench/prompts/*.txt text eol=lf

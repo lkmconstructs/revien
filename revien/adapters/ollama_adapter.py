@@ -395,9 +395,27 @@ class OllamaAdapter:
         Clean up resources (close HTTP client and graph store).
 
         Should be called when done with the adapter to ensure
-        database connections are properly closed.
+        database connections are properly closed. Idempotent — both the
+        HTTP client and the store tolerate a second close.
         """
         if self._client:
             self._client.close()
         if self.store:
             self.store.close()
+
+    def __enter__(self) -> "OllamaAdapter":
+        """
+        Enter a context-manager scope.
+
+        Returns:
+            The adapter itself, ready for chat/query calls.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        Exit a context-manager scope. Delegates to close().
+
+        Exceptions raised in the block propagate unchanged.
+        """
+        self.close()

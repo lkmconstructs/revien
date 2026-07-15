@@ -268,10 +268,10 @@ class TestIngestEndpointCapturePath:
         app = create_app(db_path=path)
         with TestClient(app) as c:
             yield c
-        try:
-            os.unlink(path)
-        except PermissionError:  # pragma: no cover - Windows WAL handle race
-            pass
+        # No PermissionError guard: TestClient exit runs the lifespan
+        # teardown, which closes the store — the unlink succeeding is
+        # part of the contract now.
+        os.unlink(path)
 
     def test_defer_embed_accepted_and_persists(self, client):
         resp = client.post(
