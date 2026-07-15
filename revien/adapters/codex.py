@@ -97,6 +97,7 @@ class CodexAdapter(RevienAdapter):
                 # granularity (adapter:project:session-stem) — sessions in one
                 # project must not share provenance.
                 project = project_name or "unknown"
+                source_id = f"codex:{project}:{jsonl_file.stem}"
 
                 results.append({
                     "content": conversation,
@@ -108,7 +109,12 @@ class CodexAdapter(RevienAdapter):
                         "session_file": jsonl_file.name,
                         "path": str(jsonl_file),
                     },
-                    "source_id": f"codex:{project}:{jsonl_file.stem}",
+                    "source_id": source_id,
+                    # Stable re-ingest identity (R3): the whole rollout file is
+                    # re-fetched on every mtime bump (correct change detector);
+                    # the key makes that re-ingest refresh the ONE existing
+                    # context node instead of stacking a duplicate per sync.
+                    "ingest_key": source_id,
                 })
 
         return results

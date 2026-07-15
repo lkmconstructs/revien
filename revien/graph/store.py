@@ -211,6 +211,19 @@ class GraphStore:
                 resolution TEXT
             );
 
+            -- Adapter-sync cursors (repair leg R3): the persisted per-adapter
+            -- sync position. cursor is the ISO-8601 instant captured BEFORE
+            -- the adapter's fetch ran (stamp-before-fetch), written only after
+            -- a fully successful sync. No row = never synced: the scheduler
+            -- starts that adapter at EPOCH so pre-daemon history is ingested.
+            -- Memory-only cursors reset to now() on every daemon restart and
+            -- silently skipped everything from the offline window.
+            CREATE TABLE IF NOT EXISTS sync_cursors (
+                adapter_name TEXT PRIMARY KEY,
+                cursor TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             -- Distill manifest (editable-vault leg): the last-rendered snapshot
             -- per distilled note. This is the ONLY safe referent for
             -- deletion-as-rejection — a line's absence means "the user deleted
@@ -910,6 +923,64 @@ class GraphStore:
             (node_id, exclude_stem),
         ).fetchone()
         return row is not None
+
+    # ── Adapter-sync cursors (repair leg R3) ───────────────────────────
+    @_locked
+    def get_sync_cursor(self, adapter_name: str) -> Optional[datetime]:
+        """Persisted sync position for one adapter. None = never synced —
+        the scheduler treats that as EPOCH (full history on first sync)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            (adapter_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(row[0])
+
+    @_locked
+    def set_sync_cursor(self, adapter_name: str, cursor: datetime) -> None:
+        """Persist an adapter's sync position (upsert). Called only after a
+        fully successful sync — a failed/unhealthy sync never advances it."""
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(adapter_name) DO UPDATE SET
+                   cursor = excluded.cursor, updated_at = excluded.updated_at""",
+            (adapter_name, cursor.isoformat(),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        self._commit(conn)
+
+    @_locked
+    def find_context_node_by_ingest_key(self, ingest_key: str) -> Optional[Node]:
+        """The CONTEXT node stamped with this ingest key (stable identity for
+        a re-ingestable unit, e.g. one adapter session file). metadata is a
+        JSON TEXT column: a LIKE prefilter on the JSON-encoded key narrows the
+        scan, then the parsed metadata confirms the exact key (substring hits
+        never false-positive). Unindexed on purpose — one lookup per keyed
+        ingest at current scale; add a real index if keyed re-ingest gets hot.
+
+        OLDEST WINS: rows scan created_at ASC, so if a concurrent same-key
+        first-ingest race ever stamped twins, every later ingest refreshes
+        the OLDEST one deterministically and the newer twin is left orphaned
+        (never refreshed, never removed). Low exposure — the race window is
+        one first-ever ingest — stated so nobody discovers it the hard way."""
+        conn = self._get_conn()
+        # json.dumps gives the exact serialized form ("quoted, escaped"), so
+        # the prefilter matches how the key sits inside the metadata JSON.
+        needle = json.dumps(ingest_key)
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE node_type = ? AND metadata LIKE ? "
+            "ORDER BY created_at ASC",
+            (NodeType.CONTEXT.value, f"%{needle}%"),
+        ).fetchall()
+        for row in rows:
+            node = self._row_to_node(row)
+            if (node.metadata or {}).get("ingest_key") == ingest_key:
+                return node
+        return None
 
     @_locked
     def search_nodes_keyword(

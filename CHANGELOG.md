@@ -3,6 +3,32 @@
 All notable changes to Revien are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [Unreleased]
+
+### Added
+- **Persistent adapter-sync cursors** (`sync_cursors` table). The first-ever sync of an
+  adapter starts at epoch, so everything from before the daemon existed is ingested; a
+  daemon restart resumes from the last successful sync instead of resetting to now()
+  and silently skipping the offline window. The cursor is captured BEFORE the fetch and
+  persisted only on success — content landing mid-sync is caught by the next window,
+  and a failed sync never advances the position.
+- **`ingest_key` on `IngestionInput`** — stable re-ingest identity for a unit that is
+  re-fetched whole on every change. The claude_code and codex adapters key each session
+  file: a grown session now REFRESHES its one existing context node (no-op when
+  unchanged, in-place update + re-extraction + dedup when grown) instead of stacking a
+  duplicate whole-session context node every sync. No key = append behavior, unchanged.
+  Note: refresh only ever adds — it never removes claims extracted from text that was
+  later edited away; the key is intended for append-only units like session logs.
+
+### Fixed
+- **Auto-sync fires immediately at daemon startup**, then every interval — no more
+  silent 6-hour wait before the first sync of connected adapters.
+- **Pre-existing duplicate session contexts stop growing.** The first keyed ingest of a
+  session that was synced before this release ADOPTS the newest of its old unkeyed
+  context nodes (stamps and refreshes it) instead of appending yet another copy. Known
+  limitation: the older historical duplicates remain in the graph — retroactive merge
+  is out of scope here; the consolidate (dream) pass is the future home for that cleanup.
+
 ## [0.3.0] — 2026-07-11
 
 Smarter by default. Retrieval quality jumped for every user with zero config —
