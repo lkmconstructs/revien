@@ -20,6 +20,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from revien.validation import validate_ingest, validate_recall
+
 # Peer-dependency guard: the core install stays lean; everything below that
 # touches the SDK checks MCP_AVAILABLE first.
 try:
@@ -165,6 +167,10 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
         Returns ranked results with content, score, and provenance path,
         plus semantic_note explaining if retrieval ran degraded.
         """
+        # Shared validation core (revien/validation.py) — ValidationError is
+        # a ValueError, so FastMCP surfaces it as a clean ToolError exactly
+        # like the bad-as_of path below (pinned by tests/test_mcp.py).
+        validate_recall(query=query, top_n=top_n)
         as_of_dt = None
         if as_of:
             try:
@@ -233,6 +239,11 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
         """
         from revien.ingestion.pipeline import IngestionInput
 
+        # Shared validation core — same rules as POST /v1/ingest (no
+        # timestamp parameter on this face, so none is validated).
+        validate_ingest(
+            content=content, source_id=source_id, content_type=content_type
+        )
         result = pipeline.ingest(
             IngestionInput(
                 source_id=source_id,

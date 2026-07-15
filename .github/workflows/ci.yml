@@ -8,11 +8,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    # Windows runners are markedly slower than ubuntu (cold pip cache, slower
+    # fs) — a generous ceiling so a slow leg fails loudly instead of hanging
+    # the default 360-minute job limit.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -29,16 +34,17 @@ jobs:
           pip install -e .
           pip install -r requirements-dev.txt
 
-      # fastembed defaults to /tmp/fastembed_cache; cache THAT path so the
-      # ~65MB bge-small model downloads once, not on every run. FASTEMBED_CACHE_PATH
-      # pins it so the cache action and the model loader always agree.
+      # FASTEMBED_CACHE_PATH pins where the ~65MB bge-small model lands so
+      # the cache action and the model loader always agree. runner.temp
+      # resolves per-OS (/tmp-ish on ubuntu, D:\ on windows), so one stanza
+      # covers the whole matrix.
       - name: Cache the fastembed model
         uses: actions/cache@v4
         with:
-          path: /tmp/fastembed_cache
+          path: ${{ runner.temp }}/fastembed_cache
           key: fastembed-bge-small-${{ runner.os }}
 
       - name: Run the test suite
         env:
-          FASTEMBED_CACHE_PATH: /tmp/fastembed_cache
+          FASTEMBED_CACHE_PATH: ${{ runner.temp }}/fastembed_cache
         run: pytest tests revien_bench/tests -q

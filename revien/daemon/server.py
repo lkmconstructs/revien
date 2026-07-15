@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from revien import __version__
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -22,6 +23,7 @@ from revien.graph.clustering import CommunityDetector
 from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 from revien.semantic.index import SemanticIndex
+from revien.validation import ValidationError, validate_ingest, validate_recall
 
 
 # ── Request/Response Models ───────────────────────────────
@@ -310,7 +312,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     app = FastAPI(
         title="Revien",
         description="Graph-based memory engine for AI systems. Memory that returns.",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
 
@@ -357,12 +359,19 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             http_request.client.host if http_request.client else "",
             http_request.headers.get("authorization", ""),
         )
-        ts = None
-        if request.timestamp:
-            try:
-                ts = datetime.fromisoformat(request.timestamp)
-            except ValueError:
-                pass
+        # Shared validation core (revien/validation.py) — same rules as the
+        # MCP and Hermes faces. An unparseable timestamp is a 400 now, not a
+        # silent drop; blank content/source_id and unknown content_type are
+        # refused before they create empty memories.
+        try:
+            ts = validate_ingest(
+                content=request.content,
+                source_id=request.source_id,
+                content_type=request.content_type,
+                timestamp=request.timestamp,
+            )
+        except ValidationError as e:
+            raise HTTPException(400, str(e))
 
         input_data = IngestionInput(
             source_id=request.source_id,
@@ -394,6 +403,17 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         """Query memory. Returns ranked nodes by three-factor score."""
         if request.format not in ("json", "toon"):
             raise HTTPException(400, f"Invalid format (json|toon expected): {request.format}")
+        # Shared validation core — blank query, out-of-range top_n (reject,
+        # don't clamp: the engine's internal clamp stays as belt), and
+        # negative min_score are 400s.
+        try:
+            validate_recall(
+                query=request.query,
+                top_n=request.top_n,
+                min_score=request.min_score,
+            )
+        except ValidationError as e:
+            raise HTTPException(400, str(e))
         as_of = None
         if request.as_of:
             try:
@@ -657,7 +677,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             node_count=store.count_nodes(),
             edge_count=store.count_edges(),
             uptime_seconds=round(time.time() - start_time, 2),
-            version="0.1.0",
+            version=__version__,
         )
 
     # ── POST /v1/sync ─────────────────────────────────

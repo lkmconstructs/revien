@@ -57,7 +57,10 @@ class TestHealthEndpoint:
         assert "node_count" in data
         assert "edge_count" in data
         assert "uptime_seconds" in data
-        assert data["version"] == "0.1.0"
+        # Single version source (R4): health reports revien.__version__,
+        # never a hardcoded string that can drift from setup.py/CLI.
+        import revien
+        assert data["version"] == revien.__version__
 
     def test_health_counts_increase_after_ingest(self, client):
         before = client.get("/v1/health").json()

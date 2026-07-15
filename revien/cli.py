@@ -20,6 +20,10 @@ except ImportError:
     print("Click is required: pip install click")
     sys.exit(1)
 
+# Single version source (R4): revien.__version__ feeds the CLI banner, the
+# FastAPI app metadata, /v1/health, and the hermes plugin manifest alike.
+from revien import __version__
+
 
 def _default_db_path() -> str:
     revien_dir = Path.home() / ".revien"
@@ -79,7 +83,7 @@ def _save_config(config: dict) -> None:
 
 
 @click.group()
-@click.version_option(version="0.3.0", prog_name="revien")
+@click.version_option(version=__version__, prog_name="revien")
 def main():
     """Revien — Memory that returns. Graph-based memory engine for AI systems."""
     pass
@@ -292,7 +296,7 @@ def connect(system: str, path: Optional[str]):
         # clobber a file we didn't write. Our generated files carry a marker; a
         # foreign __init__.py gets the paste-block, not an overwrite.
         marker = "# revien connect hermes"
-        version = "0.3.0"
+        version = __version__
         init_py = (
             f"{marker} (generated) — Hermes memory-provider plugin for Revien.\n"
             "# Re-exports the provider + entry point from the installed revien package,\n"
@@ -880,7 +884,7 @@ def status(db: Optional[str]):
     try:
         node_count = store.count_nodes()
         edge_count = store.count_edges()
-        click.echo(f"Revien Memory Engine v0.1.0")
+        click.echo(f"Revien Memory Engine v{__version__}")
         click.echo(f"Database: {db_path}")
         click.echo(f"Nodes: {node_count}")
         click.echo(f"Edges: {edge_count}")
