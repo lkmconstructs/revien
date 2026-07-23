@@ -20,6 +20,19 @@ All notable changes to Revien are documented here. Format follows
   duplicate whole-session context node every sync. No key = append behavior, unchanged.
   Note: refresh only ever adds — it never removes claims extracted from text that was
   later edited away; the key is intended for append-only units like session logs.
+- **Context fence (leg 6c)** — recall re-entry no longer becomes new memory. Every
+  ingestion route eventually calls `pipeline.ingest()`, and several of them inject
+  Revien's own recalled memory back into the text they then hand to that same
+  pipeline: Claude Code's harness-wrapped `<system-reminder>` blocks, ollama_adapter's
+  `[Revien Memory Context]` fence, hermes_provider's `## Relevant memory (Revien)`
+  header, langchain_adapter's `## Relevant Context (from N nodes)` block. Left alone,
+  the graph re-learns what it already told you, with confidence compounding on each
+  loop. `revien/ingestion/fence.py` strips exactly those marker-bounded spans —
+  case-sensitive, pairing-based, no JSON/schema sniffing — before the ingest_key hash
+  and before extraction. `REVIEN_FENCE` is ON by default (`REVIEN_FENCE=0` restores
+  pre-fence behavior byte-identically); stripped spans are logged with source_id,
+  count, chars, and which marker families fired, and content that fences down to
+  nothing is skipped rather than stored as an empty husk.
 
 ### Fixed
 - **Auto-sync fires immediately at daemon startup**, then every interval — no more
