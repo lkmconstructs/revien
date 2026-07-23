@@ -175,6 +175,7 @@ class GraphStore:
                 confidence_set_at TEXT,
                 confidence_set_by TEXT DEFAULT '',
                 source_context TEXT DEFAULT '',
+                invalidated_at TEXT,
                 FOREIGN KEY (source_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE,
                 FOREIGN KEY (target_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
             );
@@ -265,6 +266,7 @@ class GraphStore:
         # Claim Sovereignty Layer (Leg 2): add temporal columns to older DBs.
         self._migrate_add_temporal_columns(conn)
         self._migrate_add_validity_columns(conn)
+        self._migrate_add_edge_invalidation_column(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -441,6 +443,28 @@ class GraphStore:
             # Swallow ONLY the idempotency race (column/table/index already
             # there). Anything else — locked db, disk, corruption — must be
             # loud at startup, not a "Migration note" that hides it.
+            if "duplicate column name" in str(e) or "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
+
+    def _migrate_add_edge_invalidation_column(self, conn: sqlite3.Connection) -> None:
+        """Add the edge soft-invalidation column (alias leg) to existing DBs.
+
+        Idempotent and no-op for fresh databases. Nullable, backfills NULL on
+        every existing row (every old edge is live), so edge reads and the
+        graph walk stay byte-identical until something explicitly reverses an
+        edge (today: `revien aliases --remove`)."""
+        try:
+            cursor = conn.execute("PRAGMA table_info(edges)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "invalidated_at" not in columns:
+                conn.execute("ALTER TABLE edges ADD COLUMN invalidated_at TEXT")
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            # Swallow ONLY the idempotency race (column already there).
+            # Anything else — locked db, disk, corruption — must be loud at
+            # startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
                 print(f"Migration note: {e}")
             else:
@@ -758,7 +782,16 @@ class GraphStore:
     def get_neighbors_bulk(self, node_ids) -> dict:
         """Neighbor ids for many nodes at once: {node_id: [neighbor_ids]}.
         Lets the BFS walker do one round-trip per LEVEL instead of one per
-        visited node. Every requested id gets a key (possibly empty list)."""
+        visited node. Every requested id gets a key (possibly empty list).
+
+        Excludes soft-invalidated edges (alias leg): an invalidated edge
+        (e.g. a reversed ALIAS_OF) must never route a walk — the row stays
+        for audit/history, but "the walk still crosses it" would make
+        --remove a lie. Blast radius today is nil (edge invalidation is new
+        this leg, nothing pre-existing relied on walking a dead edge); any
+        FUTURE invalidation caller inherits this exclusion, which is the
+        correct default for every edge type, not just ALIAS_OF.
+        """
         ids = [i for i in node_ids]
         out: dict = {nid: [] for nid in ids}
         if not ids:
@@ -769,8 +802,9 @@ class GraphStore:
             placeholders = ",".join("?" * len(chunk))
             rows = conn.execute(
                 f"SELECT source_node_id, target_node_id FROM edges "
-                f"WHERE source_node_id IN ({placeholders}) "
-                f"OR target_node_id IN ({placeholders})",
+                f"WHERE (source_node_id IN ({placeholders}) "
+                f"OR target_node_id IN ({placeholders})) "
+                f"AND invalidated_at IS NULL",
                 chunk + chunk,
             ).fetchall()
             wanted = set(chunk)
@@ -794,6 +828,9 @@ class GraphStore:
         the same pair keep the MAX strength — the strongest relationship is
         the one the walk should credit. Same one-round-trip-per-BFS-level
         shape as get_neighbors_bulk; the extra columns ride the same rows.
+
+        Excludes soft-invalidated edges — see get_neighbors_bulk's docstring;
+        same ruling, same rationale, for every edge type.
         """
         ids = [i for i in node_ids]
         out: dict = {nid: {} for nid in ids}
@@ -806,8 +843,9 @@ class GraphStore:
             rows = conn.execute(
                 f"SELECT source_node_id, target_node_id, weight, confidence "
                 f"FROM edges "
-                f"WHERE source_node_id IN ({placeholders}) "
-                f"OR target_node_id IN ({placeholders})",
+                f"WHERE (source_node_id IN ({placeholders}) "
+                f"OR target_node_id IN ({placeholders})) "
+                f"AND invalidated_at IS NULL",
                 chunk + chunk,
             ).fetchall()
             wanted = set(chunk)
@@ -1266,17 +1304,63 @@ class GraphStore:
             })
         return out
 
+    @_locked
+    def list_alias_pairs(self, live_only: bool = True) -> list[dict]:
+        """The alias view (alias leg): every ALIAS_OF pair with both labels
+        and the evidence that drew the edge. Mirrors list_tension_pairs.
+
+        live_only (default) excludes reversed (soft-invalidated) alias edges
+        — a removed alias is history, not a live recall-expansion path. Pass
+        False for lineage/audit reading (the CLI's ``--all``).
+        """
+        conn = self._get_conn()
+        q = (
+            "SELECT e.edge_id, e.source_context, e.created_at, e.weight, "
+            "       e.confidence, e.confidence_set_by, e.metadata, e.invalidated_at, "
+            "       a.node_id, a.label, a.node_type, a.invalidated_at, "
+            "       b.node_id, b.label, b.node_type, b.invalidated_at "
+            "FROM edges e "
+            "JOIN nodes a ON a.node_id = e.source_node_id "
+            "JOIN nodes b ON b.node_id = e.target_node_id "
+            "WHERE e.edge_type = 'alias_of' "
+            "ORDER BY e.created_at ASC"
+        )
+        out = []
+        for r in conn.execute(q).fetchall():
+            if live_only and r[7] is not None:
+                continue
+            meta = json.loads(r[6]) if r[6] else {}
+            out.append({
+                "edge_id": r[0],
+                "source_context": r[1],
+                "created_at": r[2],
+                "weight": r[3],
+                "confidence": r[4],
+                "set_by": r[5],
+                "method": meta.get("method"),
+                "embedding_sim": meta.get("embedding_sim"),
+                "cooccurrence": meta.get("cooccurrence"),
+                "invalidated_at": r[7],
+                "a": {"node_id": r[8], "label": r[9], "node_type": r[10],
+                      "invalidated_at": r[11]},
+                "b": {"node_id": r[12], "label": r[13], "node_type": r[14],
+                      "invalidated_at": r[15]},
+            })
+        return out
+
     # ── Edge CRUD ─────────────────────────────────────────
 
-    @_locked
-    def add_edge(self, edge: Edge) -> Edge:
-        conn = self._get_conn()
+    @staticmethod
+    def _add_edge_stmt(conn: sqlite3.Connection, edge: Edge) -> None:
+        """The bare INSERT for one edge — no commit, no audit. Callers own
+        the transaction (add_edge and add_edge_audited both wrap it)."""
         conn.execute(
             """INSERT INTO edges
                (edge_id, edge_type, source_node_id, target_node_id,
                 weight, created_at, metadata,
-                confidence, confidence_set_at, confidence_set_by, source_context)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                confidence, confidence_set_at, confidence_set_by, source_context,
+                invalidated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 edge.edge_id,
                 edge.edge_type.value,
@@ -1289,10 +1373,122 @@ class GraphStore:
                 edge.confidence_set_at.isoformat(),
                 edge.confidence_set_by,
                 edge.source_context,
+                edge.invalidated_at.isoformat() if edge.invalidated_at else None,
             ),
         )
+
+    @_locked
+    def add_edge(self, edge: Edge) -> Edge:
+        """Unaudited edge creation — UNCHANGED behavior for its many existing
+        callers (mention-linking, connect_nodes, tombstone re-pointing, the
+        /v1/edges endpoint, import_graph). See add_edge_audited for the
+        provenance-bearing path (alias leg)."""
+        conn = self._get_conn()
+        self._add_edge_stmt(conn, edge)
         self._commit(conn)
         return edge
+
+    @_locked
+    def add_edge_audited(self, edge: Edge, actor: str = "") -> Edge:
+        """Audited edge creation (alias leg): the INSERT and its 'create'
+        audit row land in ONE commit, mirroring add_node exactly — an audit
+        failure rolls the edge creation back rather than leaving an edge the
+        trail can't account for. Use this for edges whose provenance matters
+        (ALIAS_OF today); add_edge above is UNCHANGED for every other caller.
+        """
+        with self.transaction() as conn:
+            self._add_edge_stmt(conn, edge)
+            self._record_edge_audit(
+                edge.edge_id, "create", actor=actor,
+                before_edge=None, after_edge=edge,
+            )
+        return edge
+
+    @_locked
+    def _record_edge_audit(
+        self,
+        edge_id: str,
+        op: str,
+        actor: str = "",
+        before_edge: Optional["Edge"] = None,
+        after_edge: Optional["Edge"] = None,
+    ) -> None:
+        """Edge analogue of _record_node_audit — same audit_log table, same
+        transaction-depth contract (required/raises inside a transaction,
+        best-effort/swallowed standalone). There is no dedicated edge_audit
+        table: audit_log's subject-id column carries a node_id OR an edge_id
+        interchangeably (both are opaque UUID strings; the ``op`` and the
+        before/after snapshot shape disambiguate which)."""
+        if self._txn_depth > 0:
+            self.record_audit(
+                edge_id, op, actor=actor,
+                before=self._audit_snapshot(before_edge),
+                after=self._audit_snapshot(after_edge),
+            )
+            return
+        try:
+            self.record_audit(
+                edge_id, op, actor=actor,
+                before=self._audit_snapshot(before_edge),
+                after=self._audit_snapshot(after_edge),
+            )
+        except Exception:
+            pass
+
+    def get_edge_audit(self, edge_id: str) -> list[dict]:
+        """Edge audit history — same audit_log table as get_node_audit, keyed
+        by edge_id instead of node_id (see _record_edge_audit)."""
+        return self.get_node_audit(edge_id)
+
+    @_locked
+    def update_edge(
+        self, edge_id: str, _audit_op: Optional[str] = "update",
+        _audit_actor: str = "", **kwargs
+    ) -> Optional[Edge]:
+        """Update specific fields on an edge. Mirrors update_node: mutation +
+        audit land in ONE commit, an audit failure rolls the UPDATE back.
+        Fields are confined to what provenance/invalidation needs today —
+        the existing (unaudited) update_edge_weight keeps serving weight
+        reinforcement callers, untouched.
+        """
+        existing = self.get_edge(edge_id)
+        if existing is None:
+            return None
+
+        allowed_fields = (
+            "metadata", "confidence", "confidence_set_at",
+            "confidence_set_by", "source_context", "invalidated_at",
+        )
+        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        if not updates:
+            return existing
+
+        conn = self._get_conn()
+        set_clauses = []
+        values = []
+        datetime_fields = ("confidence_set_at", "invalidated_at")
+        for key, val in updates.items():
+            set_clauses.append(f"{key} = ?")
+            if key == "metadata":
+                values.append(json.dumps(val))
+            elif key in datetime_fields:
+                values.append(val.isoformat() if isinstance(val, datetime) else val)
+            else:
+                values.append(val)
+        values.append(edge_id)
+
+        with self.transaction():
+            conn.execute(
+                f"UPDATE edges SET {', '.join(set_clauses)} WHERE edge_id = ?",
+                values,
+            )
+            updated = self.get_edge(edge_id)
+            if _audit_op:
+                self._record_edge_audit(
+                    edge_id, _audit_op, actor=_audit_actor,
+                    before_edge=existing, after_edge=updated,
+                )
+        return updated
 
     @_locked
     def get_edge(self, edge_id: str) -> Optional[Edge]:
@@ -1588,4 +1784,7 @@ class GraphStore:
             confidence_set_at=datetime.fromisoformat(row[8]) if len(row) > 8 and row[8] else datetime.now(timezone.utc),
             confidence_set_by=row[9] if len(row) > 9 and row[9] else "",
             source_context=row[10] if len(row) > 10 and row[10] else "",
+            # Provenance Layer, edge half (column 11, alias leg): soft-
+            # invalidation marker. Absent/NULL on every pre-alias-leg row.
+            invalidated_at=datetime.fromisoformat(row[11]) if len(row) > 11 and row[11] else None,
         )

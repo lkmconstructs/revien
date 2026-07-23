@@ -602,9 +602,11 @@ def tensions(db: Optional[str], include_history: bool, json_output: bool):
               help="Also backfill the semantic index (recovery, not routine)")
 @click.option("--invalidate-orphans", "invalidate_orphans", is_flag=True,
               help="Soft-invalidate edgeless nodes (reversible; default is report-only)")
+@click.option("--alias", "alias", is_flag=True,
+              help="Also run evidence-backed ALIAS_OF inference (writes edges; opt-in)")
 @click.option("--json-output", is_flag=True, help="Output the full report as JSON")
 def dream(db: Optional[str], reindex: bool, invalidate_orphans: bool,
-          json_output: bool):
+          alias: bool, json_output: bool):
     """Run the consolidation pass ("dream mode"): persist confidence decay,
     refresh communities, and report orphaned memories. Nothing is deleted;
     every change is audited and reported."""
@@ -626,7 +628,7 @@ def dream(db: Optional[str], reindex: bool, invalidate_orphans: bool,
         semantic = SemanticIndex(store)
         report = Consolidator(
             store, semantic=semantic, clustering=clustering,
-        ).run(reindex=reindex, invalidate_orphans=invalidate_orphans)
+        ).run(reindex=reindex, invalidate_orphans=invalidate_orphans, alias=alias)
 
         if json_output:
             click.echo(_json.dumps(report.to_dict(), indent=2))
@@ -649,7 +651,79 @@ def dream(db: Optional[str], reindex: bool, invalidate_orphans: bool,
                       "--invalidate-orphans to act)"))
         for item in d["orphans"]["sample"][:5]:
             click.echo(f"              [{item['node_type']}] {item['label'][:50]}")
+        if d["alias"]["ran"]:
+            click.echo(f"  aliases   : {d['alias']['edges_created']} edge(s) created "
+                       f"({d['alias']['candidates_considered']} candidate(s) considered)")
+            for item in d["alias"]["sample"][:5]:
+                click.echo(f"              {item['label_a'][:30]} <-> "
+                           f"{item['label_b'][:30]} [{item['method']}]")
+        else:
+            click.echo("  aliases   : skipped (use --alias)"
+                       + (f" — {d['alias']['note']}" if d["alias"]["note"] else ""))
         click.echo()
+    finally:
+        store.close()
+
+
+@main.command()
+@click.option("--db", default=None, help="Database path")
+@click.option("--remove", "remove_edge_id", default=None,
+              help="Soft-invalidate one alias edge by id (reversible, audited)")
+@click.option("--all", "include_history", is_flag=True,
+              help="Include reversed (removed) alias edges")
+@click.option("--json-output", is_flag=True, help="Output as JSON")
+def aliases(db: Optional[str], remove_edge_id: Optional[str],
+            include_history: bool, json_output: bool):
+    """List evidence-backed ALIAS_OF edges, or reverse one with
+    --remove <edge_id> (soft-invalidate; the edge is retained and auditable,
+    never deleted). Aliases are created by 'revien dream --alias', by
+    POST /v1/edges with edge_type=alias_of, or by the recall anchor
+    expansion's own inference pass."""
+    from revien.graph.operations import GraphOperations
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        if remove_edge_id:
+            ops = GraphOperations(store)
+            edge = ops.invalidate_edge(
+                remove_edge_id, reason="cli_remove", construct_id="cli"
+            )
+            if edge is None:
+                click.echo(f"No such edge: {remove_edge_id}")
+                return
+            click.echo(
+                f"Removed alias edge {remove_edge_id} "
+                f"(soft-invalidated — reversible, not deleted)."
+            )
+            return
+
+        pairs = store.list_alias_pairs(live_only=not include_history)
+
+        if json_output:
+            click.echo(json.dumps({"count": len(pairs), "aliases": pairs}, indent=2))
+            return
+
+        if not pairs:
+            click.echo("No alias edges recorded. (Run 'revien dream --alias', "
+                       "or POST /v1/edges with edge_type=alias_of.)")
+            return
+
+        click.echo(f"\n{len(pairs)} alias pair{'s' if len(pairs) != 1 else ''}:\n")
+        for i, p in enumerate(pairs, 1):
+            a, b = p["a"], p["b"]
+            click.echo(f"  [{i}] {a['label']} <-> {b['label']}"
+                       + (f"  ({p['method']})" if p.get("method") else ""))
+            if p.get("source_context"):
+                click.echo(f"      {p['source_context']}")
+            click.echo(f"      edge_id={p['edge_id']}")
+            click.echo()
     finally:
         store.close()
 

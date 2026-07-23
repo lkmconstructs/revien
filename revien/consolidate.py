@@ -32,6 +32,12 @@ Passes (each individually toggleable):
                from a corrupted/absent vector table, not routine upkeep.
   orphans    — detect nodes with no edges. Report always; soft-invalidate
                only with invalidate_orphans=True.
+  alias      — evidence-backed ALIAS_OF inference (alias leg). DEFAULT OFF
+               (opt-in like reindex): unlike decay/orphans, this pass WRITES
+               new edges rather than only reporting or demoting, so it stays
+               off the default sweep until a caller asks for it explicitly.
+               Never merges nodes — see revien/alias.py's own header for the
+               full evidence/guard contract.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from revien.alias import run_alias_pass
 from revien.graph.operations import GraphOperations
 from revien.graph.schema import NodeType, SourceType
 from revien.graph.store import GraphStore
@@ -69,6 +76,12 @@ class ConsolidationReport:
     orphans_found: int = 0
     orphan_sample: List[Dict[str, str]] = field(default_factory=list)
     orphans_invalidated: int = 0
+    # alias inference (alias leg)
+    alias_ran: bool = False
+    alias_candidates_considered: int = 0
+    alias_edges_created: int = 0
+    alias_sample: List[Dict[str, Any]] = field(default_factory=list)
+    alias_note: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,6 +99,13 @@ class ConsolidationReport:
                 "found": self.orphans_found,
                 "sample": self.orphan_sample,
                 "invalidated": self.orphans_invalidated,
+            },
+            "alias": {
+                "ran": self.alias_ran,
+                "candidates_considered": self.alias_candidates_considered,
+                "edges_created": self.alias_edges_created,
+                "sample": self.alias_sample,
+                "note": self.alias_note,
             },
         }
 
@@ -171,6 +191,18 @@ class Consolidator:
                 )
                 report.orphans_invalidated += 1
 
+    def _alias_pass(self, report: ConsolidationReport) -> None:
+        """Evidence-backed ALIAS_OF inference (alias leg). Delegates the
+        actual pass to revien.alias.run_alias_pass — this method's only job
+        is translating that result onto the shared ConsolidationReport, the
+        same shape as every other pass here."""
+        result = run_alias_pass(self.store, self.ops, semantic=self.semantic)
+        report.alias_ran = result.ran
+        report.alias_candidates_considered = result.candidates_considered
+        report.alias_edges_created = result.edges_created
+        report.alias_sample = result.sample
+        report.alias_note = result.note
+
     # ── entry point ───────────────────────────────────────────────────────
 
     def run(
@@ -179,6 +211,7 @@ class Consolidator:
         recluster: bool = True,
         reindex: bool = False,
         invalidate_orphans: bool = False,
+        alias: bool = False,
     ) -> ConsolidationReport:
         report = ConsolidationReport(
             started_at=datetime.now(timezone.utc).isoformat()
@@ -190,6 +223,8 @@ class Consolidator:
             self._recluster_pass(report)
         if reindex:
             self._reindex_pass(report)
+        if alias:
+            self._alias_pass(report)
         self._orphan_pass(report, invalidate=invalidate_orphans)
         report.duration_ms = (time.perf_counter() - t0) * 1000
         return report

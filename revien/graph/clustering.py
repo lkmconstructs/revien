@@ -354,9 +354,17 @@ class CommunityDetector:
         for row in rows:
             G.add_node(row[0])
 
-        # Load edges with weights
+        # Load edges with weights. Excludes invalidated edges (a reversed
+        # edge shouldn't shape communities either) AND excludes ALIAS_OF
+        # entirely (alias leg): ALIAS_OF is a RECALL-ROUTING edge, not a
+        # semantic-community one — "Sam" and "Sam R." being the same person
+        # says nothing about which topic cluster they belong to, and at its
+        # 0.8 name_form weight it would reshape Louvain communities and
+        # distort community_boost for queries that have nothing to do with
+        # aliasing.
         rows = conn.execute(
-            "SELECT source_node_id, target_node_id, weight FROM edges"
+            "SELECT source_node_id, target_node_id, weight FROM edges "
+            "WHERE invalidated_at IS NULL AND edge_type != 'alias_of'"
         ).fetchall()
         for src, tgt, weight in rows:
             if G.has_node(src) and G.has_node(tgt):

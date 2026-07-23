@@ -40,6 +40,14 @@ class EdgeType(str, Enum):
     CORRECTS = "corrects"
     # Provenance / lineage (leg 6a): target is derived FROM source.
     DERIVED_FROM = "derived_from"
+    # Evidence-backed alias resolution (alias leg): source and target are the
+    # SAME real-world thing wearing different surface forms ("Sam" / "Sam R." /
+    # "sam@...") or the same underlying concept named differently ("offline
+    # mode" / "Roadmap 2026"). Symmetric AT READ TIME — stored once, in either
+    # direction, and every consumer (recall expansion, the CLI listing) treats
+    # it undirected. Deliberately NEVER a merge: both nodes stay live, distinct,
+    # independently correctable — this edge only widens what recall reaches.
+    ALIAS_OF = "alias_of"
 
 
 class SourceType(str, Enum):
@@ -156,6 +164,14 @@ class Edge(BaseModel):
     confidence_set_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     confidence_set_by: str = ""  # Which construct validated this edge
     source_context: str = ""  # Why this edge confidence
+
+    # Provenance Layer, edge half (alias leg): soft-invalidation, mirroring
+    # Node.invalidated_at exactly. NULL means live; a timestamp means this
+    # edge has been reversed (e.g. a wrong ALIAS_OF removed via `revien
+    # aliases --remove`) and is excluded from recall expansion by default.
+    # The row is RETAINED — never deleted — so a reversal is auditable and
+    # a later re-evidenced alias can be redrawn without archaeology.
+    invalidated_at: Optional[datetime] = None
 
 
 class Graph(BaseModel):

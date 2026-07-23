@@ -45,6 +45,18 @@ from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
 
 
+def _alias_expansion_enabled_by_env() -> bool:
+    """ALIAS_OF anchor-expansion gate (alias leg). DEFAULT ON — same
+    on-by-default convention as REVIEN_FENCE/REVIEN_RERANK. REVIEN_ALIAS=0
+    restores pre-alias anchor selection byte-identically. Read PER CALL
+    (like pipeline.py's _fence_enabled_by_env), not cached at construction,
+    so a live deployment (or a test) can flip it without rebuilding the
+    engine."""
+    return os.environ.get("REVIEN_ALIAS", "1").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
 def rrf_fuse(
     ranked_lists: List[List[str]],
     k: float = 60.0,
@@ -669,7 +681,54 @@ class RetrievalEngine:
                 if match.node_id not in anchor_ids:
                     anchor_ids.append(match.node_id)
 
+        # Alias expansion (alias leg): union in the LIVE ALIAS_OF neighbors of
+        # every anchor found above — "Sam" anchors also seed "Sam R." and
+        # "sam@..." when evidence-backed ALIAS_OF edges connect them. ONE hop
+        # only, off the ORIGINAL anchors — deliberately not transitive
+        # (expanding an alias's alias's alias compounds false-positive risk
+        # multiplicatively, and v1 has no reason to take that risk for a gap
+        # that one hop already closes). Distinguishability: the walker seeds
+        # every anchor (original AND alias-expanded) at distance 0 with its
+        # own path entry, so a result reached ONLY through the alias node
+        # carries that node's label as the first hop in `path` — no new
+        # response field needed, the existing path already tells the story.
+        if _alias_expansion_enabled_by_env():
+            for anchor_id in list(anchor_ids):
+                for alias_id in self._live_alias_neighbors(anchor_id):
+                    if alias_id not in anchor_ids:
+                        anchor_ids.append(alias_id)
+
         return anchor_ids
+
+    # Defensive bound, not a normal-path limit: the inference pass (alias.py)
+    # is precision-first and blocked, so it can't realistically fan one node
+    # out to dozens of live aliases. This exists for the OTHER creation path
+    # — POST /v1/edges lets any caller draw ALIAS_OF edges directly — so a
+    # spammed/misbehaving caller can't turn one anchor into an unbounded
+    # anchor-set (and unbounded walk-seed) blowup.
+    MAX_ALIAS_NEIGHBORS_PER_ANCHOR = 25
+
+    def _live_alias_neighbors(self, node_id: str) -> List[str]:
+        """LIVE ALIAS_OF neighbors of one node, both directions, one hop.
+        Skips invalidated edges (a reversed alias) AND invalidated/missing
+        neighbor nodes — a superseded alias must not silently keep expanding
+        recall. One get_edges_for_node call per anchor; anchor sets are
+        small (typically <10), so this stays cheap. Capped at
+        MAX_ALIAS_NEIGHBORS_PER_ANCHOR (see its comment)."""
+        neighbor_ids: List[str] = []
+        for edge in self.store.get_edges_for_node(node_id):
+            if edge.edge_type is not EdgeType.ALIAS_OF or edge.invalidated_at is not None:
+                continue
+            other_id = (edge.target_node_id if edge.source_node_id == node_id
+                        else edge.source_node_id)
+            neighbor_ids.append(other_id)
+            if len(neighbor_ids) >= self.MAX_ALIAS_NEIGHBORS_PER_ANCHOR:
+                break
+        if not neighbor_ids:
+            return []
+        others = self.store.get_nodes_bulk(neighbor_ids)
+        return [nid for nid in neighbor_ids
+                if nid in others and others[nid].invalidated_at is None]
 
     def _keyword_search(self, query: str, limit: int = 10) -> List[str]:
         """
