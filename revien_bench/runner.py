@@ -78,6 +78,42 @@ def _restore_env(prev: Dict[str, Optional[str]]) -> None:
             os.environ[k] = v
 
 
+# ── Alias-inference measurement hook (opt-in, DEFAULT OFF) ────────────────────
+# revien.alias.run_alias_pass draws ALIAS_OF edges but nothing in the bench
+# pipeline ever calls it — recall's anchor expansion (REVIEN_ALIAS, on by
+# default) can only union an alias's neighborhood in if the edge already
+# exists, so measuring the recall claim needs the pass run BEFORE recall,
+# per conversation, right after ingest completes. REVIEN_BENCH_ALIAS=1 turns
+# it on; unset/0 is a byte-identical no-op (the hook is never even imported).
+
+
+def _bench_alias_enabled() -> bool:
+    """Read per-call, not cached — matches REVIEN_ALIAS / REVIEN_FENCE's
+    on-demand env convention elsewhere in this codebase."""
+    return os.environ.get("REVIEN_BENCH_ALIAS", "0").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def _run_bench_alias_pass(store: GraphStore, semantic) -> Dict:
+    """Run the alias-inference pass on `store` (post-ingest, pre-recall) and
+    shape a compact stats dict for the checkpoint/report. Lazy import so an
+    unset REVIEN_BENCH_ALIAS never even touches revien.alias."""
+    from revien.alias import run_alias_pass
+    t0 = time.perf_counter()
+    result = run_alias_pass(store, semantic=semantic)
+    return {
+        "ran": result.ran,
+        "entities_considered": result.entities_considered,
+        "candidates_considered": result.candidates_considered,
+        "edges_created": result.edges_created,
+        "edges_by_method": dict(result.edges_by_method),
+        "sample": result.sample,
+        "note": result.note,
+        "duration_ms": round((time.perf_counter() - t0) * 1000, 3),
+    }
+
+
 # ── Per-conversation checkpoint / resume ──────────────────────────────────────
 # A full LoCoMo run is ~20 min and ~2000 QA. Writing results only at the very
 # end means any interruption (laptop sleep, a single hung HTTP call) loses
@@ -392,6 +428,7 @@ def run_benchmark(
         per_q: List[Dict] = []
         ingest_rates: List[float] = []
         recall_latencies: List[float] = []
+        alias_pass_stats: List[Dict] = []
         total_audit_creates_expected = 0
         n_resumed = 0
         n_ran = 0
@@ -422,6 +459,8 @@ def run_benchmark(
             if ir:
                 ingest_rates.append(ir)
             total_audit_creates_expected += rec.get("nodes_created", 0)
+            if rec.get("alias") is not None:
+                alias_pass_stats.append(rec["alias"])
             resumed_cloud_calls += int(rec.get("conv_network_calls", 0) or 0)
             resumed_cost_usd += float(rec.get("conv_cost_usd", 0.0) or 0.0)
 
@@ -504,6 +543,15 @@ def run_benchmark(
                         }), encoding="utf-8")
                 total_audit_creates_expected += summary["nodes_created"]
 
+                # Optional alias-inference measurement hook — after ingest,
+                # before recall (see _bench_alias_enabled's header). Runs on
+                # BOTH cache-hit and freshly-ingested conversations alike, so
+                # --db-cache reuse never silently skips it.
+                alias_stats: Optional[Dict] = None
+                if _bench_alias_enabled():
+                    alias_stats = _run_bench_alias_pass(store, semantic)
+                    alias_pass_stats.append(alias_stats)
+
                 clustering = None
                 if cfg.get("cluster"):
                     detector = CommunityDetector(db_path)
@@ -543,6 +591,7 @@ def run_benchmark(
                         "nodes_created": summary["nodes_created"],
                         "conv_network_calls": conv_calls,
                         "conv_cost_usd": round(conv_cost, 6),
+                        "alias": alias_stats,
                     },
                 )
 
@@ -604,6 +653,7 @@ def run_benchmark(
         # Retrieval failure taxonomy: where the missed gold evidence died.
         # Rows from pre-taxonomy checkpoints are counted as unclassified.
         report["retrieval_failure_analysis"] = FA.aggregate_failures(per_q)
+        report["alias"] = _aggregate_alias(alias_pass_stats, enabled=_bench_alias_enabled())
         report["normalization_merges_sample"] = norm_merges_sample
         report["sovereignty"] = S.checks_to_dict(checks)
         report["config"] = {
@@ -655,6 +705,36 @@ def run_benchmark(
         return report
     finally:
         _restore_env(prev_env)
+
+
+def _aggregate_alias(stats: List[Dict], enabled: bool) -> Dict:
+    """Fold per-conversation alias-pass stats (REVIEN_BENCH_ALIAS=1) into one
+    run-level report section. Present-but-empty when the hook never ran (env
+    unset, or a resumed checkpoint predates the hook) so a report diff always
+    shows whether the measurement fired, never a silently missing key."""
+    if not enabled or not stats:
+        return {"enabled": enabled, "ran": False}
+    from revien.alias import ALIAS_SAMPLE_CAP
+
+    edges_by_method: Dict[str, int] = {}
+    for s in stats:
+        for method, n in (s.get("edges_by_method") or {}).items():
+            edges_by_method[method] = edges_by_method.get(method, 0) + n
+    sample: List[Dict] = []
+    for s in stats:
+        sample.extend(s.get("sample") or [])
+    return {
+        "enabled": True,
+        "ran": True,
+        "conversations": len(stats),
+        "entities_considered": sum(s.get("entities_considered", 0) for s in stats),
+        "candidates_considered": sum(s.get("candidates_considered", 0) for s in stats),
+        "edges_created": sum(s.get("edges_created", 0) for s in stats),
+        "edges_by_method": edges_by_method,
+        "duration_ms_total": round(sum(s.get("duration_ms", 0.0) for s in stats), 3),
+        "notes": sorted({s["note"] for s in stats if s.get("note")}),
+        "sample": sample[:ALIAS_SAMPLE_CAP],
+    }
 
 
 def _aggregate(

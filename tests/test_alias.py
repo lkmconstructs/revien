@@ -368,6 +368,22 @@ class TestGuards:
         assert result.edges_created == 0
         assert result.entities_considered == 1  # sam_r excluded up front
 
+    def test_normalized_equal_labels_never_alias(self, store):
+        # Two live nodes wearing one normalized label ("The Wolves" /
+        # "the wolves") are dedup's problem — an ALIAS_OF between them is a
+        # self-loop in disguise. Evidence is stacked so ONLY the equal-label
+        # guard can be what blocks the edge.
+        a = _entity(store, "The Wolves")
+        b = _entity(store, "the wolves")
+        c1 = _context(store, "turn1", "the wolves played")
+        c2 = _context(store, "turn2", "the wolves won")
+        for c in (c1, c2):
+            _link(store, c.node_id, a.node_id)
+            _link(store, c.node_id, b.node_id)
+
+        result = run_alias_pass(store)
+        assert result.edges_created == 0
+
     def test_idempotent_no_duplicate_on_rerun(self, store):
         rivera, sam_r = self._evidenced_pair(store)
 

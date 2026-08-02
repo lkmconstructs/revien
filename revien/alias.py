@@ -148,6 +148,7 @@ class AliasPassResult:
     entities_considered: int = 0
     candidates_considered: int = 0
     edges_created: int = 0
+    edges_by_method: Dict[str, int] = field(default_factory=dict)
     sample: List[Dict[str, Any]] = field(default_factory=list)
     note: Optional[str] = None
 
@@ -375,6 +376,14 @@ def run_alias_pass(
             continue  # idempotent: already aliased, no duplicate
 
         norm_a, norm_b = norm_labels[i], norm_labels[j]
+        if norm_a == norm_b:
+            # Same normalized label is dedup's territory, not alias's — two
+            # live nodes wearing one name means dedup declined (or hasn't
+            # run); an ALIAS_OF edge here is a self-loop in disguise and
+            # tells recall nothing it couldn't get from the label match.
+            # (Banked: the LoCoMo alias run drew exactly this degenerate
+            # pair before this guard existed.)
+            continue
         sim = _cosine(vectors[i], vectors[j]) if vectors else None
         shared = _shared_context_topic_count(store, a.node_id, b.node_id)
 
@@ -446,6 +455,7 @@ def run_alias_pass(
         )
         store.add_edge_audited(edge, actor=actor)
         result.edges_created += 1
+        result.edges_by_method[method] = result.edges_by_method.get(method, 0) + 1
         if len(result.sample) < ALIAS_SAMPLE_CAP:
             result.sample.append({
                 "label_a": a.label,
