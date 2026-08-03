@@ -61,7 +61,7 @@ setup(
         # MCP surface (LEG P5): `revien mcp` (stdio) and the daemon's /mcp
         # mount (REVIEN_MCP_HTTP=1). Peer dependency — revien imports of the
         # SDK are guarded, so the core install stays lean without it.
-        "mcp": ["mcp>=1.28.1"],
+        "mcp": ["mcp>=1.28.1,<2"],
         # Hermes Agent memory provider (LEG P6). Peer dependency — revien
         # imports of the Hermes SDK are guarded (HERMES_AVAILABLE), so the core
         # install stays lean without it. `hermes-agent` ships the MemoryProvider
@@ -85,7 +85,7 @@ setup(
         "semantic": ["sqlite-vec>=0.1.0", "fastembed>=0.3.0"],
         "all": [
             "langchain-core>=0.1.0",
-            "mcp>=1.28.1",
+            "mcp>=1.28.1,<2",
             "leidenalg>=0.10.0",
             "python-igraph>=0.11.0",
             "scikit-learn>=1.3.0",
