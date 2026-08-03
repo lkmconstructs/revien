@@ -213,6 +213,36 @@ class RetrievalEngine:
         # keyword-fallback anchor path) resolve to.
         requested_lexical = os.environ.get("REVIEN_LEXICAL", "").strip().lower()
         self.lexical_mode = "bm25" if requested_lexical == "bm25" else "keyword"
+        # WHY: the RRF fusion call site (below, in recall()) capped the
+        # lexical candidate list at ``self.semantic_top_k`` — but the
+        # production overlay this lane was validated against (bm25.py's
+        # header, 0.5814 -> 0.6395) ran the lexical list UNCAPPED
+        # (limit=None). That's a capped-vs-uncapped confound: any recall
+        # delta measured between the keyword and BM25 lanes under RRF was
+        # never isolating the ranking math alone, it was also comparing a
+        # capped list against what the overlay actually ran. This knob lets
+        # a sweep pick apart the two effects independently.
+        # REVIEN_LEXICAL_LIMIT unset -> None -> the RRF call site uses
+        # self.semantic_top_k exactly as before (byte-identical). Set to a
+        # positive int -> that value overrides the cap. Set to "0" ->
+        # uncapped (None is passed through to _lexical_candidates, which
+        # already treats None as "no cap" on both lanes). Same
+        # never-raise contract as REVIEN_RRF_K just above: malformed values
+        # fall back to the default (None / semantic_top_k) silently — a bad
+        # experiment knob must never crash recall.
+        _raw_lexical_limit = os.environ.get("REVIEN_LEXICAL_LIMIT")
+        self.lexical_limit_override: Optional[int] = None
+        if _raw_lexical_limit is not None:
+            try:
+                _parsed_lexical_limit = int(_raw_lexical_limit.strip())
+            except (ValueError, AttributeError):
+                _parsed_lexical_limit = None
+            if _parsed_lexical_limit is not None and _parsed_lexical_limit >= 0:
+                # 0 means "uncapped" downstream (None); store the sentinel
+                # value itself and resolve it at the RRF call site so the
+                # "unset" (None-override) and "0" (uncapped) states stay
+                # distinguishable here.
+                self.lexical_limit_override = _parsed_lexical_limit
         # A bad experiment knob must never crash recall (scorer.py's own
         # convention, _env_float's docstring) — this runs unconditionally,
         # even when REVIEN_HYBRID isn't "rrf", so a malformed or zero
@@ -371,8 +401,18 @@ class RetrievalEngine:
             # read as "the entity match owns this," not as whichever list
             # rrf_fuse happened to place first.
             entity_anchor_ids = self._find_anchors(query)
+            # REVIEN_LEXICAL_LIMIT resolution: unset (override is None) keeps
+            # the shipped cap (semantic_top_k) byte-identical; 0 resolves to
+            # None here (uncapped, both lanes treat None that way); a
+            # positive int overrides the cap directly.
+            if self.lexical_limit_override is None:
+                _lexical_limit = self.semantic_top_k
+            elif self.lexical_limit_override == 0:
+                _lexical_limit = None
+            else:
+                _lexical_limit = self.lexical_limit_override
             keyword_anchor_ids, bm25_scores = self._lexical_candidates(
-                query, limit=self.semantic_top_k
+                query, limit=_lexical_limit
             )
             semantic_ranked: List[str] = []
             if self.semantic.is_enabled:
@@ -801,13 +841,16 @@ class RetrievalEngine:
         return [nid for nid in neighbor_ids
                 if nid in others and others[nid].invalidated_at is None]
 
-    def _keyword_search(self, query: str, limit: int = 10) -> List[str]:
+    def _keyword_search(self, query: str, limit: Optional[int] = 10) -> List[str]:
         """
         Fallback: search node labels and content for query keywords.
         Used when entity extraction finds no anchors — and, under
         REVIEN_HYBRID=rrf (LEG P1), ALWAYS, as the keyword-ranked fusion
-        list (with limit widened to match the semantic list length).
+        list (with limit widened to match the semantic list length, or
+        uncapped under REVIEN_LEXICAL_LIMIT=0 — see engine.py's __init__
+        comment on that knob).
         Default limit=10 keeps the shipped fallback path byte-identical.
+        ``limit=None`` requests every matching node (SQLite's LIMIT -1).
         """
         words = set(query.lower().split())
         # Remove very common words
@@ -828,13 +871,16 @@ class RetrievalEngine:
         # any-keyword hit on label+content, newest first, CONTEXT excluded,
         # capped at `limit` anchors). The old list_nodes(limit=999999) full
         # scan was the single biggest recall latency driver (OPEN 2).
+        # limit=None -> SQLite LIMIT -1, its documented "no limit" value —
+        # only reachable via REVIEN_LEXICAL_LIMIT=0, never the default path.
+        sql_limit = -1 if limit is None else limit
         matches = self.store.search_nodes_keyword(
-            keywords, limit=limit, exclude_context=True
+            keywords, limit=sql_limit, exclude_context=True
         )
         return [n.node_id for n in matches]
 
     def _bm25_candidates(
-        self, query: str, limit: int = 10,
+        self, query: str, limit: Optional[int] = 10,
     ) -> Tuple[List[str], Dict[str, float]]:
         """BM25-lane counterpart to ``_keyword_search`` (REVIEN_LEXICAL=bm25).
 
@@ -873,7 +919,7 @@ class RetrievalEngine:
         return [node_id for node_id, _score in ranked], scores
 
     def _lexical_candidates(
-        self, query: str, limit: int = 10,
+        self, query: str, limit: Optional[int] = 10,
     ) -> Tuple[List[str], Dict[str, float]]:
         """Dispatch to the selected lexical lane (REVIEN_LEXICAL) without
         touching either call site's shipped behavior when unset: the
@@ -881,7 +927,8 @@ class RetrievalEngine:
         through here, so flipping the env var moves both at once. Unset (or
         any value other than "bm25") returns exactly what ``_keyword_search``
         returned before this lane existed, with an empty scores dict — the
-        keyword path is byte-identical."""
+        keyword path is byte-identical. ``limit=None`` (REVIEN_LEXICAL_LIMIT
+        =0, resolved by the RRF call site) means uncapped on either lane."""
         if self.lexical_mode == "bm25":
             return self._bm25_candidates(query, limit=limit)
         return self._keyword_search(query, limit=limit), {}

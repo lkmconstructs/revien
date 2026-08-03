@@ -261,6 +261,94 @@ class TestBM25LaneWiring:
         assert any(r.node_id == target.node_id for r in resp.results)
 
 
+class TestLexicalLimitKnob:
+    """REVIEN_LEXICAL_LIMIT — only touches the RRF fusion call site's
+    lexical-candidate cap (engine.py's recall(), REVIEN_HYBRID=rrf branch).
+    Closes the capped-vs-uncapped confound: the bm25.py-validated overlay
+    ran the lexical list UNCAPPED (limit=None), but the RRF call site here
+    capped it at semantic_top_k — so a keyword-vs-bm25 delta measured under
+    RRF was never isolating the ranking math alone."""
+
+    def _many_matching_facts(self, store, count=40):
+        # 40 distinct nodes that all substring/BM25-match "gronwall" so the
+        # lexical lane's candidate list can exceed the shipped cap (30) —
+        # proves the uncapped knob actually returns MORE than the cap, not
+        # just a different ordering within it.
+        ids = []
+        for i in range(count):
+            n = _add_fact(
+                store, f"note-{i}",
+                f"gronwall widget number {i} appears in this note",
+            )
+            ids.append(n.node_id)
+        return ids
+
+    def test_unset_is_byte_identical_to_no_knob(self, store, monkeypatch):
+        self._many_matching_facts(store, count=40)
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        monkeypatch.delenv("REVIEN_LEXICAL_LIMIT", raising=False)
+
+        def snapshot(resp):
+            return [
+                (r.node_id, round(r.score, 12), tuple(sorted(r.score_breakdown)))
+                for r in resp.results
+            ]
+
+        baseline_eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert baseline_eng.lexical_limit_override is None
+        baseline = snapshot(
+            baseline_eng.recall("gronwall widget", top_n=10, min_score=0.0)
+        )
+
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        resp = eng.recall("gronwall widget", top_n=10, min_score=0.0)
+        assert snapshot(resp) == baseline
+
+    def test_zero_is_uncapped_exceeds_old_cap(self, store, monkeypatch):
+        self._many_matching_facts(store, count=40)
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        monkeypatch.setenv("REVIEN_LEXICAL_LIMIT", "0")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert eng.lexical_limit_override == 0
+
+        resp = eng.recall("gronwall widget", top_n=100, min_score=0.0, debug=True)
+        # 40 facts all substring-match "gronwall" and/or "widget"; the
+        # shipped cap (semantic_top_k, default 30) would truncate the
+        # keyword-lane candidate list at 30. Uncapped must exceed that.
+        assert len(resp.diagnostics["anchors"]["keyword"]) > 30
+
+    def test_positive_int_overrides_cap_directly(self, store, monkeypatch):
+        self._many_matching_facts(store, count=40)
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        monkeypatch.setenv("REVIEN_LEXICAL_LIMIT", "5")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert eng.lexical_limit_override == 5
+
+        resp = eng.recall("gronwall widget", top_n=100, min_score=0.0, debug=True)
+        assert len(resp.diagnostics["anchors"]["keyword"]) == 5
+
+    @pytest.mark.parametrize("bad_value", ["not-a-number", "3.5", "", "  ", "-1"])
+    def test_malformed_falls_back_to_default_no_raise(self, store, monkeypatch, bad_value):
+        self._many_matching_facts(store, count=40)
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        monkeypatch.setenv("REVIEN_LEXICAL_LIMIT", bad_value)
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert eng.lexical_limit_override is None
+
+        resp = eng.recall("gronwall widget", top_n=100, min_score=0.0, debug=True)
+        assert len(resp.diagnostics["anchors"]["keyword"]) <= eng.semantic_top_k
+
+    def test_applies_to_bm25_lane_too(self, store, monkeypatch):
+        self._many_matching_facts(store, count=40)
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        monkeypatch.setenv("REVIEN_LEXICAL", "bm25")
+        monkeypatch.setenv("REVIEN_LEXICAL_LIMIT", "0")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+
+        resp = eng.recall("gronwall widget", top_n=100, min_score=0.0, debug=True)
+        assert len(resp.diagnostics["anchors"]["keyword"]) > 30
+
+
 # ── Tier 3: scoring-blend contract (semantic layer ENABLED via a stub) ──
 
 
