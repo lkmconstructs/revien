@@ -190,6 +190,40 @@ class GraphOperations:
             _audit_actor=construct_id,
         )
 
+    def invalidate_edge(
+        self, edge_id: str, reason: str = "", construct_id: str = ""
+    ) -> Optional[Edge]:
+        """Soft-invalidate an edge: mark it stale without deleting anything.
+
+        Edge analogue of invalidate_node (alias leg): sets ``invalidated_at``
+        to now and writes an audit entry via ``store.update_edge``. The row
+        is RETAINED — a wrong ALIAS_OF (or any future provenance-bearing
+        edge) is reversible, not erased, and recall expansion / the alias
+        CLI listing both skip invalidated edges by default. Idempotent:
+        re-invalidating an already-invalid edge leaves the original
+        timestamp untouched.
+        """
+        edge = self.store.get_edge(edge_id)
+        if edge is None:
+            return None
+        if edge.invalidated_at is not None:
+            # Already reversed — don't overwrite the original timestamp.
+            return edge
+
+        now = datetime.now(timezone.utc)
+        return self.store.update_edge(
+            edge_id,
+            invalidated_at=now,
+            metadata={
+                **edge.metadata,
+                "_invalidated_by": construct_id,
+                "_invalidated_reason": reason,
+                "_invalidated_at": now.isoformat(),
+            },
+            _audit_op="invalidate",
+            _audit_actor=construct_id,
+        )
+
     def get_lineage(self, node_id: str, max_depth: int = 10) -> Dict:
         """Trace a node's derivation chain via DERIVED_FROM edges.
 

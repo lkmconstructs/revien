@@ -6,6 +6,107 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **BM25 lexical lane (REVIEN_LEXICAL=bm25) + entity-anchor union (P1
+  follow-up)** — `revien/retrieval/bm25.py` is a production-validated
+  overlay ported near-verbatim from a pre-0.3.0 engine where it measured
+  recall@10 0.5814 -> 0.6395 (REVIEN_HYBRID=rrf, live graph): a pure-stdlib
+  Okapi BM25 ranker over the same node label+content corpus the shipped
+  substring keyword lane scans. Where that lane treats every keyword hit
+  the same (a document repeating a common word looks as relevant as the
+  one document holding the rare, query-specific term), BM25 scores term
+  rarity (inverse document frequency) and saturating term frequency, so
+  the genuinely distinctive document wins. `_lexical_candidates` dispatches
+  both call sites that previously called `_keyword_search` directly — the
+  RRF fusion list and the keyword-fallback anchor path — to whichever lane
+  `REVIEN_LEXICAL` selects; unset (or anything but `bm25`) is the shipped
+  keyword lane, byte-identical. BM25 scores compose with semantic
+  similarity by MAX (not sum) at the same seam the overlay used, so a node
+  with both signals isn't double-counted; `score_breakdown["bm25_score"]`
+  only appears when the lane is actually selected, same pattern as
+  `semantic_sim`.
+  Also lands the P1 regression fix this lane's production deployment
+  exposed: under `REVIEN_HYBRID=rrf`, entity anchors (`_find_anchors`,
+  alias expansion included) used to be REPLACED wholesale by the RRF-fused
+  keyword/semantic candidate list — measured +65 disconnected results on
+  the eval, because any node reachable ONLY through an entity match (never
+  surfacing in either fusion list) stopped seeding the walk at all. Entity
+  anchors are now PREPENDED onto the fused set unconditionally under
+  `REVIEN_HYBRID=rrf` (no separate flag — this corrects a known
+  regression, not a new experiment), and because `_find_anchors` already
+  runs its `REVIEN_ALIAS` one-hop `ALIAS_OF` expansion before this union,
+  an alias-expanded anchor now survives into the RRF path exactly like it
+  does on the shipped path. The prepend is a real ordering effect, not
+  cosmetic: `diagnostics["anchors"]["all"]` now lists entity anchors
+  (deduped, keeping first occurrence) ahead of the fused list, and — since
+  the walker seeds every anchor at distance 0 with its own path entry —
+  can change which anchor's label leads a shared result's `path` when a
+  node is reachable from both an entity anchor and a fused one. Both
+  defaults stay off: unset `REVIEN_LEXICAL` is the exact keyword lane;
+  unset `REVIEN_HYBRID` is the exact shipped anchor path.
+  Honesty notes from review: (1) this port caps the RRF path's lexical
+  candidate list at `semantic_top_k`, where the production overlay this
+  was validated against ran that list uncapped — the quoted recall@10
+  0.5814 -> 0.6395 numbers come from a slightly different configuration;
+  a LoCoMo cross-check of the capped shape is still pending, not done.
+  (2) `_bm25_candidates` reintroduces the exact
+  `list_nodes(limit=999999)`-then-scan-in-Python shape OPEN 2 (see
+  `store.py`'s `search_nodes_keyword`) moved OFF of and into SQL, because
+  BM25's document-frequency/average-length stats need the whole corpus's
+  tokens, not a pre-filtered slice — measured ~2.2x recall latency at 4k
+  nodes vs the keyword lane's SQL-side scan when `REVIEN_LEXICAL=bm25` is
+  selected; unselected, the cost isn't paid. (3) `REVIEN_RRF_K` stays
+  unvalidated by design — a malformed or non-positive value silently falls
+  back to the default (60.0), matching every other env-float ranking knob
+  in this class; it is never allowed to raise and crash `recall()`.
+- **Evidence-backed alias resolution (alias leg)** — "Sam", "Sam R.", and
+  "sam@..." land as three separate ENTITY nodes (extraction has no way to
+  know they're one person), and a recall anchored to one of them used to
+  never reach the others. A new `ALIAS_OF` edge type (`revien/graph/schema.py`)
+  joins surface-form variants and conceptual synonyms without ever merging
+  the underlying nodes — reversible, audited, evidence-only. `revien/alias.py`
+  is the new inference pass: BLOCKED candidate generation (shared normalized
+  token, or mutual top-K label-embedding neighbors — never all-pairs),
+  precision-first scoring (name_form needs co-occurrence or embedding
+  corroboration; conceptual needs BOTH high embedding similarity AND
+  co-occurrence), hard guards against aliasing conflicting or
+  differently-typed nodes, and idempotent re-runs. Opt-in via
+  `revien dream --alias` / `Consolidator.run(alias=True)` / `POST
+  /v1/consolidate {"alias": true}` — off by default because, unlike the
+  other dream passes, it writes new edges. At recall, `_find_anchors`
+  unions in each anchor's LIVE `ALIAS_OF` neighbors, one hop only (no
+  transitive chaining — that compounds false-positive risk multiplicatively
+  for a gap one hop already closes); gated by `REVIEN_ALIAS` (default on).
+  `revien aliases` lists live alias pairs with their evidence;
+  `revien aliases --remove <edge_id>` reverses one (soft-invalidate,
+  audited, never deleted). `POST /v1/edges` also accepts `alias_of` directly
+  for manually-declared aliases (routed through `add_edge_audited` too, so a
+  manually-declared alias carries the same create-audit row an inferred one
+  does). New audited edge-mutation path (`store.add_edge_audited`,
+  `store.update_edge`, `GraphOperations.invalidate_edge`) backing all of
+  this — the existing (unaudited) `store.add_edge` is unchanged for its
+  other callers.
+  Coherent semantics after adversarial review: the graph walk
+  (`get_neighbors_bulk` / `get_neighbors_weighted_bulk`) now excludes
+  soft-invalidated edges for every edge type, not just ALIAS_OF — an
+  invalidated edge never routes a walk again, so `revien aliases --remove`
+  actually kills that pair's connection everywhere, not just at the anchor
+  step. `REVIEN_ALIAS=0` disables anchor-expansion (distance-0 seeding)
+  only — a still-LIVE alias edge legitimately continues to route ordinary
+  graph walks at whatever hop distance it sits. Community detection
+  (`clustering.py`) excludes ALIAS_OF edges entirely (a recall-routing edge
+  reshaping topic communities was never the intent) plus any invalidated
+  edge. name_form scoring tightened: the SUBSET shape — one label's
+  normalized token set a strict subset of the other's, at ANY token count
+  ("sam" is a subset of "sam r", but just as much "new york" of "new york
+  times" or "ford" of "ford foundation") — can no longer be aliased on
+  co-occurrence alone regardless of how much of it exists, because a
+  qualified superset is usually a DIFFERENT entity that merely shares the
+  shorter name (a first pass only caught the single-token case, missing
+  "New York" / "New York Times"-shaped false positives — fixed to cover
+  every token count). Only a real label-embedding similarity draws that
+  shape now; every other name_form pair's co-occurrence bar rose from >=1
+  to >=2 distinct shared neighbors, matching conceptual's bar.
+- `action` node type — committed future work (to-dos, follow-ups, "I'll X"), DECISION's forward-looking sibling. Extracted by both the rule extractor (conservative commitment patterns) and the LLM extractor, and distilled to an "Actions" section in vault notes.
 - **Persistent adapter-sync cursors** (`sync_cursors` table). The first-ever sync of an
   adapter starts at epoch, so everything from before the daemon existed is ingested; a
   daemon restart resumes from the last successful sync instead of resetting to now()
@@ -19,6 +120,19 @@ All notable changes to Revien are documented here. Format follows
   duplicate whole-session context node every sync. No key = append behavior, unchanged.
   Note: refresh only ever adds — it never removes claims extracted from text that was
   later edited away; the key is intended for append-only units like session logs.
+- **Context fence (leg 6c)** — recall re-entry no longer becomes new memory. Every
+  ingestion route eventually calls `pipeline.ingest()`, and several of them inject
+  Revien's own recalled memory back into the text they then hand to that same
+  pipeline: Claude Code's harness-wrapped `<system-reminder>` blocks, ollama_adapter's
+  `[Revien Memory Context]` fence, hermes_provider's `## Relevant memory (Revien)`
+  header, langchain_adapter's `## Relevant Context (from N nodes)` block. Left alone,
+  the graph re-learns what it already told you, with confidence compounding on each
+  loop. `revien/ingestion/fence.py` strips exactly those marker-bounded spans —
+  case-sensitive, pairing-based, no JSON/schema sniffing — before the ingest_key hash
+  and before extraction. `REVIEN_FENCE` is ON by default (`REVIEN_FENCE=0` restores
+  pre-fence behavior byte-identically); stripped spans are logged with source_id,
+  count, chars, and which marker families fired, and content that fences down to
+  nothing is skipped rather than stored as an empty husk.
 
 ### Fixed
 - **Auto-sync fires immediately at daemon startup**, then every interval — no more

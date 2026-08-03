@@ -23,8 +23,18 @@ def _ingest_deny_set() -> set:
     """
     raw = os.environ.get("REVIEN_INGEST_DENY", "")
     return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _fence_enabled_by_env() -> bool:
+    """Context fence toggle (recursive-pollution guard, leg 6c). DEFAULT ON —
+    same on-by-default convention as REVIEN_RERANK. REVIEN_FENCE=0 disables
+    and restores pre-fence ingest behavior byte-identically."""
+    return os.environ.get("REVIEN_FENCE", "1").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
 from .extractor import ExtractionResult, RuleBasedExtractor
 from .extractor_llm import TextExtractor, build_extractor
+from .fence import fence_content
 from .dedup import Deduplicator
 from .temporal import resolve_event_time
 from .supersession_ingest import ClaimGovernor, build_governor
@@ -95,6 +105,12 @@ class IngestionOutput:
     # the CSL governor is wired. Each entry is a GovernanceOutcome: what the gate
     # decided for a contradicting existing claim and what happened to the data.
     governance: List = field(default_factory=list)
+    # Context fence (leg 6c): spans of recall re-entry (system-reminders,
+    # the ollama/hermes/langchain recall fences) stripped from this input
+    # before extraction. 0 when nothing fired or REVIEN_FENCE=0. Existing
+    # consumers construct their own response dicts field-by-field, so a new
+    # dataclass field with a default is additive, not breaking.
+    fenced_spans: int = 0
 
 
 class IngestionPipeline:
@@ -226,6 +242,50 @@ class IngestionPipeline:
                 total_edges_in_graph=self.store.count_edges(),
             )
 
+        # 0a. Context fence (recursive-pollution guard, leg 6c). Recalled
+        #     memory that re-enters a prompt — Claude Code's harness-injected
+        #     <system-reminder> blocks, the [Revien Memory Context] fence
+        #     ollama_adapter builds from recall, hermes_provider's and
+        #     langchain_adapter's recall headers — must not re-enter the
+        #     graph as new memory, or the graph re-learns what it already
+        #     told you. Strip it BEFORE the ingest_key hash and BEFORE
+        #     extraction, so a keyed refresh's "did this change?" check
+        #     compares fenced content on both sides.
+        #     Mutates input_data.content IN PLACE (not a local copy): the
+        #     refresh path below (_refresh_keyed) takes input_data and reads
+        #     .content itself, so the same fenced text has to be what both
+        #     paths see.
+        fenced_spans = 0
+        if _fence_enabled_by_env():
+            fenced = fence_content(input_data.content)
+            fenced_spans = fenced.stripped_spans
+            if fenced.stripped_spans:
+                print(
+                    f"[revien] context-fenced source_id={input_data.source_id!r} "
+                    f"spans={fenced.stripped_spans} chars={fenced.stripped_chars} "
+                    f"markers={fenced.markers}"
+                )
+            input_data.content = fenced.content
+            # Only short-circuit when FENCING is what emptied the content —
+            # content that arrived already empty/whitespace-only is a
+            # pre-existing caller-behavior edge case (test_empty_content),
+            # not recall re-entry, and is unaffected by this feature.
+            if fenced.stripped_spans and not input_data.content.strip():
+                print(
+                    f"[revien] ingest skipped for source_id={input_data.source_id!r} "
+                    f"— content was entirely recall re-entry (fenced to empty), "
+                    f"nothing left to capture."
+                )
+                return IngestionOutput(
+                    context_node_id="",
+                    nodes_created=0,
+                    nodes_deduplicated=0,
+                    edges_created=0,
+                    total_nodes_in_graph=self.store.count_nodes(),
+                    total_edges_in_graph=self.store.count_edges(),
+                    fenced_spans=fenced_spans,
+                )
+
         # 0b. Stable ingestion key (repair leg R3). With a key, look for the
         #     context node a previous ingest of this same unit stamped:
         #     unchanged content is a clean NO-OP; grown/changed content
@@ -279,9 +339,11 @@ class IngestionPipeline:
                         edges_created=0,
                         total_nodes_in_graph=self.store.count_nodes(),
                         total_edges_in_graph=self.store.count_edges(),
+                        fenced_spans=fenced_spans,
                     )
                 return self._refresh_keyed(
-                    input_data, ingest_key, content_hash, existing_ctx
+                    input_data, ingest_key, content_hash, existing_ctx,
+                    fenced_spans=fenced_spans,
                 )
 
         # 1. Extract nodes and edges
@@ -486,6 +548,7 @@ class IngestionPipeline:
             total_nodes_in_graph=self.store.count_nodes(),
             total_edges_in_graph=self.store.count_edges(),
             governance=governance,
+            fenced_spans=fenced_spans,
         )
 
     def _find_adoptable_context(self, source_id: str) -> Optional[Node]:
@@ -521,6 +584,7 @@ class IngestionPipeline:
         ingest_key: str,
         content_hash: str,
         existing_ctx: Node,
+        fenced_spans: int = 0,
     ) -> IngestionOutput:
         """Refresh path (repair leg R3): this unit was ingested before under
         the same key and its content changed (typically a session that GREW).
@@ -710,6 +774,7 @@ class IngestionPipeline:
             total_nodes_in_graph=self.store.count_nodes(),
             total_edges_in_graph=self.store.count_edges(),
             governance=governance,
+            fenced_spans=fenced_spans,
         )
 
     def _edge_exists(

@@ -53,11 +53,14 @@ class IngestResponse(BaseModel):
 
 class ConsolidateRequest(BaseModel):
     """Dream-mode pass (B3.1). Reindex is a backfill, off by default;
-    orphan invalidation is soft/reversible and strictly opt-in."""
+    orphan invalidation is soft/reversible and strictly opt-in. alias (alias
+    leg) is opt-in too — it's the one pass here that WRITES new edges rather
+    than only reporting or demoting."""
     decay: bool = True
     recluster: bool = True
     reindex: bool = False
     invalidate_orphans: bool = False
+    alias: bool = False
 
 
 class RecallRequest(BaseModel):
@@ -552,7 +555,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if store.get_node(request.target_node_id) is None:
             raise HTTPException(404, f"Target node not found: {request.target_node_id}")
 
-        edge = store.add_edge(Edge(
+        new_edge = Edge(
             edge_type=edge_type,
             source_node_id=request.source_node_id,
             target_node_id=request.target_node_id,
@@ -561,7 +564,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             confidence=request.confidence,
             confidence_set_by=request.confidence_set_by,
             source_context=request.source_context,
-        ))
+        )
+        if edge_type is EdgeType.ALIAS_OF:
+            # Alias leg: a user-declared alias needs the SAME provenance an
+            # inferred one gets (create audit row) — otherwise its later
+            # --remove would write an 'invalidate' entry with no 'create'
+            # before it, an incoherent trail. Every other edge_type keeps
+            # the existing unaudited add_edge path, unchanged.
+            edge = store.add_edge_audited(
+                new_edge, actor=request.confidence_set_by
+            )
+        else:
+            edge = store.add_edge(new_edge)
         return _edge_to_response(edge)
 
     # ── POST /v1/consolidate ──────────────────────────
@@ -582,6 +596,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             recluster=request.recluster,
             reindex=request.reindex,
             invalidate_orphans=request.invalidate_orphans,
+            alias=request.alias,
         )
         return report.to_dict()
 

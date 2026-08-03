@@ -85,6 +85,7 @@ Schema:
   "entities": [{"label": "<=200 chars", "content": "one sentence on what it is"}],
   "facts": [{"label": "<=200 chars", "content": "the fact in context"}],
   "decisions": [{"label": "<=200 chars", "content": "what was decided and why"}],
+  "actions": [{"label": "<=200 chars", "content": "the committed future work: who will do what"}],
   "preferences": [{"label": "<=200 chars", "content": "the preference"}],
   "topics": [{"label": "<=200 chars (a real recurring theme, NOT a single stray word)"}]
 }
@@ -93,6 +94,7 @@ Rules:
 - entities: people, systems, products, tools that MATTER to the discussion. Not every capitalized word. Not generic tech terms unless they're a real subject of discussion.
 - facts: concrete, specific, durable data points (configs, requirements, states). Not conversational filler.
 - decisions: actual choices made, not topics discussed.
+- actions: committed future work — to-dos, follow-ups, "I'll do X". A real commitment someone owes, not a hypothetical or a bare prediction.
 - preferences: stable likes/dislikes/conventions, not one-off reactions.
 - topics: substantive recurring threads. NEVER single isolated words. If it isn't a real theme, omit it.
 - If a category has nothing worth keeping, return an empty list for it.
@@ -259,6 +261,8 @@ class LLMExtractor:
                                  EdgeType.RELATED_TO, result, context_node, source_id, now)
         self._build_typed_nodes(parsed, "decisions", NodeType.DECISION,
                                  EdgeType.DECIDED_IN, result, context_node, source_id, now)
+        self._build_typed_nodes(parsed, "actions", NodeType.ACTION,
+                                 EdgeType.RELATED_TO, result, context_node, source_id, now)
         self._build_typed_nodes(parsed, "preferences", NodeType.PREFERENCE,
                                  EdgeType.RELATED_TO, result, context_node, source_id, now)
         self._build_typed_nodes(parsed, "topics", NodeType.TOPIC,

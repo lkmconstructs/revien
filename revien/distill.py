@@ -61,6 +61,7 @@ def _hash(text: str) -> str:
 # Claim-bearing node types rendered into a distilled note, in section order.
 _SECTIONS: List[Tuple[NodeType, str]] = [
     (NodeType.DECISION, "Decisions"),
+    (NodeType.ACTION, "Actions"),
     (NodeType.FACT, "Facts"),
     (NodeType.PREFERENCE, "Preferences"),
     (NodeType.EVENT, "Events"),

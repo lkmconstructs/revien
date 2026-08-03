@@ -84,6 +84,37 @@ class TestRuleBasedExtractor:
         assert "499" in decision_text or "pricing" in decision_text, \
             f"Decision should reference $499 pricing, got: {[d.content for d in decisions]}"
 
+    def test_extracts_action_nodes(self, extractor):
+        """ACTION: committed future work — first-person commitments, to-do
+        markers, and explicit next steps all yield action nodes."""
+        content = (
+            "User: I'll update the architecture doc after lunch.\n"
+            "Assistant: Noted. TODO: rotate the staging credentials.\n"
+            "User: We need to migrate the analytics tables before Friday.\n"
+            "Assistant: The next step is to benchmark the new reranker."
+        )
+        result = extractor.extract(content)
+        actions = [n for n in result.nodes if n.node_type == NodeType.ACTION]
+        assert len(actions) >= 3, (
+            f"Expected commitments captured, got: {[a.label for a in actions]}"
+        )
+        text = " ".join(a.content.lower() for a in actions)
+        assert "architecture doc" in text
+        assert "rotate the staging credentials" in text
+
+    def test_bare_futures_are_not_actions(self, extractor):
+        """Hypotheticals and non-person futures must NOT become action nodes —
+        the patterns require a commitment, not a prediction."""
+        content = (
+            "User: It will rain tomorrow, so the deploy window might slip.\n"
+            "Assistant: The market will probably recover next quarter."
+        )
+        result = extractor.extract(content)
+        actions = [n for n in result.nodes if n.node_type == NodeType.ACTION]
+        assert actions == [], (
+            f"Predictions must not extract as actions: {[a.label for a in actions]}"
+        )
+
     def test_extracts_fact_nodes(self, extractor):
         result = extractor.extract(SAMPLE_CONVERSATION)
         facts = [n for n in result.nodes if n.node_type == NodeType.FACT]

@@ -72,7 +72,7 @@ The discipline behind these claims is the product. Revien ships with a benchmark
 
 ### Memory is a graph, not a compaction buffer
 
-When you feed Revien a conversation or a note, it extracts typed nodes — **entities, decisions, facts, preferences, topics, events** — and connects them with typed edges. Every ingestion also stores the verbatim turn as a `context` node, so the original wording is never lost. The graph grows; nothing is thrown away.
+When you feed Revien a conversation or a note, it extracts typed nodes — **entities, decisions, actions, facts, preferences, topics, events** — and connects them with typed edges. Every ingestion also stores the verbatim turn as a `context` node, so the original wording is never lost. The graph grows; nothing is thrown away.
 
 ### Retrieval is semantic-first, refined by the graph
 
@@ -294,7 +294,7 @@ recall supports TOON output (`format: "toon"` on `/v1/recall`, `--format toon` o
 
 ## Graph schema
 
-**Node types:** `entity` · `topic` · `decision` · `fact` · `preference` · `event` · `context`
+**Node types:** `entity` · `topic` · `decision` · `action` · `fact` · `preference` · `event` · `context`
 
 **Edge types:** `related_to` · `decided_in` · `mentioned_by` · `depends_on` · `followed_by` · `contradicts` · `conflicts_with` · `corrects` · `derived_from`
 
