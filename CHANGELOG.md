@@ -6,6 +6,58 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **BM25 lexical lane (REVIEN_LEXICAL=bm25) + entity-anchor union (P1
+  follow-up)** — `revien/retrieval/bm25.py` is a production-validated
+  overlay ported near-verbatim from a pre-0.3.0 engine where it measured
+  recall@10 0.5814 -> 0.6395 (REVIEN_HYBRID=rrf, live graph): a pure-stdlib
+  Okapi BM25 ranker over the same node label+content corpus the shipped
+  substring keyword lane scans. Where that lane treats every keyword hit
+  the same (a document repeating a common word looks as relevant as the
+  one document holding the rare, query-specific term), BM25 scores term
+  rarity (inverse document frequency) and saturating term frequency, so
+  the genuinely distinctive document wins. `_lexical_candidates` dispatches
+  both call sites that previously called `_keyword_search` directly — the
+  RRF fusion list and the keyword-fallback anchor path — to whichever lane
+  `REVIEN_LEXICAL` selects; unset (or anything but `bm25`) is the shipped
+  keyword lane, byte-identical. BM25 scores compose with semantic
+  similarity by MAX (not sum) at the same seam the overlay used, so a node
+  with both signals isn't double-counted; `score_breakdown["bm25_score"]`
+  only appears when the lane is actually selected, same pattern as
+  `semantic_sim`.
+  Also lands the P1 regression fix this lane's production deployment
+  exposed: under `REVIEN_HYBRID=rrf`, entity anchors (`_find_anchors`,
+  alias expansion included) used to be REPLACED wholesale by the RRF-fused
+  keyword/semantic candidate list — measured +65 disconnected results on
+  the eval, because any node reachable ONLY through an entity match (never
+  surfacing in either fusion list) stopped seeding the walk at all. Entity
+  anchors are now PREPENDED onto the fused set unconditionally under
+  `REVIEN_HYBRID=rrf` (no separate flag — this corrects a known
+  regression, not a new experiment), and because `_find_anchors` already
+  runs its `REVIEN_ALIAS` one-hop `ALIAS_OF` expansion before this union,
+  an alias-expanded anchor now survives into the RRF path exactly like it
+  does on the shipped path. The prepend is a real ordering effect, not
+  cosmetic: `diagnostics["anchors"]["all"]` now lists entity anchors
+  (deduped, keeping first occurrence) ahead of the fused list, and — since
+  the walker seeds every anchor at distance 0 with its own path entry —
+  can change which anchor's label leads a shared result's `path` when a
+  node is reachable from both an entity anchor and a fused one. Both
+  defaults stay off: unset `REVIEN_LEXICAL` is the exact keyword lane;
+  unset `REVIEN_HYBRID` is the exact shipped anchor path.
+  Honesty notes from review: (1) this port caps the RRF path's lexical
+  candidate list at `semantic_top_k`, where the production overlay this
+  was validated against ran that list uncapped — the quoted recall@10
+  0.5814 -> 0.6395 numbers come from a slightly different configuration;
+  a LoCoMo cross-check of the capped shape is still pending, not done.
+  (2) `_bm25_candidates` reintroduces the exact
+  `list_nodes(limit=999999)`-then-scan-in-Python shape OPEN 2 (see
+  `store.py`'s `search_nodes_keyword`) moved OFF of and into SQL, because
+  BM25's document-frequency/average-length stats need the whole corpus's
+  tokens, not a pre-filtered slice — measured ~2.2x recall latency at 4k
+  nodes vs the keyword lane's SQL-side scan when `REVIEN_LEXICAL=bm25` is
+  selected; unselected, the cost isn't paid. (3) `REVIEN_RRF_K` stays
+  unvalidated by design — a malformed or non-positive value silently falls
+  back to the default (60.0), matching every other env-float ranking knob
+  in this class; it is never allowed to raise and crash `recall()`.
 - **Evidence-backed alias resolution (alias leg)** — "Sam", "Sam R.", and
   "sam@..." land as three separate ENTITY nodes (extraction has no way to
   know they're one person), and a recall anchored to one of them used to

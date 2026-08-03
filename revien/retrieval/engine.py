@@ -15,12 +15,13 @@ when numpy/scikit-learn are absent, neural is silently disabled and every other
 layer runs unchanged.
 """
 
+import math
 import os
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # One-shot flag for the graph-only degrade warning (per process, not per engine
 # — bench runs construct hundreds of engines and one warning is the message).
@@ -41,6 +42,7 @@ from revien.neural.training import TrainingLoop
 # recall() runs the unchanged graph path when it is absent or REVIEN_SEMANTIC=0.
 from revien.semantic.index import SemanticIndex
 from revien.semantic.rerank import CrossEncoderReranker
+from .bm25 import bm25_rank
 from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
 
@@ -202,7 +204,26 @@ class RetrievalEngine:
         # everything downstream (walk, scoring, rerank) is untouched. Unset
         # or any other value: the shipped anchor path runs byte-identical.
         self.hybrid_mode = os.environ.get("REVIEN_HYBRID", "").strip().lower()
-        self.rrf_k = _env_float("REVIEN_RRF_K", self.RRF_K)
+        # BM25 lexical lane (production-validated overlay, see revien/retrieval
+        # /bm25.py header — recall@10 0.5814 -> 0.6395 measured under
+        # REVIEN_HYBRID=rrf). Read once at init, same convention as
+        # hybrid_mode: unset/any-other-value keeps the shipped substring
+        # keyword lane byte-identical; REVIEN_LEXICAL=bm25 swaps the ranking
+        # math both _lexical_candidates call sites (RRF fusion list AND the
+        # keyword-fallback anchor path) resolve to.
+        requested_lexical = os.environ.get("REVIEN_LEXICAL", "").strip().lower()
+        self.lexical_mode = "bm25" if requested_lexical == "bm25" else "keyword"
+        # A bad experiment knob must never crash recall (scorer.py's own
+        # convention, _env_float's docstring) — this runs unconditionally,
+        # even when REVIEN_HYBRID isn't "rrf", so a malformed or zero
+        # REVIEN_RRF_K silently falls back to the shipped default instead of
+        # raising, same as every other env-float knob in this class.
+        _requested_rrf_k = _env_float("REVIEN_RRF_K", self.RRF_K)
+        self.rrf_k = (
+            _requested_rrf_k
+            if math.isfinite(_requested_rrf_k) and _requested_rrf_k > 0
+            else self.RRF_K
+        )
         # Frequency feedback-loop gate — DEFAULT OFF (sweep-shipped July 2026):
         # recall() touching its own results made access_count a popularity
         # prior contaminated by the engine's own behavior (being returned →
@@ -314,16 +335,43 @@ class RetrievalEngine:
         entity_anchor_ids: List[str] = []
         keyword_anchor_ids: List[str] = []
         semantic_sims: Dict[str, float] = {}
+        bm25_scores: Dict[str, float] = {}
 
         if self.hybrid_mode == "rrf":
             # LEG P1 — RRF hybrid fusion (REVIEN_HYBRID=rrf, experimental).
-            # Replaces the entity → keyword-fallback → semantic-union anchor
-            # composition wholesale: keyword search runs ALWAYS (not as a
-            # fallback) as one ranked list, the semantic top-K (same floor as
-            # the shipped path) is the other, and the RRF-fused top-N IS the
-            # anchor set. The walk + scoring + rerank pipeline downstream is
-            # unchanged — this experiment moves anchor selection only.
-            keyword_anchor_ids = self._keyword_search(
+            # Fuses keyword/BM25-ranked and semantic-ranked candidate lists;
+            # keyword search runs ALWAYS (not as a fallback) as one ranked
+            # list, the semantic top-K (same floor as the shipped path) is
+            # the other, and the RRF-fused top-N seeds the anchor set. The
+            # walk + scoring + rerank pipeline downstream is unchanged.
+            #
+            # ENTITY-ANCHOR UNION (P1 regression receipt): earlier the fused
+            # list REPLACED entity anchors wholesale, which measured +65
+            # disconnected results on the eval — entity anchors had stopped
+            # seeding the walk at all, so any node reachable only through an
+            # entity match (and, downstream, its alias-expanded neighbors —
+            # _find_anchors already unions ALIAS_OF neighbors onto entity
+            # anchors under REVIEN_ALIAS) became silently unreachable. Entity
+            # anchors are found the same way the shipped path finds them
+            # (with alias expansion intact) and PREPENDED onto the fused set
+            # below — this correction is unconditional (no separate flag):
+            # it fixes a known regression, not an experiment of its own.
+            #
+            # ORDER IS A REAL EFFECT, not incidental: entity anchors go at
+            # the FRONT (``entity_anchor_ids + fused_ids``, de-duped keeping
+            # first occurrence), not appended. This changes
+            # ``diagnostics["anchors"]["all"]`` ordering versus a plain
+            # RRF-only list, and — because the walker seeds every anchor at
+            # distance 0 with its own path entry — can flip which anchor's
+            # label appears first in a shared result's ``path`` when the
+            # SAME node is reachable from both an entity anchor and a fused
+            # one. Entity anchors lead because they are the higher-precision
+            # signal (exact/fuzzy label match, optionally alias-expanded)
+            # versus the fused list's rank-fusion heuristic — ties should
+            # read as "the entity match owns this," not as whichever list
+            # rrf_fuse happened to place first.
+            entity_anchor_ids = self._find_anchors(query)
+            keyword_anchor_ids, bm25_scores = self._lexical_candidates(
                 query, limit=self.semantic_top_k
             )
             semantic_ranked: List[str] = []
@@ -335,19 +383,21 @@ class RetrievalEngine:
                         continue
                     semantic_sims[node_id] = sim
                     semantic_ranked.append(node_id)
-            anchor_ids = rrf_fuse(
+            fused_ids = rrf_fuse(
                 [keyword_anchor_ids, semantic_ranked],
                 k=self.rrf_k,
                 top_n=self.semantic_top_k,
             )
+            anchor_ids = list(dict.fromkeys(entity_anchor_ids + fused_ids))
         else:
             # 1. Parse query — extract entities and topics
             entity_anchor_ids = self._find_anchors(query)
             anchor_ids = list(entity_anchor_ids)
 
             # 2. If no anchors found, try keyword search across all nodes
+            # (or BM25-ranked candidates under REVIEN_LEXICAL=bm25).
             if not anchor_ids:
-                keyword_anchor_ids = self._keyword_search(query)
+                keyword_anchor_ids, bm25_scores = self._lexical_candidates(query)
                 anchor_ids = list(keyword_anchor_ids)
 
             # 2a. Hybrid semantic anchors (opt-in). When the semantic layer is
@@ -480,9 +530,22 @@ class RetrievalEngine:
             # nodes outrank frequency/proximity hubs. semantic_sims is empty when
             # the layer is disabled, so sim is None and the graph-only expression
             # below runs unchanged (byte-identical to the pre-semantic path).
+            #
+            # BM25 composes the SAME way (bm25_scores is empty unless
+            # REVIEN_LEXICAL=bm25): it's another query-relevance signal, not a
+            # separate term, so a node with both takes the MAX rather than
+            # double-counting overlapping evidence — mirrors the production
+            # overlay's contract (bm25.py header; the overlay blended it at
+            # this exact seam).
             sim = semantic_sims.get(node_id)
-            if sim is not None:
-                final_score = (sim + self.graph_refine * base_score + community_boost) * effective_confidence
+            bm25_score = bm25_scores.get(node_id)
+            if sim is not None or bm25_score is not None:
+                query_relevance = max(
+                    score for score in (sim, bm25_score) if score is not None
+                )
+                final_score = (
+                    query_relevance + self.graph_refine * base_score + community_boost
+                ) * effective_confidence
             else:
                 final_score = (base_score + community_boost) * effective_confidence
 
@@ -514,6 +577,12 @@ class RetrievalEngine:
             # enabled, so the disabled-path breakdown is byte-for-byte unchanged.
             if self.semantic.is_enabled:
                 score_breakdown["semantic_sim"] = sim if sim is not None else 0.0
+            # Same rule for BM25: only surfaced when the lane is actually
+            # selected, so the keyword-lane breakdown stays byte-identical.
+            if self.lexical_mode == "bm25":
+                score_breakdown["bm25_score"] = (
+                    bm25_score if bm25_score is not None else 0.0
+                )
             # Same rule for path strength: only in the breakdown when the
             # weighted-walk blend is actually shaping the score.
             if self.scorer.config.edge_weight_blend > 0.0:
@@ -585,6 +654,8 @@ class RetrievalEngine:
                     "semantic": list(semantic_sims.keys()),
                     "all": list(anchor_ids),
                 },
+                "lexical_mode": self.lexical_mode,
+                "bm25_scores": dict(bm25_scores),
                 "node_distances": dict(node_distances),
                 "scores": diag_scores,
                 "filtered": diag_filtered,
@@ -761,6 +832,59 @@ class RetrievalEngine:
             keywords, limit=limit, exclude_context=True
         )
         return [n.node_id for n in matches]
+
+    def _bm25_candidates(
+        self, query: str, limit: int = 10,
+    ) -> Tuple[List[str], Dict[str, float]]:
+        """BM25-lane counterpart to ``_keyword_search`` (REVIEN_LEXICAL=bm25).
+
+        Ranks the SAME corpus ``_keyword_search`` scans conceptually — every
+        non-CONTEXT node's label+content, live OR soft-invalidated; NEITHER
+        lane filters ``invalidated_at`` here, that's a downstream ``recall()``
+        filter, not a property of this candidate read — but by Okapi BM25
+        term rarity and saturating term frequency instead of substring
+        presence, so a rare exact identifier or phrase outranks a document
+        that merely repeats a common query word more often (see bm25.py's
+        header for the production numbers this lane is validated against).
+
+        COST (disclose, don't bury): this reintroduces the exact
+        ``list_nodes(limit=999999)``-then-scan-in-Python shape that OPEN 2
+        (see ``_keyword_search``'s comment, ``store.py``'s
+        ``search_nodes_keyword``) moved OFF of and into SQL — because BM25's
+        document-frequency/average-length stats need the WHOLE corpus's
+        tokens, not a pre-filtered slice, or rarity is measured against the
+        wrong population. Measured ~2.2x recall latency at 4k nodes vs the
+        keyword lane's SQL-side scan. O(corpus) per call, not paid unless
+        REVIEN_LEXICAL=bm25 is explicitly selected.
+
+        Returns ``(ranked_ids, scores)`` where scores are bounded to
+        ``score / (score + 1)`` — this keeps them a comparable 0..1-ish
+        query-relevance signal alongside semantic cosine similarity, so
+        ``recall()``'s max-of-available-signals blend (mirrors the overlay's
+        contract) isn't dominated by BM25's unbounded raw magnitude.
+        """
+        documents = [
+            (node.node_id, f"{node.label} {node.content}")
+            for node in self.store.list_nodes(limit=999999)
+            if node.node_type != NodeType.CONTEXT
+        ]
+        ranked = bm25_rank(query, documents, top_n=limit)
+        scores = {node_id: score / (score + 1.0) for node_id, score in ranked}
+        return [node_id for node_id, _score in ranked], scores
+
+    def _lexical_candidates(
+        self, query: str, limit: int = 10,
+    ) -> Tuple[List[str], Dict[str, float]]:
+        """Dispatch to the selected lexical lane (REVIEN_LEXICAL) without
+        touching either call site's shipped behavior when unset: the
+        keyword-fallback anchor path and the RRF fusion list both resolve
+        through here, so flipping the env var moves both at once. Unset (or
+        any value other than "bm25") returns exactly what ``_keyword_search``
+        returned before this lane existed, with an empty scores dict — the
+        keyword path is byte-identical."""
+        if self.lexical_mode == "bm25":
+            return self._bm25_candidates(query, limit=limit)
+        return self._keyword_search(query, limit=limit), {}
 
     def mark_used(self, node_id: str, query: Optional[str] = None) -> None:
         """

@@ -1,7 +1,7 @@
 """
 Tests for LEG P1 — RRF hybrid fusion (REVIEN_HYBRID=rrf, experimental).
 
-Three tiers:
+Four tiers:
   1. Fusion math — rrf_score = Σ 1/(k + rank) on synthetic lists, exact
      values, ordering, top-N truncation, deterministic tie-break.
   2. Gate-off byte-identity — with REVIEN_HYBRID unset (or any value other
@@ -13,6 +13,11 @@ Three tiers:
   3. RRF path wiring — under REVIEN_HYBRID=rrf the anchor set is fused from
      BOTH lists (keyword-only hits AND semantic-only hits are anchors),
      keyword search runs ALWAYS, and REVIEN_RRF_K is honored.
+  4. Entity-anchor union (P1 follow-up) — entity anchors (alias expansion
+     included) are PREPENDED onto the fused set, not replaced by it; the
+     regression test proves an entity-only anchor absent from BOTH fusion
+     lists still seeds the walk, and the alias test proves an ALIAS_OF
+     expanded anchor composes with the union.
 """
 
 import os
@@ -21,7 +26,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from revien.graph.schema import Node, NodeType, SourceType
+from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.retrieval.engine import RetrievalEngine, rrf_fuse
 from revien.semantic.index import SemanticIndex
@@ -229,7 +234,15 @@ class TestRRFPath:
 
     def test_consensus_node_ranks_first_in_fused_anchors(self, store, monkeypatch):
         """A node present in BOTH lists must outrank single-list nodes in the
-        fused anchor ordering (RRF consensus)."""
+        fused anchor ordering (RRF consensus).
+
+        Since the P1 entity-anchor union PREPENDS entity anchors onto the
+        fused set, ``anchors["all"][0]`` is really "first entity anchor,
+        else top of the fused list" — asserting against index 0 alone would
+        be a latent false-pass that only holds because this query's lowercase
+        single word extracts no entity anchor. Assert that explicitly, so
+        the entity-list-is-empty precondition this test relies on is a
+        checked fact, not an assumption."""
         both = _add_fact(store, "dog", "the dog was at the park")  # kw 'dog' + semantic
         _add_fact(store, "bread", "A sourdough bread recipe.")
 
@@ -239,7 +252,12 @@ class TestRRFPath:
         monkeypatch.setenv("REVIEN_HYBRID", "rrf")
         eng = RetrievalEngine(store, semantic=sem)
         resp = eng.recall("dog", top_n=5, debug=True, include_context=True)
-        assert resp.diagnostics["anchors"]["all"][0] == both.node_id
+        anchors = resp.diagnostics["anchors"]
+        assert anchors["entity"] == [], (
+            "precondition: no entity anchor means anchors['all'][0] IS the "
+            "fused list's head, not a prepended entity anchor"
+        )
+        assert anchors["all"][0] == both.node_id
 
     def test_rrf_works_with_semantic_disabled(self, store, monkeypatch):
         """Keyword-only fusion still produces anchors when the semantic layer
@@ -263,3 +281,95 @@ class TestRRFPath:
         monkeypatch.setenv("REVIEN_HYBRID", " RRF ")
         eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
         assert eng.hybrid_mode == "rrf"
+
+
+# ── Tier 4: entity-anchor union (P1 follow-up) ──────────────────────────
+#
+# Earlier, the RRF path REPLACED entity anchors wholesale
+# (anchor_ids = rrf_fuse(...)), so any node reachable ONLY through an
+# entity match — never surfacing in either the keyword-ranked or
+# semantic-ranked candidate list — stopped seeding the walk at all.
+# Measured +65 disconnected results on the eval. entity_anchor_ids is now
+# unioned into the fused set unconditionally under REVIEN_HYBRID=rrf (no
+# separate flag — this corrects a known regression, not an experiment).
+
+class TestEntityAnchorUnion:
+    def test_entity_anchor_survives_union_when_absent_from_fused_lists(
+        self, store, monkeypatch
+    ):
+        """THE regression test for P1: an entity anchor that appears in
+        NEITHER the keyword-ranked nor the semantic-ranked candidate list
+        must still seed the walk (and therefore appear in results) under
+        REVIEN_HYBRID=rrf."""
+        entity_only = _add_fact(store, "entity-only-node",
+                                 "completely unrelated filler text")
+        fused_only = _add_fact(store, "fused-node", "some other content")
+
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        monkeypatch.setattr(eng, "_find_anchors", lambda query: [entity_only.node_id])
+        monkeypatch.setattr(
+            eng, "_keyword_search", lambda query, limit=10: [fused_only.node_id]
+        )
+
+        resp = eng.recall("irrelevant query text", top_n=10, debug=True,
+                          include_context=True, min_score=0.0)
+
+        anchors = resp.diagnostics["anchors"]
+        assert entity_only.node_id in anchors["entity"]
+        assert entity_only.node_id in anchors["all"], (
+            "entity anchor absent from BOTH fused lists must still be unioned in"
+        )
+        got = {r.node_id for r in resp.results}
+        assert entity_only.node_id in got
+
+    def test_alias_expanded_anchor_survives_into_rrf_fused_set(self, store, monkeypatch):
+        """Alias composition: _find_anchors' ALIAS_OF one-hop expansion
+        (REVIEN_ALIAS, default on) runs BEFORE the entity anchors join the
+        RRF-fused set, so an alias-expanded anchor — and the fact reachable
+        only through it — survives into the final anchor set exactly like
+        it does on the shipped (non-rrf) path.
+
+        The alias node ("Sam R.") is forced OUT of the keyword/semantic
+        fusion lists (``_keyword_search`` stubbed empty; semantic stays
+        disabled) — its own label otherwise substring-matches the query's
+        "sam" keyword and would land in the keyword list on its own,
+        which would make this test pass even with the union deleted. With
+        both fusion lists empty, ``sam_r`` can ONLY reach the anchor set
+        through the entity-anchor union, so this is a real regression
+        test for the union, not a false-pass off unrelated keyword luck."""
+        rivera = store.add_node(Node(
+            node_type=NodeType.ENTITY, label="Sam Rivera", content="Sam Rivera",
+        ))
+        sam_r = store.add_node(Node(
+            node_type=NodeType.ENTITY, label="Sam R.", content="Sam R.",
+        ))
+        store.add_edge_audited(Edge(
+            edge_type=EdgeType.ALIAS_OF,
+            source_node_id=rivera.node_id, target_node_id=sam_r.node_id,
+            metadata={"method": "manual", "embedding_sim": None, "cooccurrence": 0},
+        ), actor="test")
+        fact = _add_fact(store, "Sam R. likes hiking",
+                         "Sam R. likes hiking on weekends.")
+        store.add_edge(Edge(
+            edge_type=EdgeType.RELATED_TO,
+            source_node_id=fact.node_id, target_node_id=sam_r.node_id,
+        ))
+
+        monkeypatch.setenv("REVIEN_HYBRID", "rrf")
+        monkeypatch.delenv("REVIEN_ALIAS", raising=False)  # default on
+        eng = RetrievalEngine(store, max_depth=1,
+                              semantic=SemanticIndex(store, enabled=False))
+        monkeypatch.setattr(eng, "_keyword_search", lambda query, limit=10: [])
+        resp = eng.recall("Tell me about Sam Rivera", top_n=10, debug=True,
+                          min_score=0.0)
+
+        anchors = resp.diagnostics["anchors"]
+        assert sam_r.node_id not in anchors["keyword"], (
+            "test setup: alias node must be absent from the fusion lists"
+        )
+        assert sam_r.node_id not in anchors["semantic"]
+        assert sam_r.node_id in anchors["entity"], "alias expansion must run pre-union"
+        assert sam_r.node_id in anchors["all"]
+        got = {r.node_id for r in resp.results}
+        assert fact.node_id in got
