@@ -283,7 +283,7 @@ class TestRRFPath:
         assert eng.hybrid_mode == "rrf"
 
 
-# ── Tier 4: entity-anchor union (P1 follow-up) ──────────────────────────
+# ── Tier four: entity-anchor union (P1 follow-up) ──────────────────────────
 #
 # Earlier, the RRF path REPLACED entity anchors wholesale
 # (anchor_ids = rrf_fuse(...)), so any node reachable ONLY through an
