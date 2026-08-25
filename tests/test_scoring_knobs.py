@@ -186,7 +186,7 @@ class TestTypeWeights:
 
 
 class TestPerTypeHalfLife:
-    """Item 3: taste is not an event. A mapped type uses its own half-life;
+    """Taste is not an event. A mapped type uses its own half-life;
     a mapped value <= 0 means the type does not decay at all."""
 
     def test_preference_pinned_while_fact_decays(self, store):
