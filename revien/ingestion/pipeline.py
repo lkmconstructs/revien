@@ -136,12 +136,15 @@ class IngestionPipeline:
         # mandatory fallback inside any LLM backend, so ingestion never crashes
         # and never goes to the network unless explicitly opted in.
         self.extractor: TextExtractor = extractor or build_extractor()
-        self.dedup = Deduplicator(store, self.ops)
         # Opt-in semantic indexing. Self-disables without the `semantic` extra;
         # when enabled, newly-created nodes are embedded at ingest time so the
         # hybrid recall path can find them. Failures inside the index never
         # propagate (it self-disables), so ingest is robust either way.
         self.semantic = semantic if semantic is not None else SemanticIndex(store)
+        # The deduplicator gets the index so its OPT-IN semantic layer
+        # (REVIEN_SEMANTIC_DEDUP=1) can query vec_nodes; with the gate unset
+        # this changes nothing.
+        self.dedup = Deduplicator(store, self.ops, semantic=self.semantic)
         # Known-entity gazetteer for mention linking: [(node_id, normalized
         # label)]. Loaded lazily from the store on first ingest, appended as
         # new entities are created, so the scan never re-reads the store per
@@ -410,7 +413,12 @@ class IngestionPipeline:
 
         for candidate_node in extraction.nodes:
             old_id = candidate_node.node_id
-            actual_node, is_new = self.dedup.deduplicate_node(candidate_node)
+            # allow_semantic tracks defer_embed: semantic dedup embeds the
+            # candidate inline, and the capture path's whole contract is
+            # "no model inference before the 200".
+            actual_node, is_new = self.dedup.deduplicate_node(
+                candidate_node, allow_semantic=not input_data.defer_embed
+            )
             id_map[old_id] = actual_node.node_id
             if is_new:
                 nodes_created += 1
@@ -681,7 +689,17 @@ class IngestionPipeline:
                         **(candidate_node.metadata or {}), "curated": True,
                     }
                 old_id = candidate_node.node_id
-                actual_node, is_new = self.dedup.deduplicate_node(candidate_node)
+                # allow_semantic=False here is a TRANSACTION constraint, not a
+                # capture-path one: this loop runs inside store.transaction()
+                # (no savepoints — only the outermost commit is real), and
+                # semantic dedup can commit on the shared connection
+                # (drain_pending, vec-table DDL), which would flush this
+                # half-done refresh. Lexical dedup still runs; paraphrase
+                # merging for refreshed content waits on a consolidation pass
+                # that runs outside any open transaction.
+                actual_node, is_new = self.dedup.deduplicate_node(
+                    candidate_node, allow_semantic=False
+                )
                 id_map[old_id] = actual_node.node_id
                 if is_new:
                     nodes_created += 1

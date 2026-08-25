@@ -32,7 +32,8 @@ class TestScoringConfigFromEnv:
     def test_unset_env_is_exact_defaults(self, monkeypatch):
         for var in ("REVIEN_RECENCY_WEIGHT", "REVIEN_FREQUENCY_WEIGHT",
                     "REVIEN_PROXIMITY_WEIGHT", "REVIEN_RECENCY_HALF_LIFE_DAYS",
-                    "REVIEN_PROXIMITY_DECAY_PER_HOP"):
+                    "REVIEN_PROXIMITY_DECAY_PER_HOP", "REVIEN_TYPE_WEIGHTS",
+                    "REVIEN_TYPE_HALF_LIFE_DAYS"):
             monkeypatch.delenv(var, raising=False)
         assert ScoringConfig.from_env() == ScoringConfig()
 
@@ -80,16 +81,20 @@ class TestEngineKnobs:
         assert eng.scorer.config.recency_half_life_days == 14.0
 
 
-def _fact(store, label, content, recorded_at=None):
+def _node(store, label, content, node_type=None, recorded_at=None):
     from datetime import datetime, timezone
     from revien.graph.schema import Node, NodeType, SourceType
     now = datetime.now(timezone.utc)
     node = Node(
-        node_type=NodeType.FACT, label=label, content=content,
+        node_type=node_type or NodeType.FACT, label=label, content=content,
         source_type=SourceType.EXTRACTED, confidence=1.0,
         created_at=now, last_accessed=now, recorded_at=recorded_at,
     )
     return store.add_node(node)
+
+
+def _fact(store, label, content, recorded_at=None):
+    return _node(store, label, content, recorded_at=recorded_at)
 
 
 class TestContentTimeRecency:
@@ -127,6 +132,135 @@ class TestContentTimeRecency:
         rec = {r.node_id: r.score_breakdown["recency"] for r in resp.results}
         # created_at is ~now, so fallback recency is ~1.0 (not a crash, not 0).
         assert rec[node.node_id] > 0.9
+
+
+class TestTypeWeights:
+    """Node-type prior: per-type multiplier on the
+    FINAL score. Empty map = byte-identical; the prior must be able to flip
+    a ranking where a fact and a preference are otherwise equal."""
+
+    def _pair(self, store):
+        """A preference and a fact, same age, both matching 'pacing'."""
+        from revien.graph.schema import NodeType
+        pref = _node(store, "pacing preference",
+                     "prefers books that do not lose pacing",
+                     node_type=NodeType.PREFERENCE)
+        fact = _node(store, "pacing fact",
+                     "the pacing slowed mid-book", node_type=NodeType.FACT)
+        return pref, fact
+
+    def test_env_map_parses(self, monkeypatch):
+        monkeypatch.setenv("REVIEN_TYPE_WEIGHTS", "preference:1.0, fact:0.8")
+        cfg = ScoringConfig.from_env()
+        assert cfg.type_weights == {"preference": 1.0, "fact": 0.8}
+
+    def test_malformed_env_map_entries_skipped(self, monkeypatch):
+        monkeypatch.setenv("REVIEN_TYPE_WEIGHTS",
+                           "preference:1.0,junk,fact:not-a-number")
+        assert ScoringConfig.from_env().type_weights == {"preference": 1.0}
+
+    def test_empty_map_is_byte_identical(self, store):
+        pref, fact = self._pair(store)
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        resp = eng.recall("pacing")
+        by_id = {r.node_id: r for r in resp.results}
+        # No prior configured: no breakdown key, no score movement.
+        assert "type_weight" not in by_id[pref.node_id].score_breakdown
+        assert "type_weight" not in by_id[fact.node_id].score_breakdown
+
+    def test_type_weight_flips_equal_ranking(self, store):
+        pref, fact = self._pair(store)
+        eng = RetrievalEngine(
+            store,
+            scoring_config=ScoringConfig(
+                type_weights={"preference": 1.0, "fact": 0.5}
+            ),
+            semantic=SemanticIndex(store, enabled=False),
+        )
+        resp = eng.recall("pacing")
+        by_id = {r.node_id: r for r in resp.results}
+        assert by_id[pref.node_id].score > by_id[fact.node_id].score
+        # Only the downweighted node surfaces the multiplier (1.0 is silent).
+        assert by_id[fact.node_id].score_breakdown["type_weight"] == 0.5
+        assert "type_weight" not in by_id[pref.node_id].score_breakdown
+
+
+class TestPerTypeHalfLife:
+    """Taste is not an event. A mapped type uses its own half-life;
+    a mapped value <= 0 means the type does not decay at all."""
+
+    def test_preference_pinned_while_fact_decays(self, store):
+        from datetime import datetime, timedelta, timezone
+        from revien.graph.schema import NodeType
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=70)
+        pref = _node(store, "pacing preference", "never lose pacing",
+                     node_type=NodeType.PREFERENCE, recorded_at=old)
+        fact = _node(store, "pacing fact", "pacing slowed mid-book",
+                     node_type=NodeType.FACT, recorded_at=old)
+        eng = RetrievalEngine(
+            store,
+            scoring_config=ScoringConfig(
+                recency_half_life_days=7.0,
+                recency_half_life_by_type={"preference": 0.0},
+            ),
+            semantic=SemanticIndex(store, enabled=False),
+        )
+        resp = eng.recall("pacing", now=now)
+        rec = {r.node_id: r.score_breakdown["recency"] for r in resp.results}
+        # Same 70-day-old content: pinned preference vs 7d-half-life fact.
+        assert rec[pref.node_id] == 1.0
+        assert rec[fact.node_id] < 0.01
+
+    def test_unmapped_type_uses_global_half_life(self):
+        from datetime import datetime, timedelta, timezone
+        from revien.retrieval.scorer import ThreeFactorScorer
+        now = datetime.now(timezone.utc)
+        scorer = ThreeFactorScorer(ScoringConfig(
+            recency_half_life_days=7.0,
+            recency_half_life_by_type={"preference": 0.0},
+        ))
+        typed = scorer.score(now - timedelta(days=7), 0, 0, now=now,
+                             node_type="fact")
+        untyped = scorer.score(now - timedelta(days=7), 0, 0, now=now)
+        assert typed.recency == untyped.recency == pytest.approx(0.5, abs=0.01)
+
+
+class TestPreferTypesHint:
+    """recall(prefer_types=[...]) — soft boost, not a filter. Callers express
+    intent; non-preferred types still surface."""
+
+    def test_hint_boosts_and_surfaces_in_breakdown(self, store):
+        from revien.graph.schema import NodeType
+        pref = _node(store, "pacing preference", "never lose pacing",
+                     node_type=NodeType.PREFERENCE)
+        fact = _node(store, "pacing fact", "pacing slowed mid-book",
+                     node_type=NodeType.FACT)
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+
+        plain = eng.recall("pacing")
+        hinted = eng.recall("pacing", prefer_types=["preference"])
+
+        plain_by_id = {r.node_id: r for r in plain.results}
+        hinted_by_id = {r.node_id: r for r in hinted.results}
+        # Boosted node moved by exactly the knob; non-preferred untouched
+        # AND still present (soft hint, not a filter).
+        assert hinted_by_id[pref.node_id].score == pytest.approx(
+            plain_by_id[pref.node_id].score * eng.prefer_boost
+        )
+        assert hinted_by_id[fact.node_id].score == pytest.approx(
+            plain_by_id[fact.node_id].score
+        )
+        assert hinted_by_id[pref.node_id].score_breakdown["prefer_boost"] == (
+            eng.prefer_boost
+        )
+        assert "prefer_boost" not in hinted_by_id[fact.node_id].score_breakdown
+        assert "prefer_boost" not in plain_by_id[pref.node_id].score_breakdown
+
+    def test_prefer_boost_env_knob(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_PREFER_BOOST", "2.0")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert eng.prefer_boost == 2.0
 
 
 class TestTouchOnRecallGate:

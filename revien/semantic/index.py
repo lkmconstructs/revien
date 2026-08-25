@@ -767,3 +767,35 @@ class SemanticIndex:
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
             return []
+
+    def find_similar(self, text: str, top_k: int = 8) -> List[Tuple[str, float]]:
+        """Embed arbitrary text and return [(node_id, COSINE similarity)]
+        nearest first. Unlike search() — whose 1/(1+distance) similarity is
+        shaped for the recall score blend — this returns the raw cosine
+        (1 - cosine_distance), so a caller's threshold reads exactly as the
+        literature's does ("merge at >= 0.90"). Semantic dedup is the
+        consumer: the candidate node is NOT yet stored, so every hit is an
+        existing node. Drains the pending queue first for the same reason
+        search() does — a paraphrase captured minutes ago must be findable —
+        and callers on the defer-embed path skip this method entirely.
+        Returns [] when disabled or on any runtime error (self-disabling)."""
+        if not self.is_enabled or not text.strip():
+            return []
+        self.drain_pending()
+        if not self.is_enabled:  # drain failure self-disabled the layer
+            return []
+        try:
+            embedder = self._get_embedder()
+            vec = embedder.embed([text])[0]
+            self._ensure_table(len(vec))
+            with self._db():
+                conn = self.store._get_conn()
+                rows = conn.execute(
+                    f"SELECT node_id, distance FROM {self.TABLE} "
+                    f"WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (_serialize_f32(vec), int(top_k)),
+                ).fetchall()
+            return [(nid, 1.0 - float(dist)) for nid, dist in rows]
+        except Exception as e:  # noqa: BLE001
+            self._safe_disable(e)
+            return []

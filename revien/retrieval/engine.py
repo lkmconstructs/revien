@@ -156,6 +156,13 @@ class RetrievalEngine:
     # RRF fusion constant (LEG P1, active only under REVIEN_HYBRID=rrf).
     # Canonical default 60; REVIEN_RRF_K overrides for the sweep.
     RRF_K = 60.0
+    # prefer_types recall hint: final-score multiplier
+    # for nodes whose type the CALLER asked to favor for THIS query ("what
+    # does this reader avoid" -> prefer_types=["preference"]). A soft boost,
+    # not a filter — other types still surface, just outranked when preferred
+    # ones compete. Inert when recall() gets no prefer_types. 1.5 is a
+    # starting point, not a benched value; REVIEN_PREFER_BOOST for the sweep.
+    PREFER_BOOST = 1.5
 
     def __init__(
         self,
@@ -198,6 +205,7 @@ class RetrievalEngine:
         )
         self.graph_refine = _env_float("REVIEN_GRAPH_REFINE", self.GRAPH_REFINE)
         self.community_boost = _env_float("REVIEN_COMMUNITY_BOOST", self.COMMUNITY_BOOST)
+        self.prefer_boost = _env_float("REVIEN_PREFER_BOOST", self.PREFER_BOOST)
         # LEG P1 — RRF hybrid fusion gate (EXPERIMENTAL, default off). When
         # REVIEN_HYBRID=rrf, anchor selection is replaced by Reciprocal Rank
         # Fusion of the keyword-ranked and semantic-ranked candidate lists;
@@ -315,6 +323,7 @@ class RetrievalEngine:
         include_tensions: bool = False,
         as_of: Optional[datetime] = None,
         debug: bool = False,
+        prefer_types: Optional[List[str]] = None,
     ) -> RetrievalResponse:
         """
         Query the memory graph and return ranked results.
@@ -348,6 +357,15 @@ class RetrievalEngine:
                 scores including sub-threshold ones, and filter reasons) so a
                 caller can classify WHY a given node was or wasn't returned.
                 Default False: zero overhead, response unchanged.
+            prefer_types: Per-query type hint — node types (e.g.
+                ["preference"]) whose final scores are multiplied by the
+                prefer-boost knob (PREFER_BOOST / REVIEN_PREFER_BOOST) so a
+                caller can express intent WITHOUT hard filtering: other types
+                still surface, preferred ones win contested rankings. Unknown
+                type strings are ignored. Composes with (multiplies on top
+                of) the config-level type_weights prior, which applies to
+                every query regardless of this hint. Default None: no-op,
+                response byte-identical.
 
         Returns:
             RetrievalResponse with ranked nodes and timing data
@@ -359,6 +377,11 @@ class RetrievalEngine:
             # An as_of query ranks relative to the queried moment — recency
             # scored from wall-clock now would bury the era being asked about.
             now = as_of if as_of is not None else datetime.now(timezone.utc)
+
+        # Normalized once; empty/None means the hint is inert.
+        preferred_types = (
+            {t.strip().lower() for t in prefer_types} if prefer_types else None
+        )
         if as_of is not None and as_of.tzinfo is None:
             as_of = as_of.replace(tzinfo=timezone.utc)
 
@@ -544,6 +567,7 @@ class RetrievalEngine:
                 graph_distance=distance,
                 now=now,
                 path_strength=node_strengths.get(node_id, 1.0),
+                node_type=node.node_type.value,
             )
 
             # Neural adjustment (opt-in). Pass-through when no trained model /
@@ -589,6 +613,24 @@ class RetrievalEngine:
             else:
                 final_score = (base_score + community_boost) * effective_confidence
 
+            # Node-type prior: applied HERE, on the final score, so
+            # the prior shapes ranking identically on the semantic-first and
+            # graph-only paths — multiplying the graph composite instead would
+            # scale it by graph_refine on the semantic path and dilute it
+            # exactly where the type-blind misses were measured. Unmapped
+            # types weigh 1.0, so an empty map is byte-identical.
+            type_weight = self.scorer.config.type_weight(node.node_type.value)
+            final_score *= type_weight
+
+            # Per-query prefer_types hint: soft boost, composes with the
+            # config prior above. None/empty = inert.
+            prefer_boosted = (
+                preferred_types is not None
+                and node.node_type.value in preferred_types
+            )
+            if prefer_boosted:
+                final_score *= self.prefer_boost
+
             if debug:
                 diag_scores[node_id] = final_score
 
@@ -629,6 +671,12 @@ class RetrievalEngine:
                 score_breakdown["path_strength"] = round(
                     node_strengths.get(node_id, 1.0), 4
                 )
+            # Same rule for the type prior and prefer hint: keys appear only
+            # when the multiplier actually moved this node's score.
+            if type_weight != 1.0:
+                score_breakdown["type_weight"] = type_weight
+            if prefer_boosted:
+                score_breakdown["prefer_boost"] = self.prefer_boost
 
             scored_results.append(RetrievalResult(
                 node_id=node.node_id,
