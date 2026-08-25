@@ -5,7 +5,7 @@ This is the core ranking algorithm that makes Revien's retrieval surgical.
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -20,6 +20,26 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _env_type_map(name: str) -> Dict[str, float]:
+    """Read a per-node-type env map: "preference:1.0,fact:0.8,entity:0.5".
+    Malformed entries are skipped individually (a bad experiment knob must
+    never crash recall); unset or empty means an empty map, which every
+    consumer treats as "no per-type override" — byte-identical defaults."""
+    raw = os.environ.get(name)
+    if not raw:
+        return {}
+    result: Dict[str, float] = {}
+    for entry in raw.split(","):
+        key, sep, value = entry.partition(":")
+        if not sep:
+            continue
+        try:
+            result[key.strip().lower()] = float(value)
+        except ValueError:
+            continue
+    return result
 
 
 @dataclass
@@ -64,6 +84,32 @@ class ScoringConfig:
     # writing. Override: REVIEN_EDGE_WEIGHT_BLEND.
     edge_weight_blend: float = 0.0
 
+    # Node-type prior: per-type multiplier on the FINAL
+    # score (applied in engine.recall, not on the graph composite — on the
+    # semantic-first path the composite is scaled by graph_refine, which would
+    # dilute the prior exactly where the type-blind misses were measured).
+    # Empty map (default) = every type weighs 1.0, byte-identical. Keys are
+    # NodeType values ("preference", "fact", ...); missing keys weigh 1.0.
+    # Benched starting point for per-user conversational memory:
+    #   preference:1.0,decision:0.9,fact:0.8,entity:0.5,topic:0.5,context:0.3
+    # Override: REVIEN_TYPE_WEIGHTS (same spec-string format).
+    type_weights: Dict[str, float] = field(default_factory=dict)
+
+    # Per-type recency half-life: taste is not an event. A stable
+    # rule ("no animal deaths, ever") must not decay like a session fact —
+    # supersession, not time, retires a preference. Types absent from the map
+    # use recency_half_life_days unchanged; a value <= 0 means DOES NOT DECAY
+    # (recency pinned to 1.0 until superseded), which is the intended setting
+    # for preference/decision. Override: REVIEN_TYPE_HALF_LIFE_DAYS
+    # (e.g. "preference:0,decision:0,event:180").
+    recency_half_life_by_type: Dict[str, float] = field(default_factory=dict)
+
+    def type_weight(self, node_type: Optional[str]) -> float:
+        """Final-score multiplier for a node type; 1.0 when unmapped."""
+        if not node_type:
+            return 1.0
+        return self.type_weights.get(node_type, 1.0)
+
     @classmethod
     def from_env(cls) -> "ScoringConfig":
         """Build a config with env overrides for the ranking knobs the miss
@@ -84,6 +130,10 @@ class ScoringConfig:
             ),
             edge_weight_blend=_env_float(
                 "REVIEN_EDGE_WEIGHT_BLEND", d.edge_weight_blend
+            ),
+            type_weights=_env_type_map("REVIEN_TYPE_WEIGHTS"),
+            recency_half_life_by_type=_env_type_map(
+                "REVIEN_TYPE_HALF_LIFE_DAYS"
             ),
         )
 
@@ -106,6 +156,7 @@ class ThreeFactorScorer:
         graph_distance: int,
         now: Optional[datetime] = None,
         path_strength: float = 1.0,
+        node_type: Optional[str] = None,
     ) -> ScoreBreakdown:
         """
         Compute composite score for a candidate node.
@@ -122,6 +173,12 @@ class ThreeFactorScorer:
             path_strength: Product of edge strengths along the node's
                 shortest-hop path from the anchors (walker strengths dict;
                 anchors = 1.0). Inert unless edge_weight_blend > 0.
+            node_type: The node's type value ("preference", "fact", ...).
+                Selects a per-type recency half-life when the config maps one
+                (recency_half_life_by_type); None or an unmapped type uses the
+                global half-life — byte-identical to the type-blind scorer.
+                NOTE: type_weights is NOT applied here — it multiplies the
+                FINAL score in engine.recall (see the config field comment).
 
         Returns:
             ScoreBreakdown with individual factor scores and composite
@@ -129,7 +186,7 @@ class ThreeFactorScorer:
         if now is None:
             now = datetime.now(timezone.utc)
 
-        recency = self._score_recency(timestamp, now)
+        recency = self._score_recency(timestamp, now, node_type)
         frequency = self._score_frequency(access_count)
         proximity = self._score_proximity(graph_distance, path_strength)
 
@@ -146,11 +203,21 @@ class ThreeFactorScorer:
             composite=round(composite, 4),
         )
 
-    def _score_recency(self, timestamp: datetime, now: datetime) -> float:
+    def _score_recency(
+        self,
+        timestamp: datetime,
+        now: datetime,
+        node_type: Optional[str] = None,
+    ) -> float:
         """
         Exponential decay from the node's content time.
         Score = 0.5 ^ (days_since / half_life)
         Recent nodes score close to 1.0; old nodes decay toward 0.
+
+        A type mapped in recency_half_life_by_type uses its own half-life;
+        mapped values <= 0 mean the type does not decay at all (recency 1.0
+        until supersession retires the node). The global half_life <= 0
+        branch keeps its historical step-function semantics untouched.
         """
         # Ensure both datetimes are timezone-aware for comparison
         if timestamp.tzinfo is None:
@@ -160,6 +227,13 @@ class ThreeFactorScorer:
 
         delta = now - timestamp
         days_since = max(delta.total_seconds() / 86400.0, 0.0)
+
+        if node_type is not None and node_type in self.config.recency_half_life_by_type:
+            half_life = self.config.recency_half_life_by_type[node_type]
+            if half_life <= 0:
+                return 1.0
+            return math.pow(0.5, days_since / half_life)
+
         half_life = self.config.recency_half_life_days
 
         if half_life <= 0:
