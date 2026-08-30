@@ -480,12 +480,43 @@ class SemanticIndex:
         (drain re-reads the node, so the freshest edit wins)."""
         self.defer_nodes([(node_id, label, content)])
 
+    def _ready_existing_table(self) -> bool:
+        """Make an ALREADY-CREATED vec table usable on this connection.
+
+        _table_ready is per-INSTANCE state: a fresh open of an existing db
+        starts False and only _ensure_table (first index/search) flips it. A
+        consumer that opens, deletes, and closes — every right-to-forget flow
+        — never searches, so gating deletes on _table_ready alone leaked the
+        deleted content's embedding forever (ghost vector). Probe
+        sqlite_master for the real table instead; when present, load the
+        extension (a vec0 DELETE needs it on the connection) and mark ready.
+        Returns False when the table has never been created — nothing to
+        delete from. _dim stays None on this path (unknown until an embed);
+        _ensure_table still owns creation and sizing."""
+        if self._table_ready:
+            return True
+        with self._db():
+            conn = self.store._get_conn()
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.TABLE,),
+            ).fetchone()
+            if row is None:
+                return False
+            self._load_extension(conn)
+        self._table_ready = True
+        return True
+
     def remove_node(self, node_id: str) -> None:
         """Store listener: node deleted — drop its vector so search can't
-        return a ghost. Safe no-op when disabled or the table doesn't exist."""
-        if not self.is_enabled or not self._table_ready:
+        return a ghost. Safe no-op when disabled or the table was never
+        created. Works on a fresh-opened index (see _ready_existing_table):
+        right-to-forget must remove the embedding, not just the node row."""
+        if not self.is_enabled:
             return
         try:
+            if not self._ready_existing_table():
+                return
             with self._db():
                 conn = self.store._get_conn()
                 conn.execute(f"DELETE FROM {self.TABLE} WHERE node_id = ?", (node_id,))

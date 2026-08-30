@@ -152,10 +152,29 @@ class RetrievalEngine:
     # real matches while excluding pure noise; the candidates are already the
     # top-K nearest, so relative rank — not an absolute threshold — carries the
     # signal.
+    #
+    # SCALE HONESTY (retrieval-door leg): against search()'s 1/(1+distance)
+    # similarity (min 1/3) a 0.30 floor could never bind — dead code from the
+    # day it shipped; every sweep of it measured noise. The head-admission
+    # check keeps that (inert) comparison for byte-compatibility; the
+    # over-fetch TAIL gate applies this floor on the RAW COSINE scale
+    # (cosine = 2 - 1/sim), where 0.30 actually gates what may union into
+    # the candidate set. See the 2a block in recall().
     SEMANTIC_SIM_FLOOR = 0.30
     # RRF fusion constant (LEG P1, active only under REVIEN_HYBRID=rrf).
     # Canonical default 60; REVIEN_RRF_K overrides for the sweep.
     RRF_K = 60.0
+    # Hard ceiling on recall(top_n=...). Requests above it are capped LOUDLY
+    # (stderr) — the old silent min(top_n, 20) made rank-depth evaluations
+    # measure the clamp instead of the ranking.
+    TOP_N_MAX = 200
+    # Vector-union over-fetch factor (retrieval-door leg, see the 2a block in
+    # recall). The vector fetch pulls factor*top_k, keeps the original top-k
+    # admission unchanged, and extends with non-CONTEXT hits until top_k
+    # returnable nodes are in. 1.0 = exact pre-leg behavior (kill switch for
+    # A/B). Override: REVIEN_VECTOR_OVERFETCH. Fetch geometry stays sweepable
+    # pending the server-side k-sweep verdict.
+    VECTOR_OVERFETCH = 4.0
     # prefer_types recall hint: final-score multiplier
     # for nodes whose type the CALLER asked to favor for THIS query ("what
     # does this reader avoid" -> prefer_types=["preference"]). A soft boost,
@@ -206,6 +225,11 @@ class RetrievalEngine:
         self.graph_refine = _env_float("REVIEN_GRAPH_REFINE", self.GRAPH_REFINE)
         self.community_boost = _env_float("REVIEN_COMMUNITY_BOOST", self.COMMUNITY_BOOST)
         self.prefer_boost = _env_float("REVIEN_PREFER_BOOST", self.PREFER_BOOST)
+        # < 1.0 makes no sense (can't under-fetch the head); clamp to the
+        # kill-switch value instead of crashing on a bad experiment knob.
+        self.vector_overfetch = max(
+            1.0, _env_float("REVIEN_VECTOR_OVERFETCH", self.VECTOR_OVERFETCH)
+        )
         # LEG P1 — RRF hybrid fusion gate (EXPERIMENTAL, default off). When
         # REVIEN_HYBRID=rrf, anchor selection is replaced by Reciprocal Rank
         # Fusion of the keyword-ranked and semantic-ranked candidate lists;
@@ -273,9 +297,23 @@ class RetrievalEngine:
             "REVIEN_TOUCH_ON_RECALL", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
 
-        # Neural components (opt-in). These construct cleanly even without the
-        # `neural` extra: NeuralScorer.is_neural stays False and adjust_score()
-        # is a pass-through, so recall() degrades to base scoring.
+        # Neural components — opt-in by EXPLICIT REQUEST, not by dependency
+        # presence. "Opt-in = the extra is installed" was a landmine: any env
+        # that happened to have sklearn (most do) silently activated score
+        # adjustment from a GLOBAL per-machine model (~/.revien/models) that
+        # the training loop retrains on whatever traffic the box has seen —
+        # cross-tenant reranking of per-user stores, measured at -20pts
+        # generic recall on the per-user conversational bench (0.7 with the
+        # ambient model vs 0.9 without; the model had been retrained by the
+        # bench runs themselves). Opt in with REVIEN_NEURAL=1, or implicitly
+        # by passing model_dir/training_db (explicit args ARE intent). Off:
+        # scoring is pure pass-through and NOTHING trains or writes models.
+        self.neural_enabled = (
+            model_dir is not None
+            or training_db is not None
+            or os.environ.get("REVIEN_NEURAL", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
 
@@ -330,7 +368,8 @@ class RetrievalEngine:
 
         Args:
             query: Natural language query
-            top_n: Maximum results to return (default 5, max 20)
+            top_n: Maximum results to return (default 5). Capped at
+                TOP_N_MAX (200) with a stderr warning — never silently.
             min_score: Minimum composite score threshold
             now: Current time for recency scoring (defaults to UTC now)
             include_invalidated: When False (default), soft-invalidated nodes
@@ -371,7 +410,15 @@ class RetrievalEngine:
             RetrievalResponse with ranked nodes and timing data
         """
         start_time = time.perf_counter()
-        top_n = min(top_n, 20)
+        # Honest bound, not a silent lie: the old min(top_n, 20) quietly
+        # returned 20 to a caller asking for 30 — an evaluation probing rank
+        # depth measured the clamp, not the ranking. 200 bounds pathological
+        # asks; anything above it is logged so the caller can see the cap.
+        if top_n > self.TOP_N_MAX:
+            sys.stderr.write(
+                f"[revien] recall top_n={top_n} capped to {self.TOP_N_MAX}\n"
+            )
+            top_n = self.TOP_N_MAX
 
         if now is None:
             # An as_of query ranks relative to the queried moment — recency
@@ -469,8 +516,31 @@ class RetrievalEngine:
             # (no entity/keyword overlap with any node) still find relevant nodes.
             # When the layer is disabled, semantic_sims is empty and the anchor set
             # is byte-for-byte what it was before this leg.
+            #
+            # RETRIEVAL DOOR (vector-union leg, mirrors server patch-H): the
+            # plain top-k fetch burned most of its budget on CONTEXT nodes
+            # that result assembly then discards (include_context=False, the
+            # default) — so an edge-poor preference node OUTSIDE the vector
+            # top-k was unreachable at any walk depth, while the specific
+            # query (which embeds right next to it) found it fine. Fix:
+            # over-fetch (REVIEN_VECTOR_OVERFETCH, 1.0 = old behavior
+            # byte-identical), keep the original top-k admission UNCHANGED
+            # (CONTEXT hits still seed walks to their extracted neighbors),
+            # then extend with non-CONTEXT hits from the over-fetch tail
+            # until top-k non-CONTEXT nodes are unioned in. Tail admissions
+            # are gated by SEMANTIC_SIM_FLOOR on the RAW COSINE scale — the
+            # floor's original intent; on the 1/(1+distance) scale it could
+            # never bind (min 1/3 > 0.30, dead code since the leg shipped).
+            # cosine = 2 - 1/sim inverts the search() similarity shape.
             if self.semantic.is_enabled:
-                for node_id, sim in self.semantic.search(query, top_k=self.semantic_top_k):
+                fetch_k = self.semantic_top_k
+                overfetch = self.vector_overfetch if not include_context else 1.0
+                if overfetch > 1.0:
+                    fetch_k = int(self.semantic_top_k * overfetch)
+                hits = self.semantic.search(query, top_k=fetch_k)
+                head = hits[: self.semantic_top_k]
+                tail = hits[self.semantic_top_k:]
+                for node_id, sim in head:
                     # Only nodes that clear the floor act as semantic anchors. This
                     # is what lets a keyword-less query reach a genuinely-close node
                     # without near-uniform mild similarity reshuffling keyword hits.
@@ -479,6 +549,29 @@ class RetrievalEngine:
                     semantic_sims[node_id] = sim
                     if node_id not in anchor_ids:
                         anchor_ids.append(node_id)
+                if tail:
+                    hit_nodes = self.store.get_nodes_bulk(
+                        [nid for nid, _ in hits]
+                    )
+                    non_ctx_admitted = sum(
+                        1 for nid, _ in head
+                        if nid in semantic_sims
+                        and nid in hit_nodes
+                        and hit_nodes[nid].node_type != NodeType.CONTEXT
+                    )
+                    for node_id, sim in tail:
+                        if non_ctx_admitted >= self.semantic_top_k:
+                            break
+                        node = hit_nodes.get(node_id)
+                        if node is None or node.node_type == NodeType.CONTEXT:
+                            continue
+                        # Binding gate: raw cosine, not the 1/(1+d) shape.
+                        if (2.0 - 1.0 / sim) < self.semantic_sim_floor:
+                            continue
+                        semantic_sims[node_id] = sim
+                        if node_id not in anchor_ids:
+                            anchor_ids.append(node_id)
+                        non_ctx_admitted += 1
 
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
@@ -570,13 +663,17 @@ class RetrievalEngine:
                 node_type=node.node_type.value,
             )
 
-            # Neural adjustment (opt-in). Pass-through when no trained model /
-            # neural extra absent — base_score == breakdown.composite in that case.
-            base_score = self.neural_scorer.adjust_score(
-                base_score=breakdown.composite,
-                node_label=node.label,
-                query=query,
-            )
+            # Neural adjustment (opt-in, REVIEN_NEURAL / explicit model_dir).
+            # Gated HERE, not just inside adjust_score: an ambient trained
+            # model on the machine must not rerank without explicit opt-in.
+            if self.neural_enabled:
+                base_score = self.neural_scorer.adjust_score(
+                    base_score=breakdown.composite,
+                    node_label=node.label,
+                    query=query,
+                )
+            else:
+                base_score = breakdown.composite
 
             # Community boost — nodes in same community as anchors get a boost
             community_boost = 0.0
@@ -653,7 +750,9 @@ class RetrievalEngine:
                 "base_composite": breakdown.composite,
                 "community_boost": community_boost,
                 "effective_confidence": effective_confidence,
-                "neural_adjusted": self.neural_scorer.is_neural,
+                "neural_adjusted": (
+                    self.neural_enabled and self.neural_scorer.is_neural
+                ),
             }
             # Only surface the semantic component when the opt-in layer is
             # enabled, so the disabled-path breakdown is byte-for-byte unchanged.
@@ -715,21 +814,22 @@ class RetrievalEngine:
             for result in top_results:
                 self.ops.touch_node(result.node_id)
 
-        # 7. Log retrieval for neural training. The TrainingLoop is pure
-        # stdlib, so signals accumulate even when the neural extra is absent —
-        # training itself just no-ops until numpy/sklearn are installed.
-        self.training_loop.log_retrieval(
-            query=query,
-            results=[
-                {
-                    "node_id": r.node_id,
-                    "label": r.label,
-                    "node_type": r.node_type,
-                    "score": r.score,
-                }
-                for r in top_results
-            ],
-        )
+        # 7. Log retrieval for neural training — ONLY under explicit neural
+        # opt-in. Unconditional "signals accumulate for later" is how the
+        # ambient global model got trained in the first place.
+        if self.neural_enabled:
+            self.training_loop.log_retrieval(
+                query=query,
+                results=[
+                    {
+                        "node_id": r.node_id,
+                        "label": r.label,
+                        "node_type": r.node_type,
+                        "score": r.score,
+                    }
+                    for r in top_results
+                ],
+            )
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
@@ -755,7 +855,7 @@ class RetrievalEngine:
             results=top_results,
             nodes_examined=nodes_examined,
             retrieval_time_ms=round(elapsed_ms, 2),
-            neural_active=self.neural_scorer.is_neural,
+            neural_active=self.neural_enabled and self.neural_scorer.is_neural,
             semantic_active=self.semantic.is_enabled,
             # Active layer: note deferred-capture state (drained N at search
             # time / M still pending) when there is any — None otherwise, so
@@ -987,8 +1087,10 @@ class RetrievalEngine:
         Call this when the user references or acts on retrieved information.
         Provides positive training signal AND reinforces edge weights along the path.
         """
-        # 1. Log training signal (pure stdlib — works without neural extra)
-        self.training_loop.mark_used(node_id, query)
+        # 1. Log training signal — only under explicit neural opt-in (same
+        # gate as recall's log_retrieval; no silent signal accumulation).
+        if self.neural_enabled:
+            self.training_loop.mark_used(node_id, query)
 
         # 2. Touch the node (bump access count + last_accessed)
         self.ops.touch_node(node_id)
