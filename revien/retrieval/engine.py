@@ -297,9 +297,23 @@ class RetrievalEngine:
             "REVIEN_TOUCH_ON_RECALL", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
 
-        # Neural components (opt-in). These construct cleanly even without the
-        # `neural` extra: NeuralScorer.is_neural stays False and adjust_score()
-        # is a pass-through, so recall() degrades to base scoring.
+        # Neural components — opt-in by EXPLICIT REQUEST, not by dependency
+        # presence. "Opt-in = the extra is installed" was a landmine: any env
+        # that happened to have sklearn (most do) silently activated score
+        # adjustment from a GLOBAL per-machine model (~/.revien/models) that
+        # the training loop retrains on whatever traffic the box has seen —
+        # cross-tenant reranking of per-user stores, measured at -20pts
+        # generic recall on the per-user conversational bench (0.7 with the
+        # ambient model vs 0.9 without; the model had been retrained by the
+        # bench runs themselves). Opt in with REVIEN_NEURAL=1, or implicitly
+        # by passing model_dir/training_db (explicit args ARE intent). Off:
+        # scoring is pure pass-through and NOTHING trains or writes models.
+        self.neural_enabled = (
+            model_dir is not None
+            or training_db is not None
+            or os.environ.get("REVIEN_NEURAL", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
 
@@ -649,13 +663,17 @@ class RetrievalEngine:
                 node_type=node.node_type.value,
             )
 
-            # Neural adjustment (opt-in). Pass-through when no trained model /
-            # neural extra absent — base_score == breakdown.composite in that case.
-            base_score = self.neural_scorer.adjust_score(
-                base_score=breakdown.composite,
-                node_label=node.label,
-                query=query,
-            )
+            # Neural adjustment (opt-in, REVIEN_NEURAL / explicit model_dir).
+            # Gated HERE, not just inside adjust_score: an ambient trained
+            # model on the machine must not rerank without explicit opt-in.
+            if self.neural_enabled:
+                base_score = self.neural_scorer.adjust_score(
+                    base_score=breakdown.composite,
+                    node_label=node.label,
+                    query=query,
+                )
+            else:
+                base_score = breakdown.composite
 
             # Community boost — nodes in same community as anchors get a boost
             community_boost = 0.0
@@ -732,7 +750,9 @@ class RetrievalEngine:
                 "base_composite": breakdown.composite,
                 "community_boost": community_boost,
                 "effective_confidence": effective_confidence,
-                "neural_adjusted": self.neural_scorer.is_neural,
+                "neural_adjusted": (
+                    self.neural_enabled and self.neural_scorer.is_neural
+                ),
             }
             # Only surface the semantic component when the opt-in layer is
             # enabled, so the disabled-path breakdown is byte-for-byte unchanged.
@@ -794,21 +814,22 @@ class RetrievalEngine:
             for result in top_results:
                 self.ops.touch_node(result.node_id)
 
-        # 7. Log retrieval for neural training. The TrainingLoop is pure
-        # stdlib, so signals accumulate even when the neural extra is absent —
-        # training itself just no-ops until numpy/sklearn are installed.
-        self.training_loop.log_retrieval(
-            query=query,
-            results=[
-                {
-                    "node_id": r.node_id,
-                    "label": r.label,
-                    "node_type": r.node_type,
-                    "score": r.score,
-                }
-                for r in top_results
-            ],
-        )
+        # 7. Log retrieval for neural training — ONLY under explicit neural
+        # opt-in. Unconditional "signals accumulate for later" is how the
+        # ambient global model got trained in the first place.
+        if self.neural_enabled:
+            self.training_loop.log_retrieval(
+                query=query,
+                results=[
+                    {
+                        "node_id": r.node_id,
+                        "label": r.label,
+                        "node_type": r.node_type,
+                        "score": r.score,
+                    }
+                    for r in top_results
+                ],
+            )
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
@@ -834,7 +855,7 @@ class RetrievalEngine:
             results=top_results,
             nodes_examined=nodes_examined,
             retrieval_time_ms=round(elapsed_ms, 2),
-            neural_active=self.neural_scorer.is_neural,
+            neural_active=self.neural_enabled and self.neural_scorer.is_neural,
             semantic_active=self.semantic.is_enabled,
             # Active layer: note deferred-capture state (drained N at search
             # time / M still pending) when there is any — None otherwise, so
@@ -1066,8 +1087,10 @@ class RetrievalEngine:
         Call this when the user references or acts on retrieved information.
         Provides positive training signal AND reinforces edge weights along the path.
         """
-        # 1. Log training signal (pure stdlib — works without neural extra)
-        self.training_loop.mark_used(node_id, query)
+        # 1. Log training signal — only under explicit neural opt-in (same
+        # gate as recall's log_retrieval; no silent signal accumulation).
+        if self.neural_enabled:
+            self.training_loop.mark_used(node_id, query)
 
         # 2. Touch the node (bump access count + last_accessed)
         self.ops.touch_node(node_id)

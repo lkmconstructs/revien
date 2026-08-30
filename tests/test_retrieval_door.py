@@ -165,6 +165,64 @@ class TestTopNCap:
         assert "top_n=500 capped to 200" in err
 
 
+# ── Neural gate: explicit opt-in, never dependency-presence ───────────
+
+class TestNeuralGate:
+    """An ambient trained model (~/.revien/models) plus an env that happens
+    to have sklearn silently reranked per-user stores with a model trained
+    on the whole machine's traffic: -20pts generic recall on the per-user
+    bench. Neural must activate only on explicit request."""
+
+    def _spy_loop(self, eng):
+        calls = []
+        class _Spy:
+            def log_retrieval(self, **kw):
+                calls.append(("log", kw))
+            def mark_used(self, node_id, query):
+                calls.append(("mark", node_id))
+        eng.training_loop = _Spy()
+        return calls
+
+    def test_default_is_off(self, store, monkeypatch):
+        monkeypatch.delenv("REVIEN_NEURAL", raising=False)
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert eng.neural_enabled is False
+
+    def test_env_opts_in(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_NEURAL", "1")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        assert eng.neural_enabled is True
+
+    def test_explicit_model_dir_is_intent(self, store, monkeypatch):
+        monkeypatch.delenv("REVIEN_NEURAL", raising=False)
+        model_dir = tempfile.mkdtemp()  # tmp_path fixture is broken on this box
+        eng = RetrievalEngine(
+            store, model_dir=model_dir,
+            semantic=SemanticIndex(store, enabled=False),
+        )
+        assert eng.neural_enabled is True
+
+    def test_no_training_writes_when_off(self, store, monkeypatch):
+        monkeypatch.delenv("REVIEN_NEURAL", raising=False)
+        node = _add(store, "docker note", "docker detail")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        calls = self._spy_loop(eng)
+        resp = eng.recall("docker")
+        assert resp.neural_active is False
+        eng.mark_used(node.node_id)
+        assert calls == [], "gated-off engine must not accumulate signals"
+
+    def test_training_writes_when_on(self, store, monkeypatch):
+        monkeypatch.setenv("REVIEN_NEURAL", "1")
+        node = _add(store, "docker note", "docker detail")
+        eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
+        calls = self._spy_loop(eng)
+        eng.recall("docker")
+        eng.mark_used(node.node_id)
+        assert ("mark", node.node_id) in calls
+        assert any(c[0] == "log" for c in calls)
+
+
 # ── Item: ghost-vector delete leak ─────────────────────────────────────
 
 sqlite_vec = pytest.importorskip(
