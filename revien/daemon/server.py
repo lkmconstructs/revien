@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from revien import __version__
+from revien import __version__, pairing
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -148,25 +148,37 @@ def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
 
     Loopback callers are never gated — the local adapter path is unchanged
     whether or not a token is configured. A remote caller is refused outright
-    unless ``REVIEN_CAPTURE_TOKEN`` is set (remote capture is opt-in), and
-    with it set must present ``Authorization: Bearer <token>``. Comparison is
-    constant-time.
+    unless a pairing token is configured (remote capture is opt-in) — either
+    ``REVIEN_CAPTURE_TOKEN`` or a minted ``revien token`` file, see
+    ``revien.pairing.configured_token`` — and with one configured must present
+    ``Authorization: Bearer <token>``. Comparison is constant-time.
     """
     host = (client_host or "").strip().lower()
     if host in _LOOPBACK_HOSTS:
         return
-    token = os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip()
-    if not token:
+    expected = pairing.configured_token()
+    if not expected:
         raise HTTPException(
             403,
-            "Remote capture is disabled. Set REVIEN_CAPTURE_TOKEN on the "
-            "daemon and send 'Authorization: Bearer <token>' to enable it.",
+            "Remote access is disabled — run `revien token` on the Revien "
+            "host and pair.",
         )
     expected = f"Bearer {token}"
     if not secrets.compare_digest(
         (auth_header or "").strip().encode(), expected.encode()
     ):
         raise HTTPException(401, "Invalid or missing capture token.")
+
+
+def require_mutation_auth(client_host: Optional[str], auth_header: str) -> None:
+    """Gate for remote-mutation endpoints (Leg D: skill accept/decline).
+
+    Identical rule to ``check_capture_auth`` — loopback exempt, remote needs
+    the configured pairing token as ``Bearer <token>`` — kept as a separate
+    name so mutation routes read as a deliberate choice rather than reuse of
+    the capture-specific gate.
+    """
+    check_capture_auth(client_host, auth_header)
 
 
 class _CaptureAuthASGI:
