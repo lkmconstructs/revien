@@ -6,6 +6,121 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **Origin layer — every node now carries where it came from.** Four
+  nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
+  (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/
+  chatgpt/claude/readwise/None), `origin_source` (live/import/vault/watch/
+  api/None), `project_key`, `session_key`. A shared pure function,
+  `revien/graph/origin.py:derive_origin(source_id)`, maps each adapter's
+  `source_id` convention (`claude-code:{project}:{session}`,
+  `codex:{project}:{session}`, `hermes`, `openai:conversation:{id}`,
+  `vault:{path}#{slug}`, `file:{name}`, `api:{url}`, ...) to the four
+  fields; unrecognized prefixes come back all-`None`. Every adapter now
+  sets these explicitly on `IngestionInput`; `revien/ingestion/pipeline.py`
+  stamps them on every produced node (including `context` nodes) in the
+  same loop that already stamps `source_modality`/`recorded_at`, falling
+  back to `derive_origin(source_id)` when a caller omits them.
+  Migration `revien/graph/migrations/003_origin_layer.py` adds the columns
+  and three indexes (`idx_nodes_origin_runtime`, `idx_nodes_origin_source`,
+  `idx_nodes_project`) and backfills every existing row where
+  `origin_runtime IS NULL AND source_id != ''` via the same
+  `derive_origin`; idempotent — a second run backfills 0 rows.
+  `export_graph`/`import_graph` round-trip all four fields.
+  Honesty note, stated plainly because it changed the plan for this leg:
+  the adapters' `"adapter"` tag on `IngestionInput.metadata` never reached
+  a stored node — `pipeline.py` never reads `IngestionInput.metadata` at
+  all (verified: zero references). Backfilling origin from that metadata
+  was never possible; the migration and the pipeline fallback both derive
+  origin from `source_id` instead, and an in-place guard in
+  `store._ensure_db()` runs the same backfill for any database that skips
+  the numbered-migration path.
+- **`--source` filter on recall, status, the daemon, and TOON.**
+  `store.list_nodes` gains `origin_runtime` (str or list) and
+  `project_key` filters as a SQL prefilter (not a post-filter on the
+  candidate set); the graph-walk's candidate fetch takes the same filter,
+  closing a leak where a walk could pull in a node from a runtime the
+  caller had just filtered out. `engine.recall(source=...)` filters
+  candidates by `origin_runtime`; every `RetrievalResult` now carries
+  `origin_runtime`, `origin_source`, `project_key` (`None` allowed, key
+  always present so TOON's tabular reshape stays uniform across results).
+  `POST /v1/recall` accepts `source` (str or list); `GET /v1/nodes` gains
+  `origin_runtime` (repeatable) and `project_key` query params; the recall
+  response's `results` and `toon.py`'s `serialize_recall`/`parse_recall`
+  carry and round-trip the three fields. CLI: `revien recall --source
+  claude-code` (repeatable), `revien recall` prints a runtime column,
+  `revien status` prints a per-runtime node-count table.
+- **`revien token` + file-backed pairing auth.** `revien/pairing.py`:
+  `mint_token()` (32 bytes, `secrets.token_urlsafe`, written 0o600 where
+  the OS honors it) at `$REVIEN_HOME/pairing.token` (default
+  `~/.revien/pairing.token`); `configured_token()` resolves
+  `REVIEN_CAPTURE_TOKEN` (env) first, then the file, then `None`. `revien
+  token` prints the token, minting one if absent; `--rotate` mints a
+  replacement; `--path` prints only the file path. The full token prints
+  exactly once per invocation — never partial, never masked.
+  `daemon/server.py`'s `check_capture_auth` now resolves the token through
+  `pairing.configured_token()` instead of reading the env directly, so a
+  remote caller can pair via the minted file with no env var set. A new
+  `require_mutation_auth(client_host, auth_header)` — same rule, separate
+  name — gates the skill-mutation endpoints below. Loopback stays trusted
+  unconditionally; a remote caller with no token configured gets 403, a
+  remote caller with the wrong token gets 401. `revien status` prints
+  `pairing token: set (env)` / `set (file)` / `not set`.
+- **`revien skills ingest` / `list` / `show`.** A new `NodeType.SKILL`
+  node stores a `SKILL.md`'s body verbatim (frontmatter stripped) via a
+  minimal non-YAML parser in the `obsidian.py` style
+  (`revien/skills/frontmatter.py` — name/description/triggers/version,
+  inline or block list; no pyyaml). `revien skills ingest [--path P]...
+  [--global]` scans project skill folders (default `./.claude/skills`,
+  `./.codex/skills`) or, with `--global`, the global homes
+  (`~/.claude/skills`, `~/.codex/skills`, `~/.hermes/skills`) and is
+  idempotent by path — re-ingesting an unchanged skill refreshes its node
+  in place rather than duplicating it. `origin_runtime` is set from which
+  root a skill was found under (`.claude` → claude-code, `.codex` → codex,
+  `.hermes` → hermes, else `None`); `origin_source` is `vault`; a project
+  skill's `project_key` is its containing project folder's name, a global
+  skill's is `None`. `[[wikilink]]`s and trigger words in the body get
+  best-effort `RELATED_TO` edges to existing `ENTITY`/`TOPIC` nodes by
+  exact case-insensitive label match — no new entities are created.
+  `revien skills list [--project P] [--status S] [--format json|toon]` and
+  `revien skills show <name>` (prints the body). A user-authored skill is
+  `origin=user`, `curated=True`, and sorts before any engine-origin skill
+  of the same name everywhere skills are listed or recalled.
+- **Skill proposals — the engine drafts a skill from what you actually
+  did.** `revien/skills/proposals.py:detect_repeated_sequences` groups
+  live `ACTION` nodes by `(project_key, session_key)` (or, when
+  `session_key` is `None`, by `(project_key, recorded_at date)` as a
+  time-gap fallback), normalizes each label (lowercase, strip punctuation,
+  drop leading articles/pronouns, collapse whitespace), and slides 2-4
+  gram windows over the ordered sequence to find a step sequence that
+  repeats. Detection thresholds are fixed for this release —
+  **3 occurrences across at least 2 distinct sessions** — not adaptive;
+  adaptive per-user thresholds are v0.5. A qualifying pattern becomes
+  exactly one `SKILL` node (`propose_skills`, idempotent by
+  `pattern_hash` = sha256 of the normalized steps): `metadata.origin =
+  "engine"`, `status = "proposed"`, `confidence = 0.5`, `source_type =
+  INFERRED`, with a `DERIVED_FROM` edge to every source `ACTION` node it
+  was built from. When an LLM extractor is configured
+  (`REVIEN_EXTRACTOR != rule-based`) the body is drafted through it and
+  `draft = True`; the rule-based path sets `draft = False` and only ever
+  writes a numbered-steps skeleton. A proposal is never created with
+  `status = "active"` — a human has to move it there.
+  `revien skills accept <node_id>` sets `status = "active"` (origin stays
+  `engine`), `revien skills decline <node_id>` increments `declines`; the
+  third decline soft-invalidates the node via
+  `GraphOperations.invalidate_node`. Both audit before/after snapshots
+  (`skill_accept` / `skill_decline`); both take exactly one node id, no
+  `--all`. User-origin skills are curated and are never overwritten by a
+  proposal. `GET /v1/skills` (filters: status, origin, project_key), `GET
+  /v1/skills/{node_id}`, and the two mutating routes — `POST
+  /v1/skills/{node_id}/accept` / `.../decline` — gated by
+  `require_mutation_auth`. Recall's response gains `skill_proposals`
+  (always present, may be `[]`): proposals with `status = "proposed"`,
+  `draft = True`, not invalidated, whose normalized step labels share at
+  least one keyword (length ≥ 4) with the query — a rule-drafted skeleton
+  proposal (`draft = False`) never surfaces there, only in `revien skills
+  list`. Same shape in JSON and TOON; TOON carries it as a separate
+  top-level tabular array and `parse_recall` round-trips it, present as
+  `[]` when empty.
 - **BM25 lexical lane (REVIEN_LEXICAL=bm25) + entity-anchor union (P1
   follow-up)** — `revien/retrieval/bm25.py` is a production-validated
   overlay ported near-verbatim from a pre-0.3.0 engine where it measured

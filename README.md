@@ -44,6 +44,12 @@ revien recall "What did we decide about the database?"
 
 That's the whole loop — Revien runs quietly in the background, building memory as you work, and answers when you ask. Other tools (Ollama, an Obsidian vault, a watched folder) connect the same way; see [Adapters](#adapters).
 
+A few more things worth knowing early on:
+
+- `revien recall --source claude-code "what did we decide about the database?"` narrows results to memory from one connected tool — handy once you've got more than one adapter feeding the graph.
+- `revien skills ingest` reads any `SKILL.md` files under `.claude/skills` or `.codex/skills` (add `--global` for your user-wide skill folders) into memory, so recall can surface them alongside everything else.
+- `revien token` mints (or prints) the pairing token a remote client — a memory panel on another machine, say — needs to authenticate against your Revien host.
+
 ---
 
 > **Everything below is for developers, researchers, and the curious** — how retrieval works, honest benchmark numbers, the REST API, configuration, and the sovereignty guarantees that are enforced in code. If you are curious how it works, check out the info below.

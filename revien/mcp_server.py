@@ -197,6 +197,11 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                     "score": r.score,
                     "score_breakdown": r.score_breakdown,
                     "path": r.path,
+                    # Origin Layer (WS0 Leg B): present on EVERY result, None
+                    # allowed — mirrors daemon/server.py's /v1/recall shape.
+                    "origin_runtime": r.origin_runtime,
+                    "origin_source": r.origin_source,
+                    "project_key": r.project_key,
                 }
                 for r in response.results
             ],
@@ -204,6 +209,9 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             "retrieval_time_ms": response.retrieval_time_ms,
             "semantic_active": response.semantic_active,
             "semantic_note": response.semantic_note,
+            # Skills leg D2: draft engine-origin skill proposals relevant to
+            # this query. Always present, possibly [].
+            "skill_proposals": response.skill_proposals,
         }
 
     @server.tool()

@@ -100,11 +100,12 @@ class TestToolRoundTrip:
         # Response shape mirrors POST /v1/recall (include_tensions off).
         assert set(recalled.keys()) == {
             "query", "results", "nodes_examined", "retrieval_time_ms",
-            "semantic_active", "semantic_note",
+            "semantic_active", "semantic_note", "skill_proposals",
         }
         assert set(recalled["results"][0].keys()) == {
             "node_id", "node_type", "label", "content", "score",
             "score_breakdown", "path",
+            "origin_runtime", "origin_source", "project_key",
         }
         assert recalled["semantic_active"] is False  # conftest pins graph-only
 
