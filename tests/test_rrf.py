@@ -307,9 +307,13 @@ class TestEntityAnchorUnion:
 
         monkeypatch.setenv("REVIEN_HYBRID", "rrf")
         eng = RetrievalEngine(store, semantic=SemanticIndex(store, enabled=False))
-        monkeypatch.setattr(eng, "_find_anchors", lambda query: [entity_only.node_id])
         monkeypatch.setattr(
-            eng, "_keyword_search", lambda query, limit=10: [fused_only.node_id]
+            eng, "_find_anchors",
+            lambda query, source_filter=None: [entity_only.node_id],
+        )
+        monkeypatch.setattr(
+            eng, "_keyword_search",
+            lambda query, limit=10, source_filter=None: [fused_only.node_id],
         )
 
         resp = eng.recall("irrelevant query text", top_n=10, debug=True,
@@ -360,7 +364,10 @@ class TestEntityAnchorUnion:
         monkeypatch.delenv("REVIEN_ALIAS", raising=False)  # default on
         eng = RetrievalEngine(store, max_depth=1,
                               semantic=SemanticIndex(store, enabled=False))
-        monkeypatch.setattr(eng, "_keyword_search", lambda query, limit=10: [])
+        monkeypatch.setattr(
+            eng, "_keyword_search",
+            lambda query, limit=10, source_filter=None: [],
+        )
         resp = eng.recall("Tell me about Sam Rivera", top_n=10, debug=True,
                           min_score=0.0)
 

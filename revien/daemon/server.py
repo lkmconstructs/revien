@@ -7,15 +7,15 @@ import time
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import secrets
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from revien import __version__
+from revien import __version__, pairing
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -23,6 +23,8 @@ from revien.graph.clustering import CommunityDetector
 from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 from revien.semantic.index import SemanticIndex
+from revien.skills.ingest import sort_user_before_engine
+from revien.skills.proposals import accept_proposal, decline_proposal
 from revien.validation import ValidationError, validate_ingest, validate_recall
 
 
@@ -40,6 +42,13 @@ class IngestRequest(BaseModel):
     # verbatim-only capture is not keyword-anchorable in the gap (keyword
     # anchors exclude CONTEXT nodes) — drain-at-search is the guarantee.
     defer_embed: bool = False
+    # Origin Layer (WS0) passthrough: an external caller that knows its own
+    # provenance can set these; omitted origin_runtime falls back to
+    # deriving it from source_id in the pipeline's stamp loop.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 class IngestResponse(BaseModel):
@@ -76,6 +85,10 @@ class RecallRequest(BaseModel):
     # — Token-Oriented Object Notation, the same payload serialized for
     # fewer tokens in a consuming LLM's context window (see revien/toon.py).
     format: str = "json"
+    # Origin Layer (WS0 Leg B): filter candidates/results to one or more
+    # origin_runtime values (e.g. "claude-code", or ["claude-code", "codex"]).
+    # None (default): no filtering, response byte-identical.
+    source: Optional[Union[str, List[str]]] = None
 
 
 class NodeUpdateRequest(BaseModel):
@@ -121,6 +134,12 @@ class NodeResponse(BaseModel):
     # Bi-temporal validity (B2) — when the claim WAS TRUE. Null = unbounded.
     valid_from: Optional[str] = None
     valid_until: Optional[str] = None
+    # Origin Layer (WS0 Leg B): surfaced so a GET /v1/nodes?origin_runtime=…
+    # caller can see the field it filtered on.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -136,6 +155,33 @@ class SyncResponse(BaseModel):
     message: str
 
 
+def _normalize_origin_runtime_param(
+    raw: Optional[List[str]],
+) -> Optional[List[str]]:
+    """GET /v1/nodes?origin_runtime=... (G5) — accept BOTH shapes a caller
+    might reasonably send: a repeated query param (FastAPI/Starlette gives
+    that to us as ``raw`` already split, e.g. ``["claude-code", "codex"]``)
+    AND a single comma-separated value (arrives as ``["claude-code,codex"]``
+    — one raw item that still has commas in it, since Starlette doesn't
+    split on commas itself). Every raw item is comma-split, then every
+    resulting piece is stripped and blanks are dropped — so a repeated
+    param, a comma-joined param, a single value, and an empty value
+    (``?origin_runtime=``) all normalize the same way.
+
+    None (param absent from the query string entirely) passes straight
+    through as None — unfiltered, unchanged from before. Any other input
+    normalizes to a list that MAY be empty (every segment was blank) —
+    that empty-but-present list is what makes store.list_nodes fail
+    closed (G4) instead of silently returning everything.
+    """
+    if raw is None:
+        return None
+    parts: List[str] = []
+    for item in raw:
+        parts.extend(item.split(","))
+    return [p.strip() for p in parts if p.strip()]
+
+
 # ── Capture auth (P3: remote capture is opt-in, token-gated) ─────────
 
 # starlette's TestClient reports host "testclient"; it exercises the same
@@ -148,25 +194,60 @@ def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
 
     Loopback callers are never gated — the local adapter path is unchanged
     whether or not a token is configured. A remote caller is refused outright
-    unless ``REVIEN_CAPTURE_TOKEN`` is set (remote capture is opt-in), and
-    with it set must present ``Authorization: Bearer <token>``. Comparison is
-    constant-time.
+    unless a pairing token is configured (remote capture is opt-in) — either
+    ``REVIEN_CAPTURE_TOKEN`` or a minted ``revien token`` file, see
+    ``revien.pairing.configured_token`` — and with one configured must present
+    ``Authorization: Bearer <token>``. Comparison is constant-time.
+
+    G10: the scheme ("Bearer") is compared case-insensitively — a client
+    that sends ``bearer <token>`` (lowercase, RFC 6750 doesn't mandate a
+    case) is not refused just for that. The header is split on the FIRST
+    whitespace only (``partition``, not ``strip`` + exact-string compare)
+    so the scheme and the token are judged independently: a wrong-case
+    scheme with the right token now passes, but a right scheme with a
+    malformed/padded token (extra whitespace inside what should be just
+    the token) still fails, because the token half is compared with
+    ``compare_digest`` byte-for-byte, no stripping of its own.
     """
     host = (client_host or "").strip().lower()
     if host in _LOOPBACK_HOSTS:
         return
-    token = os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip()
-    if not token:
+    expected = pairing.configured_token()
+    if not expected:
         raise HTTPException(
             403,
-            "Remote capture is disabled. Set REVIEN_CAPTURE_TOKEN on the "
-            "daemon and send 'Authorization: Bearer <token>' to enable it.",
+            "Remote access is disabled — run `revien token` on the Revien "
+            "host and pair.",
         )
-    expected = f"Bearer {token}"
-    if not secrets.compare_digest(
-        (auth_header or "").strip().encode(), expected.encode()
+    scheme, _, provided = (auth_header or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(
+        provided.encode(), expected.encode()
     ):
         raise HTTPException(401, "Invalid or missing capture token.")
+
+
+def require_mutation_auth(client_host: Optional[str], auth_header: str) -> None:
+    """Gate for remote-mutation endpoints (Leg D: skill accept/decline).
+
+    Identical rule to ``check_capture_auth`` — loopback exempt, remote needs
+    the configured pairing token as ``Bearer <token>`` — kept as a separate
+    name so mutation routes read as a deliberate choice rather than reuse of
+    the capture-specific gate.
+    """
+    check_capture_auth(client_host, auth_header)
+
+
+def _require_mutation_auth_dep(request: Request) -> None:
+    """FastAPI dependency wrapping require_mutation_auth — one implementation,
+    wired via ``dependencies=[_mutation_auth]`` on every mutating route
+    instead of a copy-pasted call + ``http_request: Request`` param each."""
+    require_mutation_auth(
+        request.client.host if request.client else "",
+        request.headers.get("authorization", ""),
+    )
+
+
+_mutation_auth = Depends(_require_mutation_auth_dep)
 
 
 class _CaptureAuthASGI:
@@ -383,8 +464,17 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             timestamp=ts,
             metadata=request.metadata,
             defer_embed=request.defer_embed,
+            origin_runtime=request.origin_runtime,
+            origin_source=request.origin_source,
+            project_key=request.project_key,
+            session_key=request.session_key,
         )
-        result = pipeline.ingest(input_data)
+        try:
+            result = pipeline.ingest(input_data)
+        except ValueError as e:
+            # Origin Layer (WS0): an unknown declared origin_runtime/
+            # origin_source is a client error, not a 500.
+            raise HTTPException(400, str(e))
 
         # Notify clustering — recluster if threshold reached
         if clustering.notify_ingest():
@@ -432,6 +522,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             include_context=request.include_context,
             include_tensions=request.include_tensions,
             as_of=as_of,
+            source=request.source,
         )
         payload = {
             "query": response.query,
@@ -444,6 +535,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "score": r.score,
                     "score_breakdown": r.score_breakdown,
                     "path": r.path,
+                    # Origin Layer (WS0 Leg B): present on EVERY result, None
+                    # allowed — key always present so TOON's tabular reshape
+                    # stays uniform.
+                    "origin_runtime": r.origin_runtime,
+                    "origin_source": r.origin_source,
+                    "project_key": r.project_key,
                     # Only present when asked for — the flag-off response
                     # shape is byte-identical to pre-B1.
                     **({"tensions": r.tensions} if request.include_tensions else {}),
@@ -457,6 +554,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # one-line reason recall is running graph-only (degraded).
             "semantic_active": response.semantic_active,
             "semantic_note": response.semantic_note,
+            # Skills leg D2: draft engine-origin skill proposals relevant to
+            # this query. Always present, possibly [].
+            "skill_proposals": response.skill_proposals,
         }
         if request.format == "toon":
             # Same payload, TOON wire format (LEG P2). text/toon is the
@@ -477,8 +577,25 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         source_id: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        origin_runtime: Optional[List[str]] = Query(None),
+        project_key: Optional[str] = Query(None),
     ):
-        """List all nodes. Supports filtering by type, date, source."""
+        """List all nodes. Supports filtering by type, date, source.
+
+        Origin Layer (WS0 Leg B): origin_runtime accepts EITHER a repeated
+        query param (``?origin_runtime=claude-code&origin_runtime=codex``)
+        OR a single comma-separated value (``?origin_runtime=claude-code,
+        codex``) — see ``_normalize_origin_runtime_param`` (G5). project_key
+        is a single exact match. Both are SQL prefilters via
+        store.list_nodes — see its docstring.
+
+        G4/G5 (fail closed): the param being ABSENT (None: no
+        origin_runtime in the query string at all) means unfiltered — same
+        as before. The param being PRESENT but resolving to an empty list
+        (``?origin_runtime=``, or every comma-split segment blank) means a
+        filter IS active and matches nothing: this returns ``[]``, it
+        never silently falls back to unfiltered.
+        """
         nt = None
         if node_type:
             try:
@@ -491,6 +608,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             source_id=source_id or None,
             limit=limit,
             offset=offset,
+            origin_runtime=_normalize_origin_runtime_param(origin_runtime),
+            project_key=project_key or None,
         )
         return [_node_to_response(n) for n in nodes]
 
@@ -506,7 +625,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── PUT /v1/nodes/{id} ────────────────────────────
 
-    @app.put("/v1/nodes/{node_id}", response_model=NodeResponse)
+    # Skill metadata keys whose transition belongs exclusively to
+    # accept/decline/ingest — a plain PUT must never be able to smuggle a
+    # skill from proposed to active, or forge origin/curated provenance.
+    _SKILL_LOCKED_METADATA_KEYS = ("status", "origin", "curated")
+
+    @app.put("/v1/nodes/{node_id}", response_model=NodeResponse, dependencies=[_mutation_auth])
     async def update_node(node_id: str, request: NodeUpdateRequest):
         """Update a node's label, content, or metadata."""
         kwargs = {}
@@ -520,6 +644,20 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if not kwargs:
             raise HTTPException(400, "No fields to update")
 
+        existing = store.get_node(node_id)
+        if existing is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        if existing.node_type == NodeType.SKILL and request.metadata is not None:
+            before_md = existing.metadata or {}
+            for key in _SKILL_LOCKED_METADATA_KEYS:
+                if request.metadata.get(key) != before_md.get(key):
+                    raise HTTPException(
+                        409,
+                        f"Cannot change skill metadata field {key!r} via PUT "
+                        f"/v1/nodes/{{id}} -- that transition belongs to "
+                        f"skills accept/decline/ingest only.",
+                    )
+
         updated = store.update_node(node_id, **kwargs)
         if updated is None:
             raise HTTPException(404, f"Node not found: {node_id}")
@@ -527,7 +665,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── DELETE /v1/nodes/{id} ─────────────────────────
 
-    @app.delete("/v1/nodes/{node_id}")
+    @app.delete("/v1/nodes/{node_id}", dependencies=[_mutation_auth])
     async def delete_node(node_id: str):
         """Delete a node and its edges. Permanent."""
         deleted = store.delete_node(node_id)
@@ -537,7 +675,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/edges ─────────────────────────────────
 
-    @app.post("/v1/edges", response_model=EdgeResponse)
+    @app.post("/v1/edges", response_model=EdgeResponse, dependencies=[_mutation_auth])
     async def create_edge(request: EdgeCreateRequest):
         """Create an explicit typed edge between two existing nodes.
 
@@ -580,7 +718,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/consolidate ──────────────────────────
 
-    @app.post("/v1/consolidate")
+    @app.post("/v1/consolidate", dependencies=[_mutation_auth])
     async def consolidate(request: ConsolidateRequest):
         """Run the dream-mode maintenance pass (B3.1): persist confidence
         decay, refresh clustering, optionally backfill the semantic index,
@@ -622,8 +760,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/graph/import ─────────────────────────
 
-    @app.post("/v1/graph/import")
-    async def import_graph(graph_data: Dict[str, Any], mode: str = Query("refuse")):
+    @app.post("/v1/graph/import", dependencies=[_mutation_auth])
+    async def import_graph(
+        graph_data: Dict[str, Any], mode: str = Query("refuse")
+    ):
         """Import a graph from JSON. For restore/migration.
 
         mode=refuse (default) 409s against a non-empty database — an import
@@ -655,7 +795,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/cluster ─────────────────────────────
 
-    @app.post("/v1/cluster")
+    @app.post("/v1/cluster", dependencies=[_mutation_auth])
     async def run_clustering():
         """Trigger community detection on the graph. Returns community summary."""
         communities = clustering.run()
@@ -697,7 +837,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/sync ─────────────────────────────────
 
-    @app.post("/v1/sync", response_model=SyncResponse)
+    @app.post("/v1/sync", response_model=SyncResponse, dependencies=[_mutation_auth])
     async def sync():
         """Trigger manual sync with connected AI systems.
 
@@ -728,7 +868,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         node_id: str
         query: Optional[str] = None
 
-    @app.post("/v1/mark_used")
+    @app.post("/v1/mark_used", dependencies=[_mutation_auth])
     async def mark_used(request: MarkUsedRequest):
         """
         Mark a retrieved node as actually used.
@@ -751,7 +891,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/training/run ──────────────────────────
 
-    @app.post("/v1/training/run")
+    @app.post("/v1/training/run", dependencies=[_mutation_auth])
     async def run_training():
         """Manually trigger neural training. No-ops (status 'skipped') when the
         neural extra is absent or insufficient signals have accumulated."""
@@ -767,8 +907,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     class ReinforceRequest(BaseModel):
         construct_id: str = ""
 
-    @app.post("/v1/nodes/{node_id}/reinforce")
-    async def reinforce_node_endpoint(node_id: str, request: Optional[ReinforceRequest] = None):
+    @app.post("/v1/nodes/{node_id}/reinforce", dependencies=[_mutation_auth])
+    async def reinforce_node_endpoint(
+        node_id: str, request: Optional[ReinforceRequest] = None
+    ):
         """Reinforce a node's confidence (+0.05, cap 1.0) after successful use."""
         req = request or ReinforceRequest()
         updated = ops.reinforce_node(node_id, construct_id=req.construct_id)
@@ -782,8 +924,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         correction_context: str = ""
         construct_id: str = ""
 
-    @app.post("/v1/nodes/{node_id}/correct")
-    async def correct_node_endpoint(node_id: str, request: Optional[CorrectRequest] = None):
+    @app.post("/v1/nodes/{node_id}/correct", dependencies=[_mutation_auth])
+    async def correct_node_endpoint(
+        node_id: str, request: Optional[CorrectRequest] = None
+    ):
         """Mark a node CORRECTED (source_type=CORRECTED, confidence=0.0). Explicit
         removal from ranking — distinct from decay, which only demotes."""
         req = request or CorrectRequest()
@@ -808,7 +952,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         reason: str = ""
         construct_id: str = ""
 
-    @app.post("/v1/nodes/{node_id}/invalidate")
+    @app.post("/v1/nodes/{node_id}/invalidate", dependencies=[_mutation_auth])
     async def invalidate_node_endpoint(
         node_id: str, request: Optional[InvalidateRequest] = None
     ):
@@ -865,8 +1009,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         days: Optional[int] = None
         construct_id: str = ""
 
-    @app.post("/v1/retention/sweep")
-    async def retention_sweep(request: Optional[RetentionSweepRequest] = None):
+    @app.post("/v1/retention/sweep", dependencies=[_mutation_auth])
+    async def retention_sweep(
+        request: Optional[RetentionSweepRequest] = None
+    ):
         """Run one retention sweep under the selected storage policy.
 
         Mode/window resolve from REVIEN_RETENTION / REVIEN_RETENTION_DAYS unless
@@ -894,8 +1040,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         reason: str = ""
         construct_id: str = ""
 
-    @app.post("/v1/nodes/{node_id}/forget")
-    async def forget_node_endpoint(node_id: str, request: Optional[ForgetRequest] = None):
+    @app.post("/v1/nodes/{node_id}/forget", dependencies=[_mutation_auth])
+    async def forget_node_endpoint(
+        node_id: str, request: Optional[ForgetRequest] = None
+    ):
         """Right-to-forget: HARD-delete the node's content (privacy).
 
         Distinct from invalidate (which retains). Writes a content-free tombstone
@@ -924,7 +1072,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # Backfill embeddings for existing nodes (opt-in semantic layer). When the
     # `semantic` extra is absent or REVIEN_SEMANTIC=0, this reports status
     # "disabled" and does nothing — graph retrieval is unaffected either way.
-    @app.post("/v1/reindex")
+    @app.post("/v1/reindex", dependencies=[_mutation_auth])
     async def reindex():
         """Embed all existing content nodes into the semantic vector index.
 
@@ -938,6 +1086,72 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def semantic_status():
         """Report whether the opt-in semantic/vector layer is active and why."""
         return semantic.status()
+
+    # ── Skills (leg D2: proposals) ─────────────────────
+    # GETs are open on loopback like every other read route; the two POSTs
+    # (accept/decline) are mutations and gated by require_mutation_auth —
+    # identical rule to /v1/ingest's check_capture_auth, mirrored under its
+    # own name (Leg C).
+
+    @app.get("/v1/skills")
+    async def list_skills_endpoint(
+        status: Optional[str] = Query(None),
+        origin: Optional[str] = Query(None),
+        project_key: Optional[str] = Query(None),
+    ):
+        """List SKILL nodes (ingested + proposed), user-before-engine
+        ordered. `status`/`origin` filter on metadata; `project_key` is a
+        SQL prefilter (store.list_nodes)."""
+        nodes = store.list_nodes(
+            node_type=NodeType.SKILL, limit=1000, project_key=project_key or None,
+        )
+        if status is not None:
+            nodes = [n for n in nodes if (n.metadata or {}).get("status") == status]
+        if origin is not None:
+            nodes = [n for n in nodes if (n.metadata or {}).get("origin") == origin]
+        nodes = sort_user_before_engine(nodes)
+        return [_node_to_response(n) for n in nodes]
+
+    @app.get("/v1/skills/{node_id}")
+    async def get_skill_endpoint(node_id: str):
+        """Get one SKILL node (ingested or proposed) by id."""
+        node = store.get_node(node_id)
+        if node is None or node.node_type != NodeType.SKILL:
+            raise HTTPException(404, f"Skill not found: {node_id}")
+        return _node_to_response(node)
+
+    @app.post("/v1/skills/{node_id}/accept", dependencies=[_mutation_auth])
+    async def accept_skill_endpoint(node_id: str):
+        """Accept a proposal: status -> active, origin stays engine.
+
+        404 when the node doesn't exist at all; 409 when it exists but
+        can't be accepted right now (not a SKILL, invalidated, or status
+        isn't "proposed") — a real conflict, not a missing resource.
+        """
+        if store.get_node(node_id) is None:
+            raise HTTPException(404, f"Skill not found: {node_id}")
+        try:
+            updated = accept_proposal(store, node_id)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return _node_to_response(updated)
+
+    @app.post("/v1/skills/{node_id}/decline", dependencies=[_mutation_auth])
+    async def decline_skill_endpoint(node_id: str):
+        """Decline a proposal: declines += 1; the third decline soft-
+        invalidates it (GraphOperations.invalidate_node).
+
+        404 when the node doesn't exist at all; 409 when it exists but
+        can't be declined right now (not a SKILL, invalidated, or status
+        isn't "proposed").
+        """
+        if store.get_node(node_id) is None:
+            raise HTTPException(404, f"Skill not found: {node_id}")
+        try:
+            updated = decline_proposal(store, node_id)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        return _node_to_response(updated)
 
     return app
 
@@ -955,6 +1169,10 @@ def _node_to_response(node: Node) -> NodeResponse:
         metadata=node.metadata,
         valid_from=node.valid_from.isoformat() if node.valid_from else None,
         valid_until=node.valid_until.isoformat() if node.valid_until else None,
+        origin_runtime=node.origin_runtime,
+        origin_source=node.origin_source,
+        project_key=node.project_key,
+        session_key=node.session_key,
     )
 
 

@@ -13,6 +13,7 @@ from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType, Source
 from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
+from revien.graph.origin import derive_origin, validate_origin
 
 
 def _ingest_deny_set() -> set:
@@ -23,6 +24,47 @@ def _ingest_deny_set() -> set:
     """
     raw = os.environ.get("REVIEN_INGEST_DENY", "")
     return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _resolve_origin(input_data: "IngestionInput"):
+    """Resolve the (runtime, source, project, session) tuple for one input,
+    once per ingest call — shared by the fresh-ingest and refresh paths.
+
+    An explicit origin_runtime is validated against the fixed vocabulary
+    (revien.graph.origin.validate_origin) and WINS outright; ValueError
+    propagates to the caller (daemon -> 400, CLI/MCP -> their own handling).
+    Omitted origin_runtime falls back to deriving runtime/source from
+    source_id — never validated, since derive_origin only ever returns
+    values from that same vocabulary or None. A caller-declared
+    project_key/session_key is kept even in the fallback case (only
+    runtime/source come from source_id there) — a caller that knows its
+    own project/session identity but not its runtime must not have that
+    identity silently discarded; derive_origin's own project/session only
+    fills in whichever of the two the caller left unset.
+
+    Returns (origin_tuple, declared) — `declared` is True only when the
+    caller supplied origin_runtime explicitly, which is what gates whether
+    produced nodes get metadata["origin_declared"] = True.
+    """
+    if input_data.origin_runtime is None:
+        derived = derive_origin(input_data.source_id)
+        project_key = (
+            input_data.project_key if input_data.project_key is not None
+            else derived.project
+        )
+        session_key = (
+            input_data.session_key if input_data.session_key is not None
+            else derived.session
+        )
+        return (derived.runtime, derived.source, project_key, session_key), False
+    validate_origin(input_data.origin_runtime, input_data.origin_source)
+    return (
+        (
+            input_data.origin_runtime, input_data.origin_source,
+            input_data.project_key, input_data.session_key,
+        ),
+        True,
+    )
 
 
 def _fence_enabled_by_env() -> bool:
@@ -90,6 +132,15 @@ class IngestionInput:
     # stale-claim risk. Contradictions are supersession/CSL territory, not
     # refresh's.
     ingest_key: Optional[str] = None
+    # Origin Layer (WS0): where the words actually came from. An adapter that
+    # knows its own runtime/project/session sets these explicitly; a caller
+    # that omits origin_runtime gets it derived from source_id (see
+    # revien.graph.origin.derive_origin) in the stamp loop below — unknown
+    # source_id shapes derive to None, never a guess.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 @dataclass
@@ -365,10 +416,24 @@ class IngestionPipeline:
         # node from this unit, and the anchor relative temporal expressions resolve
         # against. (Was silently dropped before; created_at was ingest-time now().)
         ctx_id = extraction.context_node.node_id if extraction.context_node else None
+        # Origin Layer (WS0): resolve once per input, then stamp every node.
+        # An explicit origin_runtime wins outright (the caller knows its own
+        # provenance) and is validated (ValueError propagates); omitted
+        # origin_runtime falls back to deriving runtime/source from
+        # source_id, keeping a declared project_key/session_key — see
+        # _resolve_origin's docstring — never validated (derive_origin only
+        # ever returns vocabulary values or None).
+        _origin, _origin_declared = _resolve_origin(input_data)
         for node in extraction.nodes:
             node.source_modality = input_data.source_modality
             node.vision_processed = input_data.vision_processed
             node.recorded_at = input_data.timestamp
+            node.origin_runtime, node.origin_source, node.project_key, node.session_key = _origin
+            if _origin_declared:
+                # Declared vs derived must stay distinguishable after the
+                # fact — a node whose origin came from derive_origin(source_id)
+                # gets no such key.
+                node.metadata = {**(node.metadata or {}), "origin_declared": True}
             if node.node_id == ctx_id:
                 node.answerable_by_text = input_data.answerable_by_text
                 # Stamp the ingest key + content hash (R3) so the NEXT ingest
@@ -484,6 +549,10 @@ class IngestionPipeline:
                         confidence=1.0 if input_data.curated else 0.8,
                         recorded_at=input_data.timestamp,
                         metadata={"curated": True} if input_data.curated else {},
+                        origin_runtime=_origin[0],
+                        origin_source=_origin[1],
+                        project_key=_origin[2],
+                        session_key=_origin[3],
                     ))
                     nodes_created += 1
                     self._register_entity(target)
@@ -677,12 +746,22 @@ class IngestionPipeline:
             id_map = {}
             if extraction_ctx_id is not None:
                 id_map[extraction_ctx_id] = ctx_id
+            # Origin Layer (WS0): same resolve-once-per-input rule as ingest().
+            _origin, _origin_declared = _resolve_origin(input_data)
             for candidate_node in extraction.nodes:
                 if candidate_node.node_id == extraction_ctx_id:
                     continue
                 candidate_node.source_modality = input_data.source_modality
                 candidate_node.vision_processed = input_data.vision_processed
                 candidate_node.recorded_at = input_data.timestamp
+                (
+                    candidate_node.origin_runtime, candidate_node.origin_source,
+                    candidate_node.project_key, candidate_node.session_key,
+                ) = _origin
+                if _origin_declared:
+                    candidate_node.metadata = {
+                        **(candidate_node.metadata or {}), "origin_declared": True,
+                    }
                 if input_data.curated:
                     candidate_node.confidence = 1.0
                     candidate_node.metadata = {
@@ -746,6 +825,10 @@ class IngestionPipeline:
                         confidence=1.0 if input_data.curated else 0.8,
                         recorded_at=input_data.timestamp,
                         metadata={"curated": True} if input_data.curated else {},
+                        origin_runtime=_origin[0],
+                        origin_source=_origin[1],
+                        project_key=_origin[2],
+                        session_key=_origin[3],
                     ))
                     nodes_created += 1
                     self._register_entity(target)

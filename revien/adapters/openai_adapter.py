@@ -325,6 +325,9 @@ class OpenAIAdapter:
                 "title": title,
                 "adapter": "openai",
             },
+            origin_runtime="openai",
+            origin_source="import",
+            session_key=conv_id,
         )
         self.store.add_node(context_node)
 
@@ -382,6 +385,9 @@ class OpenAIAdapter:
                     "openai_message_id": msg.get("id", ""),
                     "is_system": is_system,
                 },
+                origin_runtime="openai",
+                origin_source="import",
+                session_key=conv_id,
             )
             self.store.add_node(msg_node)
             node_map[node_id] = msg_node

@@ -262,7 +262,7 @@ class TestRecallFormatParam:
             body = resp.json()
             assert set(body.keys()) == {
                 "query", "results", "nodes_examined", "retrieval_time_ms",
-                "semantic_active", "semantic_note",
+                "semantic_active", "semantic_note", "skill_proposals",
             }
 
     def test_invalid_format_rejected(self, seeded_client):

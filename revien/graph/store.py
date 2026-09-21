@@ -11,8 +11,9 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
+from .origin import derive_origin
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -160,7 +161,11 @@ class GraphStore:
                 event_time_confidence REAL,
                 event_time_text TEXT DEFAULT '',
                 valid_from TEXT,
-                valid_until TEXT
+                valid_until TEXT,
+                origin_runtime TEXT,
+                origin_source TEXT,
+                project_key TEXT,
+                session_key TEXT
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -256,6 +261,13 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_candidates_unresolved
                 ON supersession_candidates(resolved_at);
         """)
+        # idx_nodes_origin_* are NOT created here: on a legacy DB whose
+        # "nodes" table predates the origin columns, CREATE TABLE IF NOT
+        # EXISTS is a no-op (the table already exists) but CREATE INDEX ...
+        # ON nodes(origin_runtime) would still fail — no such column — since
+        # the ALTER hasn't run yet. Same reason idx_nodes_modality lives only
+        # in its own migration guard. Created in _migrate_add_origin_columns
+        # below, after the ALTERs, for both fresh and legacy databases.
         conn.execute("PRAGMA foreign_keys = ON")
         self._commit(conn)
 
@@ -267,6 +279,9 @@ class GraphStore:
         self._migrate_add_temporal_columns(conn)
         self._migrate_add_validity_columns(conn)
         self._migrate_add_edge_invalidation_column(conn)
+        # Origin Layer (WS0): add origin columns to older DBs and backfill
+        # from source_id wherever derive_origin recognizes it.
+        self._migrate_add_origin_columns(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -463,6 +478,102 @@ class GraphStore:
             self._commit(conn)
         except sqlite3.OperationalError as e:
             # Swallow ONLY the idempotency race (column already there).
+            # Anything else — locked db, disk, corruption — must be loud at
+            # startup, not a "Migration note" that hides it.
+            if "duplicate column name" in str(e) or "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
+
+    def _migrate_add_origin_columns(self, conn: sqlite3.Connection) -> None:
+        """Add Origin Layer (WS0) columns to existing DBs, then backfill.
+
+        Idempotent and no-op for fresh databases (columns already created in
+        ``_ensure_db``). All four columns are nullable TEXT and backfill NULL
+        on ALTER for old rows — then the backfill pass below fills in every
+        row whose source_id derive_origin recognizes. Runs on every connect
+        (same as the other migration guards) UNTIL ``PRAGMA user_version``
+        reaches 3: a full ``SELECT ... WHERE origin_runtime IS NULL`` table
+        scan on every single connect doesn't scale on a large graph once the
+        backfill has already done its job, so once a backfill pass completes
+        cleanly, user_version is bumped to 3 (only if it was lower) and every
+        later connect skips the scan outright. A DB already at user_version
+        >= 3 is trusted — new rows are stamped at ingest time, not by this
+        scan.
+        """
+        try:
+            cursor = conn.execute("PRAGMA table_info(nodes)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            columns_added = False
+            for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
+                if col not in columns:
+                    conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
+                    columns_added = True
+
+            # G6: composite indexes — not single-column. list_nodes(
+            # origin_runtime=..., limit=N) and list_nodes(project_key=...,
+            # limit=N) both filter AND ``ORDER BY created_at DESC`` in the
+            # same query — a single-column index on origin_runtime/
+            # project_key answers the WHERE but leaves SQLite to sort the
+            # matching rows itself ("USE TEMP B-TREE FOR ORDER BY" in
+            # EXPLAIN QUERY PLAN), which is the expensive part at scale.
+            # (origin_runtime, created_at DESC) / (project_key, created_at
+            # DESC) let the index satisfy both the filter AND the order in
+            # one pass. Old single-column index names are dropped first so
+            # an upgraded DB converges on the composite instead of
+            # carrying a redundant single-column index alongside it
+            # forever. idx_nodes_origin_source stays single-column — it
+            # isn't ordered by created_at anywhere in this codebase.
+            # created_at is always present: it's a NOT NULL column in this
+            # store's CREATE TABLE nodes, so a nodes table missing it isn't
+            # a state this store can produce.
+            conn.execute("DROP INDEX IF EXISTS idx_nodes_origin_runtime")
+            conn.execute("DROP INDEX IF EXISTS idx_nodes_project")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
+                "ON nodes(origin_runtime, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_source ON nodes(origin_source)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_project "
+                "ON nodes(project_key, created_at DESC)"
+            )
+            self._commit(conn)
+
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            # A column that had to be ALTERed back in just now means this
+            # connection is genuinely pre-origin-layer no matter what
+            # user_version claims (e.g. a column dropped out-of-band after
+            # the marker was set) — never trust the marker over the schema
+            # actually in front of us.
+            if user_version >= 3 and not columns_added:
+                return
+
+            # Backfill: any row with a source_id but no derived origin yet.
+            # Rows whose source_id derive_origin doesn't recognize stay NULL
+            # (honest "unknown", never a guess) — they're rescanned on every
+            # connect UNTIL user_version reaches 3 below, which self-corrects
+            # if a future adapter convention is added before then.
+            rows = conn.execute(
+                "SELECT node_id, source_id FROM nodes "
+                "WHERE origin_runtime IS NULL AND source_id != ''"
+            ).fetchall()
+            for node_id, source_id in rows:
+                origin = derive_origin(source_id)
+                if origin.runtime is None:
+                    continue
+                conn.execute(
+                    "UPDATE nodes SET origin_runtime = ?, origin_source = ?, "
+                    "project_key = ?, session_key = ? WHERE node_id = ?",
+                    (origin.runtime, origin.source, origin.project, origin.session, node_id),
+                )
+            conn.execute("PRAGMA user_version = 3")
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            # Swallow ONLY the idempotency race (column/index already there).
             # Anything else — locked db, disk, corruption — must be loud at
             # startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
@@ -708,9 +819,10 @@ class GraphStore:
                 invalidated_at, source_modality, answerable_by_text,
                 vision_processed, recorded_at, event_time_start,
                 event_time_end, event_time_granularity, event_time_confidence,
-                event_time_text, valid_from, valid_until)
+                event_time_text, valid_from, valid_until,
+                origin_runtime, origin_source, project_key, session_key)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -740,6 +852,10 @@ class GraphStore:
                 node.event_time_text,
                 node.valid_from.isoformat() if node.valid_from else None,
                 node.valid_until.isoformat() if node.valid_until else None,
+                node.origin_runtime,
+                node.origin_source,
+                node.project_key,
+                node.session_key,
             ),
         )
 
@@ -992,11 +1108,16 @@ class GraphStore:
         self._commit(conn)
 
     @_locked
-    def find_context_node_by_ingest_key(self, ingest_key: str) -> Optional[Node]:
-        """The CONTEXT node stamped with this ingest key (stable identity for
-        a re-ingestable unit, e.g. one adapter session file). metadata is a
-        JSON TEXT column: a LIKE prefilter on the JSON-encoded key narrows the
-        scan, then the parsed metadata confirms the exact key (substring hits
+    def find_context_node_by_ingest_key(
+        self, ingest_key: str, node_type: NodeType = NodeType.CONTEXT
+    ) -> Optional[Node]:
+        """The node stamped with this ingest key (stable identity for a
+        re-ingestable unit, e.g. one adapter session file). Defaults to
+        CONTEXT (its original, still the common case); ``node_type=SKILL``
+        is the same lookup scoped to skill ingest (revien/skills/ingest.py)
+        instead of a separate near-duplicate. metadata is a JSON TEXT
+        column: a LIKE prefilter on the JSON-encoded key narrows the scan,
+        then the parsed metadata confirms the exact key (substring hits
         never false-positive). Unindexed on purpose — one lookup per keyed
         ingest at current scale; add a real index if keyed re-ingest gets hot.
 
@@ -1012,7 +1133,7 @@ class GraphStore:
         rows = conn.execute(
             "SELECT * FROM nodes WHERE node_type = ? AND metadata LIKE ? "
             "ORDER BY created_at ASC",
-            (NodeType.CONTEXT.value, f"%{needle}%"),
+            (node_type.value, f"%{needle}%"),
         ).fetchall()
         for row in rows:
             node = self._row_to_node(row)
@@ -1022,13 +1143,20 @@ class GraphStore:
 
     @_locked
     def search_nodes_keyword(
-        self, keywords, limit: int = 10, exclude_context: bool = True
+        self, keywords, limit: int = 10, exclude_context: bool = True,
+        origin_runtime: Optional[Union[str, List[str]]] = None,
+        project_key: Optional[str] = None,
     ) -> list["Node"]:
         """SQL-side keyword search over label+content (case-insensitive
         substring, OR across keywords), newest first. Replaces the recall
         fallback's list_nodes(limit=999999)-then-scan-in-Python, which was
         the single biggest recall latency driver (OPEN 2). Semantics match
-        the old Python scan: any-keyword substring hit qualifies."""
+        the old Python scan: any-keyword substring hit qualifies.
+
+        Origin Layer (WS0 Leg B): origin_runtime/project_key are the SAME
+        SQL prefilter as list_nodes — applied in the WHERE clause here, not
+        as a post-fetch scan, so a filtered recall's keyword-anchor path
+        never even considers another runtime's rows as candidates."""
         kws = [k for k in keywords if k]
         if not kws:
             return []
@@ -1037,10 +1165,26 @@ class GraphStore:
             ["instr(lower(label || ' ' || content), ?) > 0"] * len(kws)
         )
         query = f"SELECT * FROM nodes WHERE ({conditions})"
+        params: list = [k.lower() for k in kws]
         if exclude_context:
             query += " AND node_type != 'context'"
+        if origin_runtime is not None:
+            # G4: ``is not None``, never a truthy check — origin_runtime=[]
+            # is a PRESENT-but-empty filter (fail closed, matches nothing
+            # via "IN ()", valid SQL), and a truthy check would silently
+            # treat that the same as "no filter" (origin_runtime=None).
+            runtimes = (
+                [origin_runtime] if isinstance(origin_runtime, str) else list(origin_runtime)
+            )
+            placeholders = ", ".join("?" * len(runtimes))
+            query += f" AND origin_runtime IN ({placeholders})"
+            params.extend(runtimes)
+        if project_key:
+            query += " AND project_key = ?"
+            params.append(project_key)
         query += " ORDER BY created_at DESC LIMIT ?"
-        rows = conn.execute(query, [k.lower() for k in kws] + [limit]).fetchall()
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     @_locked
@@ -1149,7 +1293,16 @@ class GraphStore:
         source_id: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        origin_runtime: Optional[Union[str, List[str]]] = None,
+        project_key: Optional[str] = None,
     ) -> list[Node]:
+        """List nodes, newest first. Origin Layer (WS0 Leg B): origin_runtime
+        and project_key are SQL WHERE prefilters, not a post-fetch scan — a
+        single runtime string ('claude-code') or a list of runtimes
+        (['claude-code', 'codex']) both compile to a bound-parameter IN
+        clause, never string interpolation. A node whose origin_runtime is
+        NULL (unknown provenance) never matches either filter — filtered
+        recall never silently includes "unknown" as a fourth runtime."""
         conn = self._get_conn()
         query = "SELECT * FROM nodes WHERE 1=1"
         params: list = []
@@ -1159,15 +1312,61 @@ class GraphStore:
         if source_id:
             query += " AND source_id = ?"
             params.append(source_id)
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        if origin_runtime is not None:
+            # G4: ``is not None``, never a truthy check — see the same note
+            # in search_nodes_keyword above. origin_runtime=[] must fail
+            # closed (match nothing), not silently unfilter.
+            runtimes = (
+                [origin_runtime] if isinstance(origin_runtime, str) else list(origin_runtime)
+            )
+            placeholders = ", ".join("?" * len(runtimes))
+            query += f" AND origin_runtime IN ({placeholders})"
+            params.extend(runtimes)
+        if project_key:
+            query += " AND project_key = ?"
+            params.append(project_key)
+        # G7: created_at ties (same-millisecond ingest, common in bulk
+        # backfills/tests) previously left paging order unstable across
+        # calls — node_id is a deterministic tiebreaker so offset paging
+        # never skips or repeats a row.
+        query += " ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = conn.execute(query, params).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
+    @_locked
+    def list_draft_proposed_skills(self, limit: int = 1000, offset: int = 0) -> list[Node]:
+        """SKILL nodes whose metadata LIKELY has status="proposed" AND
+        draft=true — an SQL LIKE prefilter (G9); callers still parse+confirm
+        metadata exactly, a substring hit is never trusted as the whole truth."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE node_type = ? "
+            "AND metadata LIKE '%\"status\": \"proposed\"%' "
+            "AND metadata LIKE '%\"draft\": true%' "
+            "ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?",
+            (NodeType.SKILL.value, limit, offset),
+        ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     @_locked
     def count_nodes(self) -> int:
         conn = self._get_conn()
         return conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+
+    @_locked
+    def count_nodes_by_origin_runtime(self) -> dict:
+        """Per-runtime node counts (WS0 Leg B) — feeds `revien status`'s
+        per-runtime table. NULL origin_runtime (unrecognized/pre-origin-layer
+        source_id) groups under the string key "unknown" so its count isn't
+        silently dropped from the total."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT COALESCE(origin_runtime, 'unknown'), COUNT(*) "
+            "FROM nodes GROUP BY 1 "
+            "ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        return {runtime: count for runtime, count in rows}
 
     # ── Supersession candidate queue (CSL Leg 3 wiring) ───────────────────────
     @_locked
@@ -1768,6 +1967,12 @@ class GraphStore:
             # row reads back with an unbounded window.
             valid_from=datetime.fromisoformat(row[26]) if len(row) > 26 and row[26] else None,
             valid_until=datetime.fromisoformat(row[27]) if len(row) > 27 and row[27] else None,
+            # Origin Layer (columns 28-31): nullable — a pre-WS0 row reads
+            # back with no origin at all until the backfill pass runs.
+            origin_runtime=row[28] if len(row) > 28 and row[28] else None,
+            origin_source=row[29] if len(row) > 29 and row[29] else None,
+            project_key=row[30] if len(row) > 30 and row[30] else None,
+            session_key=row[31] if len(row) > 31 and row[31] else None,
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:

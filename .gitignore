@@ -51,3 +51,4 @@ Thumbs.db
 
 # Internal working documents — never ship
 HANDOFF*
+.gates-tmp/

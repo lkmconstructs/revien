@@ -115,6 +115,12 @@ class CodexAdapter(RevienAdapter):
                     # the key makes that re-ingest refresh the ONE existing
                     # context node instead of stacking a duplicate per sync.
                     "ingest_key": source_id,
+                    # Origin Layer (WS0): known at read time. project_key
+                    # matches the same value baked into source_id above.
+                    "origin_runtime": "codex",
+                    "origin_source": "live",
+                    "project_key": project,
+                    "session_key": jsonl_file.stem,
                 })
 
         return results

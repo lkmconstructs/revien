@@ -24,6 +24,12 @@ class NodeType(str, Enum):
     # records work still owed. Same lifecycle as every claim type
     # (dedup/recall/supersession apply unchanged).
     ACTION = "action"
+    # A skill definition (SKILL.md-style): a named, reusable procedure with
+    # trigger words, ingested from a skills folder (WS3, thin leg D1) or
+    # proposed by the engine from repeated ACTION sequences (leg D2). Content
+    # is the skill body verbatim; metadata carries description/triggers/
+    # version/origin/status/scope/path. Participates in recall like any node.
+    SKILL = "skill"
 
 
 class EdgeType(str, Enum):
@@ -148,6 +154,20 @@ class Node(BaseModel):
     # answer "where did she live in March?" after June's fact replaced it.
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
+
+    # Origin Layer (WS0): where the words actually came from, independent of
+    # source_id's free-form conventions. origin_runtime is the producing
+    # system (claude-code/codex/hermes/ollama/openai/langchain/obsidian/
+    # file/api/chatgpt/claude/readwise); origin_source is how it arrived
+    # (live/import/vault/watch/api). project_key/session_key are the
+    # adapter's own project/session identifiers when it has them. All four
+    # are nullable — unknown/unrecognized sources stay None, never guessed.
+    # See revien/graph/origin.py:derive_origin for the source_id -> origin
+    # convention table.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 class Edge(BaseModel):

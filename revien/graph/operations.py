@@ -7,7 +7,7 @@ Confidence layer: confidence tagging, reinforcement, decay, propagation
 
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
@@ -675,7 +675,9 @@ class GraphOperations:
         return nodes, scores
 
     def find_node_by_label(
-        self, label: str, node_type: Optional[NodeType] = None
+        self, label: str, node_type: Optional[NodeType] = None,
+        origin_runtime: Optional[Union[str, List[str]]] = None,
+        project_key: Optional[str] = None,
     ) -> Optional[Node]:
         """Find a node by NORMALIZED label match, optionally filtered by type.
 
@@ -683,26 +685,40 @@ class GraphOperations:
         are the same entity in different surface forms, and this lookup is
         where dedup, anchor selection, and link resolution all meet. The
         entity-fragmentation this closes was the top cause of unattached
-        cross-corpus claims (vault eval attachment track)."""
+        cross-corpus claims (vault eval attachment track).
+
+        origin_runtime/project_key (WS0 Leg B): the SAME SQL prefilter as
+        store.list_nodes, so a filtered recall's entity-anchor lookup never
+        considers another runtime's nodes at all."""
         from revien.graph.normalize import normalize_label
         target = normalize_label(label)
-        nodes = self.store.list_nodes(node_type=node_type, limit=999999)
+        nodes = self.store.list_nodes(
+            node_type=node_type, limit=999999,
+            origin_runtime=origin_runtime, project_key=project_key,
+        )
         for node in nodes:
             if normalize_label(node.label) == target:
                 return node
         return None
 
     def find_nodes_by_label_fuzzy(
-        self, label: str, max_distance: int = 5, min_ratio: float = 0.75
+        self, label: str, max_distance: int = 5, min_ratio: float = 0.75,
+        origin_runtime: Optional[Union[str, List[str]]] = None,
+        project_key: Optional[str] = None,
     ) -> List[Node]:
         """Find nodes with similar labels using both Levenshtein distance
         and ratio-based matching. Ratio-based matching handles length
         differences better (e.g., 'PostgreSQL' vs 'Postgres'). Labels are
         normalized first so separator/case noise doesn't eat the distance
-        budget."""
+        budget.
+
+        origin_runtime/project_key (WS0 Leg B): SQL prefilter, see
+        find_node_by_label above."""
         from difflib import SequenceMatcher
         from revien.graph.normalize import normalize_label
-        nodes = self.store.list_nodes(limit=999999)
+        nodes = self.store.list_nodes(
+            limit=999999, origin_runtime=origin_runtime, project_key=project_key,
+        )
         matches = []
         target = normalize_label(label)
         for node in nodes:

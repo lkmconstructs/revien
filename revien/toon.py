@@ -46,15 +46,20 @@ by two nested fields — measured on real payloads, plain list-form TOON is
 LARGER than compact JSON. So ``serialize_recall`` applies a recall-specific,
 exactly-invertible reshape when (and only when) the payload matches the
 recall schema precisely (top-level keys ``query, results, nodes_examined,
-retrieval_time_ms, semantic_active, semantic_note`` in order; every result
-``node_id, node_type, label, content, score, score_breakdown, path`` in
-order; breakdown key order uniform across results; leaf values primitive):
+retrieval_time_ms, semantic_active, semantic_note, skill_proposals`` in
+order; every result ``node_id, node_type, label, content, score,
+score_breakdown, path`` in order; breakdown key order uniform across
+results; leaf values primitive):
 
   - each result's ``score_breakdown`` dict is flattened into dotted columns
     (``score_breakdown.recency`` … — dots are legal in unquoted keys, §7.3),
     making rows all-primitive and therefore tabular under §9.3;
   - each result's ``path`` array moves to a parallel top-level ``paths[N]``
-    list array (one inline primitive array per result, same order).
+    list array (one inline primitive array per result, same order);
+  - ``skill_proposals`` (Skills leg D2) needs no reshape at all — each row
+    is already a fixed, all-primitive key set (``node_id, label,
+    occurrences, sessions, project_key, steps``), so it rides straight
+    through as its own top-level tabular array (or ``[]``).
 
 ``parse_recall`` detects the reshape by the reserved top-level ``paths``
 key and inverts it exactly; payloads that do not match the schema (e.g.
@@ -555,10 +560,25 @@ def decode(text: str) -> Dict[str, Any]:
 # ── Recall wire-format face ───────────────────────────────
 
 _RECALL_KEYS = ("query", "results", "nodes_examined", "retrieval_time_ms",
-                "semantic_active", "semantic_note")
+                "semantic_active", "semantic_note",
+                # Skills leg D2: always present (possibly []) — see
+                # _SKILL_PROPOSAL_KEYS below.
+                "skill_proposals")
 _RESULT_KEYS = ("node_id", "node_type", "label", "content", "score",
-                "score_breakdown", "path")
+                "score_breakdown", "path",
+                # Origin Layer (WS0 Leg B): always present (None allowed),
+                # so the reshape below can treat them as plain primitive
+                # columns like node_id/node_type/etc.
+                "origin_runtime", "origin_source", "project_key")
+_RESULT_PRIMITIVE_KEYS = ("node_id", "node_type", "label", "content", "score",
+                          "origin_runtime", "origin_source", "project_key")
 _SB_PREFIX = "score_breakdown."
+# Skills leg D2: skill_proposals rows are ALREADY flat (no nested fields to
+# reshape out, unlike a recall result's score_breakdown/path) — this fixed
+# key set is what makes them a uniform tabular array on their own, with no
+# reshape needed beyond validating the shape at eligibility time.
+_SKILL_PROPOSAL_KEYS = ("node_id", "label", "occurrences", "sessions",
+                        "project_key", "steps")
 # Reserved by the flattening convention (see module docstring): its
 # presence at top level is how parse_recall detects a reshaped document.
 _PATHS_KEY = "paths"
@@ -585,14 +605,21 @@ def _recall_flatten_eligible(payload: Any) -> bool:
             return False
         if not all(_is_primitive(p) for p in path):
             return False
-        if not all(_is_primitive(r[k]) for k in
-                   ("node_id", "node_type", "label", "content", "score")):
+        if not all(_is_primitive(r[k]) for k in _RESULT_PRIMITIVE_KEYS):
             return False
         keys = tuple(sb.keys())
         if sb_keys is None:
             sb_keys = keys
         elif keys != sb_keys:
             return False  # non-uniform breakdowns: rows would not be tabular
+    proposals = payload["skill_proposals"]
+    if not isinstance(proposals, list):
+        return False
+    for p in proposals:
+        if not isinstance(p, dict) or tuple(p.keys()) != _SKILL_PROPOSAL_KEYS:
+            return False
+        if not all(_is_primitive(v) for v in p.values()):
+            return False
     return True
 
 
@@ -603,6 +630,12 @@ def _flatten_recall(payload: Dict[str, Any]) -> Dict[str, Any]:
         row = {k: r[k] for k in ("node_id", "node_type", "label", "content", "score")}
         for k, v in r["score_breakdown"].items():
             row[_SB_PREFIX + k] = v
+        # Origin Layer (WS0 Leg B) columns, after the score_breakdown ones —
+        # already plain primitives (None allowed), so they need no reshape
+        # of their own, just a place in the tabular row.
+        row["origin_runtime"] = r["origin_runtime"]
+        row["origin_source"] = r["origin_source"]
+        row["project_key"] = r["project_key"]
         rows.append(row)
         paths.append(list(r["path"]))
     return {
@@ -613,6 +646,10 @@ def _flatten_recall(payload: Dict[str, Any]) -> Dict[str, Any]:
         "retrieval_time_ms": payload["retrieval_time_ms"],
         "semantic_active": payload["semantic_active"],
         "semantic_note": payload["semantic_note"],
+        # Skills leg D2: already a flat, uniform-key tabular array (or []) —
+        # no reshape needed, just carried straight through so it lands in
+        # the encoded TOON as its own tabular block.
+        "skill_proposals": payload["skill_proposals"],
     }
 
 
@@ -638,6 +675,9 @@ def _unflatten_recall(obj: Dict[str, Any]) -> Dict[str, Any]:
                 "score": row["score"],
                 "score_breakdown": sb,
                 "path": path,
+                "origin_runtime": row["origin_runtime"],
+                "origin_source": row["origin_source"],
+                "project_key": row["project_key"],
             })
         except KeyError as exc:
             raise ToonError("flattened recall row missing column: %s" % exc)

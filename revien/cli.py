@@ -12,7 +12,7 @@ import shutil
 import sys
 import sysconfig
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     import click
@@ -450,6 +450,11 @@ def connect(system: str, path: Optional[str]):
               help="Bi-temporal query time (ISO-8601): what was true AT this "
                    "time — superseded facts whose validity window covers it "
                    "come back")
+@click.option("--source", "source", multiple=True,
+              help="Filter to one or more origin_runtime values "
+                   "(claude-code/codex/hermes/ollama/openai/langchain/"
+                   "obsidian/file/api/...). Repeatable: --source claude-code "
+                   "--source codex. Omit for no filtering.")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
 @click.option("--format", "output_format", type=click.Choice(["json", "toon"]),
               default="json", show_default=True,
@@ -458,7 +463,7 @@ def connect(system: str, path: Optional[str]):
                    "tokens for a consuming LLM); 'json' keeps the existing "
                    "behavior (human-readable, or JSON with --json-output)")
 def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
-           json_output: bool, output_format: str):
+           source: tuple, json_output: bool, output_format: str):
     """Query Revien memory from the command line."""
     from datetime import datetime
     from revien.graph.store import GraphStore
@@ -479,11 +484,17 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
             click.echo(f"Invalid --as-of (ISO-8601 expected): {as_of}")
             return
 
+    # Origin Layer (WS0 Leg B): multiple=True gives a tuple; empty tuple
+    # means "no filter" (engine.recall(source=None) is the byte-identical
+    # unfiltered path), one value stays a list of one — engine.recall
+    # accepts either a bare string or a list, list is simplest here.
+    source_filter = list(source) if source else None
+
     store = GraphStore(db_path=db_path)
     engine = RetrievalEngine(store)
 
     try:
-        response = engine.recall(query, top_n=top, as_of=as_of_dt)
+        response = engine.recall(query, top_n=top, as_of=as_of_dt, source=source_filter)
 
         if output_format == "toon":
             if json_output:
@@ -506,6 +517,9 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "score": r.score,
                         "score_breakdown": r.score_breakdown,
                         "path": r.path,
+                        "origin_runtime": r.origin_runtime,
+                        "origin_source": r.origin_source,
+                        "project_key": r.project_key,
                     }
                     for r in response.results
                 ],
@@ -513,6 +527,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                 "retrieval_time_ms": response.retrieval_time_ms,
                 "semantic_active": response.semantic_active,
                 "semantic_note": response.semantic_note,
+                "skill_proposals": response.skill_proposals,
             }
             click.echo(serialize_recall(payload))
         elif json_output:
@@ -526,11 +541,15 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "content": r.content,
                         "score": r.score,
                         "score_breakdown": r.score_breakdown,
+                        "origin_runtime": r.origin_runtime,
+                        "origin_source": r.origin_source,
+                        "project_key": r.project_key,
                     }
                     for r in response.results
                 ],
                 "nodes_examined": response.nodes_examined,
                 "retrieval_time_ms": response.retrieval_time_ms,
+                "skill_proposals": response.skill_proposals,
             }
             click.echo(json.dumps(output, indent=2))
         else:
@@ -544,9 +563,19 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                        f"{response.nodes_examined} nodes examined)\n")
 
             for i, r in enumerate(response.results, 1):
+                runtime = r.origin_runtime or "unknown"
                 click.echo(f"  [{i}] {r.label}")
-                click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f}")
+                click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f} "
+                           f"| Runtime: {runtime}")
                 click.echo(f"      {r.content[:120]}{'...' if len(r.content) > 120 else ''}")
+                click.echo()
+
+            if response.skill_proposals:
+                click.echo(f"{len(response.skill_proposals)} draft skill "
+                           f"proposal(s) match this query:")
+                for p in response.skill_proposals:
+                    click.echo(f"  - {p['label']}  ({p['occurrences']}x across "
+                               f"{p['sessions']} sessions)")
                 click.echo()
     finally:
         store.close()
@@ -969,8 +998,51 @@ def status(db: Optional[str]):
             click.echo(f"Connected adapters: {', '.join(adapters.keys())}")
         else:
             click.echo("No adapters connected. Run 'revien connect <system>'")
+
+        # Origin Layer (WS0 Leg B): per-runtime node counts. "unknown"
+        # (NULL origin_runtime — pre-origin-layer or unrecognized source_id)
+        # is a real bucket, not hidden — see
+        # GraphStore.count_nodes_by_origin_runtime.
+        by_runtime = store.count_nodes_by_origin_runtime()
+        if by_runtime:
+            click.echo("Nodes by runtime:")
+            for runtime, count in by_runtime.items():
+                click.echo(f"  {runtime}: {count}")
+
+        click.echo(f"Pairing token: {_pairing_token_status()}")
     finally:
         store.close()
+
+
+def _pairing_token_status() -> str:
+    """set (env) / set (file) / not set — mirrors pairing.configured_token's
+    precedence without ever printing the token itself."""
+    from revien import pairing
+
+    if os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip():
+        return "set (env)"
+    if pairing.load_token():
+        return "set (file)"
+    return "not set"
+
+
+@main.command()
+@click.option("--rotate", is_flag=True, help="Mint a new token, replacing any existing one.")
+@click.option("--path", "show_path", is_flag=True, help="Print the token file path only — not the token.")
+def token(rotate: bool, show_path: bool):
+    """Print the pairing token for remote capture/mutation, minting one if absent.
+
+    A remote /v1/ingest (or skill accept/decline) caller pairs by sending this
+    token as `Authorization: Bearer <token>`. REVIEN_CAPTURE_TOKEN, if set,
+    overrides whatever is minted here. The full token prints exactly once per
+    invocation — nothing is echoed partially or masked.
+    """
+    from revien import pairing
+
+    if show_path:
+        click.echo(str(pairing.token_path()))
+        return
+    click.echo(pairing.mint_token(rotate=rotate))
 
 
 @main.command()
@@ -1143,6 +1215,228 @@ def watch(db: Optional[str], interval: float, keep: int, use_gzip: bool):
             time.sleep(interval * 60)
     except KeyboardInterrupt:
         click.echo("\nStopped.")
+
+
+# ── skills (thin WS3, leg D1) ──────────────────────────────────────────────
+# A group, not flat commands, so `propose`/`accept`/`decline` (leg D2, a
+# parallel worktree) can land as siblings of `ingest`/`list`/`show` without
+# touching anything above this line.
+
+@main.group()
+def skills():
+    """Manage skills (SKILL.md-style procedures) as first-class memory."""
+    pass
+
+
+@skills.command(name="ingest")
+@click.option("--path", "paths", multiple=True, type=click.Path(),
+              help="Skill root to scan (repeatable). Default: ./.claude/skills "
+                   "and ./.codex/skills.")
+@click.option("--global", "include_global", is_flag=True,
+              help="Also scan the global skill homes: ~/.claude/skills, "
+                   "~/.codex/skills, ~/.hermes/skills.")
+@click.option("--db", default=None, help="Database path")
+def skills_ingest(paths: Tuple[str, ...], include_global: bool, db: Optional[str]):
+    """Scan skill folders and ingest each SKILL.md as a SKILL node.
+
+    Idempotent by path: re-running refreshes an unchanged skill's node in
+    place (label/content/metadata) rather than duplicating it."""
+    from revien.graph.store import GraphStore
+    from revien.skills.ingest import ingest_roots
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        summary = ingest_roots(store, paths=list(paths) or None, include_global=include_global)
+    finally:
+        store.close()
+
+    if summary["scanned"] == 0:
+        click.echo("No SKILL.md files found under the scanned roots.")
+        return
+    click.echo(
+        f"Scanned {summary['scanned']} skill(s): {summary['created']} created, "
+        f"{summary['refreshed']} refreshed, {summary['edges']} entity/topic "
+        f"edge(s) linked."
+    )
+
+
+@skills.command(name="list")
+@click.option("--project", default=None, help="Filter to one project_key")
+@click.option("--status", default=None, help="Filter to one metadata status (e.g. active)")
+@click.option("--format", "output_format", type=click.Choice(["json", "toon"]),
+              default=None, help="Machine-readable output (default: human table)")
+@click.option("--db", default=None, help="Database path")
+def skills_list_cmd(project: Optional[str], status: Optional[str],
+                     output_format: Optional[str], db: Optional[str]):
+    """List ingested skills — name, origin, status, scope, version, project."""
+    from revien.graph.store import GraphStore
+    from revien.skills.ingest import list_skills
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        nodes = list_skills(store, project=project, status=status)
+    finally:
+        store.close()
+
+    rows = [
+        {
+            "name": n.label,
+            "origin": (n.metadata or {}).get("origin", ""),
+            "status": (n.metadata or {}).get("status", ""),
+            "scope": (n.metadata or {}).get("scope", ""),
+            "version": (n.metadata or {}).get("version", ""),
+            "project": n.project_key or "",
+        }
+        for n in nodes
+    ]
+
+    if output_format == "json":
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if output_format == "toon":
+        from revien.toon import encode
+        click.echo(encode({"skills": rows}))
+        return
+
+    if not rows:
+        click.echo("No skills ingested. Run 'revien skills ingest' first.")
+        return
+    for r in rows:
+        click.echo(
+            f"  {r['name']}  [{r['origin']}/{r['status']}/{r['scope']}]"
+            f"{' v' + r['version'] if r['version'] else ''}"
+            f"{' (' + r['project'] + ')' if r['project'] else ''}"
+        )
+
+
+@skills.command(name="show")
+@click.argument("name")
+@click.option("--db", default=None, help="Database path")
+def skills_show(name: str, db: Optional[str]):
+    """Print one skill's body markdown (user-authored wins over engine-proposed)."""
+    from revien.graph.store import GraphStore
+    from revien.skills.ingest import show_skill
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        node = show_skill(store, name)
+    finally:
+        store.close()
+
+    if node is None:
+        click.echo(f"No skill named '{name}'.")
+        sys.exit(1)
+    click.echo(node.content)
+
+
+@skills.command(name="propose")
+@click.option("--min-occurrences", "min_occurrences", default=3, show_default=True,
+              help="Minimum total occurrences of a step-sequence to propose it.")
+@click.option("--min-sessions", "min_sessions", default=2, show_default=True,
+              help="Minimum distinct sessions a step-sequence must appear in.")
+@click.option("--db", default=None, help="Database path")
+def skills_propose(min_occurrences: int, min_sessions: int, db: Optional[str]):
+    """Detect repeated ACTION sequences and propose skills from them.
+
+    Idempotent: re-running refreshes an unchanged pattern's occurrence/
+    session counts in place rather than duplicating the proposal. Never
+    creates an active skill — proposals land with status=proposed,
+    origin=engine; accept them with 'revien skills accept <node_id>'."""
+    from revien.graph.store import GraphStore
+    from revien.skills.proposals import propose_skills
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        summary = propose_skills(
+            store, min_occurrences=min_occurrences, min_sessions=min_sessions,
+            progress=click.echo,
+        )
+    finally:
+        store.close()
+
+    if summary["detected"] == 0:
+        click.echo("No repeated action sequences met the threshold.")
+        return
+    click.echo(
+        f"Detected {summary['detected']} pattern(s): {summary['created']} "
+        f"proposed, {summary['updated']} refreshed, {summary['edges']} "
+        f"derived-from edge(s) linked."
+    )
+    for node in summary["proposals"]:
+        click.echo(f"  {node.node_id}  {node.label}")
+
+
+@skills.command(name="accept")
+@click.argument("node_id")
+@click.option("--db", default=None, help="Database path")
+def skills_accept(node_id: str, db: Optional[str]):
+    """Accept a proposed skill: status -> active. Origin stays engine —
+    exactly one node_id per invocation, no bulk accept."""
+    from revien.graph.store import GraphStore
+    from revien.skills.proposals import accept_proposal
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        try:
+            node = accept_proposal(store, node_id)
+        except ValueError as e:
+            click.echo(str(e))
+            sys.exit(1)
+    finally:
+        store.close()
+    click.echo(f"Accepted: {node.label} (status={node.metadata.get('status')})")
+
+
+@skills.command(name="decline")
+@click.argument("node_id")
+@click.option("--db", default=None, help="Database path")
+def skills_decline(node_id: str, db: Optional[str]):
+    """Decline a proposed skill (declines += 1). The third decline
+    soft-invalidates it. Exactly one node_id per invocation, no bulk
+    decline."""
+    from revien.graph.store import GraphStore
+    from revien.skills.proposals import decline_proposal
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        try:
+            node = decline_proposal(store, node_id)
+        except ValueError as e:
+            click.echo(str(e))
+            sys.exit(1)
+    finally:
+        store.close()
+    declines = (node.metadata or {}).get("declines", 0)
+    if node.invalidated_at is not None:
+        click.echo(f"Declined ({declines}x) and invalidated: {node.label}")
+    else:
+        click.echo(f"Declined ({declines}x): {node.label}")
 
 
 if __name__ == "__main__":

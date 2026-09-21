@@ -74,10 +74,13 @@ class GenericAPIAdapter(RevienAdapter):
 
             results = self.response_parser(data)
 
-            # Ensure each result has a source_id
+            # Ensure each result has a source_id and an origin. setdefault so
+            # a custom response_parser's own values (if any) win.
             for r in results:
                 if "source_id" not in r:
                     r["source_id"] = f"{self.source_id_prefix}:{self.url}"
+                r.setdefault("origin_runtime", "api")
+                r.setdefault("origin_source", "api")
 
             return results
 
@@ -131,6 +134,8 @@ class GenericAPIAdapter(RevienAdapter):
                     "content_type": "conversation",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "metadata": {"adapter": "generic_api"},
+                    "origin_runtime": "api",
+                    "origin_source": "api",
                 })
             elif isinstance(item, dict):
                 content = (
@@ -145,6 +150,8 @@ class GenericAPIAdapter(RevienAdapter):
                         "content_type": item.get("content_type", "conversation"),
                         "timestamp": item.get("timestamp", datetime.now(timezone.utc).isoformat()),
                         "metadata": item.get("metadata", {"adapter": "generic_api"}),
+                        "origin_runtime": "api",
+                        "origin_source": "api",
                     })
 
         return results

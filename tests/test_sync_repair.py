@@ -680,3 +680,35 @@ class TestAdapterIngestKeys:
             assert len(results) == 1
             assert results[0]["ingest_key"] == results[0]["source_id"]
             assert results[0]["source_id"].startswith("codex:proj-y:rollout-")
+
+
+# ── Poison items must not wedge the cursor (v0.4 origin validation) ──
+
+
+class TestPoisonItemSkipped:
+    def test_bad_origin_is_skipped_and_cursor_advances(self, store, pipeline):
+        """An out-of-vocabulary origin_runtime (reachable via a custom
+        generic_api response_parser) raises ValueError in the pipeline. The
+        batch must skip that item, ingest the rest, and still persist the
+        cursor — otherwise the adapter re-fetches and re-fails the same item
+        on every sync, forever."""
+        t = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        good = _item("Mara chose Fernweh-Core for the benchmark harness.", t)
+        bad = dict(_item("Theo prefers dark mode in every editor.", t))
+        bad["origin_runtime"] = "TOTALLY-MADE-UP"
+        adapter = FakeAdapter([bad, good])
+        scheduler = SyncScheduler(pipeline=pipeline)
+        scheduler.register_adapter("fake", adapter)
+
+        result = run_async(scheduler.sync_one("fake"))
+
+        assert result["status"] == "ok"
+        assert result["items_ingested"] == 1
+        assert result["items_skipped"] == 1
+        assert store.get_sync_cursor("fake") is not None
+
+        # Second sync: nothing re-fetched, nothing re-failed.
+        second = run_async(scheduler.sync_one("fake"))
+        assert second["status"] == "ok"
+        assert second["items_ingested"] == 0
+        assert "items_skipped" not in second

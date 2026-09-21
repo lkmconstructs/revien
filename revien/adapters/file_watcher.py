@@ -63,6 +63,8 @@ class FileWatcherAdapter(RevienAdapter):
                         "adapter": "file_watcher",
                     },
                     "source_id": f"file:{filepath.name}",
+                    "origin_runtime": "file",
+                    "origin_source": "watch",
                 })
 
         return results

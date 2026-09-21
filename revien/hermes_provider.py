@@ -83,7 +83,7 @@ import os
 import queue
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Peer-dependency guard (mirrors the langchain adapter and mcp_server): the
 # core install never depends on Hermes. Everything that touches the SDK checks
@@ -184,8 +184,12 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
         # lock, so concurrent ingests would interleave transactions and lose
         # writes; serializing through one worker removes the race while keeping
         # sync_turn non-blocking (an unbounded put returns immediately). The
-        # queue carries turn text; None is the stop sentinel.
-        self._sync_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        # queue carries (turn text, session_key) tuples — session_key is
+        # captured at ENQUEUE time (sync_turn's own session_id kwarg, else
+        # self._session_id), not read off self at drain time, so a second
+        # initialize() landing mid-flight can never relabel an already-queued
+        # turn under the wrong session. None is the stop sentinel.
+        self._sync_queue: "queue.Queue[Optional[Tuple[str, Optional[str]]]]" = queue.Queue()
         self._sync_worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
 
@@ -294,7 +298,13 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
             return
         self._ensure_stack()
         self._ensure_sync_worker()
-        self._sync_queue.put(text)
+        # Captured NOW, not read off self at drain time: the kwarg wins when
+        # given, else whatever initialize() has set so far. This is the only
+        # correct point to resolve it — self._session_id can change before
+        # the worker gets to this item (a new initialize() mid-flight must
+        # not relabel an already-queued turn).
+        session_key = session_id or self._session_id or None
+        self._sync_queue.put((text, session_key))
 
     def on_session_end(self, messages: Any) -> None:
         """Session ended — flush deferred embeddings, else no-op.
@@ -478,6 +488,9 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                 source_id=_HERMES_SOURCE_ID,
                 content=content,
                 content_type="note",
+                origin_runtime="hermes",
+                origin_source="live",
+                session_key=self._session_id or None,
             )
         )
         return {
@@ -572,14 +585,25 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
             try:
                 if item is None:
                     return
+                text, session_key = item
                 pipeline = self._pipeline
                 if pipeline is not None:
                     pipeline.ingest(
                         IngestionInput(
                             source_id=_HERMES_SOURCE_ID,
-                            content=item,
+                            content=text,
                             content_type=_CONVERSATION,
                             defer_embed=True,  # persist now, embed on drain/sweep
+                            origin_runtime="hermes",
+                            origin_source="live",
+                            # Captured at ENQUEUE time in sync_turn (kwarg
+                            # first, else self._session_id then) and carried
+                            # on the queue item — NOT read off self here,
+                            # which would stamp a turn with whatever session
+                            # happens to be live when the worker gets to it
+                            # rather than the one it was actually queued
+                            # under.
+                            session_key=session_key,
                         )
                     )
             except Exception:  # noqa: BLE001 - a sync failure never breaks Hermes

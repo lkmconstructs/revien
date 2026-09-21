@@ -197,6 +197,11 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                     "score": r.score,
                     "score_breakdown": r.score_breakdown,
                     "path": r.path,
+                    # Origin Layer (WS0 Leg B): present on EVERY result, None
+                    # allowed — mirrors daemon/server.py's /v1/recall shape.
+                    "origin_runtime": r.origin_runtime,
+                    "origin_source": r.origin_source,
+                    "project_key": r.project_key,
                 }
                 for r in response.results
             ],
@@ -204,6 +209,9 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             "retrieval_time_ms": response.retrieval_time_ms,
             "semantic_active": response.semantic_active,
             "semantic_note": response.semantic_note,
+            # Skills leg D2: draft engine-origin skill proposals relevant to
+            # this query. Always present, possibly [].
+            "skill_proposals": response.skill_proposals,
         }
 
     @server.tool()
@@ -212,6 +220,9 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
         source_id: str = "mcp",
         content_type: str = "note",
         defer_embed: bool = False,
+        origin_runtime: Optional[str] = None,
+        project_key: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store a durable memory in the user's persistent memory graph.
 
@@ -234,6 +245,13 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                 latency-critical capture; the memory is keyword-searchable
                 immediately and semantically searchable after the queue
                 drains.
+            origin_runtime, project_key, session_key: Origin Layer (WS0)
+                provenance — set these if the caller knows its own runtime/
+                project/session. Omitted origin_runtime falls back to
+                deriving it from source_id. origin_source is NOT a
+                parameter here — an LLM-facing tool must not be able to
+                claim the vault channel, so this face always stamps
+                origin_source="api".
 
         Returns the created context node id and node/edge counts.
         """
@@ -250,6 +268,12 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                 content=content,
                 content_type=content_type,
                 defer_embed=defer_embed,
+                origin_runtime=origin_runtime,
+                # Hard-set, not a parameter: an LLM-facing tool must not be
+                # able to claim the vault channel.
+                origin_source="api",
+                project_key=project_key,
+                session_key=session_key,
             )
         )
         return {

@@ -129,6 +129,7 @@ class SyncScheduler:
 
         # Ingest each piece of content
         ingested = 0
+        skipped = 0
         for item in new_content:
             # timestamp was previously dropped here — every synced item
             # ingested with recorded_at=None, so temporal resolution and
@@ -153,15 +154,36 @@ class SyncScheduler:
                 # the pipeline refreshes ONE context node instead of stacking
                 # duplicates every sync. Absent = append-forever, unchanged.
                 ingest_key=item.get("ingest_key"),
+                # Origin Layer (WS0): pass through whatever the adapter knows
+                # about its own provenance; None falls back to deriving it
+                # from source_id in the pipeline's stamp loop.
+                origin_runtime=item.get("origin_runtime"),
+                origin_source=item.get("origin_source"),
+                project_key=item.get("project_key"),
+                session_key=item.get("session_key"),
             )
-            if input_data.content.strip():
+            if not input_data.content.strip():
+                continue
+            # One poison item (e.g. an out-of-vocabulary origin_runtime from
+            # a custom generic_api response_parser) must not abort the batch:
+            # without this the cursor never advances and the adapter re-fetches
+            # and re-fails the same item on every sync, forever.
+            try:
                 self.pipeline.ingest(input_data)
                 ingested += 1
+            except ValueError as exc:
+                skipped += 1
+                logger.warning(
+                    f"Skipped item from {name} ({input_data.source_id}): {exc}"
+                )
 
         # Success: persist the pre-fetch stamp as the new cursor.
         store.set_sync_cursor(name, sync_started)
-        logger.info(f"Synced {name}: {ingested} items ingested")
-        return {"status": "ok", "adapter": name, "items_ingested": ingested}
+        logger.info(f"Synced {name}: {ingested} items ingested, {skipped} skipped")
+        result = {"status": "ok", "adapter": name, "items_ingested": ingested}
+        if skipped:
+            result["items_skipped"] = skipped
+        return result
 
     async def drain_pending_embeds(self) -> int:
         """Idle sweep for the deferred-embed queue (capture leg): embed
