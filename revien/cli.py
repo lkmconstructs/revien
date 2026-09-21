@@ -969,8 +969,41 @@ def status(db: Optional[str]):
             click.echo(f"Connected adapters: {', '.join(adapters.keys())}")
         else:
             click.echo("No adapters connected. Run 'revien connect <system>'")
+
+        click.echo(f"Pairing token: {_pairing_token_status()}")
     finally:
         store.close()
+
+
+def _pairing_token_status() -> str:
+    """set (env) / set (file) / not set — mirrors pairing.configured_token's
+    precedence without ever printing the token itself."""
+    from revien import pairing
+
+    if os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip():
+        return "set (env)"
+    if pairing.load_token():
+        return "set (file)"
+    return "not set"
+
+
+@main.command()
+@click.option("--rotate", is_flag=True, help="Mint a new token, replacing any existing one.")
+@click.option("--path", "show_path", is_flag=True, help="Print the token file path only — not the token.")
+def token(rotate: bool, show_path: bool):
+    """Print the pairing token for remote capture/mutation, minting one if absent.
+
+    A remote /v1/ingest (or skill accept/decline) caller pairs by sending this
+    token as `Authorization: Bearer <token>`. REVIEN_CAPTURE_TOKEN, if set,
+    overrides whatever is minted here. The full token prints exactly once per
+    invocation — nothing is echoed partially or masked.
+    """
+    from revien import pairing
+
+    if show_path:
+        click.echo(str(pairing.token_path()))
+        return
+    click.echo(pairing.mint_token(rotate=rotate))
 
 
 @main.command()
