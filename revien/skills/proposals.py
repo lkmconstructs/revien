@@ -41,9 +41,9 @@ detail:
 
 import hashlib
 import re
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from revien.graph.operations import GraphOperations
 from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
@@ -86,7 +86,18 @@ def normalize_label(text: str) -> str:
     return " ".join(tokens)
 
 
-def _session_group_key(node: Node) -> Tuple[Optional[str], str]:
+# G8(c): the lean row detect_repeated_sequences actually needs per ACTION
+# node — node_id/label/project_key/session_key/recorded_at/created_at — NOT
+# a full Node (content, metadata dict, confidence, etc.). Same field names
+# as Node's own attributes on purpose, so _session_group_key and the window
+# logic below work unmodified against either a Node or an _ActionRow.
+_ActionRow = namedtuple(
+    "_ActionRow",
+    "node_id label project_key session_key recorded_at created_at origin_runtime",
+)
+
+
+def _session_group_key(node: Union[Node, "_ActionRow"]) -> Tuple[Optional[str], str]:
     """(project_key, session_key) when the node has one; otherwise the
     documented time-gap fallback — (project_key, recorded_at's date) —
     since nodes with session_key None still cluster by "the same rough
@@ -111,13 +122,25 @@ def _is_contiguous_subsequence(short: List[str], long: List[str]) -> bool:
     return False
 
 
-def _all_action_nodes(store: GraphStore) -> List[Node]:
-    out: List[Node] = []
+def _all_action_rows(store: GraphStore) -> List[_ActionRow]:
+    """Live (non-invalidated) ACTION nodes as lean tuples (G8c) — a 16.7k-
+    ACTION corpus building a Python list of 16.7k FULL Node objects (each
+    carrying content, metadata dict, confidence, timestamps it never uses
+    here) was measured as unnecessary retained memory relative to what
+    detect_repeated_sequences actually reads: node_id, label, project_key,
+    session_key, recorded_at, created_at. Each page is reduced to tuples
+    and the Node objects dropped before the next page is fetched. Page
+    size 1000 (was 500) halves the round trips at that scale."""
+    out: List[_ActionRow] = []
     offset = 0
-    page = 500
+    page = 1000
     while True:
         batch = store.list_nodes(node_type=NodeType.ACTION, limit=page, offset=offset)
-        out.extend(batch)
+        out.extend(
+            _ActionRow(n.node_id, n.label, n.project_key, n.session_key,
+                       n.recorded_at, n.created_at, n.origin_runtime)
+            for n in batch if n.invalidated_at is None
+        )
         if len(batch) < page:
             return out
         offset += page
@@ -150,7 +173,7 @@ def detect_repeated_sequences(
         {pattern_hash, steps (normalized), display_steps (original label
          text, same order), occurrences, sessions, project_key, node_ids}
     """
-    nodes = [n for n in _all_action_nodes(store) if n.invalidated_at is None]
+    nodes = _all_action_rows(store)
 
     groups: Dict[Tuple, List[Node]] = defaultdict(list)
     for n in nodes:
@@ -183,10 +206,12 @@ def detect_repeated_sequences(
                     "occurrences": 0,
                     "session_keys": set(),
                     "node_ids": set(),
+                    "origin_runtimes": set(),
                 })
                 entry["occurrences"] += 1
                 entry["session_keys"].add(group_key)
                 entry["node_ids"].update(wn.node_id for wn in window_nodes)
+                entry["origin_runtimes"].update(wn.origin_runtime for wn in window_nodes)
 
     qualifying = [
         e for e in acc.values()
@@ -211,6 +236,18 @@ def detect_repeated_sequences(
             "sessions": len(e["session_keys"]),
             "project_key": e["project_key"],
             "node_ids": sorted(e["node_ids"]),
+            # G3: the proposal built from this pattern is stamped with
+            # this origin_runtime so a filtered recall's skill_proposals
+            # can be gated the same way every other node is. Only
+            # attributed when EVERY source ACTION node agrees — a pattern
+            # whose occurrences span more than one runtime (or include an
+            # unknown-provenance node) gets None, an honest "don't know",
+            # never a guess.
+            "origin_runtime": (
+                next(iter(e["origin_runtimes"]))
+                if len(e["origin_runtimes"]) == 1
+                else None
+            ),
         }
         for e in kept
     ]
@@ -270,19 +307,24 @@ def _resolve_extractor(extractor):
     return resolved, not isinstance(resolved, RuleBasedExtractor)
 
 
-def _find_proposal_by_pattern_hash(store: GraphStore, pattern_hash: str) -> Optional[Node]:
+def _load_proposal_index(store: GraphStore) -> Dict[str, Node]:
+    """{pattern_hash: engine-origin SKILL node} — ONE pass over every SKILL
+    node (G8a). This replaces the old per-pattern _find_proposal_by_
+    pattern_hash, which page-scanned ALL SKILL nodes for EVERY pattern —
+    O(patterns * skills). propose_skills builds this once per call and
+    does O(1) dict lookups instead: O(patterns + skills)."""
+    index: Dict[str, Node] = {}
     offset = 0
-    page = 500
+    page = 1000
     while True:
         batch = store.list_nodes(node_type=NodeType.SKILL, limit=page, offset=offset)
-        if not batch:
-            return None
         for node in batch:
             md = node.metadata or {}
-            if md.get("origin") == "engine" and md.get("pattern_hash") == pattern_hash:
-                return node
+            phash = md.get("pattern_hash")
+            if md.get("origin") == "engine" and phash:
+                index[phash] = node
         if len(batch) < page:
-            return None
+            return index
         offset += page
 
 
@@ -299,6 +341,7 @@ def propose_skills(
     extractor=None,
     min_occurrences: int = DEFAULT_MIN_OCCURRENCES,
     min_sessions: int = DEFAULT_MIN_SESSIONS,
+    progress=None,
 ) -> Dict:
     """Detect qualifying repeated ACTION sequences and create/refresh one
     engine-origin SKILL proposal each. Idempotent by pattern_hash: a
@@ -307,108 +350,142 @@ def propose_skills(
     it never duplicates a proposal node or an edge. An already-accepted
     proposal (status active) is never demoted back to "proposed" by a
     re-run; its origin stays "engine" either way.
+
+    G8: O(n), not O(patterns * skills) — ``proposal_index`` is built with
+    ONE pass over every SKILL node (see _load_proposal_index) instead of
+    the old per-pattern page-scan.
+
+    ``progress`` (optional): a ``callable(str)`` invoked with two status
+    lines — one right after pattern detection ("patterns found: N"), one
+    at the end ("proposals written: N") — the hook `revien skills propose`
+    uses to print a progress line without this module importing click.
     """
     resolved_extractor, is_llm = _resolve_extractor(extractor)
     patterns = detect_repeated_sequences(
         store, min_occurrences=min_occurrences, min_sessions=min_sessions
     )
+    if progress is not None:
+        progress(f"patterns found: {len(patterns)}")
     summary = {"detected": len(patterns), "created": 0, "updated": 0, "edges": 0, "proposals": []}
+    proposal_index = _load_proposal_index(store)
 
-    for pattern in patterns:
-        body, draft = _draft_body(
-            resolved_extractor, is_llm,
-            pattern["display_steps"], pattern["occurrences"], pattern["sessions"],
-        )
-        label = _label_for(pattern["display_steps"])
-        existing = _find_proposal_by_pattern_hash(store, pattern["pattern_hash"])
+    # G8: ONE commit for the whole run, not one per add_node/record_audit/
+    # add_edge call. At the 997-pattern / 24.7k-edge synthetic this was
+    # measured as the actual first-run bottleneck (150s) — SQLite commits
+    # fsync, and store.add_edge/add_node/record_audit each call
+    # self._commit() individually outside a transaction. store.transaction()
+    # is reentrant (nests by depth, only the outermost commit is real — see
+    # its docstring) so every write below still gets its normal audit-row
+    # guarantees, just batched into one disk sync at the end. A failure
+    # partway rolls back the WHOLE batch, same all-or-nothing shape
+    # import_graph already uses for its bulk writes.
+    with store.transaction():
+        for pattern in patterns:
+            body, draft = _draft_body(
+                resolved_extractor, is_llm,
+                pattern["display_steps"], pattern["occurrences"], pattern["sessions"],
+            )
+            label = _label_for(pattern["display_steps"])
+            existing = proposal_index.get(pattern["pattern_hash"])
 
-        metadata = {
-            "origin": "engine",
-            "status": "proposed",
-            "pattern_hash": pattern["pattern_hash"],
-            "occurrences": pattern["occurrences"],
-            "sessions": pattern["sessions"],
-            "declines": (existing.metadata or {}).get("declines", 0) if existing else 0,
-            "steps": pattern["steps"],
-            "draft": draft,
-            # Deliberately absent: "curated" — that flag is reserved for
-            # human-authored (D1) skills; an engine proposal never sets it.
-        }
-        if existing is None:
-            node = Node(
-                node_type=NodeType.SKILL,
-                label=label,
-                content=body,
-                source_id=f"skill-proposal:{pattern['pattern_hash']}",
-                metadata=metadata,
-                source_type=SourceType.INFERRED,
-                confidence=0.5,
-                project_key=pattern["project_key"],
-                session_key=None,
-                recorded_at=datetime.now(timezone.utc),
-            )
-            node = store.add_node(node)
-            store.record_audit(
-                node.node_id, "skill_propose",
-                before=None, after=node.model_dump(mode="json"),
-            )
-            summary["created"] += 1
-        elif existing.invalidated_at is not None:
-            # 3x-declined and soft-invalidated — leave it alone. Re-running
-            # propose must not resurrect a proposal the human already
-            # rejected three times.
-            summary["proposals"].append(existing)
-            continue
-        elif (existing.metadata or {}).get("status") != "proposed":
-            # The node has moved on (accepted -> "active", or any other
-            # status a future path might set) — a re-run must NEVER touch
-            # label/content/origin/status again once a human has acted on
-            # it. Only the observational counters move: occurrences,
-            # sessions, and any DERIVED_FROM edges the detector found that
-            # aren't already wired (below). Everything else about the
-            # existing node — label, content, status, origin, declines,
-            # steps, draft — is carried forward untouched.
-            before_snapshot = existing.model_dump(mode="json")
-            frozen_metadata = dict(existing.metadata or {})
-            frozen_metadata["occurrences"] = pattern["occurrences"]
-            frozen_metadata["sessions"] = pattern["sessions"]
-            node = store.update_node(
-                existing.node_id,
-                metadata=frozen_metadata,
-                _audit_op=None,
-            )
-            store.record_audit(
-                node.node_id, "skill_propose",
-                before=before_snapshot, after=node.model_dump(mode="json"),
-            )
-            summary["updated"] += 1
-        else:
-            before_snapshot = existing.model_dump(mode="json")
-            node = store.update_node(
-                existing.node_id,
-                label=label, content=body, metadata=metadata,
-                _audit_op=None,
-            )
-            store.record_audit(
-                node.node_id, "skill_propose",
-                before=before_snapshot, after=node.model_dump(mode="json"),
-            )
-            summary["updated"] += 1
-
-        already = _existing_derived_targets(store, node.node_id)
-        for action_node_id in pattern["node_ids"]:
-            if action_node_id in already:
+            metadata = {
+                "origin": "engine",
+                "status": "proposed",
+                "pattern_hash": pattern["pattern_hash"],
+                "occurrences": pattern["occurrences"],
+                "sessions": pattern["sessions"],
+                "declines": (existing.metadata or {}).get("declines", 0) if existing else 0,
+                "steps": pattern["steps"],
+                "draft": draft,
+                # Deliberately absent: "curated" — that flag is reserved for
+                # human-authored (D1) skills; an engine proposal never sets it.
+            }
+            if existing is None:
+                node = Node(
+                    node_type=NodeType.SKILL,
+                    label=label,
+                    content=body,
+                    source_id=f"skill-proposal:{pattern['pattern_hash']}",
+                    metadata=metadata,
+                    source_type=SourceType.INFERRED,
+                    confidence=0.5,
+                    project_key=pattern["project_key"],
+                    # G3: origin_runtime is what lets a source-filtered
+                    # recall's skill_proposals be gated at all — None (mixed
+                    # or unknown source ACTION nodes) means this proposal
+                    # never matches an active filter, same rule as every
+                    # other node in the origin layer.
+                    origin_runtime=pattern.get("origin_runtime"),
+                    session_key=None,
+                    recorded_at=datetime.now(timezone.utc),
+                )
+                node = store.add_node(node)
+                store.record_audit(
+                    node.node_id, "skill_propose",
+                    before=None, after=node.model_dump(mode="json"),
+                )
+                summary["created"] += 1
+            elif existing.invalidated_at is not None:
+                # 3x-declined and soft-invalidated — leave it alone. Re-running
+                # propose must not resurrect a proposal the human already
+                # rejected three times.
+                summary["proposals"].append(existing)
                 continue
-            store.add_edge(Edge(
-                edge_type=EdgeType.DERIVED_FROM,
-                source_node_id=node.node_id,
-                target_node_id=action_node_id,
-                weight=0.8,
-            ))
-            summary["edges"] += 1
+            elif (existing.metadata or {}).get("status") != "proposed":
+                # The node has moved on (accepted -> "active", or any other
+                # status a future path might set) — a re-run must NEVER touch
+                # label/content/origin/status again once a human has acted on
+                # it. Only the observational counters move: occurrences,
+                # sessions, and any DERIVED_FROM edges the detector found that
+                # aren't already wired (below). Everything else about the
+                # existing node — label, content, status, origin, declines,
+                # steps, draft — is carried forward untouched.
+                before_snapshot = existing.model_dump(mode="json")
+                frozen_metadata = dict(existing.metadata or {})
+                frozen_metadata["occurrences"] = pattern["occurrences"]
+                frozen_metadata["sessions"] = pattern["sessions"]
+                node = store.update_node(
+                    existing.node_id,
+                    metadata=frozen_metadata,
+                    _audit_op=None,
+                )
+                store.record_audit(
+                    node.node_id, "skill_propose",
+                    before=before_snapshot, after=node.model_dump(mode="json"),
+                )
+                summary["updated"] += 1
+            else:
+                before_snapshot = existing.model_dump(mode="json")
+                node = store.update_node(
+                    existing.node_id,
+                    label=label, content=body, metadata=metadata,
+                    _audit_op=None,
+                )
+                store.record_audit(
+                    node.node_id, "skill_propose",
+                    before=before_snapshot, after=node.model_dump(mode="json"),
+                )
+                summary["updated"] += 1
 
-        summary["proposals"].append(node)
+            already = _existing_derived_targets(store, node.node_id)
+            for action_node_id in pattern["node_ids"]:
+                if action_node_id in already:
+                    continue
+                store.add_edge(Edge(
+                    edge_type=EdgeType.DERIVED_FROM,
+                    source_node_id=node.node_id,
+                    target_node_id=action_node_id,
+                    weight=0.8,
+                ))
+                summary["edges"] += 1
 
+            summary["proposals"].append(node)
+
+    if progress is not None:
+        progress(
+            f"proposals written: {summary['created']} created, "
+            f"{summary['updated']} updated"
+        )
     return summary
 
 
@@ -495,7 +572,11 @@ def _query_keywords(query: str) -> set:
     return {w for w in normalize_label(query).split(" ") if len(w) >= 4}
 
 
-def matching_proposals(store: GraphStore, query: str) -> List[Dict]:
+def matching_proposals(
+    store: GraphStore,
+    query: str,
+    source_filter: Optional[List[str]] = None,
+) -> List[Dict]:
     """Draft (draft=True) engine-origin proposals relevant to a recall
     query — the recall response's `skill_proposals` field.
 
@@ -508,6 +589,22 @@ def matching_proposals(store: GraphStore, query: str) -> List[Dict]:
     branches" recall-matches a proposal whose step said "I'll sync the
     Fernweh branches".
 
+    G3 (RULING): ``source_filter`` is the SAME normalized filter recall()
+    applies to results/tensions/path — None means unfiltered (byte-
+    identical to before); ANY other value (including an empty list, G4's
+    fail-closed case) means only proposals whose origin_runtime is IN the
+    filter are returned, exactly the same membership rule used
+    everywhere else in the origin layer. A proposal's origin_runtime
+    reflects which runtime's ACTION nodes it was derived from (set at
+    propose_skills() ingest time via the pattern's project/nodes) — a
+    proposal built out of claude-code ACTIONs must never surface through
+    a recall filtered to source="codex".
+
+    G9: prefiltered in SQL (store.list_draft_proposed_skills) instead of
+    a page-scan of every SKILL node — with zero draft proposals in the
+    graph this costs ~one indexed-free LIKE scan against an empty result,
+    regardless of how many accepted/declined/non-draft SKILL nodes exist.
+
     Rows use a FIXED key set (node_id, label, occurrences, sessions,
     project_key, steps) so toon.py can carry them as a uniform tabular
     array; `steps` is the normalized step list already joined by " -> "
@@ -519,20 +616,27 @@ def matching_proposals(store: GraphStore, query: str) -> List[Dict]:
 
     out: List[Dict] = []
     offset = 0
-    page = 500
+    page = 1000
     while True:
-        batch = store.list_nodes(node_type=NodeType.SKILL, limit=page, offset=offset)
+        batch = store.list_draft_proposed_skills(limit=page, offset=offset)
         if not batch:
             break
         for node in batch:
             if node.invalidated_at is not None:
                 continue
             md = node.metadata or {}
+            # The LIKE prefilter can only narrow candidates, never confirm
+            # them (a substring hit isn't a parsed-JSON guarantee) — these
+            # three checks are the exact same confirmation the old full
+            # scan did, just against a far smaller candidate set.
             if md.get("origin") != "engine":
                 continue
             if md.get("status") != "proposed":
                 continue
             if not md.get("draft"):
+                continue
+            if (source_filter is not None
+                    and node.origin_runtime not in source_filter):
                 continue
             steps = md.get("steps") or []
             step_words = set()

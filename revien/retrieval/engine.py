@@ -461,9 +461,25 @@ class RetrievalEngine:
         # re-checked in the final scoring loop (see step 4) so a node
         # reached only through graph-walk expansion from an in-filter
         # anchor can't leak a different runtime into results.
-        source_filter: Optional[List[str]] = (
-            [source] if isinstance(source, str) else (list(source) if source else None)
-        )
+        #
+        # G4 (fail-closed empty filter): None means "no source kwarg at
+        # all" — unfiltered, the only way source_filter stays None. ANY
+        # other shape means "a filter is present" and normalizes to a list
+        # that may be EMPTY: source=[] , source="", and source=[""] all
+        # collapse to source_filter == [] below (raw values are split out,
+        # then blank strings are dropped). The membership tests downstream
+        # (``origin_runtime in source_filter``) are unchanged by this — an
+        # empty list simply never contains anything, so "filter present,
+        # matches nothing" falls out for free instead of needing a special
+        # "is the filter active" flag threaded everywhere. Do NOT write
+        # this as ``[source] if source else None`` / ``list(source) if
+        # source else None`` — those truthy checks silently turn an empty
+        # filter back into "unfiltered", which is exactly the leak this
+        # guards against.
+        source_filter: Optional[List[str]] = None
+        if source is not None:
+            _raw = [source] if isinstance(source, str) else list(source)
+            source_filter = [s for s in _raw if s]
         if as_of is not None and as_of.tzinfo is None:
             as_of = as_of.replace(tzinfo=timezone.utc)
 
@@ -811,11 +827,28 @@ class RetrievalEngine:
 
             # Build path labels (path nodes are all within the walked set,
             # so the bulk map already has them).
+            #
+            # G2 (origin filter must cover path labels too): a hop's own
+            # label is provenance-bearing content just like a result's
+            # label/content — a query filtered to "codex" that walks
+            # anchor(codex) -> mid(claude-code) -> leaf(codex) must not
+            # spell "mid"'s claude-code label into the response merely
+            # because the FINAL node on that path is in-filter. When a
+            # source filter is active, any path node outside the filter
+            # (None origin included, same rule as everywhere else) is
+            # replaced by the literal "[filtered]" placeholder — never the
+            # real label — and the list keeps its original length so hop
+            # counts (len(path)) stay honest.
             path_ids = node_paths.get(node_id, [node_id])
             path_labels = []
             for pid in path_ids:
                 pnode = nodes_map.get(pid)
-                if pnode:
+                if pnode is None:
+                    continue
+                if (source_filter is not None
+                        and pnode.origin_runtime not in source_filter):
+                    path_labels.append("[filtered]")
+                else:
                     path_labels.append(pnode.label)
 
             score_breakdown = {
@@ -889,7 +922,7 @@ class RetrievalEngine:
         # said this — AND holds this opposing pull" in one response. Flag-off
         # is a no-op: zero queries, response byte-identical.
         if include_tensions and top_results:
-            self._attach_tensions(top_results)
+            self._attach_tensions(top_results, source_filter)
 
         # 6. Touch retrieved nodes (update access tracking). Env-gated
         # (REVIEN_TOUCH_ON_RECALL=0 disables) because this is the frequency
@@ -954,16 +987,36 @@ class RetrievalEngine:
             ),
             diagnostics=diagnostics,
             # Skills leg D2: always computed, always present (possibly
-            # empty) — cheap (SKILL-typed nodes only) relative to the walk
-            # above, so there's no flag gating it off.
-            skill_proposals=matching_proposals(self.store, query),
+            # empty). G9: cheap because matching_proposals prefilters in
+            # SQL (metadata LIKE on status/draft) before any Python-side
+            # scan — NOT because "SKILL-typed nodes only" is inherently a
+            # small set (a graph can carry thousands of accepted/declined
+            # SKILL nodes that were never draft proposals; the old comment
+            # here was wrong about why this was cheap). G3: source_filter
+            # is the SAME normalized filter recall() applies everywhere
+            # else — a filtered recall's skill_proposals never surfaces a
+            # proposal derived from a foreign runtime's ACTION nodes.
+            skill_proposals=matching_proposals(self.store, query, source_filter),
         )
 
-    def _attach_tensions(self, results: List[RetrievalResult]) -> None:
+    def _attach_tensions(
+        self,
+        results: List[RetrievalResult],
+        source_filter: Optional[List[str]] = None,
+    ) -> None:
         """Populate each result's `tensions` with the live counterpart of any
         CONFLICTS_WITH edge it carries. One edges query + one bulk node fetch
         per result that HAS such edges — tension edges are rare, so the
-        common case is the single get_edges_for_node lookup."""
+        common case is the single get_edges_for_node lookup.
+
+        G1 (origin filter must cover tensions too): a tension partner is
+        foreign content riding in on a result that's IN the filter — the
+        result itself passed the gate at step 4, but its CONFLICTS_WITH
+        counterpart never did, because tensions are attached AFTER that
+        gate. When a source filter is active, a counterpart whose
+        origin_runtime is not IN the filter is dropped — same rule as
+        everywhere else, including a counterpart with origin_runtime None
+        (unknown provenance never matches an active filter)."""
         for result in results:
             counterpart_ids = []
             for edge in self.store.get_edges_for_node(result.node_id):
@@ -980,6 +1033,9 @@ class RetrievalEngine:
                 node = nodes.get(nid)
                 if node is None or node.invalidated_at is not None:
                     continue  # a superseded claim's tension is history
+                if (source_filter is not None
+                        and node.origin_runtime not in source_filter):
+                    continue
                 result.tensions.append({
                     "node_id": node.node_id,
                     "label": node.label,
@@ -1014,8 +1070,13 @@ class RetrievalEngine:
         own (the semantic/vector index) — one bulk node fetch, then a
         membership check against ``source_filter``. Returns every id
         unfiltered (as a set) when no filter is active, so callers can
-        unconditionally intersect against this without a None-check."""
-        if not source_filter:
+        unconditionally intersect against this without a None-check.
+
+        G4: the check is ``source_filter is None``, never a truthy check —
+        an EMPTY-but-present filter (``source_filter == []``) must fail
+        closed (match nothing), and ``not []`` is True, so a truthy check
+        here would silently unfilter it."""
+        if source_filter is None:
             return set(node_ids)
         nodes = self.store.get_nodes_bulk(node_ids)
         return {

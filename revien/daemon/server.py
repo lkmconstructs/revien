@@ -155,6 +155,33 @@ class SyncResponse(BaseModel):
     message: str
 
 
+def _normalize_origin_runtime_param(
+    raw: Optional[List[str]],
+) -> Optional[List[str]]:
+    """GET /v1/nodes?origin_runtime=... (G5) — accept BOTH shapes a caller
+    might reasonably send: a repeated query param (FastAPI/Starlette gives
+    that to us as ``raw`` already split, e.g. ``["claude-code", "codex"]``)
+    AND a single comma-separated value (arrives as ``["claude-code,codex"]``
+    — one raw item that still has commas in it, since Starlette doesn't
+    split on commas itself). Every raw item is comma-split, then every
+    resulting piece is stripped and blanks are dropped — so a repeated
+    param, a comma-joined param, a single value, and an empty value
+    (``?origin_runtime=``) all normalize the same way.
+
+    None (param absent from the query string entirely) passes straight
+    through as None — unfiltered, unchanged from before. Any other input
+    normalizes to a list that MAY be empty (every segment was blank) —
+    that empty-but-present list is what makes store.list_nodes fail
+    closed (G4) instead of silently returning everything.
+    """
+    if raw is None:
+        return None
+    parts: List[str] = []
+    for item in raw:
+        parts.extend(item.split(","))
+    return [p.strip() for p in parts if p.strip()]
+
+
 # ── Capture auth (P3: remote capture is opt-in, token-gated) ─────────
 
 # starlette's TestClient reports host "testclient"; it exercises the same
@@ -171,6 +198,16 @@ def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
     ``REVIEN_CAPTURE_TOKEN`` or a minted ``revien token`` file, see
     ``revien.pairing.configured_token`` — and with one configured must present
     ``Authorization: Bearer <token>``. Comparison is constant-time.
+
+    G10: the scheme ("Bearer") is compared case-insensitively — a client
+    that sends ``bearer <token>`` (lowercase, RFC 6750 doesn't mandate a
+    case) is not refused just for that. The header is split on the FIRST
+    whitespace only (``partition``, not ``strip`` + exact-string compare)
+    so the scheme and the token are judged independently: a wrong-case
+    scheme with the right token now passes, but a right scheme with a
+    malformed/padded token (extra whitespace inside what should be just
+    the token) still fails, because the token half is compared with
+    ``compare_digest`` byte-for-byte, no stripping of its own.
     """
     host = (client_host or "").strip().lower()
     if host in _LOOPBACK_HOSTS:
@@ -182,9 +219,9 @@ def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
             "Remote access is disabled — run `revien token` on the Revien "
             "host and pair.",
         )
-    expected = f"Bearer {token}"
-    if not secrets.compare_digest(
-        (auth_header or "").strip().encode(), expected.encode()
+    scheme, _, provided = (auth_header or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(
+        provided.encode(), expected.encode()
     ):
         raise HTTPException(401, "Invalid or missing capture token.")
 
@@ -532,10 +569,19 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     ):
         """List all nodes. Supports filtering by type, date, source.
 
-        Origin Layer (WS0 Leg B): origin_runtime accepts a repeated query
-        param (``?origin_runtime=claude-code&origin_runtime=codex``) for a
-        multi-runtime filter; project_key is a single exact match. Both are
-        SQL prefilters via store.list_nodes — see its docstring.
+        Origin Layer (WS0 Leg B): origin_runtime accepts EITHER a repeated
+        query param (``?origin_runtime=claude-code&origin_runtime=codex``)
+        OR a single comma-separated value (``?origin_runtime=claude-code,
+        codex``) — see ``_normalize_origin_runtime_param`` (G5). project_key
+        is a single exact match. Both are SQL prefilters via
+        store.list_nodes — see its docstring.
+
+        G4/G5 (fail closed): the param being ABSENT (None: no
+        origin_runtime in the query string at all) means unfiltered — same
+        as before. The param being PRESENT but resolving to an empty list
+        (``?origin_runtime=``, or every comma-split segment blank) means a
+        filter IS active and matches nothing: this returns ``[]``, it
+        never silently falls back to unfiltered.
         """
         nt = None
         if node_type:
@@ -549,7 +595,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             source_id=source_id or None,
             limit=limit,
             offset=offset,
-            origin_runtime=origin_runtime or None,
+            origin_runtime=_normalize_origin_runtime_param(origin_runtime),
             project_key=project_key or None,
         )
         return [_node_to_response(n) for n in nodes]

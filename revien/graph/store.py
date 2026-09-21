@@ -511,15 +511,50 @@ class GraphStore:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
                     columns_added = True
 
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime ON nodes(origin_runtime)"
-            )
+            # G6: composite indexes, not single-column. list_nodes(
+            # origin_runtime=..., limit=N) and list_nodes(project_key=...,
+            # limit=N) both filter AND ``ORDER BY created_at DESC`` in the
+            # same query — a single-column index on origin_runtime/
+            # project_key answers the WHERE but leaves SQLite to sort the
+            # matching rows itself ("USE TEMP B-TREE FOR ORDER BY" in
+            # EXPLAIN QUERY PLAN), which is the expensive part at scale.
+            # (origin_runtime, created_at DESC) / (project_key, created_at
+            # DESC) let the index satisfy both the filter AND the order in
+            # one pass. Old single-column index names are dropped first so
+            # an upgraded DB converges on the composite instead of
+            # carrying a redundant single-column index alongside it
+            # forever. idx_nodes_origin_source stays single-column — it
+            # isn't ordered by created_at anywhere in this codebase.
+            # created_at guard: see the matching comment in
+            # migrations/003_origin_layer.py — a degenerate table missing
+            # created_at can't back a created_at-ordered index.
+            has_created_at = "created_at" in {
+                row[1] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
+            }
+            conn.execute("DROP INDEX IF EXISTS idx_nodes_origin_runtime")
+            conn.execute("DROP INDEX IF EXISTS idx_nodes_project")
+            if has_created_at:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
+                    "ON nodes(origin_runtime, created_at DESC)"
+                )
+            else:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
+                    "ON nodes(origin_runtime)"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_origin_source ON nodes(origin_source)"
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_key)"
-            )
+            if has_created_at:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_nodes_project "
+                    "ON nodes(project_key, created_at DESC)"
+                )
+            else:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_key)"
+                )
             self._commit(conn)
 
             user_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -1142,7 +1177,11 @@ class GraphStore:
         params: list = [k.lower() for k in kws]
         if exclude_context:
             query += " AND node_type != 'context'"
-        if origin_runtime:
+        if origin_runtime is not None:
+            # G4: ``is not None``, never a truthy check — origin_runtime=[]
+            # is a PRESENT-but-empty filter (fail closed, matches nothing
+            # via "IN ()", valid SQL), and a truthy check would silently
+            # treat that the same as "no filter" (origin_runtime=None).
             runtimes = (
                 [origin_runtime] if isinstance(origin_runtime, str) else list(origin_runtime)
             )
@@ -1282,7 +1321,10 @@ class GraphStore:
         if source_id:
             query += " AND source_id = ?"
             params.append(source_id)
-        if origin_runtime:
+        if origin_runtime is not None:
+            # G4: ``is not None``, never a truthy check — see the same note
+            # in search_nodes_keyword above. origin_runtime=[] must fail
+            # closed (match nothing), not silently unfilter.
             runtimes = (
                 [origin_runtime] if isinstance(origin_runtime, str) else list(origin_runtime)
             )
@@ -1292,9 +1334,38 @@ class GraphStore:
         if project_key:
             query += " AND project_key = ?"
             params.append(project_key)
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        # G7: created_at ties (same-millisecond ingest, common in bulk
+        # backfills/tests) previously left paging order unstable across
+        # calls — node_id is a deterministic tiebreaker so offset paging
+        # never skips or repeats a row.
+        query += " ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = conn.execute(query, params).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
+    @_locked
+    def list_draft_proposed_skills(self, limit: int = 1000, offset: int = 0) -> list[Node]:
+        """SKILL nodes whose metadata LIKELY has status="proposed" AND
+        draft=true — an SQL LIKE prefilter (G9), same technique as
+        find_context_node_by_ingest_key: metadata is a JSON TEXT column,
+        so an index can't see inside it, but a LIKE substring match on the
+        json.dumps-exact spelling ('"status": "proposed"' / '"draft":
+        true' — default json.dumps separators, confirmed against how
+        add_node serializes metadata) narrows a full-table scan down to
+        only rows that could possibly match BEFORE any Python-side JSON
+        parse. Callers still parse+confirm metadata exactly (a substring
+        hit is never trusted as the whole truth) — this only skips the
+        rows that can't possibly qualify, which is the entire cost win: with
+        zero draft proposals in a graph of any size, this query returns
+        zero rows and callers never touch the rest of the SKILL corpus."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM nodes WHERE node_type = ? "
+            "AND metadata LIKE '%\"status\": \"proposed\"%' "
+            "AND metadata LIKE '%\"draft\": true%' "
+            "ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?",
+            (NodeType.SKILL.value, limit, offset),
+        ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     @_locked

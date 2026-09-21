@@ -49,15 +49,43 @@ def migrate(db_path: str = "revien.db") -> dict:
                 conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
                 columns_added.append(col)
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime ON nodes(origin_runtime)"
-        )
+        # G6: composite indexes — see the matching comment in
+        # store.py's _migrate_add_origin_columns for why (list_nodes
+        # filters AND orders by created_at DESC in the same query; a
+        # single-column index can't satisfy both, so SQLite falls back to
+        # a temp B-tree sort). Old single-column index names are dropped
+        # first so a DB that already ran the pre-composite version of this
+        # migration converges on the composite instead of keeping both.
+        # ``created_at`` is guarded (re-read after the ALTERs above,
+        # never assumed) because a degenerate/hand-built nodes table
+        # (no created_at column at all) can't back a created_at-ordered
+        # index — that table falls back to a single-column index instead
+        # of the migration raising on it.
+        has_created_at = "created_at" in _columns(conn, "nodes")
+        conn.execute("DROP INDEX IF EXISTS idx_nodes_origin_runtime")
+        conn.execute("DROP INDEX IF EXISTS idx_nodes_project")
+        if has_created_at:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
+                "ON nodes(origin_runtime, created_at DESC)"
+            )
+        else:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
+                "ON nodes(origin_runtime)"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_origin_source ON nodes(origin_source)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_key)"
-        )
+        if has_created_at:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_project "
+                "ON nodes(project_key, created_at DESC)"
+            )
+        else:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_key)"
+            )
         conn.commit()
 
         rows = conn.execute(

@@ -1369,6 +1369,7 @@ def skills_propose(min_occurrences: int, min_sessions: int, db: Optional[str]):
     try:
         summary = propose_skills(
             store, min_occurrences=min_occurrences, min_sessions=min_sessions,
+            progress=click.echo,
         )
     finally:
         store.close()
