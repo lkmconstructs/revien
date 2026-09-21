@@ -450,6 +450,11 @@ def connect(system: str, path: Optional[str]):
               help="Bi-temporal query time (ISO-8601): what was true AT this "
                    "time — superseded facts whose validity window covers it "
                    "come back")
+@click.option("--source", "source", multiple=True,
+              help="Filter to one or more origin_runtime values "
+                   "(claude-code/codex/hermes/ollama/openai/langchain/"
+                   "obsidian/file/api/...). Repeatable: --source claude-code "
+                   "--source codex. Omit for no filtering.")
 @click.option("--json-output", is_flag=True, help="Output as JSON")
 @click.option("--format", "output_format", type=click.Choice(["json", "toon"]),
               default="json", show_default=True,
@@ -458,7 +463,7 @@ def connect(system: str, path: Optional[str]):
                    "tokens for a consuming LLM); 'json' keeps the existing "
                    "behavior (human-readable, or JSON with --json-output)")
 def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
-           json_output: bool, output_format: str):
+           source: tuple, json_output: bool, output_format: str):
     """Query Revien memory from the command line."""
     from datetime import datetime
     from revien.graph.store import GraphStore
@@ -479,11 +484,17 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
             click.echo(f"Invalid --as-of (ISO-8601 expected): {as_of}")
             return
 
+    # Origin Layer (WS0 Leg B): multiple=True gives a tuple; empty tuple
+    # means "no filter" (engine.recall(source=None) is the byte-identical
+    # unfiltered path), one value stays a list of one — engine.recall
+    # accepts either a bare string or a list, list is simplest here.
+    source_filter = list(source) if source else None
+
     store = GraphStore(db_path=db_path)
     engine = RetrievalEngine(store)
 
     try:
-        response = engine.recall(query, top_n=top, as_of=as_of_dt)
+        response = engine.recall(query, top_n=top, as_of=as_of_dt, source=source_filter)
 
         if output_format == "toon":
             if json_output:
@@ -506,6 +517,9 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "score": r.score,
                         "score_breakdown": r.score_breakdown,
                         "path": r.path,
+                        "origin_runtime": r.origin_runtime,
+                        "origin_source": r.origin_source,
+                        "project_key": r.project_key,
                     }
                     for r in response.results
                 ],
@@ -526,6 +540,9 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "content": r.content,
                         "score": r.score,
                         "score_breakdown": r.score_breakdown,
+                        "origin_runtime": r.origin_runtime,
+                        "origin_source": r.origin_source,
+                        "project_key": r.project_key,
                     }
                     for r in response.results
                 ],
@@ -544,8 +561,10 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                        f"{response.nodes_examined} nodes examined)\n")
 
             for i, r in enumerate(response.results, 1):
+                runtime = r.origin_runtime or "unknown"
                 click.echo(f"  [{i}] {r.label}")
-                click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f}")
+                click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f} "
+                           f"| Runtime: {runtime}")
                 click.echo(f"      {r.content[:120]}{'...' if len(r.content) > 120 else ''}")
                 click.echo()
     finally:
@@ -969,6 +988,16 @@ def status(db: Optional[str]):
             click.echo(f"Connected adapters: {', '.join(adapters.keys())}")
         else:
             click.echo("No adapters connected. Run 'revien connect <system>'")
+
+        # Origin Layer (WS0 Leg B): per-runtime node counts. "unknown"
+        # (NULL origin_runtime — pre-origin-layer or unrecognized source_id)
+        # is a real bucket, not hidden — see
+        # GraphStore.count_nodes_by_origin_runtime.
+        by_runtime = store.count_nodes_by_origin_runtime()
+        if by_runtime:
+            click.echo("Nodes by runtime:")
+            for runtime, count in by_runtime.items():
+                click.echo(f"  {runtime}: {count}")
 
         click.echo(f"Pairing token: {_pairing_token_status()}")
     finally:

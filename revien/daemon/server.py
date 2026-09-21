@@ -7,7 +7,7 @@ import time
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import secrets
 
@@ -83,6 +83,10 @@ class RecallRequest(BaseModel):
     # — Token-Oriented Object Notation, the same payload serialized for
     # fewer tokens in a consuming LLM's context window (see revien/toon.py).
     format: str = "json"
+    # Origin Layer (WS0 Leg B): filter candidates/results to one or more
+    # origin_runtime values (e.g. "claude-code", or ["claude-code", "codex"]).
+    # None (default): no filtering, response byte-identical.
+    source: Optional[Union[str, List[str]]] = None
 
 
 class NodeUpdateRequest(BaseModel):
@@ -128,6 +132,12 @@ class NodeResponse(BaseModel):
     # Bi-temporal validity (B2) — when the claim WAS TRUE. Null = unbounded.
     valid_from: Optional[str] = None
     valid_until: Optional[str] = None
+    # Origin Layer (WS0 Leg B): surfaced so a GET /v1/nodes?origin_runtime=…
+    # caller can see the field it filtered on.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -455,6 +465,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             include_context=request.include_context,
             include_tensions=request.include_tensions,
             as_of=as_of,
+            source=request.source,
         )
         payload = {
             "query": response.query,
@@ -467,6 +478,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "score": r.score,
                     "score_breakdown": r.score_breakdown,
                     "path": r.path,
+                    # Origin Layer (WS0 Leg B): present on EVERY result, None
+                    # allowed — key always present so TOON's tabular reshape
+                    # stays uniform.
+                    "origin_runtime": r.origin_runtime,
+                    "origin_source": r.origin_source,
+                    "project_key": r.project_key,
                     # Only present when asked for — the flag-off response
                     # shape is byte-identical to pre-B1.
                     **({"tensions": r.tensions} if request.include_tensions else {}),
@@ -500,8 +517,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         source_id: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
+        origin_runtime: Optional[List[str]] = Query(None),
+        project_key: Optional[str] = Query(None),
     ):
-        """List all nodes. Supports filtering by type, date, source."""
+        """List all nodes. Supports filtering by type, date, source.
+
+        Origin Layer (WS0 Leg B): origin_runtime accepts a repeated query
+        param (``?origin_runtime=claude-code&origin_runtime=codex``) for a
+        multi-runtime filter; project_key is a single exact match. Both are
+        SQL prefilters via store.list_nodes — see its docstring.
+        """
         nt = None
         if node_type:
             try:
@@ -514,6 +539,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             source_id=source_id or None,
             limit=limit,
             offset=offset,
+            origin_runtime=origin_runtime or None,
+            project_key=project_key or None,
         )
         return [_node_to_response(n) for n in nodes]
 
@@ -978,6 +1005,10 @@ def _node_to_response(node: Node) -> NodeResponse:
         metadata=node.metadata,
         valid_from=node.valid_from.isoformat() if node.valid_from else None,
         valid_until=node.valid_until.isoformat() if node.valid_until else None,
+        origin_runtime=node.origin_runtime,
+        origin_source=node.origin_source,
+        project_key=node.project_key,
+        session_key=node.session_key,
     )
 
 

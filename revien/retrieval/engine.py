@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # One-shot flag for the graph-only degrade warning (per process, not per engine
 # — bench runs construct hundreds of engines and one warning is the message).
@@ -97,6 +97,13 @@ class RetrievalResult:
     # to — the other side of a recognized tension. Populated ONLY when
     # recall(include_tensions=True); empty (and cost-free) otherwise.
     tensions: List[Dict[str, str]] = field(default_factory=list)
+    # Origin Layer (WS0 Leg B): the node's provenance, carried on EVERY
+    # result so a caller (or TOON's uniform-key tabular reshape) never has
+    # to special-case an origin-less row. None is a valid, honest value —
+    # "unknown provenance" — not an omission; the key is always present.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
 
 
 @dataclass
@@ -362,6 +369,7 @@ class RetrievalEngine:
         as_of: Optional[datetime] = None,
         debug: bool = False,
         prefer_types: Optional[List[str]] = None,
+        source: Optional[Union[str, List[str]]] = None,
     ) -> RetrievalResponse:
         """
         Query the memory graph and return ranked results.
@@ -405,6 +413,16 @@ class RetrievalEngine:
                 of) the config-level type_weights prior, which applies to
                 every query regardless of this hint. Default None: no-op,
                 response byte-identical.
+            source: Origin Layer (WS0 Leg B) filter — a single origin_runtime
+                string (e.g. "claude-code") or a list of them. Applied as a
+                SQL prefilter at every candidate/anchor source (entity-label
+                lookup, keyword/BM25 lexical search) AND as a final gate on
+                every walked node, so a node reached only through graph-walk
+                expansion from an in-filter anchor can never leak a
+                different runtime into the results. A node with
+                origin_runtime None (unknown provenance) never matches a
+                source filter. Default None: no filtering, response
+                byte-identical.
 
         Returns:
             RetrievalResponse with ranked nodes and timing data
@@ -428,6 +446,14 @@ class RetrievalEngine:
         # Normalized once; empty/None means the hint is inert.
         preferred_types = (
             {t.strip().lower() for t in prefer_types} if prefer_types else None
+        )
+        # Origin Layer (WS0 Leg B) source filter — normalized once to a list
+        # (or None). Threaded into every candidate/anchor source below AND
+        # re-checked in the final scoring loop (see step 4) so a node
+        # reached only through graph-walk expansion from an in-filter
+        # anchor can't leak a different runtime into results.
+        source_filter: Optional[List[str]] = (
+            [source] if isinstance(source, str) else (list(source) if source else None)
         )
         if as_of is not None and as_of.tzinfo is None:
             as_of = as_of.replace(tzinfo=timezone.utc)
@@ -470,7 +496,7 @@ class RetrievalEngine:
             # versus the fused list's rank-fusion heuristic — ties should
             # read as "the entity match owns this," not as whichever list
             # rrf_fuse happened to place first.
-            entity_anchor_ids = self._find_anchors(query)
+            entity_anchor_ids = self._find_anchors(query, source_filter)
             # REVIEN_LEXICAL_LIMIT resolution: unset (override is None) keeps
             # the shipped cap (semantic_top_k) byte-identical; 0 resolves to
             # None here (uncapped, both lanes treat None that way); a
@@ -482,14 +508,25 @@ class RetrievalEngine:
             else:
                 _lexical_limit = self.lexical_limit_override
             keyword_anchor_ids, bm25_scores = self._lexical_candidates(
-                query, limit=_lexical_limit
+                query, limit=_lexical_limit, source_filter=source_filter,
             )
             semantic_ranked: List[str] = []
             if self.semantic.is_enabled:
-                for node_id, sim in self.semantic.search(
-                    query, top_k=self.semantic_top_k
-                ):
-                    if sim < self.semantic_sim_floor:
+                sem_hits = [
+                    (node_id, sim)
+                    for node_id, sim in self.semantic.search(
+                        query, top_k=self.semantic_top_k
+                    )
+                    if sim >= self.semantic_sim_floor
+                ]
+                # Semantic index carries no origin fields of its own (WS0 Leg
+                # B) — filter its hits against the store so a filtered
+                # recall's semantic lane can't anchor on another runtime.
+                allowed = self._origin_allowed_ids(
+                    [nid for nid, _ in sem_hits], source_filter
+                )
+                for node_id, sim in sem_hits:
+                    if node_id not in allowed:
                         continue
                     semantic_sims[node_id] = sim
                     semantic_ranked.append(node_id)
@@ -501,13 +538,15 @@ class RetrievalEngine:
             anchor_ids = list(dict.fromkeys(entity_anchor_ids + fused_ids))
         else:
             # 1. Parse query — extract entities and topics
-            entity_anchor_ids = self._find_anchors(query)
+            entity_anchor_ids = self._find_anchors(query, source_filter)
             anchor_ids = list(entity_anchor_ids)
 
             # 2. If no anchors found, try keyword search across all nodes
             # (or BM25-ranked candidates under REVIEN_LEXICAL=bm25).
             if not anchor_ids:
-                keyword_anchor_ids, bm25_scores = self._lexical_candidates(query)
+                keyword_anchor_ids, bm25_scores = self._lexical_candidates(
+                    query, source_filter=source_filter,
+                )
                 anchor_ids = list(keyword_anchor_ids)
 
             # 2a. Hybrid semantic anchors (opt-in). When the semantic layer is
@@ -540,19 +579,29 @@ class RetrievalEngine:
                 hits = self.semantic.search(query, top_k=fetch_k)
                 head = hits[: self.semantic_top_k]
                 tail = hits[self.semantic_top_k:]
+                # Semantic index carries no origin fields (WS0 Leg B) — a
+                # source filter needs the store's own view of these hits, so
+                # fetch it whenever filtering OR the tail is non-empty (the
+                # tail admission already needed node_type from this bulk
+                # fetch pre-Leg-B).
+                hit_nodes = (
+                    self.store.get_nodes_bulk([nid for nid, _ in hits])
+                    if (tail or source_filter) else {}
+                )
                 for node_id, sim in head:
                     # Only nodes that clear the floor act as semantic anchors. This
                     # is what lets a keyword-less query reach a genuinely-close node
                     # without near-uniform mild similarity reshuffling keyword hits.
                     if sim < self.semantic_sim_floor:
                         continue
+                    if source_filter is not None:
+                        node = hit_nodes.get(node_id)
+                        if node is None or node.origin_runtime not in source_filter:
+                            continue
                     semantic_sims[node_id] = sim
                     if node_id not in anchor_ids:
                         anchor_ids.append(node_id)
                 if tail:
-                    hit_nodes = self.store.get_nodes_bulk(
-                        [nid for nid, _ in hits]
-                    )
                     non_ctx_admitted = sum(
                         1 for nid, _ in head
                         if nid in semantic_sims
@@ -564,6 +613,9 @@ class RetrievalEngine:
                             break
                         node = hit_nodes.get(node_id)
                         if node is None or node.node_type == NodeType.CONTEXT:
+                            continue
+                        if (source_filter is not None
+                                and node.origin_runtime not in source_filter):
                             continue
                         # Binding gate: raw cosine, not the 1/(1+d) shape.
                         if (2.0 - 1.0 / sim) < self.semantic_sim_floor:
@@ -614,6 +666,20 @@ class RetrievalEngine:
             if node.node_type == NodeType.CONTEXT and not include_context:
                 if debug:
                     diag_filtered[node_id] = "context_excluded"
+                continue
+
+            # Origin Layer (WS0 Leg B): the FINAL gate, re-checked here on
+            # every walked node regardless of how it entered node_distances
+            # (entity/keyword/BM25/semantic anchor, alias expansion, OR
+            # graph-walk expansion off any of those). This is what makes
+            # "filtered recall never leaks other runtimes" true even though
+            # walk expansion can reach a neighbor with different provenance
+            # than the anchor that seeded it — the SQL prefilters above keep
+            # candidate/anchor sources cheap, this is what keeps the
+            # guarantee. A node with origin_runtime None never matches.
+            if source_filter is not None and node.origin_runtime not in source_filter:
+                if debug:
+                    diag_filtered[node_id] = "origin_filtered"
                 continue
 
             # Bi-temporal filter (B2): with as_of set, validity windows decide.
@@ -785,6 +851,12 @@ class RetrievalEngine:
                 score=final_score,
                 score_breakdown=score_breakdown,
                 path=path_labels,
+                # Origin Layer (WS0 Leg B): populated on EVERY result, None
+                # allowed — the key is always present so TOON's uniform-key
+                # tabular reshape never has to special-case an origin-less row.
+                origin_runtime=node.origin_runtime,
+                origin_source=node.origin_source,
+                project_key=node.project_key,
             ))
 
         # 5. Rank by final score, then (opt-in) cross-encoder rerank of the
@@ -912,10 +984,34 @@ class RetrievalEngine:
             return node.confidence
         return self.ops._compute_decayed_confidence(node)
 
-    def _find_anchors(self, query: str) -> List[str]:
+    def _origin_allowed_ids(
+        self, node_ids: List[str], source_filter: Optional[List[str]]
+    ) -> set:
+        """Which of ``node_ids`` pass the origin_runtime filter (WS0 Leg B).
+
+        Used for candidate sources that don't carry origin data of their
+        own (the semantic/vector index) — one bulk node fetch, then a
+        membership check against ``source_filter``. Returns every id
+        unfiltered (as a set) when no filter is active, so callers can
+        unconditionally intersect against this without a None-check."""
+        if not source_filter:
+            return set(node_ids)
+        nodes = self.store.get_nodes_bulk(node_ids)
+        return {
+            nid for nid in node_ids
+            if nid in nodes and nodes[nid].origin_runtime in source_filter
+        }
+
+    def _find_anchors(
+        self, query: str, source_filter: Optional[List[str]] = None
+    ) -> List[str]:
         """
         Extract entities/topics from query and find matching nodes in the graph.
         These become the starting points for graph traversal.
+
+        source_filter (WS0 Leg B): threaded straight into the entity-label
+        lookups as a SQL prefilter — a filtered recall's entity anchor
+        search never even sees another runtime's nodes.
         """
         # Use the same extraction logic as ingestion
         extraction = self.extractor.extract(query, source_id="__query__")
@@ -928,14 +1024,17 @@ class RetrievalEngine:
 
             # Try exact match first
             existing = self.ops.find_node_by_label(
-                candidate.label, node_type=candidate.node_type
+                candidate.label, node_type=candidate.node_type,
+                origin_runtime=source_filter,
             )
             if existing:
                 anchor_ids.append(existing.node_id)
                 continue
 
             # Try fuzzy match
-            fuzzy = self.ops.find_nodes_by_label_fuzzy(candidate.label, max_distance=3)
+            fuzzy = self.ops.find_nodes_by_label_fuzzy(
+                candidate.label, max_distance=3, origin_runtime=source_filter,
+            )
             for match in fuzzy:
                 if match.node_id not in anchor_ids:
                     anchor_ids.append(match.node_id)
@@ -989,7 +1088,10 @@ class RetrievalEngine:
         return [nid for nid in neighbor_ids
                 if nid in others and others[nid].invalidated_at is None]
 
-    def _keyword_search(self, query: str, limit: Optional[int] = 10) -> List[str]:
+    def _keyword_search(
+        self, query: str, limit: Optional[int] = 10,
+        source_filter: Optional[List[str]] = None,
+    ) -> List[str]:
         """
         Fallback: search node labels and content for query keywords.
         Used when entity extraction finds no anchors — and, under
@@ -999,6 +1101,10 @@ class RetrievalEngine:
         comment on that knob).
         Default limit=10 keeps the shipped fallback path byte-identical.
         ``limit=None`` requests every matching node (SQLite's LIMIT -1).
+
+        source_filter (WS0 Leg B): SQL prefilter passed straight through to
+        store.search_nodes_keyword — a filtered recall's keyword-fallback
+        anchor search never considers another runtime's rows.
         """
         words = set(query.lower().split())
         # Remove very common words
@@ -1023,12 +1129,14 @@ class RetrievalEngine:
         # only reachable via REVIEN_LEXICAL_LIMIT=0, never the default path.
         sql_limit = -1 if limit is None else limit
         matches = self.store.search_nodes_keyword(
-            keywords, limit=sql_limit, exclude_context=True
+            keywords, limit=sql_limit, exclude_context=True,
+            origin_runtime=source_filter,
         )
         return [n.node_id for n in matches]
 
     def _bm25_candidates(
         self, query: str, limit: Optional[int] = 10,
+        source_filter: Optional[List[str]] = None,
     ) -> Tuple[List[str], Dict[str, float]]:
         """BM25-lane counterpart to ``_keyword_search`` (REVIEN_LEXICAL=bm25).
 
@@ -1056,10 +1164,19 @@ class RetrievalEngine:
         query-relevance signal alongside semantic cosine similarity, so
         ``recall()``'s max-of-available-signals blend (mirrors the overlay's
         contract) isn't dominated by BM25's unbounded raw magnitude.
+
+        source_filter (WS0 Leg B): SQL prefilter on the list_nodes corpus
+        fetch — a filtered recall's BM25 stats (document frequency, average
+        length) are scored over the FILTERED corpus, not the whole graph,
+        which is the correct population for "rarity" under a runtime
+        filter, and — same as every other candidate source — a node outside
+        the filter can never enter the ranked list at all.
         """
         documents = [
             (node.node_id, f"{node.label} {node.content}")
-            for node in self.store.list_nodes(limit=999999)
+            for node in self.store.list_nodes(
+                limit=999999, origin_runtime=source_filter,
+            )
             if node.node_type != NodeType.CONTEXT
         ]
         ranked = bm25_rank(query, documents, top_n=limit)
@@ -1068,6 +1185,7 @@ class RetrievalEngine:
 
     def _lexical_candidates(
         self, query: str, limit: Optional[int] = 10,
+        source_filter: Optional[List[str]] = None,
     ) -> Tuple[List[str], Dict[str, float]]:
         """Dispatch to the selected lexical lane (REVIEN_LEXICAL) without
         touching either call site's shipped behavior when unset: the
@@ -1076,10 +1194,12 @@ class RetrievalEngine:
         any value other than "bm25") returns exactly what ``_keyword_search``
         returned before this lane existed, with an empty scores dict — the
         keyword path is byte-identical. ``limit=None`` (REVIEN_LEXICAL_LIMIT
-        =0, resolved by the RRF call site) means uncapped on either lane."""
+        =0, resolved by the RRF call site) means uncapped on either lane.
+
+        source_filter (WS0 Leg B): threaded through to whichever lane runs."""
         if self.lexical_mode == "bm25":
-            return self._bm25_candidates(query, limit=limit)
-        return self._keyword_search(query, limit=limit), {}
+            return self._bm25_candidates(query, limit=limit, source_filter=source_filter)
+        return self._keyword_search(query, limit=limit, source_filter=source_filter), {}
 
     def mark_used(self, node_id: str, query: Optional[str] = None) -> None:
         """

@@ -557,7 +557,13 @@ def decode(text: str) -> Dict[str, Any]:
 _RECALL_KEYS = ("query", "results", "nodes_examined", "retrieval_time_ms",
                 "semantic_active", "semantic_note")
 _RESULT_KEYS = ("node_id", "node_type", "label", "content", "score",
-                "score_breakdown", "path")
+                "score_breakdown", "path",
+                # Origin Layer (WS0 Leg B): always present (None allowed),
+                # so the reshape below can treat them as plain primitive
+                # columns like node_id/node_type/etc.
+                "origin_runtime", "origin_source", "project_key")
+_RESULT_PRIMITIVE_KEYS = ("node_id", "node_type", "label", "content", "score",
+                          "origin_runtime", "origin_source", "project_key")
 _SB_PREFIX = "score_breakdown."
 # Reserved by the flattening convention (see module docstring): its
 # presence at top level is how parse_recall detects a reshaped document.
@@ -585,8 +591,7 @@ def _recall_flatten_eligible(payload: Any) -> bool:
             return False
         if not all(_is_primitive(p) for p in path):
             return False
-        if not all(_is_primitive(r[k]) for k in
-                   ("node_id", "node_type", "label", "content", "score")):
+        if not all(_is_primitive(r[k]) for k in _RESULT_PRIMITIVE_KEYS):
             return False
         keys = tuple(sb.keys())
         if sb_keys is None:
@@ -603,6 +608,12 @@ def _flatten_recall(payload: Dict[str, Any]) -> Dict[str, Any]:
         row = {k: r[k] for k in ("node_id", "node_type", "label", "content", "score")}
         for k, v in r["score_breakdown"].items():
             row[_SB_PREFIX + k] = v
+        # Origin Layer (WS0 Leg B) columns, after the score_breakdown ones —
+        # already plain primitives (None allowed), so they need no reshape
+        # of their own, just a place in the tabular row.
+        row["origin_runtime"] = r["origin_runtime"]
+        row["origin_source"] = r["origin_source"]
+        row["project_key"] = r["project_key"]
         rows.append(row)
         paths.append(list(r["path"]))
     return {
@@ -638,6 +649,9 @@ def _unflatten_recall(obj: Dict[str, Any]) -> Dict[str, Any]:
                 "score": row["score"],
                 "score_breakdown": sb,
                 "path": path,
+                "origin_runtime": row["origin_runtime"],
+                "origin_source": row["origin_source"],
+                "project_key": row["project_key"],
             })
         except KeyError as exc:
             raise ToonError("flattened recall row missing column: %s" % exc)

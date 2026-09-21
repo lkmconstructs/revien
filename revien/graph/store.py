@@ -11,7 +11,7 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 from .origin import derive_origin
 from .schema import (
@@ -1101,13 +1101,20 @@ class GraphStore:
 
     @_locked
     def search_nodes_keyword(
-        self, keywords, limit: int = 10, exclude_context: bool = True
+        self, keywords, limit: int = 10, exclude_context: bool = True,
+        origin_runtime: Optional[Union[str, List[str]]] = None,
+        project_key: Optional[str] = None,
     ) -> list["Node"]:
         """SQL-side keyword search over label+content (case-insensitive
         substring, OR across keywords), newest first. Replaces the recall
         fallback's list_nodes(limit=999999)-then-scan-in-Python, which was
         the single biggest recall latency driver (OPEN 2). Semantics match
-        the old Python scan: any-keyword substring hit qualifies."""
+        the old Python scan: any-keyword substring hit qualifies.
+
+        Origin Layer (WS0 Leg B): origin_runtime/project_key are the SAME
+        SQL prefilter as list_nodes — applied in the WHERE clause here, not
+        as a post-fetch scan, so a filtered recall's keyword-anchor path
+        never even considers another runtime's rows as candidates."""
         kws = [k for k in keywords if k]
         if not kws:
             return []
@@ -1116,10 +1123,22 @@ class GraphStore:
             ["instr(lower(label || ' ' || content), ?) > 0"] * len(kws)
         )
         query = f"SELECT * FROM nodes WHERE ({conditions})"
+        params: list = [k.lower() for k in kws]
         if exclude_context:
             query += " AND node_type != 'context'"
+        if origin_runtime:
+            runtimes = (
+                [origin_runtime] if isinstance(origin_runtime, str) else list(origin_runtime)
+            )
+            placeholders = ", ".join("?" * len(runtimes))
+            query += f" AND origin_runtime IN ({placeholders})"
+            params.extend(runtimes)
+        if project_key:
+            query += " AND project_key = ?"
+            params.append(project_key)
         query += " ORDER BY created_at DESC LIMIT ?"
-        rows = conn.execute(query, [k.lower() for k in kws] + [limit]).fetchall()
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     @_locked
@@ -1228,7 +1247,16 @@ class GraphStore:
         source_id: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        origin_runtime: Optional[Union[str, List[str]]] = None,
+        project_key: Optional[str] = None,
     ) -> list[Node]:
+        """List nodes, newest first. Origin Layer (WS0 Leg B): origin_runtime
+        and project_key are SQL WHERE prefilters, not a post-fetch scan — a
+        single runtime string ('claude-code') or a list of runtimes
+        (['claude-code', 'codex']) both compile to a bound-parameter IN
+        clause, never string interpolation. A node whose origin_runtime is
+        NULL (unknown provenance) never matches either filter — filtered
+        recall never silently includes "unknown" as a fourth runtime."""
         conn = self._get_conn()
         query = "SELECT * FROM nodes WHERE 1=1"
         params: list = []
@@ -1238,6 +1266,16 @@ class GraphStore:
         if source_id:
             query += " AND source_id = ?"
             params.append(source_id)
+        if origin_runtime:
+            runtimes = (
+                [origin_runtime] if isinstance(origin_runtime, str) else list(origin_runtime)
+            )
+            placeholders = ", ".join("?" * len(runtimes))
+            query += f" AND origin_runtime IN ({placeholders})"
+            params.extend(runtimes)
+        if project_key:
+            query += " AND project_key = ?"
+            params.append(project_key)
         query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = conn.execute(query, params).fetchall()
@@ -1247,6 +1285,20 @@ class GraphStore:
     def count_nodes(self) -> int:
         conn = self._get_conn()
         return conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+
+    @_locked
+    def count_nodes_by_origin_runtime(self) -> dict:
+        """Per-runtime node counts (WS0 Leg B) — feeds `revien status`'s
+        per-runtime table. NULL origin_runtime (unrecognized/pre-origin-layer
+        source_id) groups under the string key "unknown" so its count isn't
+        silently dropped from the total."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT COALESCE(origin_runtime, 'unknown'), COUNT(*) "
+            "FROM nodes GROUP BY COALESCE(origin_runtime, 'unknown') "
+            "ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        return {runtime: count for runtime, count in rows}
 
     # ── Supersession candidate queue (CSL Leg 3 wiring) ───────────────────────
     @_locked
