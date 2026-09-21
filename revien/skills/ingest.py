@@ -148,6 +148,10 @@ def build_skill_node(
         "triggers": fm.get("triggers", []),
         "version": fm.get("version", ""),
         "origin": "user",
+        # Human-authored ground truth: the CSL gate reads this flag before
+        # letting any machine claim supersede the node. Engine-origin
+        # proposals never set it.
+        "curated": True,
         "status": status,
         "scope": scope,
         "path": str(skill_md_path.resolve()),
