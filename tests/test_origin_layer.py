@@ -173,8 +173,13 @@ class TestMigration003:
         assert summary2["backfilled"] == 0
 
     def test_columns_added_on_a_truly_pre_003_table(self):
-        """A raw sqlite db with a 002-shaped nodes table (no origin columns
-        at all) gets the columns added AND populated in one pass."""
+        """A raw sqlite db with a pre-origin-layer nodes table (every column
+        this store has ever had EXCEPT the four origin columns) gets them
+        added AND populated in one pass. migrate() now delegates to
+        GraphStore's own migration chain, so the fixture must be a table
+        that store can actually open — a table missing columns from
+        earlier migrations (confidence, modality, ...) is not a state this
+        store produces and isn't what migration 003 is responsible for."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         try:
@@ -185,13 +190,37 @@ class TestMigration003:
                     node_type TEXT NOT NULL,
                     label TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    source_id TEXT DEFAULT ''
+                    source_id TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    last_accessed TEXT NOT NULL,
+                    access_count INTEGER DEFAULT 0,
+                    metadata TEXT DEFAULT '{}',
+                    source_type TEXT DEFAULT 'inferred',
+                    confidence REAL DEFAULT 0.5,
+                    pinned INTEGER DEFAULT 0,
+                    confidence_set_at TEXT,
+                    confidence_set_by TEXT DEFAULT '',
+                    source_context TEXT DEFAULT '',
+                    last_referenced TEXT,
+                    invalidated_at TEXT,
+                    source_modality TEXT DEFAULT 'text',
+                    answerable_by_text INTEGER DEFAULT 1,
+                    vision_processed INTEGER DEFAULT 0,
+                    recorded_at TEXT,
+                    event_time_start TEXT,
+                    event_time_end TEXT,
+                    event_time_granularity TEXT,
+                    event_time_confidence REAL,
+                    event_time_text TEXT DEFAULT '',
+                    valid_from TEXT,
+                    valid_until TEXT
                 )"""
             )
+            now_iso = datetime.now(timezone.utc).isoformat()
             conn.execute(
-                "INSERT INTO nodes (node_id, node_type, label, content, source_id) "
-                "VALUES (?, ?, ?, ?, ?)",
-                ("n1", "context", "note", "body", "vault:notes/Theo.md#top"),
+                "INSERT INTO nodes (node_id, node_type, label, content, source_id, "
+                "created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("n1", "context", "note", "body", "vault:notes/Theo.md#top", now_iso, now_iso),
             )
             conn.commit()
             conn.close()
@@ -709,6 +738,50 @@ class TestPipelineOriginValidation:
         ))
         assert out.nodes_created >= 1
 
+    def test_omitted_runtime_keeps_declared_project_and_session(self, store, pipeline):
+        """Correctness fix: when origin_runtime is omitted but the caller
+        DID declare project_key/session_key, those must survive — only
+        runtime/source fall back to source_id derivation. Previously the
+        whole declared tuple was discarded in favor of derive_origin's,
+        even though this source_id (unrecognized) derives to project=None,
+        session=None -- the bug would have silently wiped the caller's
+        values instead of keeping them."""
+        pipeline.ingest(IngestionInput(
+            source_id="mystery-source",
+            content="User: We decided something notable.\nAssistant: OK.",
+            project_key="Fernweh-Core",
+            session_key="sess-declared-1",
+        ))
+        nodes = store.list_nodes(limit=999)
+        assert nodes
+        for n in nodes:
+            assert n.project_key == "Fernweh-Core"
+            assert n.session_key == "sess-declared-1"
+            # runtime/source still come from derive_origin (unrecognized here)
+            assert n.origin_runtime is None
+            # Declared-project/session alone doesn't set origin_declared --
+            # that flag is gated on origin_runtime specifically (unchanged).
+            assert "origin_declared" not in (n.metadata or {})
+
+    def test_omitted_runtime_derived_project_session_fill_gaps(self, store, pipeline):
+        """When the caller declares only ONE of project_key/session_key,
+        the other is backfilled from derive_origin -- a per-field merge,
+        not an all-or-nothing swap."""
+        pipeline.ingest(IngestionInput(
+            source_id="claude-code:Fernweh-Core:sess-derived",
+            content="User: We decided to use SQLite.\nAssistant: Noted.",
+            session_key="sess-declared-override",
+        ))
+        nodes = store.list_nodes(limit=999)
+        assert nodes
+        for n in nodes:
+            # project_key wasn't declared -- backfilled from source_id.
+            assert n.project_key == "Fernweh-Core"
+            # session_key WAS declared -- kept, not overwritten by the
+            # source_id-derived "sess-derived".
+            assert n.session_key == "sess-declared-override"
+            assert n.origin_runtime == "claude-code"
+
     def test_origin_declared_true_when_caller_supplies_runtime(self, store, pipeline):
         pipeline.ingest(IngestionInput(
             source_id="claude-code:Fernweh-Core:sess-1",
@@ -874,16 +947,19 @@ class TestOriginBackfillUserVersionMarker:
     def test_migration_003_standalone_sets_user_version(self):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
-        os.unlink(path)
         try:
+            # A store-openable pre-003 table: everything but the origin
+            # columns (see TestMigration003.test_columns_added_on_a_truly_
+            # pre_003_table — migrate() delegates to GraphStore, so the
+            # fixture must be something GraphStore can actually open).
+            s = GraphStore(db_path=path)
+            s.close()
             conn = sqlite3.connect(path)
-            conn.execute(
-                """CREATE TABLE nodes (
-                    node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL,
-                    label TEXT NOT NULL, content TEXT NOT NULL,
-                    source_id TEXT DEFAULT ''
-                )"""
-            )
+            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project"):
+                conn.execute(f"DROP INDEX IF EXISTS {ix}")
+            for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
+                conn.execute(f"ALTER TABLE nodes DROP COLUMN {col}")
+            conn.execute("PRAGMA user_version = 0")
             conn.commit()
             conn.close()
 

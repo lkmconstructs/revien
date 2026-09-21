@@ -268,7 +268,6 @@ def _label_for(display_steps: List[str]) -> str:
 
 
 def _draft_body(
-    extractor,
     is_llm: bool,
     display_steps: List[str],
     occurrences: int,
@@ -277,22 +276,11 @@ def _draft_body(
     """(content, draft). Rule-based path (the default): always the
     skeleton, draft=False — recall must NOT surface these. LLM path
     (REVIEN_EXTRACTOR != rule-based, or a caller-injected non-rule-based
-    extractor): draft=True is reported truthfully regardless of whether the
-    optional `draft_skill_body` hook actually produced prose — an LLM
-    backend was consulted, that's the fact draft=True records. Any failure
-    (missing hook, exception, bad return) falls back to the skeleton text
-    so a flaky/offline backend can never break proposal generation."""
+    extractor): draft=True is reported truthfully — an LLM backend was
+    resolved, that's the fact draft=True records — the body itself stays
+    the skeleton either way."""
     skeleton = _skeleton_body(display_steps, occurrences, sessions)
-    if not is_llm:
-        return skeleton, False
-    draft_fn = getattr(extractor, "draft_skill_body", None)
-    if draft_fn is None:
-        return skeleton, True
-    try:
-        drafted = draft_fn(steps=display_steps, occurrences=occurrences, sessions=sessions)
-    except Exception:
-        return skeleton, True
-    return (drafted or skeleton), True
+    return skeleton, is_llm
 
 
 def _resolve_extractor(extractor):
@@ -360,7 +348,7 @@ def propose_skills(
     at the end ("proposals written: N") — the hook `revien skills propose`
     uses to print a progress line without this module importing click.
     """
-    resolved_extractor, is_llm = _resolve_extractor(extractor)
+    _, is_llm = _resolve_extractor(extractor)
     patterns = detect_repeated_sequences(
         store, min_occurrences=min_occurrences, min_sessions=min_sessions
     )
@@ -382,7 +370,7 @@ def propose_skills(
     with store.transaction():
         for pattern in patterns:
             body, draft = _draft_body(
-                resolved_extractor, is_llm,
+                is_llm,
                 pattern["display_steps"], pattern["occurrences"], pattern["sessions"],
             )
             label = _label_for(pattern["display_steps"])
@@ -614,45 +602,38 @@ def matching_proposals(
     if not keywords:
         return []
 
+    # One call, not a paged loop: limit=1000 is already more draft proposals
+    # than any realistic graph accumulates before a human triages the queue.
     out: List[Dict] = []
-    offset = 0
-    page = 1000
-    while True:
-        batch = store.list_draft_proposed_skills(limit=page, offset=offset)
-        if not batch:
-            break
-        for node in batch:
-            if node.invalidated_at is not None:
-                continue
-            md = node.metadata or {}
-            # The LIKE prefilter can only narrow candidates, never confirm
-            # them (a substring hit isn't a parsed-JSON guarantee) — these
-            # three checks are the exact same confirmation the old full
-            # scan did, just against a far smaller candidate set.
-            if md.get("origin") != "engine":
-                continue
-            if md.get("status") != "proposed":
-                continue
-            if not md.get("draft"):
-                continue
-            if (source_filter is not None
-                    and node.origin_runtime not in source_filter):
-                continue
-            steps = md.get("steps") or []
-            step_words = set()
-            for step in steps:
-                step_words.update(w for w in step.split(" ") if len(w) >= 4)
-            if not (keywords & step_words):
-                continue
-            out.append({
-                "node_id": node.node_id,
-                "label": node.label,
-                "occurrences": md.get("occurrences", 0),
-                "sessions": md.get("sessions", 0),
-                "project_key": node.project_key,
-                "steps": ARROW.join(steps),
-            })
-        if len(batch) < page:
-            break
-        offset += page
+    for node in store.list_draft_proposed_skills(limit=1000):
+        if node.invalidated_at is not None:
+            continue
+        md = node.metadata or {}
+        # The LIKE prefilter can only narrow candidates, never confirm
+        # them (a substring hit isn't a parsed-JSON guarantee) — these
+        # three checks are the exact same confirmation the old full
+        # scan did, just against a far smaller candidate set.
+        if md.get("origin") != "engine":
+            continue
+        if md.get("status") != "proposed":
+            continue
+        if not md.get("draft"):
+            continue
+        if (source_filter is not None
+                and node.origin_runtime not in source_filter):
+            continue
+        steps = md.get("steps") or []
+        step_words = set()
+        for step in steps:
+            step_words.update(w for w in step.split(" ") if len(w) >= 4)
+        if not (keywords & step_words):
+            continue
+        out.append({
+            "node_id": node.node_id,
+            "label": node.label,
+            "occurrences": md.get("occurrences", 0),
+            "sessions": md.get("sessions", 0),
+            "project_key": node.project_key,
+            "steps": ARROW.join(steps),
+        })
     return out

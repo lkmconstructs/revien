@@ -511,7 +511,7 @@ class GraphStore:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
                     columns_added = True
 
-            # G6: composite indexes, not single-column. list_nodes(
+            # G6: composite indexes — not single-column. list_nodes(
             # origin_runtime=..., limit=N) and list_nodes(project_key=...,
             # limit=N) both filter AND ``ORDER BY created_at DESC`` in the
             # same query — a single-column index on origin_runtime/
@@ -525,36 +525,22 @@ class GraphStore:
             # carrying a redundant single-column index alongside it
             # forever. idx_nodes_origin_source stays single-column — it
             # isn't ordered by created_at anywhere in this codebase.
-            # created_at guard: see the matching comment in
-            # migrations/003_origin_layer.py — a degenerate table missing
-            # created_at can't back a created_at-ordered index.
-            has_created_at = "created_at" in {
-                row[1] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
-            }
+            # created_at is always present: it's a NOT NULL column in this
+            # store's CREATE TABLE nodes, so a nodes table missing it isn't
+            # a state this store can produce.
             conn.execute("DROP INDEX IF EXISTS idx_nodes_origin_runtime")
             conn.execute("DROP INDEX IF EXISTS idx_nodes_project")
-            if has_created_at:
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
-                    "ON nodes(origin_runtime, created_at DESC)"
-                )
-            else:
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
-                    "ON nodes(origin_runtime)"
-                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
+                "ON nodes(origin_runtime, created_at DESC)"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_origin_source ON nodes(origin_source)"
             )
-            if has_created_at:
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_nodes_project "
-                    "ON nodes(project_key, created_at DESC)"
-                )
-            else:
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_key)"
-                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_project "
+                "ON nodes(project_key, created_at DESC)"
+            )
             self._commit(conn)
 
             user_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -1122,11 +1108,16 @@ class GraphStore:
         self._commit(conn)
 
     @_locked
-    def find_context_node_by_ingest_key(self, ingest_key: str) -> Optional[Node]:
-        """The CONTEXT node stamped with this ingest key (stable identity for
-        a re-ingestable unit, e.g. one adapter session file). metadata is a
-        JSON TEXT column: a LIKE prefilter on the JSON-encoded key narrows the
-        scan, then the parsed metadata confirms the exact key (substring hits
+    def find_context_node_by_ingest_key(
+        self, ingest_key: str, node_type: NodeType = NodeType.CONTEXT
+    ) -> Optional[Node]:
+        """The node stamped with this ingest key (stable identity for a
+        re-ingestable unit, e.g. one adapter session file). Defaults to
+        CONTEXT (its original, still the common case); ``node_type=SKILL``
+        is the same lookup scoped to skill ingest (revien/skills/ingest.py)
+        instead of a separate near-duplicate. metadata is a JSON TEXT
+        column: a LIKE prefilter on the JSON-encoded key narrows the scan,
+        then the parsed metadata confirms the exact key (substring hits
         never false-positive). Unindexed on purpose — one lookup per keyed
         ingest at current scale; add a real index if keyed re-ingest gets hot.
 
@@ -1142,7 +1133,7 @@ class GraphStore:
         rows = conn.execute(
             "SELECT * FROM nodes WHERE node_type = ? AND metadata LIKE ? "
             "ORDER BY created_at ASC",
-            (NodeType.CONTEXT.value, f"%{needle}%"),
+            (node_type.value, f"%{needle}%"),
         ).fetchall()
         for row in rows:
             node = self._row_to_node(row)
@@ -1346,18 +1337,8 @@ class GraphStore:
     @_locked
     def list_draft_proposed_skills(self, limit: int = 1000, offset: int = 0) -> list[Node]:
         """SKILL nodes whose metadata LIKELY has status="proposed" AND
-        draft=true — an SQL LIKE prefilter (G9), same technique as
-        find_context_node_by_ingest_key: metadata is a JSON TEXT column,
-        so an index can't see inside it, but a LIKE substring match on the
-        json.dumps-exact spelling ('"status": "proposed"' / '"draft":
-        true' — default json.dumps separators, confirmed against how
-        add_node serializes metadata) narrows a full-table scan down to
-        only rows that could possibly match BEFORE any Python-side JSON
-        parse. Callers still parse+confirm metadata exactly (a substring
-        hit is never trusted as the whole truth) — this only skips the
-        rows that can't possibly qualify, which is the entire cost win: with
-        zero draft proposals in a graph of any size, this query returns
-        zero rows and callers never touch the rest of the SKILL corpus."""
+        draft=true — an SQL LIKE prefilter (G9); callers still parse+confirm
+        metadata exactly, a substring hit is never trusted as the whole truth."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM nodes WHERE node_type = ? "
@@ -1382,7 +1363,7 @@ class GraphStore:
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT COALESCE(origin_runtime, 'unknown'), COUNT(*) "
-            "FROM nodes GROUP BY COALESCE(origin_runtime, 'unknown') "
+            "FROM nodes GROUP BY 1 "
             "ORDER BY COUNT(*) DESC"
         ).fetchall()
         return {runtime: count for runtime, count in rows}

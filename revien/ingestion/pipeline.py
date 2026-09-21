@@ -33,16 +33,30 @@ def _resolve_origin(input_data: "IngestionInput"):
     An explicit origin_runtime is validated against the fixed vocabulary
     (revien.graph.origin.validate_origin) and WINS outright; ValueError
     propagates to the caller (daemon -> 400, CLI/MCP -> their own handling).
-    Omitted origin_runtime falls back to deriving the whole tuple from
+    Omitted origin_runtime falls back to deriving runtime/source from
     source_id — never validated, since derive_origin only ever returns
-    values from that same vocabulary or None.
+    values from that same vocabulary or None. A caller-declared
+    project_key/session_key is kept even in the fallback case (only
+    runtime/source come from source_id there) — a caller that knows its
+    own project/session identity but not its runtime must not have that
+    identity silently discarded; derive_origin's own project/session only
+    fills in whichever of the two the caller left unset.
 
     Returns (origin_tuple, declared) — `declared` is True only when the
     caller supplied origin_runtime explicitly, which is what gates whether
     produced nodes get metadata["origin_declared"] = True.
     """
     if input_data.origin_runtime is None:
-        return derive_origin(input_data.source_id), False
+        derived = derive_origin(input_data.source_id)
+        project_key = (
+            input_data.project_key if input_data.project_key is not None
+            else derived.project
+        )
+        session_key = (
+            input_data.session_key if input_data.session_key is not None
+            else derived.session
+        )
+        return (derived.runtime, derived.source, project_key, session_key), False
     validate_origin(input_data.origin_runtime, input_data.origin_source)
     return (
         (
@@ -405,9 +419,10 @@ class IngestionPipeline:
         # Origin Layer (WS0): resolve once per input, then stamp every node.
         # An explicit origin_runtime wins outright (the caller knows its own
         # provenance) and is validated (ValueError propagates); omitted
-        # origin_runtime falls back to deriving the whole tuple from
-        # source_id — never a per-field merge, never validated (derive_origin
-        # only ever returns vocabulary values or None).
+        # origin_runtime falls back to deriving runtime/source from
+        # source_id, keeping a declared project_key/session_key — see
+        # _resolve_origin's docstring — never validated (derive_origin only
+        # ever returns vocabulary values or None).
         _origin, _origin_declared = _resolve_origin(input_data)
         for node in extraction.nodes:
             node.source_modality = input_data.source_modality

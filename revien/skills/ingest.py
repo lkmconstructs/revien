@@ -101,37 +101,6 @@ def skill_ingest_key(skill_md_path: Path) -> str:
     return f"skill:{skill_md_path.resolve()}"
 
 
-def _find_skill_node_by_ingest_key(store: GraphStore, ingest_key: str) -> Optional[Node]:
-    """SKILL-typed equivalent of GraphStore.find_context_node_by_ingest_key
-    (store.py:1074), which is hard-coded to CONTEXT nodes. Paginates
-    list_nodes(node_type=SKILL) rather than editing store.py to add a
-    generic-node-type version."""
-    offset = 0
-    page = 500
-    while True:
-        batch = store.list_nodes(node_type=NodeType.SKILL, limit=page, offset=offset)
-        if not batch:
-            return None
-        for node in batch:
-            if (node.metadata or {}).get("ingest_key") == ingest_key:
-                return node
-        if len(batch) < page:
-            return None
-        offset += page
-
-
-def _all_nodes(store: GraphStore, node_type: NodeType) -> List[Node]:
-    out: List[Node] = []
-    offset = 0
-    page = 500
-    while True:
-        batch = store.list_nodes(node_type=node_type, limit=page, offset=offset)
-        out.extend(batch)
-        if len(batch) < page:
-            return out
-        offset += page
-
-
 def build_skill_node(
     skill_md_path: Path,
     scope: str,
@@ -188,7 +157,13 @@ def _link_matching_entities(store: GraphStore, skill_node: Node) -> int:
     if not wanted:
         return 0
 
-    candidates = _all_nodes(store, NodeType.ENTITY) + _all_nodes(store, NodeType.TOPIC)
+    # One call each, not a paged loop — same 1000-cap convention as
+    # matching_proposals/list_skills: more than any realistic entity/topic
+    # count at this scale.
+    candidates = (
+        store.list_nodes(node_type=NodeType.ENTITY, limit=1000)
+        + store.list_nodes(node_type=NodeType.TOPIC, limit=1000)
+    )
     by_label = {}
     for node in candidates:
         by_label.setdefault(node.label.strip().lower(), node)
@@ -214,7 +189,7 @@ def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, projec
     existing node in place rather than duplicating it."""
     fresh = build_skill_node(skill_md_path, scope, project_key, origin_runtime)
     ikey = fresh.metadata["ingest_key"]
-    existing = _find_skill_node_by_ingest_key(store, ikey)
+    existing = store.find_context_node_by_ingest_key(ikey, node_type=NodeType.SKILL)
 
     if existing is None:
         node = store.add_node(fresh)
@@ -272,7 +247,7 @@ def list_skills(
 ) -> List[Node]:
     """All SKILL nodes, optionally filtered by project_key / metadata
     status, user-before-engine ordered."""
-    nodes = _all_nodes(store, NodeType.SKILL)
+    nodes = store.list_nodes(node_type=NodeType.SKILL, limit=1000)
     if project is not None:
         nodes = [n for n in nodes if n.project_key == project]
     if status is not None:
@@ -307,7 +282,10 @@ def skill_index_row(node: Node) -> str:
 def show_skill(store: GraphStore, name: str) -> Optional[Node]:
     """The highest-precedence (user-before-engine) SKILL node matching
     `name` case-insensitively, or None."""
-    nodes = [n for n in _all_nodes(store, NodeType.SKILL) if n.label.strip().lower() == name.strip().lower()]
+    nodes = [
+        n for n in store.list_nodes(node_type=NodeType.SKILL, limit=1000)
+        if n.label.strip().lower() == name.strip().lower()
+    ]
     if not nodes:
         return None
     return sort_user_before_engine(nodes)[0]

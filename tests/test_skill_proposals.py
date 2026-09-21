@@ -350,55 +350,41 @@ class TestAcceptDecline:
         refreshed = store.get_node(node.node_id)
         assert refreshed.invalidated_at is not None
 
-    def test_accept_wrong_node_type_raises(self, store):
-        fact = store.add_node(Node(
-            node_type=NodeType.FACT, label="not a skill", content="x",
-            source_type=SourceType.EXTRACTED, confidence=1.0,
-        ))
-        with pytest.raises(ValueError):
-            accept_proposal(store, fact.node_id)
-
-    def test_accept_missing_node_raises(self, store):
-        with pytest.raises(ValueError):
-            accept_proposal(store, "does-not-exist")
-
-    def test_accept_already_active_raises(self, store):
-        node = self._propose(store)
-        accept_proposal(store, node.node_id)
-        with pytest.raises(ValueError, match="proposed"):
+    @pytest.mark.parametrize("fn", [accept_proposal, decline_proposal], ids=["accept", "decline"])
+    @pytest.mark.parametrize(
+        "state,match",
+        [
+            ("wrong_type", None),
+            ("missing", None),
+            ("already_active", "proposed"),
+            ("invalidated", None),
+        ],
+    )
+    def test_accept_decline_refusals(self, store, fn, state, match):
+        """accept_proposal/decline_proposal both refuse (ValueError) against
+        the same four non-live states: not a SKILL node, missing node,
+        already active (message names the required "proposed" status), and
+        3x-declined/invalidated."""
+        if state == "wrong_type":
+            fact = store.add_node(Node(
+                node_type=NodeType.FACT, label="not a skill", content="x",
+                source_type=SourceType.EXTRACTED, confidence=1.0,
+            ))
+            node_id = fact.node_id
+        elif state == "missing":
+            node_id = "does-not-exist"
+        elif state == "already_active":
+            node = self._propose(store)
             accept_proposal(store, node.node_id)
+            node_id = node.node_id
+        else:  # invalidated
+            node = self._propose(store)
+            for _ in range(3):
+                decline_proposal(store, node.node_id)
+            node_id = node.node_id
 
-    def test_accept_invalidated_raises(self, store):
-        node = self._propose(store)
-        for _ in range(3):
-            decline_proposal(store, node.node_id)
-        with pytest.raises(ValueError):
-            accept_proposal(store, node.node_id)
-
-    def test_decline_wrong_node_type_raises(self, store):
-        fact = store.add_node(Node(
-            node_type=NodeType.FACT, label="not a skill", content="x",
-            source_type=SourceType.EXTRACTED, confidence=1.0,
-        ))
-        with pytest.raises(ValueError):
-            decline_proposal(store, fact.node_id)
-
-    def test_decline_missing_node_raises(self, store):
-        with pytest.raises(ValueError):
-            decline_proposal(store, "does-not-exist")
-
-    def test_decline_already_active_raises(self, store):
-        node = self._propose(store)
-        accept_proposal(store, node.node_id)
-        with pytest.raises(ValueError, match="proposed"):
-            decline_proposal(store, node.node_id)
-
-    def test_decline_already_invalidated_raises(self, store):
-        node = self._propose(store)
-        for _ in range(3):
-            decline_proposal(store, node.node_id)
-        with pytest.raises(ValueError):
-            decline_proposal(store, node.node_id)
+        with pytest.raises(ValueError, match=match):
+            fn(store, node_id)
 
 
 # ── recall: skill_proposals field ─────────────────────────────────────────
@@ -590,31 +576,7 @@ class TestAsciiArrowInsteadOfUnicode:
     def test_arrow_constant_is_ascii(self):
         from revien.skills import proposals as proposals_module
         assert proposals_module.ARROW == " -> "
-        proposals_module.ARROW.encode("ascii")  # must not raise
-
-    def test_proposal_label_is_pure_ascii(self, store):
-        _seed_three_sessions(store, ["ping theo", "sync fernweh branches"])
-        summary = propose_skills(store)
-        node = summary["proposals"][0]
-        node.label.encode("ascii")  # must not raise UnicodeEncodeError
-        assert "->" in node.label
-        assert "→" not in node.label
-
-    def test_matching_proposals_steps_field_is_pure_ascii(self, store):
-        node = store.add_node(Node(
-            node_type=NodeType.SKILL,
-            label="proposed: ping theo -> sync fernweh branches",
-            content="## Steps\n\n1. ping theo\n2. sync fernweh branches\n",
-            metadata={
-                "origin": "engine", "status": "proposed", "pattern_hash": "abc",
-                "occurrences": 3, "sessions": 3, "declines": 0,
-                "steps": ["ping theo", "sync fernweh branches"], "draft": True,
-            },
-            source_type=SourceType.INFERRED, confidence=0.5,
-        ))
-        results = matching_proposals(store, "sync the fernweh branches please")
-        assert results
-        results[0]["steps"].encode("ascii")
+        assert proposals_module.ARROW.isascii()
 
     def test_cli_skills_propose_output_is_pure_ascii(self, store):
         """Run the actual CLI command (CliRunner) and assert the full

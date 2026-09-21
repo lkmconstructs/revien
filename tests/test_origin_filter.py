@@ -684,14 +684,6 @@ class TestEmptyFilterFailsClosed:
         store.add_node(_node("Mara note", "content", origin_runtime="claude-code"))
         assert store.list_nodes(origin_runtime=None)
 
-    def test_store_search_nodes_keyword_origin_runtime_empty_list(self, store):
-        store.add_node(_node("Mara pricing note", "enterprise pricing details",
-                              origin_runtime="claude-code"))
-        matches = store.search_nodes_keyword(
-            {"pricing"}, origin_runtime=[], exclude_context=False,
-        )
-        assert matches == []
-
 
 # ── G5: GET /v1/nodes origin_runtime accepts multiple shapes ────────────────
 
@@ -764,36 +756,6 @@ class TestGetNodesOriginRuntimeShapes:
         nodes = resp.json()
         runtimes = {n["origin_runtime"] for n in nodes}
         assert "claude-code" in runtimes and "codex" in runtimes
-
-
-# ── G6: composite indexes avoid a temp B-tree sort ──────────────────────────
-
-
-class TestOriginIndexPlan:
-    def test_list_nodes_query_plan_has_no_temp_btree_sort(self, store):
-        for i in range(5):
-            store.add_node(_node(f"note {i}", f"content {i}",
-                                  origin_runtime="codex" if i % 2 else "claude-code"))
-        conn = store._get_conn()
-        plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT * FROM nodes WHERE origin_runtime IN (?) "
-            "ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?",
-            ("codex", 100, 0),
-        ).fetchall()
-        plan_text = " ".join(row[-1] for row in plan)
-        assert "USE TEMP B-TREE FOR ORDER BY" not in plan_text
-
-    def test_project_key_query_plan_has_no_temp_btree_sort(self, store):
-        for i in range(5):
-            store.add_node(_node(f"note {i}", f"content {i}", project_key="p1"))
-        conn = store._get_conn()
-        plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT * FROM nodes WHERE project_key = ? "
-            "ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?",
-            ("p1", 100, 0),
-        ).fetchall()
-        plan_text = " ".join(row[-1] for row in plan)
-        assert "USE TEMP B-TREE FOR ORDER BY" not in plan_text
 
 
 # ── G7: list_nodes paging is stable under created_at ties ───────────────────

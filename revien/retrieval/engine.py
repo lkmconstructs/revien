@@ -456,26 +456,9 @@ class RetrievalEngine:
         preferred_types = (
             {t.strip().lower() for t in prefer_types} if prefer_types else None
         )
-        # Origin Layer (WS0 Leg B) source filter — normalized once to a list
-        # (or None). Threaded into every candidate/anchor source below AND
-        # re-checked in the final scoring loop (see step 4) so a node
-        # reached only through graph-walk expansion from an in-filter
-        # anchor can't leak a different runtime into results.
-        #
-        # G4 (fail-closed empty filter): None means "no source kwarg at
-        # all" — unfiltered, the only way source_filter stays None. ANY
-        # other shape means "a filter is present" and normalizes to a list
-        # that may be EMPTY: source=[] , source="", and source=[""] all
-        # collapse to source_filter == [] below (raw values are split out,
-        # then blank strings are dropped). The membership tests downstream
-        # (``origin_runtime in source_filter``) are unchanged by this — an
-        # empty list simply never contains anything, so "filter present,
-        # matches nothing" falls out for free instead of needing a special
-        # "is the filter active" flag threaded everywhere. Do NOT write
-        # this as ``[source] if source else None`` / ``list(source) if
-        # source else None`` — those truthy checks silently turn an empty
-        # filter back into "unfiltered", which is exactly the leak this
-        # guards against.
+        # Origin Layer (WS0 Leg B) source filter, normalized once (G4):
+        # None = unfiltered; any non-None value (including empty) = a
+        # filter is present, and empty matches nothing.
         source_filter: Optional[List[str]] = None
         if source is not None:
             _raw = [source] if isinstance(source, str) else list(source)
@@ -613,16 +596,20 @@ class RetrievalEngine:
                     self.store.get_nodes_bulk([nid for nid, _ in hits])
                     if (tail or source_filter) else {}
                 )
+                # Same origin-filter membership test the RRF lane uses
+                # (_origin_allowed_ids) — reuses hit_nodes instead of a
+                # second bulk fetch when a filter is active.
+                allowed = self._origin_allowed_ids(
+                    [nid for nid, _ in hits], source_filter, nodes=hit_nodes
+                )
                 for node_id, sim in head:
                     # Only nodes that clear the floor act as semantic anchors. This
                     # is what lets a keyword-less query reach a genuinely-close node
                     # without near-uniform mild similarity reshuffling keyword hits.
                     if sim < self.semantic_sim_floor:
                         continue
-                    if source_filter is not None:
-                        node = hit_nodes.get(node_id)
-                        if node is None or node.origin_runtime not in source_filter:
-                            continue
+                    if source_filter is not None and node_id not in allowed:
+                        continue
                     semantic_sims[node_id] = sim
                     if node_id not in anchor_ids:
                         anchor_ids.append(node_id)
@@ -639,8 +626,7 @@ class RetrievalEngine:
                         node = hit_nodes.get(node_id)
                         if node is None or node.node_type == NodeType.CONTEXT:
                             continue
-                        if (source_filter is not None
-                                and node.origin_runtime not in source_filter):
+                        if source_filter is not None and node_id not in allowed:
                             continue
                         # Binding gate: raw cosine, not the 1/(1+d) shape.
                         if (2.0 - 1.0 / sim) < self.semantic_sim_floor:
@@ -1062,15 +1048,23 @@ class RetrievalEngine:
         return self.ops._compute_decayed_confidence(node)
 
     def _origin_allowed_ids(
-        self, node_ids: List[str], source_filter: Optional[List[str]]
+        self,
+        node_ids: List[str],
+        source_filter: Optional[List[str]],
+        nodes: Optional[Dict[str, Node]] = None,
     ) -> set:
         """Which of ``node_ids`` pass the origin_runtime filter (WS0 Leg B).
 
         Used for candidate sources that don't carry origin data of their
-        own (the semantic/vector index) — one bulk node fetch, then a
-        membership check against ``source_filter``. Returns every id
+        own (the semantic/vector index) — a membership check against
+        ``source_filter``, over a bulk node fetch. Returns every id
         unfiltered (as a set) when no filter is active, so callers can
         unconditionally intersect against this without a None-check.
+
+        ``nodes`` (optional): a caller's own already-fetched id->Node bulk
+        lookup (e.g. one it needed anyway for a node_type check alongside
+        the filter), reused here instead of a second store round-trip.
+        Omitted, this fetches its own.
 
         G4: the check is ``source_filter is None``, never a truthy check —
         an EMPTY-but-present filter (``source_filter == []``) must fail
@@ -1078,7 +1072,8 @@ class RetrievalEngine:
         here would silently unfilter it."""
         if source_filter is None:
             return set(node_ids)
-        nodes = self.store.get_nodes_bulk(node_ids)
+        if nodes is None:
+            nodes = self.store.get_nodes_bulk(node_ids)
         return {
             nid for nid in node_ids
             if nid in nodes and nodes[nid].origin_runtime in source_filter

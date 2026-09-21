@@ -55,97 +55,110 @@ def _seed_fact(client) -> str:
     return node_id
 
 
+def _mutation_route_cases():
+    """(case_id, builder) — builder(client) -> (method, path, json_body).
+    One entry per mutation route. The builder runs BEFORE the caller forces
+    a remote host, so any seed data it needs (a fact node, two node ids for
+    an edge, an exported graph for import) is created over the normal
+    loopback path, exactly like the original per-route tests did."""
+
+    def put_nodes(client):
+        return "put", f"/v1/nodes/{_seed_fact(client)}", {"label": "x"}
+
+    def delete_nodes(client):
+        return "delete", f"/v1/nodes/{_seed_fact(client)}", None
+
+    def post_edges(client):
+        n1, n2 = _seed_fact(client), _seed_fact(client)
+        return "post", "/v1/edges", {
+            "edge_type": "related_to", "source_node_id": n1, "target_node_id": n2,
+        }
+
+    def post_consolidate(client):
+        return "post", "/v1/consolidate", {}
+
+    def post_graph_import(client):
+        exported = client.get("/v1/graph").json()
+        return "post", "/v1/graph/import", exported
+
+    def post_cluster(client):
+        return "post", "/v1/cluster", None
+
+    def post_sync(client):
+        return "post", "/v1/sync", None
+
+    def post_mark_used(client):
+        return "post", "/v1/mark_used", {"node_id": _seed_fact(client)}
+
+    def post_training_run(client):
+        return "post", "/v1/training/run", None
+
+    def post_reinforce(client):
+        return "post", f"/v1/nodes/{_seed_fact(client)}/reinforce", None
+
+    def post_correct(client):
+        return "post", f"/v1/nodes/{_seed_fact(client)}/correct", None
+
+    def post_invalidate(client):
+        return "post", f"/v1/nodes/{_seed_fact(client)}/invalidate", None
+
+    def post_retention_sweep(client):
+        return "post", "/v1/retention/sweep", None
+
+    def post_forget(client):
+        return "post", f"/v1/nodes/{_seed_fact(client)}/forget", None
+
+    def post_reindex(client):
+        return "post", "/v1/reindex", None
+
+    return {
+        "put_nodes": put_nodes,
+        "delete_nodes": delete_nodes,
+        "post_edges": post_edges,
+        "post_consolidate": post_consolidate,
+        "post_graph_import": post_graph_import,
+        "post_cluster": post_cluster,
+        "post_sync": post_sync,
+        "post_mark_used": post_mark_used,
+        "post_training_run": post_training_run,
+        "post_reinforce": post_reinforce,
+        "post_correct": post_correct,
+        "post_invalidate": post_invalidate,
+        "post_retention_sweep": post_retention_sweep,
+        "post_forget": post_forget,
+        "post_reindex": post_reindex,
+    }
+
+
+_MUTATION_ROUTE_CASES = _mutation_route_cases()
+
+
+def _call(client, method, path, body):
+    """TestClient.delete() (unlike put/post) takes no ``json`` kwarg."""
+    if method == "delete":
+        return client.delete(path)
+    return getattr(client, method)(path, json=body)
+
+# Loopback-200 originally spot-checked a subset of the routes above, not
+# every one (the gate is one shared function, per TestRemoteWithTokenPasses)
+# — same subset, kept.
+_LOOPBACK_CASE_IDS = (
+    "put_nodes", "delete_nodes", "post_cluster", "post_sync",
+    "post_reindex", "post_retention_sweep", "post_training_run",
+)
+
+
 class TestEveryMutationRouteIsGated:
     """One remote-without-token case per mutation route. Each must be
     refused (403) exactly like /v1/skills/{id}/accept already is — proving
     the route actually calls require_mutation_auth/check_capture_auth,
     not merely that it exists."""
 
-    def test_put_nodes_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
+    @pytest.mark.parametrize("case_id", _MUTATION_ROUTE_CASES.keys())
+    def test_remote_403(self, daemon_client, monkeypatch, case_id):
+        method, path, body = _MUTATION_ROUTE_CASES[case_id](daemon_client)
         _force_remote(monkeypatch)
-        resp = daemon_client.put(f"/v1/nodes/{node_id}", json={"label": "x"})
-        assert resp.status_code == 403
-
-    def test_delete_nodes_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.delete(f"/v1/nodes/{node_id}")
-        assert resp.status_code == 403
-
-    def test_post_edges_remote_403(self, daemon_client, monkeypatch):
-        n1 = _seed_fact(daemon_client)
-        n2 = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/edges", json={
-            "edge_type": "related_to", "source_node_id": n1, "target_node_id": n2,
-        })
-        assert resp.status_code == 403
-
-    def test_post_consolidate_remote_403(self, daemon_client, monkeypatch):
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/consolidate", json={})
-        assert resp.status_code == 403
-
-    def test_post_graph_import_remote_403(self, daemon_client, monkeypatch):
-        exported = daemon_client.get("/v1/graph").json()
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/graph/import", json=exported)
-        assert resp.status_code == 403
-
-    def test_post_cluster_remote_403(self, daemon_client, monkeypatch):
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/cluster")
-        assert resp.status_code == 403
-
-    def test_post_sync_remote_403(self, daemon_client, monkeypatch):
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/sync")
-        assert resp.status_code == 403
-
-    def test_post_mark_used_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/mark_used", json={"node_id": node_id})
-        assert resp.status_code == 403
-
-    def test_post_training_run_remote_403(self, daemon_client, monkeypatch):
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/training/run")
-        assert resp.status_code == 403
-
-    def test_post_reinforce_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.post(f"/v1/nodes/{node_id}/reinforce")
-        assert resp.status_code == 403
-
-    def test_post_correct_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.post(f"/v1/nodes/{node_id}/correct")
-        assert resp.status_code == 403
-
-    def test_post_invalidate_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.post(f"/v1/nodes/{node_id}/invalidate")
-        assert resp.status_code == 403
-
-    def test_post_retention_sweep_remote_403(self, daemon_client, monkeypatch):
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/retention/sweep")
-        assert resp.status_code == 403
-
-    def test_post_forget_remote_403(self, daemon_client, monkeypatch):
-        node_id = _seed_fact(daemon_client)
-        _force_remote(monkeypatch)
-        resp = daemon_client.post(f"/v1/nodes/{node_id}/forget")
-        assert resp.status_code == 403
-
-    def test_post_reindex_remote_403(self, daemon_client, monkeypatch):
-        _force_remote(monkeypatch)
-        resp = daemon_client.post("/v1/reindex")
+        resp = _call(daemon_client, method, path, body)
         assert resp.status_code == 403
 
 
@@ -154,34 +167,10 @@ class TestLoopbackUnaffected:
     result on loopback — the pairing gate must not have changed local
     behavior at all."""
 
-    def test_put_nodes_loopback_200(self, daemon_client):
-        node_id = _seed_fact(daemon_client)
-        resp = daemon_client.put(f"/v1/nodes/{node_id}", json={"label": "Renamed"})
-        assert resp.status_code == 200
-
-    def test_delete_nodes_loopback_200(self, daemon_client):
-        node_id = _seed_fact(daemon_client)
-        resp = daemon_client.delete(f"/v1/nodes/{node_id}")
-        assert resp.status_code == 200
-
-    def test_post_cluster_loopback_200(self, daemon_client):
-        resp = daemon_client.post("/v1/cluster")
-        assert resp.status_code == 200
-
-    def test_post_sync_loopback_200(self, daemon_client):
-        resp = daemon_client.post("/v1/sync")
-        assert resp.status_code == 200
-
-    def test_post_reindex_loopback_200(self, daemon_client):
-        resp = daemon_client.post("/v1/reindex")
-        assert resp.status_code == 200
-
-    def test_post_retention_sweep_loopback_200(self, daemon_client):
-        resp = daemon_client.post("/v1/retention/sweep")
-        assert resp.status_code == 200
-
-    def test_post_training_run_loopback_200(self, daemon_client):
-        resp = daemon_client.post("/v1/training/run")
+    @pytest.mark.parametrize("case_id", _LOOPBACK_CASE_IDS)
+    def test_loopback_200(self, daemon_client, case_id):
+        method, path, body = _MUTATION_ROUTE_CASES[case_id](daemon_client)
+        resp = _call(daemon_client, method, path, body)
         assert resp.status_code == 200
 
 
