@@ -75,6 +75,12 @@ def migrate(db_path: str = "revien.db") -> dict:
                 (origin.runtime, origin.source, origin.project, origin.session, node_id),
             )
             backfilled += 1
+        # Mirrors store.py's _migrate_add_origin_columns marker: once this
+        # backfill has run, later connects (via GraphStore) skip the
+        # NULL-scan outright. Only raise it, never lower it.
+        current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current_version < 3:
+            conn.execute("PRAGMA user_version = 3")
         conn.commit()
 
         return {"columns_added": columns_added, "backfilled": backfilled}

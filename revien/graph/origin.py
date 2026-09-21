@@ -39,6 +39,32 @@ class Origin(NamedTuple):
 _UNKNOWN = Origin(None, None, None, None)
 
 
+# Fixed vocabulary (WS0 Leg — origin validation). A caller declaring
+# origin_runtime/origin_source is claiming provenance; only these values are
+# recognized. None (unset) is always allowed — that's "unknown", not
+# "invalid". Kept here, next to derive_origin, so the declared-value gate and
+# the source_id-inference table can never quietly drift apart.
+RUNTIMES = frozenset({
+    "claude-code", "codex", "hermes", "ollama", "openai", "langchain",
+    "obsidian", "file", "api", "chatgpt", "claude", "readwise",
+})
+SOURCES = frozenset({"live", "import", "vault", "watch", "api"})
+
+
+def validate_origin(runtime: Optional[str], source: Optional[str]) -> None:
+    """Raise ValueError naming the offending value if either is set and not
+    in the fixed vocabulary above. None is always fine for either field —
+    only a value that claims to BE something gets checked."""
+    if runtime is not None and runtime not in RUNTIMES:
+        raise ValueError(
+            f"Unknown origin_runtime: {runtime!r}. Valid: {sorted(RUNTIMES)}"
+        )
+    if source is not None and source not in SOURCES:
+        raise ValueError(
+            f"Unknown origin_source: {source!r}. Valid: {sorted(SOURCES)}"
+        )
+
+
 def _split_project_session(source_id: str, runtime: str) -> Origin:
     """Shared claude_code/codex shape: {runtime}:{project}:{session_stem}."""
     rest = source_id[len(runtime) + 1:]

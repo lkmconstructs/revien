@@ -148,9 +148,13 @@ def build_skill_node(
         "triggers": fm.get("triggers", []),
         "version": fm.get("version", ""),
         "origin": "user",
-        # Human-authored ground truth: the CSL gate reads this flag before
-        # letting any machine claim supersede the node. Engine-origin
-        # proposals never set it.
+        # Kept so any future path that consults `curated` treats user
+        # skills as ground truth. NOT currently load-bearing: SKILL nodes
+        # never enter the ClaimGovernor's supersession candidates
+        # (supersession_ingest.py's _existing_claims is CONTEXT-only), so
+        # today no gate reads this flag before touching a skill. User
+        # skills are safe today because SKILL nodes bypass the pipeline
+        # entirely and dedup is same-type only.
         "curated": True,
         "status": status,
         "scope": scope,

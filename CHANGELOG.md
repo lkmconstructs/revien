@@ -109,8 +109,12 @@ All notable changes to Revien are documented here. Format follows
   third decline soft-invalidates the node via
   `GraphOperations.invalidate_node`. Both audit before/after snapshots
   (`skill_accept` / `skill_decline`); both take exactly one node id, no
-  `--all`. User-origin skills are curated and are never overwritten by a
-  proposal. `GET /v1/skills` (filters: status, origin, project_key), `GET
+  `--all`. A same-name proposal never overwrites a user-authored skill —
+  not because of the `curated` flag (no gate reads it for skills today;
+  SKILL nodes never enter the ClaimGovernor's supersession candidates),
+  but structurally: every proposal's label carries a "proposed: " prefix
+  no hand-written skill would use, and dedup only ever compares same-type
+  nodes. `GET /v1/skills` (filters: status, origin, project_key), `GET
   /v1/skills/{node_id}`, and the two mutating routes — `POST
   /v1/skills/{node_id}/accept` / `.../decline` — gated by
   `require_mutation_auth`. Recall's response gains `skill_proposals`

@@ -50,7 +50,9 @@ from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.ingestion.extractor import RuleBasedExtractor
 
-ARROW = " → "  # "→" — the one place this joiner string is spelled out.
+ARROW = " -> "  # ASCII on purpose — U+2192 crashes Windows console encodings
+# (cp1252/cp437) wherever a label or step-join reaches stdout/CliRunner.
+# The one place this joiner string is spelled out.
 
 # Leading pronoun/article tokens stripped during normalization — "i'll ping
 # Theo" and "ping Theo" are the same step. Matched against a token AFTER
@@ -332,13 +334,6 @@ def propose_skills(
             # Deliberately absent: "curated" — that flag is reserved for
             # human-authored (D1) skills; an engine proposal never sets it.
         }
-        if existing is not None:
-            # A re-run never re-proposes an already-accepted or already-
-            # invalidated (3x-declined) node back into "proposed".
-            prior_status = (existing.metadata or {}).get("status")
-            if prior_status in ("active",):
-                metadata["status"] = prior_status
-
         if existing is None:
             node = Node(
                 node_type=NodeType.SKILL,
@@ -364,6 +359,29 @@ def propose_skills(
             # rejected three times.
             summary["proposals"].append(existing)
             continue
+        elif (existing.metadata or {}).get("status") != "proposed":
+            # The node has moved on (accepted -> "active", or any other
+            # status a future path might set) — a re-run must NEVER touch
+            # label/content/origin/status again once a human has acted on
+            # it. Only the observational counters move: occurrences,
+            # sessions, and any DERIVED_FROM edges the detector found that
+            # aren't already wired (below). Everything else about the
+            # existing node — label, content, status, origin, declines,
+            # steps, draft — is carried forward untouched.
+            before_snapshot = existing.model_dump(mode="json")
+            frozen_metadata = dict(existing.metadata or {})
+            frozen_metadata["occurrences"] = pattern["occurrences"]
+            frozen_metadata["sessions"] = pattern["sessions"]
+            node = store.update_node(
+                existing.node_id,
+                metadata=frozen_metadata,
+                _audit_op=None,
+            )
+            store.record_audit(
+                node.node_id, "skill_propose",
+                before=before_snapshot, after=node.model_dump(mode="json"),
+            )
+            summary["updated"] += 1
         else:
             before_snapshot = existing.model_dump(mode="json")
             node = store.update_node(
@@ -397,12 +415,25 @@ def propose_skills(
 def accept_proposal(store: GraphStore, node_id: str, actor: str = "") -> Node:
     """status -> "active". origin stays "engine" — acceptance records that
     a human approved the WORKFLOW, not that they wrote it. Audit op
-    "skill_accept" with before/after snapshots."""
+    "skill_accept" with before/after snapshots.
+
+    Refuses (ValueError) when the node is not a SKILL, is invalidated, or
+    its status is not "proposed" — accept is a one-way door from proposed
+    to active; it is not a way to resurrect a declined/invalidated
+    proposal or to re-confirm an already-active/ingested skill.
+    """
     node = store.get_node(node_id)
     if node is None:
         raise ValueError(f"No such node: {node_id}")
     if node.node_type != NodeType.SKILL:
         raise ValueError(f"Node {node_id} is not a SKILL node")
+    if node.invalidated_at is not None:
+        raise ValueError(f"Node {node_id} is invalidated and cannot be accepted")
+    if (node.metadata or {}).get("status") != "proposed":
+        raise ValueError(
+            f"Node {node_id} status is "
+            f"{(node.metadata or {}).get('status')!r}, not 'proposed' -- cannot accept"
+        )
 
     before = node.model_dump(mode="json")
     metadata = dict(node.metadata or {})
@@ -420,12 +451,24 @@ def decline_proposal(store: GraphStore, node_id: str, actor: str = "", reason: s
     The THIRD decline soft-invalidates the proposal via
     GraphOperations.invalidate_node (its own "invalidate" audit row rides
     alongside this one) — content is retained, just excluded from default
-    recall/listing, same as every other invalidation in this codebase."""
+    recall/listing, same as every other invalidation in this codebase.
+
+    Refuses (ValueError) when the node is not a SKILL, is invalidated, or
+    its status is not "proposed" — decline only makes sense against a live
+    proposal awaiting a decision.
+    """
     node = store.get_node(node_id)
     if node is None:
         raise ValueError(f"No such node: {node_id}")
     if node.node_type != NodeType.SKILL:
         raise ValueError(f"Node {node_id} is not a SKILL node")
+    if node.invalidated_at is not None:
+        raise ValueError(f"Node {node_id} is already invalidated")
+    if (node.metadata or {}).get("status") != "proposed":
+        raise ValueError(
+            f"Node {node_id} status is "
+            f"{(node.metadata or {}).get('status')!r}, not 'proposed' -- cannot decline"
+        )
 
     before = node.model_dump(mode="json")
     metadata = dict(node.metadata or {})

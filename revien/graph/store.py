@@ -492,18 +492,24 @@ class GraphStore:
         ``_ensure_db``). All four columns are nullable TEXT and backfill NULL
         on ALTER for old rows — then the backfill pass below fills in every
         row whose source_id derive_origin recognizes. Runs on every connect
-        (same as the other migration guards); after the first pass every
-        recognizable row is already populated, so later runs only rescan the
-        (typically small, and shrinking as adapters stamp origin at ingest)
-        set of rows still NULL.
+        (same as the other migration guards) UNTIL ``PRAGMA user_version``
+        reaches 3: a full ``SELECT ... WHERE origin_runtime IS NULL`` table
+        scan on every single connect doesn't scale on a large graph once the
+        backfill has already done its job, so once a backfill pass completes
+        cleanly, user_version is bumped to 3 (only if it was lower) and every
+        later connect skips the scan outright. A DB already at user_version
+        >= 3 is trusted — new rows are stamped at ingest time, not by this
+        scan.
         """
         try:
             cursor = conn.execute("PRAGMA table_info(nodes)")
             columns = {row[1] for row in cursor.fetchall()}
 
+            columns_added = False
             for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
                 if col not in columns:
                     conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
+                    columns_added = True
 
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime ON nodes(origin_runtime)"
@@ -516,11 +522,20 @@ class GraphStore:
             )
             self._commit(conn)
 
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            # A column that had to be ALTERed back in just now means this
+            # connection is genuinely pre-origin-layer no matter what
+            # user_version claims (e.g. a column dropped out-of-band after
+            # the marker was set) — never trust the marker over the schema
+            # actually in front of us.
+            if user_version >= 3 and not columns_added:
+                return
+
             # Backfill: any row with a source_id but no derived origin yet.
             # Rows whose source_id derive_origin doesn't recognize stay NULL
             # (honest "unknown", never a guess) — they're rescanned on every
-            # connect, which is cheap relative to the table itself and
-            # self-corrects if a future adapter convention is added here.
+            # connect UNTIL user_version reaches 3 below, which self-corrects
+            # if a future adapter convention is added before then.
             rows = conn.execute(
                 "SELECT node_id, source_id FROM nodes "
                 "WHERE origin_runtime IS NULL AND source_id != ''"
@@ -534,6 +549,7 @@ class GraphStore:
                     "project_key = ?, session_key = ? WHERE node_id = ?",
                     (origin.runtime, origin.source, origin.project, origin.session, node_id),
                 )
+            conn.execute("PRAGMA user_version = 3")
             self._commit(conn)
         except sqlite3.OperationalError as e:
             # Swallow ONLY the idempotency race (column/index already there).

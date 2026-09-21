@@ -258,6 +258,45 @@ class TestProposeSkillsGovernance:
         assert proposals[0].metadata["occurrences"] == 4
         assert proposals[0].metadata["sessions"] == 4
 
+    def test_rerun_after_accept_never_touches_label_or_content(self, store):
+        """F2: once a proposal has been accepted (status != "proposed"), a
+        re-run with more evidence must update ONLY the occurrences/sessions
+        counters (and missing DERIVED_FROM edges) — label and content stay
+        byte-identical, and status/origin/declines are untouched."""
+        _seed_three_sessions(store, ["ping theo", "run migration"])
+        summary = propose_skills(store)
+        proposal = summary["proposals"][0]
+        accepted = accept_proposal(store, proposal.node_id, actor="mara")
+        assert accepted.metadata["status"] == "active"
+        before_label, before_content = accepted.label, accepted.content
+
+        # More evidence: a 4th, 5th, 6th session of the SAME pattern.
+        for i, sess in enumerate(("sess-d", "sess-e", "sess-f")):
+            t0 = _BASE_TIME + timedelta(days=10 + i)
+            _action(store, "ping theo", "fernweh-core", sess, t0)
+            _action(store, "run migration", "fernweh-core", sess, t0 + timedelta(minutes=1))
+
+        summary2 = propose_skills(store)
+        assert summary2["updated"] == 1
+
+        after = store.get_node(proposal.node_id)
+        assert after.label == before_label
+        assert after.content == before_content
+        assert after.metadata["status"] == "active"
+        assert after.metadata["origin"] == "engine"
+        assert after.metadata["declines"] == 0
+        assert after.metadata["occurrences"] == 6
+        assert after.metadata["sessions"] == 6
+
+        history = store.get_node_audit(proposal.node_id)
+        propose_entries = [h for h in history if h["op"] == "skill_propose"]
+        assert len(propose_entries) == 2  # initial create + the frozen update
+        last = propose_entries[-1]
+        assert last["before"]["metadata"]["status"] == "active"
+        assert last["after"]["metadata"]["status"] == "active"
+        assert last["before"]["label"] == last["after"]["label"]
+        assert last["before"]["content"] == last["after"]["content"]
+
 
 # ── accept / decline ───────────────────────────────────────────────────────
 
@@ -323,6 +362,44 @@ class TestAcceptDecline:
         with pytest.raises(ValueError):
             accept_proposal(store, "does-not-exist")
 
+    def test_accept_already_active_raises(self, store):
+        node = self._propose(store)
+        accept_proposal(store, node.node_id)
+        with pytest.raises(ValueError, match="proposed"):
+            accept_proposal(store, node.node_id)
+
+    def test_accept_invalidated_raises(self, store):
+        node = self._propose(store)
+        for _ in range(3):
+            decline_proposal(store, node.node_id)
+        with pytest.raises(ValueError):
+            accept_proposal(store, node.node_id)
+
+    def test_decline_wrong_node_type_raises(self, store):
+        fact = store.add_node(Node(
+            node_type=NodeType.FACT, label="not a skill", content="x",
+            source_type=SourceType.EXTRACTED, confidence=1.0,
+        ))
+        with pytest.raises(ValueError):
+            decline_proposal(store, fact.node_id)
+
+    def test_decline_missing_node_raises(self, store):
+        with pytest.raises(ValueError):
+            decline_proposal(store, "does-not-exist")
+
+    def test_decline_already_active_raises(self, store):
+        node = self._propose(store)
+        accept_proposal(store, node.node_id)
+        with pytest.raises(ValueError, match="proposed"):
+            decline_proposal(store, node.node_id)
+
+    def test_decline_already_invalidated_raises(self, store):
+        node = self._propose(store)
+        for _ in range(3):
+            decline_proposal(store, node.node_id)
+        with pytest.raises(ValueError):
+            decline_proposal(store, node.node_id)
+
 
 # ── recall: skill_proposals field ─────────────────────────────────────────
 
@@ -361,7 +438,7 @@ class TestRecallSkillProposals:
 
         results = matching_proposals(store, "sync the fernweh branches please")
         assert len(results) == 1
-        assert results[0]["steps"] == "ping theo → sync fernweh branches"
+        assert results[0]["steps"] == "ping theo -> sync fernweh branches"
 
     def test_matching_proposals_no_keyword_overlap(self, store):
         self._draft_proposal(store, ["ping theo", "sync fernweh branches"])
@@ -485,3 +562,72 @@ class TestSkillsDaemonRoutes:
         monkeypatch.setattr(server_module, "_LOOPBACK_HOSTS", set())
         resp = daemon_client.post(f"/v1/skills/{node_id}/decline")
         assert resp.status_code == 403
+
+    def test_accept_already_active_is_409(self, daemon_client):
+        store = daemon_client.app.state.store
+        _seed_three_sessions(store, ["ping theo", "run migration"])
+        node_id = propose_skills(store)["proposals"][0].node_id
+
+        first = daemon_client.post(f"/v1/skills/{node_id}/accept")
+        assert first.status_code == 200
+        second = daemon_client.post(f"/v1/skills/{node_id}/accept")
+        assert second.status_code == 409
+
+    def test_decline_already_active_is_409(self, daemon_client):
+        store = daemon_client.app.state.store
+        _seed_three_sessions(store, ["ping theo", "run migration"])
+        node_id = propose_skills(store)["proposals"][0].node_id
+
+        daemon_client.post(f"/v1/skills/{node_id}/accept")
+        resp = daemon_client.post(f"/v1/skills/{node_id}/decline")
+        assert resp.status_code == 409
+
+
+# ── F6: ASCII-only labels/output (Windows console crash on U+2192) ────────
+
+
+class TestAsciiArrowInsteadOfUnicode:
+    def test_arrow_constant_is_ascii(self):
+        from revien.skills import proposals as proposals_module
+        assert proposals_module.ARROW == " -> "
+        proposals_module.ARROW.encode("ascii")  # must not raise
+
+    def test_proposal_label_is_pure_ascii(self, store):
+        _seed_three_sessions(store, ["ping theo", "sync fernweh branches"])
+        summary = propose_skills(store)
+        node = summary["proposals"][0]
+        node.label.encode("ascii")  # must not raise UnicodeEncodeError
+        assert "->" in node.label
+        assert "→" not in node.label
+
+    def test_matching_proposals_steps_field_is_pure_ascii(self, store):
+        node = store.add_node(Node(
+            node_type=NodeType.SKILL,
+            label="proposed: ping theo -> sync fernweh branches",
+            content="## Steps\n\n1. ping theo\n2. sync fernweh branches\n",
+            metadata={
+                "origin": "engine", "status": "proposed", "pattern_hash": "abc",
+                "occurrences": 3, "sessions": 3, "declines": 0,
+                "steps": ["ping theo", "sync fernweh branches"], "draft": True,
+            },
+            source_type=SourceType.INFERRED, confidence=0.5,
+        ))
+        results = matching_proposals(store, "sync the fernweh branches please")
+        assert results
+        results[0]["steps"].encode("ascii")
+
+    def test_cli_skills_propose_output_is_pure_ascii(self, store):
+        """Run the actual CLI command (CliRunner) and assert the full
+        output stream encodes as pure ASCII — the concrete Windows console
+        failure mode is a UnicodeEncodeError on cp1252/cp437 stdout."""
+        from click.testing import CliRunner
+        from revien.cli import main
+
+        _seed_three_sessions(store, ["ping theo", "sync fernweh branches"])
+        store.close()
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["skills", "propose", "--db", store.db_path])
+        assert result.exit_code == 0, result.output
+        result.output.encode("ascii")  # must not raise
+        assert "->" in result.output

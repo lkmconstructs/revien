@@ -27,7 +27,7 @@ from revien.adapters.generic_api import GenericAPIAdapter
 from revien.adapters.obsidian import ObsidianVaultAdapter
 from revien.adapters.openai_adapter import OpenAIAdapter
 from revien.adapters.ollama_adapter import OllamaAdapter
-from revien.graph.origin import Origin, derive_origin
+from revien.graph.origin import Origin, RUNTIMES, SOURCES, derive_origin, validate_origin
 from revien.graph.schema import Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
@@ -239,11 +239,13 @@ class TestMigration003:
 
 
 class TestStoreEnsureDbBackfill:
-    def test_reopening_store_backfills_legacy_rows(self):
+    def test_reopening_pre_3_store_backfills_legacy_rows(self):
         """A row written with NULL origin columns (bypassing the pipeline
-        stamp) gets backfilled the next time a GraphStore opens the db —
-        _ensure_db's guard runs the same derive_origin backfill as the
-        standalone migration."""
+        stamp) on a db that hasn't reached user_version 3 yet gets
+        backfilled the next time a GraphStore opens the db — _ensure_db's
+        guard runs the same derive_origin backfill as the standalone
+        migration. (F8: once user_version reaches 3, later opens skip this
+        scan for performance — see TestOriginBackfillUserVersionMarker.)"""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         try:
@@ -263,6 +265,11 @@ class TestStoreEnsureDbBackfill:
                 "project_key=NULL, session_key=NULL WHERE node_id=?",
                 (node.node_id,),
             )
+            # Simulate a genuinely pre-origin-layer db: user_version 0 (a
+            # fresh GraphStore() sets it to 3 on the very first open, since
+            # nothing needed backfilling — a real legacy db never had this
+            # PRAGMA touched at all).
+            conn.execute("PRAGMA user_version = 0")
             conn.commit()
             conn.close()
 
@@ -644,6 +651,249 @@ class TestDaemonPassthrough:
                 assert n.project_key == "Fernweh-Core"
                 assert n.session_key == "sess-passthrough"
             store.close()
+        finally:
+            try:
+                os.unlink(path)
+            except PermissionError:  # pragma: no cover - Windows WAL race
+                pass
+
+
+# ── F3: origin validation ────────────────────────────────────────────────
+
+
+class TestValidateOrigin:
+    def test_every_known_runtime_and_source_passes(self):
+        for runtime in RUNTIMES:
+            validate_origin(runtime, None)
+        for source in SOURCES:
+            validate_origin(None, source)
+
+    def test_none_always_passes(self):
+        validate_origin(None, None)
+
+    def test_unknown_runtime_raises_with_offending_value(self):
+        with pytest.raises(ValueError, match="TOTALLY-MADE-UP"):
+            validate_origin("TOTALLY-MADE-UP", None)
+
+    def test_unknown_source_raises_with_offending_value(self):
+        with pytest.raises(ValueError, match="not-a-real-source"):
+            validate_origin("claude-code", "not-a-real-source")
+
+
+class TestPipelineOriginValidation:
+    def test_unknown_declared_runtime_raises_value_error(self, store, pipeline):
+        with pytest.raises(ValueError, match="TOTALLY-MADE-UP"):
+            pipeline.ingest(IngestionInput(
+                source_id="claude-code:Fernweh-Core:sess-9",
+                content="Theo said otherwise.",
+                origin_runtime="TOTALLY-MADE-UP",
+                origin_source="not-a-real-source",
+            ))
+
+    def test_unknown_declared_source_raises_value_error(self, store, pipeline):
+        with pytest.raises(ValueError):
+            pipeline.ingest(IngestionInput(
+                source_id="claude-code:Fernweh-Core:sess-9",
+                content="Theo said otherwise.",
+                origin_runtime="claude-code",
+                origin_source="not-a-real-source",
+            ))
+
+    def test_fallback_derivation_never_validated(self, store, pipeline):
+        """Omitted origin_runtime falls back to derive_origin, which only
+        ever returns vocabulary values or None — never raises, even for a
+        source_id shape nobody recognizes."""
+        out = pipeline.ingest(IngestionInput(
+            source_id="mystery-source",
+            content="User: We decided something.\nAssistant: OK.",
+        ))
+        assert out.nodes_created >= 1
+
+    def test_origin_declared_true_when_caller_supplies_runtime(self, store, pipeline):
+        pipeline.ingest(IngestionInput(
+            source_id="claude-code:Fernweh-Core:sess-1",
+            content="User: We decided to use PostgreSQL.\nAssistant: Noted.",
+            origin_runtime="claude-code",
+            origin_source="live",
+        ))
+        nodes = store.list_nodes(limit=999)
+        assert nodes
+        for n in nodes:
+            assert n.metadata.get("origin_declared") is True
+
+    def test_origin_declared_absent_when_derived_from_source_id(self, store, pipeline):
+        pipeline.ingest(IngestionInput(
+            source_id="claude-code:Fernweh-Core:sess-1",
+            content="User: We decided to use PostgreSQL.\nAssistant: Noted.",
+        ))
+        nodes = store.list_nodes(limit=999)
+        assert nodes
+        for n in nodes:
+            assert "origin_declared" not in (n.metadata or {})
+
+
+class TestDaemonOriginValidation:
+    def test_v1_ingest_unknown_runtime_is_400(self):
+        from fastapi.testclient import TestClient
+        from revien.daemon.server import create_app
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            app = create_app(db_path=path)
+            client = TestClient(app)
+            resp = client.post("/v1/ingest", json={
+                "source_id": "custom-source",
+                "content": "We decided to use Kafka for the event bus.",
+                "origin_runtime": "TOTALLY-MADE-UP",
+            })
+            assert resp.status_code == 400
+            assert "TOTALLY-MADE-UP" in resp.json()["detail"]
+        finally:
+            try:
+                os.unlink(path)
+            except PermissionError:  # pragma: no cover - Windows WAL race
+                pass
+
+
+class TestMCPStoreCannotClaimVault:
+    def test_revien_store_has_no_origin_source_parameter(self):
+        import inspect
+        from revien.mcp_server import _build_server
+
+        src = inspect.getsource(_build_server)
+        tool_src = src.split("def revien_store(")[1].split(") -> Dict[str, Any]:")[0]
+        assert "origin_source" not in tool_src, (
+            "revien_store must not accept an origin_source parameter"
+        )
+
+    def test_revien_store_always_stamps_api_source(self, store):
+        """Exercise the pipeline call the tool makes directly (no MCP SDK
+        dependency needed): whatever origin_runtime is passed, origin_source
+        is hard-set to 'api', never settable to 'vault'."""
+        from revien.ingestion.pipeline import IngestionPipeline
+
+        pipeline = IngestionPipeline(store)
+        # Mirrors mcp_server.revien_store's call shape exactly.
+        result = pipeline.ingest(IngestionInput(
+            source_id="mcp",
+            content="A durable fact from an LLM tool call.",
+            content_type="note",
+            defer_embed=False,
+            origin_runtime="obsidian",  # even claiming a vault-associated runtime
+            origin_source="api",  # hard-set by the tool, never caller-controlled
+            project_key=None,
+            session_key=None,
+        ))
+        node = store.get_node(result.context_node_id)
+        assert node.origin_source == "api"
+        assert node.origin_source != "vault"
+
+
+# ── F8: user_version skip marker (second open does not rescan) ────────────
+
+
+class TestOriginBackfillUserVersionMarker:
+    def test_second_open_sets_user_version_and_skips_scan(self):
+        """First open on a fresh db backfills (0 rows, but still runs the
+        pass) and sets PRAGMA user_version to 3. A second open must see
+        user_version >= 3 and skip the NULL-scan outright — proven here by
+        patching derive_origin to explode if it's ever called again."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            s = GraphStore(db_path=path)
+            s.close()
+
+            conn = sqlite3.connect(path)
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.close()
+            assert version >= 3
+
+            import revien.graph.store as store_module
+
+            def _boom(source_id):
+                raise AssertionError(
+                    "derive_origin must not be called when user_version >= 3 "
+                    "and no column needed to be added"
+                )
+
+            original = store_module.derive_origin
+            store_module.derive_origin = _boom
+            try:
+                s2 = GraphStore(db_path=path)  # must NOT scan/backfill
+                s2.close()
+            finally:
+                store_module.derive_origin = original
+        finally:
+            try:
+                os.unlink(path)
+            except PermissionError:  # pragma: no cover - Windows WAL race
+                pass
+
+    def test_columns_readded_after_version_marker_still_backfills(self):
+        """Edge case: if the origin columns are somehow missing again on a
+        db that already carries user_version >= 3 (e.g. dropped out-of-band
+        after the marker was set), the ALTER re-adds them AND the backfill
+        still runs — the schema in front of us always wins over a stale
+        marker."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            s = GraphStore(db_path=path)
+            node = s.add_node(Node(
+                node_type=NodeType.CONTEXT,
+                label="legacy",
+                content="body",
+                source_id="codex:Fernweh-Core:rollout-legacy",
+            ))
+            s.close()
+
+            conn = sqlite3.connect(path)
+            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project"):
+                conn.execute(f"DROP INDEX IF EXISTS {ix}")
+            for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
+                conn.execute(f"ALTER TABLE nodes DROP COLUMN {col}")
+            conn.commit()
+            version_before = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.close()
+            assert version_before >= 3  # the stale marker from the first open
+
+            s2 = GraphStore(db_path=path)
+            got = s2.get_node(node.node_id)
+            s2.close()
+            assert got.origin_runtime == "codex"
+            assert got.project_key == "Fernweh-Core"
+            assert got.session_key == "rollout-legacy"
+        finally:
+            try:
+                os.unlink(path)
+            except PermissionError:  # pragma: no cover - Windows WAL race
+                pass
+
+    def test_migration_003_standalone_sets_user_version(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """CREATE TABLE nodes (
+                    node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL,
+                    label TEXT NOT NULL, content TEXT NOT NULL,
+                    source_id TEXT DEFAULT ''
+                )"""
+            )
+            conn.commit()
+            conn.close()
+
+            migrate = _load_migration().migrate
+            migrate(path)
+
+            conn = sqlite3.connect(path)
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.close()
+            assert version == 3
         finally:
             try:
                 os.unlink(path)

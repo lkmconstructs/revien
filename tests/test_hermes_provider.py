@@ -171,6 +171,53 @@ class TestSyncTurnMapping:
         assert sem.pending_count() == 0, "session end must drain the queue"
         assert len(sem._vectors) >= 1, "drained nodes are now embedded"
 
+    def test_sync_turn_session_id_kwarg_wins(self, store):
+        """F7: sync_turn's own session_id kwarg must land on the resulting
+        CONTEXT node — it used to be silently discarded (the worker stamped
+        self._session_id at drain time instead)."""
+        from revien.graph.schema import NodeType
+
+        sem = _QueueTestIndex(store)
+        prov = _bypass_provider(store, sem)
+        prov.sync_turn("hello A", "hi A", session_id="hermes-sess-1")
+        prov._flush_sync()
+
+        ctx = [n for n in store.list_nodes(node_type=NodeType.CONTEXT, limit=50)]
+        assert ctx
+        assert {n.session_key for n in ctx} == {"hermes-sess-1"}
+
+    def test_sync_turn_falls_back_to_self_session_id(self, store):
+        """No explicit session_id kwarg -> self._session_id AT ENQUEUE TIME."""
+        from revien.graph.schema import NodeType
+
+        sem = _QueueTestIndex(store)
+        prov = _bypass_provider(store, sem)
+        prov._session_id = "session-ONE"
+        prov.sync_turn("hello", "hi")  # no session_id kwarg
+        prov._flush_sync()
+
+        ctx = [n for n in store.list_nodes(node_type=NodeType.CONTEXT, limit=50)]
+        assert ctx
+        assert ctx[0].session_key == "session-ONE"
+
+    def test_session_id_captured_at_enqueue_not_drain(self, store):
+        """The bug: the worker used to read self._session_id at DRAIN time.
+        A turn enqueued under session-ONE, with self._session_id flipped to
+        session-TWO before the worker drains it, must still be stamped
+        session-ONE — the session it was actually captured under."""
+        from revien.graph.schema import NodeType
+
+        sem = _QueueTestIndex(store)
+        prov = _bypass_provider(store, sem)
+        prov._session_id = "session-ONE"
+        prov.sync_turn("hello", "hi")  # captured under session-ONE at enqueue
+        prov._session_id = "session-TWO"  # a second initialize() lands mid-flight
+        prov._flush_sync()
+
+        ctx = [n for n in store.list_nodes(node_type=NodeType.CONTEXT, limit=50)]
+        assert ctx
+        assert ctx[0].session_key == "session-ONE"
+
 
 class TestToolSchemas:
     def test_schemas_well_formed(self, store):

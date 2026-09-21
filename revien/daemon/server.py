@@ -419,7 +419,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             project_key=request.project_key,
             session_key=request.session_key,
         )
-        result = pipeline.ingest(input_data)
+        try:
+            result = pipeline.ingest(input_data)
+        except ValueError as e:
+            # Origin Layer (WS0): an unknown declared origin_runtime/
+            # origin_source is a client error, not a 500.
+            raise HTTPException(400, str(e))
 
         # Notify clustering — recluster if threshold reached
         if clustering.notify_ingest():
@@ -561,9 +566,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── PUT /v1/nodes/{id} ────────────────────────────
 
+    # Skill metadata keys whose transition belongs exclusively to
+    # accept/decline/ingest — a plain PUT must never be able to smuggle a
+    # skill from proposed to active, or forge origin/curated provenance.
+    _SKILL_LOCKED_METADATA_KEYS = ("status", "origin", "curated")
+
     @app.put("/v1/nodes/{node_id}", response_model=NodeResponse)
-    async def update_node(node_id: str, request: NodeUpdateRequest):
+    async def update_node(node_id: str, request: NodeUpdateRequest, http_request: Request):
         """Update a node's label, content, or metadata."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         kwargs = {}
         if request.label is not None:
             kwargs["label"] = request.label
@@ -575,6 +589,20 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if not kwargs:
             raise HTTPException(400, "No fields to update")
 
+        existing = store.get_node(node_id)
+        if existing is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        if existing.node_type == NodeType.SKILL and request.metadata is not None:
+            before_md = existing.metadata or {}
+            for key in _SKILL_LOCKED_METADATA_KEYS:
+                if request.metadata.get(key) != before_md.get(key):
+                    raise HTTPException(
+                        409,
+                        f"Cannot change skill metadata field {key!r} via PUT "
+                        f"/v1/nodes/{{id}} -- that transition belongs to "
+                        f"skills accept/decline/ingest only.",
+                    )
+
         updated = store.update_node(node_id, **kwargs)
         if updated is None:
             raise HTTPException(404, f"Node not found: {node_id}")
@@ -583,8 +611,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── DELETE /v1/nodes/{id} ─────────────────────────
 
     @app.delete("/v1/nodes/{node_id}")
-    async def delete_node(node_id: str):
+    async def delete_node(node_id: str, http_request: Request):
         """Delete a node and its edges. Permanent."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         deleted = store.delete_node(node_id)
         if not deleted:
             raise HTTPException(404, f"Node not found: {node_id}")
@@ -593,12 +625,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/edges ─────────────────────────────────
 
     @app.post("/v1/edges", response_model=EdgeResponse)
-    async def create_edge(request: EdgeCreateRequest):
+    async def create_edge(request: EdgeCreateRequest, http_request: Request):
         """Create an explicit typed edge between two existing nodes.
 
         Useful for human/agent adjudication edges like ``conflicts_with`` where
         both claims should remain live while the tension becomes first-class.
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         try:
             edge_type = EdgeType(request.edge_type)
         except ValueError:
@@ -636,12 +672,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/consolidate ──────────────────────────
 
     @app.post("/v1/consolidate")
-    async def consolidate(request: ConsolidateRequest):
+    async def consolidate(request: ConsolidateRequest, http_request: Request):
         """Run the dream-mode maintenance pass (B3.1): persist confidence
         decay, refresh clustering, optionally backfill the semantic index,
         and report orphaned nodes. Returns the full consolidation report —
         a dream you can't inspect is a black box, so there is no silent
         variant of this endpoint."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         from revien.consolidate import Consolidator
         consolidator = Consolidator(
             store, ops, semantic=semantic, clustering=clustering,
@@ -678,7 +718,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/graph/import ─────────────────────────
 
     @app.post("/v1/graph/import")
-    async def import_graph(graph_data: Dict[str, Any], mode: str = Query("refuse")):
+    async def import_graph(
+        graph_data: Dict[str, Any], http_request: Request, mode: str = Query("refuse")
+    ):
         """Import a graph from JSON. For restore/migration.
 
         mode=refuse (default) 409s against a non-empty database — an import
@@ -686,6 +728,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         wipe). mode=merge skips colliding IDs; mode=replace swaps the whole
         graph in one transaction (any failure leaves the original intact).
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         from revien.graph.store import ImportRefusedError, ImportValidationError
 
         if mode not in ("refuse", "merge", "replace"):
@@ -711,8 +757,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/cluster ─────────────────────────────
 
     @app.post("/v1/cluster")
-    async def run_clustering():
+    async def run_clustering(http_request: Request):
         """Trigger community detection on the graph. Returns community summary."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         communities = clustering.run()
         return {
             "status": "clustered",
@@ -753,7 +803,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/sync ─────────────────────────────────
 
     @app.post("/v1/sync", response_model=SyncResponse)
-    async def sync():
+    async def sync(http_request: Request):
         """Trigger manual sync with connected AI systems.
 
         Runs the scheduler's sync_all inline when a scheduler with live
@@ -761,6 +811,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         one (bare create_app, e.g. tests/ASGI), reports that honestly
         instead of pretending a sync happened.
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         scheduler = getattr(app.state, "scheduler", None)
         if scheduler is None or not scheduler.list_adapters():
             return SyncResponse(
@@ -784,12 +838,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         query: Optional[str] = None
 
     @app.post("/v1/mark_used")
-    async def mark_used(request: MarkUsedRequest):
+    async def mark_used(request: MarkUsedRequest, http_request: Request):
         """
         Mark a retrieved node as actually used.
         Call this when the user references or acts on retrieved information.
         Provides positive training signal AND reinforces connected edge weights.
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         node = store.get_node(request.node_id)
         if node is None:
             raise HTTPException(404, f"Node not found: {request.node_id}")
@@ -807,9 +865,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/training/run ──────────────────────────
 
     @app.post("/v1/training/run")
-    async def run_training():
+    async def run_training(http_request: Request):
         """Manually trigger neural training. No-ops (status 'skipped') when the
         neural extra is absent or insufficient signals have accumulated."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         success = engine.force_train()
         return {
             "status": "success" if success else "skipped",
@@ -823,8 +885,14 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         construct_id: str = ""
 
     @app.post("/v1/nodes/{node_id}/reinforce")
-    async def reinforce_node_endpoint(node_id: str, request: Optional[ReinforceRequest] = None):
+    async def reinforce_node_endpoint(
+        node_id: str, http_request: Request, request: Optional[ReinforceRequest] = None
+    ):
         """Reinforce a node's confidence (+0.05, cap 1.0) after successful use."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         req = request or ReinforceRequest()
         updated = ops.reinforce_node(node_id, construct_id=req.construct_id)
         if updated is None:
@@ -838,9 +906,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         construct_id: str = ""
 
     @app.post("/v1/nodes/{node_id}/correct")
-    async def correct_node_endpoint(node_id: str, request: Optional[CorrectRequest] = None):
+    async def correct_node_endpoint(
+        node_id: str, http_request: Request, request: Optional[CorrectRequest] = None
+    ):
         """Mark a node CORRECTED (source_type=CORRECTED, confidence=0.0). Explicit
         removal from ranking — distinct from decay, which only demotes."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         req = request or CorrectRequest()
         updated = ops.correct_node(
             node_id, correction_context=req.correction_context, construct_id=req.construct_id
@@ -865,9 +939,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/v1/nodes/{node_id}/invalidate")
     async def invalidate_node_endpoint(
-        node_id: str, request: Optional[InvalidateRequest] = None
+        node_id: str, http_request: Request, request: Optional[InvalidateRequest] = None
     ):
         """Soft-invalidate a node (mark stale, retain content). Non-destructive."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         req = request or InvalidateRequest()
         updated = ops.invalidate_node(
             node_id, reason=req.reason, construct_id=req.construct_id
@@ -921,7 +999,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         construct_id: str = ""
 
     @app.post("/v1/retention/sweep")
-    async def retention_sweep(request: Optional[RetentionSweepRequest] = None):
+    async def retention_sweep(
+        http_request: Request, request: Optional[RetentionSweepRequest] = None
+    ):
         """Run one retention sweep under the selected storage policy.
 
         Mode/window resolve from REVIEN_RETENTION / REVIEN_RETENTION_DAYS unless
@@ -929,6 +1009,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         stale unpinned nodes (recoverable); ``expire`` hard-deletes them
         (+tombstone). Pinned nodes are always immune. Returns counts.
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         req = request or RetentionSweepRequest()
         return ops.apply_retention(
             mode=req.mode, days=req.days, construct_id=req.construct_id
@@ -950,13 +1034,19 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         construct_id: str = ""
 
     @app.post("/v1/nodes/{node_id}/forget")
-    async def forget_node_endpoint(node_id: str, request: Optional[ForgetRequest] = None):
+    async def forget_node_endpoint(
+        node_id: str, http_request: Request, request: Optional[ForgetRequest] = None
+    ):
         """Right-to-forget: HARD-delete the node's content (privacy).
 
         Distinct from invalidate (which retains). Writes a content-free tombstone
         audit entry and re-points children's lineage to a tombstone marker.
         cascade=True forgets the whole DERIVED_FROM subtree.
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         req = request or ForgetRequest()
         result = ops.forget_node(
             node_id, cascade=req.cascade, reason=req.reason,
@@ -980,12 +1070,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # `semantic` extra is absent or REVIEN_SEMANTIC=0, this reports status
     # "disabled" and does nothing — graph retrieval is unaffected either way.
     @app.post("/v1/reindex")
-    async def reindex():
+    async def reindex(http_request: Request):
         """Embed all existing content nodes into the semantic vector index.
 
         No-op (status 'disabled') when the opt-in `semantic` extra is not
         installed or REVIEN_SEMANTIC=0.
         """
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
         return semantic.reindex_all()
 
     # ── GET /v1/semantic/status ────────────────────────
@@ -1029,29 +1123,43 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/v1/skills/{node_id}/accept")
     async def accept_skill_endpoint(node_id: str, http_request: Request):
-        """Accept a proposal: status -> active, origin stays engine."""
+        """Accept a proposal: status -> active, origin stays engine.
+
+        404 when the node doesn't exist at all; 409 when it exists but
+        can't be accepted right now (not a SKILL, invalidated, or status
+        isn't "proposed") — a real conflict, not a missing resource.
+        """
         require_mutation_auth(
             http_request.client.host if http_request.client else "",
             http_request.headers.get("authorization", ""),
         )
+        if store.get_node(node_id) is None:
+            raise HTTPException(404, f"Skill not found: {node_id}")
         try:
             updated = accept_proposal(store, node_id)
-        except ValueError:
-            raise HTTPException(404, f"Skill not found: {node_id}")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
         return _node_to_response(updated)
 
     @app.post("/v1/skills/{node_id}/decline")
     async def decline_skill_endpoint(node_id: str, http_request: Request):
         """Decline a proposal: declines += 1; the third decline soft-
-        invalidates it (GraphOperations.invalidate_node)."""
+        invalidates it (GraphOperations.invalidate_node).
+
+        404 when the node doesn't exist at all; 409 when it exists but
+        can't be declined right now (not a SKILL, invalidated, or status
+        isn't "proposed").
+        """
         require_mutation_auth(
             http_request.client.host if http_request.client else "",
             http_request.headers.get("authorization", ""),
         )
+        if store.get_node(node_id) is None:
+            raise HTTPException(404, f"Skill not found: {node_id}")
         try:
             updated = decline_proposal(store, node_id)
-        except ValueError:
-            raise HTTPException(404, f"Skill not found: {node_id}")
+        except ValueError as e:
+            raise HTTPException(409, str(e))
         return _node_to_response(updated)
 
     return app
