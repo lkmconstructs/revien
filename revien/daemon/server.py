@@ -40,6 +40,13 @@ class IngestRequest(BaseModel):
     # verbatim-only capture is not keyword-anchorable in the gap (keyword
     # anchors exclude CONTEXT nodes) — drain-at-search is the guarantee.
     defer_embed: bool = False
+    # Origin Layer (WS0) passthrough: an external caller that knows its own
+    # provenance can set these; omitted origin_runtime falls back to
+    # deriving it from source_id in the pipeline's stamp loop.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 class IngestResponse(BaseModel):
@@ -156,7 +163,7 @@ def check_capture_auth(client_host: Optional[str], auth_header: str) -> None:
     if host in _LOOPBACK_HOSTS:
         return
     token = os.environ.get("REVIEN_CAPTURE_TOKEN", "").strip()
-    if not token:
+    if not expected:
         raise HTTPException(
             403,
             "Remote capture is disabled. Set REVIEN_CAPTURE_TOKEN on the "
@@ -383,6 +390,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             timestamp=ts,
             metadata=request.metadata,
             defer_embed=request.defer_embed,
+            origin_runtime=request.origin_runtime,
+            origin_source=request.origin_source,
+            project_key=request.project_key,
+            session_key=request.session_key,
         )
         result = pipeline.ingest(input_data)
 

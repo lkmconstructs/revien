@@ -188,6 +188,8 @@ class ObsidianVaultAdapter(RevienAdapter):
                 "source_id": f"vault:{rel_path.as_posix()}#{_slug(heading)}",
                 "links": links,
                 "curated": True,
+                "origin_runtime": "obsidian",
+                "origin_source": "vault",
                 "metadata": {
                     "adapter": "obsidian",
                     "vault": str(self.vault_dir),

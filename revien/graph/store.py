@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from .origin import derive_origin
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -160,7 +161,11 @@ class GraphStore:
                 event_time_confidence REAL,
                 event_time_text TEXT DEFAULT '',
                 valid_from TEXT,
-                valid_until TEXT
+                valid_until TEXT,
+                origin_runtime TEXT,
+                origin_source TEXT,
+                project_key TEXT,
+                session_key TEXT
             );
 
             CREATE TABLE IF NOT EXISTS edges (
@@ -256,6 +261,13 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_candidates_unresolved
                 ON supersession_candidates(resolved_at);
         """)
+        # idx_nodes_origin_* are NOT created here: on a legacy DB whose
+        # "nodes" table predates the origin columns, CREATE TABLE IF NOT
+        # EXISTS is a no-op (the table already exists) but CREATE INDEX ...
+        # ON nodes(origin_runtime) would still fail — no such column — since
+        # the ALTER hasn't run yet. Same reason idx_nodes_modality lives only
+        # in its own migration guard. Created in _migrate_add_origin_columns
+        # below, after the ALTERs, for both fresh and legacy databases.
         conn.execute("PRAGMA foreign_keys = ON")
         self._commit(conn)
 
@@ -267,6 +279,9 @@ class GraphStore:
         self._migrate_add_temporal_columns(conn)
         self._migrate_add_validity_columns(conn)
         self._migrate_add_edge_invalidation_column(conn)
+        # Origin Layer (WS0): add origin columns to older DBs and backfill
+        # from source_id wherever derive_origin recognizes it.
+        self._migrate_add_origin_columns(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -463,6 +478,65 @@ class GraphStore:
             self._commit(conn)
         except sqlite3.OperationalError as e:
             # Swallow ONLY the idempotency race (column already there).
+            # Anything else — locked db, disk, corruption — must be loud at
+            # startup, not a "Migration note" that hides it.
+            if "duplicate column name" in str(e) or "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
+
+    def _migrate_add_origin_columns(self, conn: sqlite3.Connection) -> None:
+        """Add Origin Layer (WS0) columns to existing DBs, then backfill.
+
+        Idempotent and no-op for fresh databases (columns already created in
+        ``_ensure_db``). All four columns are nullable TEXT and backfill NULL
+        on ALTER for old rows — then the backfill pass below fills in every
+        row whose source_id derive_origin recognizes. Runs on every connect
+        (same as the other migration guards); after the first pass every
+        recognizable row is already populated, so later runs only rescan the
+        (typically small, and shrinking as adapters stamp origin at ingest)
+        set of rows still NULL.
+        """
+        try:
+            cursor = conn.execute("PRAGMA table_info(nodes)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
+                if col not in columns:
+                    conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime ON nodes(origin_runtime)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_origin_source ON nodes(origin_source)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes(project_key)"
+            )
+            self._commit(conn)
+
+            # Backfill: any row with a source_id but no derived origin yet.
+            # Rows whose source_id derive_origin doesn't recognize stay NULL
+            # (honest "unknown", never a guess) — they're rescanned on every
+            # connect, which is cheap relative to the table itself and
+            # self-corrects if a future adapter convention is added here.
+            rows = conn.execute(
+                "SELECT node_id, source_id FROM nodes "
+                "WHERE origin_runtime IS NULL AND source_id != ''"
+            ).fetchall()
+            for node_id, source_id in rows:
+                origin = derive_origin(source_id)
+                if origin.runtime is None:
+                    continue
+                conn.execute(
+                    "UPDATE nodes SET origin_runtime = ?, origin_source = ?, "
+                    "project_key = ?, session_key = ? WHERE node_id = ?",
+                    (origin.runtime, origin.source, origin.project, origin.session, node_id),
+                )
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            # Swallow ONLY the idempotency race (column/index already there).
             # Anything else — locked db, disk, corruption — must be loud at
             # startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
@@ -708,9 +782,10 @@ class GraphStore:
                 invalidated_at, source_modality, answerable_by_text,
                 vision_processed, recorded_at, event_time_start,
                 event_time_end, event_time_granularity, event_time_confidence,
-                event_time_text, valid_from, valid_until)
+                event_time_text, valid_from, valid_until,
+                origin_runtime, origin_source, project_key, session_key)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node.node_id,
                 node.node_type.value,
@@ -740,6 +815,10 @@ class GraphStore:
                 node.event_time_text,
                 node.valid_from.isoformat() if node.valid_from else None,
                 node.valid_until.isoformat() if node.valid_until else None,
+                node.origin_runtime,
+                node.origin_source,
+                node.project_key,
+                node.session_key,
             ),
         )
 
@@ -1768,6 +1847,12 @@ class GraphStore:
             # row reads back with an unbounded window.
             valid_from=datetime.fromisoformat(row[26]) if len(row) > 26 and row[26] else None,
             valid_until=datetime.fromisoformat(row[27]) if len(row) > 27 and row[27] else None,
+            # Origin Layer (columns 28-31): nullable — a pre-WS0 row reads
+            # back with no origin at all until the backfill pass runs.
+            origin_runtime=row[28] if len(row) > 28 and row[28] else None,
+            origin_source=row[29] if len(row) > 29 and row[29] else None,
+            project_key=row[30] if len(row) > 30 and row[30] else None,
+            session_key=row[31] if len(row) > 31 and row[31] else None,
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:

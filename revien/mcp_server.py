@@ -212,6 +212,10 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
         source_id: str = "mcp",
         content_type: str = "note",
         defer_embed: bool = False,
+        origin_runtime: Optional[str] = None,
+        origin_source: Optional[str] = None,
+        project_key: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store a durable memory in the user's persistent memory graph.
 
@@ -234,6 +238,10 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                 latency-critical capture; the memory is keyword-searchable
                 immediately and semantically searchable after the queue
                 drains.
+            origin_runtime, origin_source, project_key, session_key: Origin
+                Layer (WS0) provenance — set these if the caller knows its
+                own runtime/project/session. Omitted origin_runtime falls
+                back to deriving it from source_id.
 
         Returns the created context node id and node/edge counts.
         """
@@ -250,6 +258,10 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                 content=content,
                 content_type=content_type,
                 defer_embed=defer_embed,
+                origin_runtime=origin_runtime,
+                origin_source=origin_source,
+                project_key=project_key,
+                session_key=session_key,
             )
         )
         return {

@@ -13,6 +13,7 @@ from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType, Source
 from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
+from revien.graph.origin import derive_origin
 
 
 def _ingest_deny_set() -> set:
@@ -90,6 +91,15 @@ class IngestionInput:
     # stale-claim risk. Contradictions are supersession/CSL territory, not
     # refresh's.
     ingest_key: Optional[str] = None
+    # Origin Layer (WS0): where the words actually came from. An adapter that
+    # knows its own runtime/project/session sets these explicitly; a caller
+    # that omits origin_runtime gets it derived from source_id (see
+    # revien.graph.origin.derive_origin) in the stamp loop below — unknown
+    # source_id shapes derive to None, never a guess.
+    origin_runtime: Optional[str] = None
+    origin_source: Optional[str] = None
+    project_key: Optional[str] = None
+    session_key: Optional[str] = None
 
 
 @dataclass
@@ -365,10 +375,22 @@ class IngestionPipeline:
         # node from this unit, and the anchor relative temporal expressions resolve
         # against. (Was silently dropped before; created_at was ingest-time now().)
         ctx_id = extraction.context_node.node_id if extraction.context_node else None
+        # Origin Layer (WS0): resolve once per input, then stamp every node.
+        # An explicit origin_runtime wins outright (the caller knows its own
+        # provenance); omitted origin_runtime falls back to deriving the
+        # whole tuple from source_id — never a per-field merge.
+        if input_data.origin_runtime is None:
+            _origin = derive_origin(input_data.source_id)
+        else:
+            _origin = (
+                input_data.origin_runtime, input_data.origin_source,
+                input_data.project_key, input_data.session_key,
+            )
         for node in extraction.nodes:
             node.source_modality = input_data.source_modality
             node.vision_processed = input_data.vision_processed
             node.recorded_at = input_data.timestamp
+            node.origin_runtime, node.origin_source, node.project_key, node.session_key = _origin
             if node.node_id == ctx_id:
                 node.answerable_by_text = input_data.answerable_by_text
                 # Stamp the ingest key + content hash (R3) so the NEXT ingest
@@ -484,6 +506,10 @@ class IngestionPipeline:
                         confidence=1.0 if input_data.curated else 0.8,
                         recorded_at=input_data.timestamp,
                         metadata={"curated": True} if input_data.curated else {},
+                        origin_runtime=_origin[0],
+                        origin_source=_origin[1],
+                        project_key=_origin[2],
+                        session_key=_origin[3],
                     ))
                     nodes_created += 1
                     self._register_entity(target)
@@ -677,12 +703,24 @@ class IngestionPipeline:
             id_map = {}
             if extraction_ctx_id is not None:
                 id_map[extraction_ctx_id] = ctx_id
+            # Origin Layer (WS0): same resolve-once-per-input rule as ingest().
+            if input_data.origin_runtime is None:
+                _origin = derive_origin(input_data.source_id)
+            else:
+                _origin = (
+                    input_data.origin_runtime, input_data.origin_source,
+                    input_data.project_key, input_data.session_key,
+                )
             for candidate_node in extraction.nodes:
                 if candidate_node.node_id == extraction_ctx_id:
                     continue
                 candidate_node.source_modality = input_data.source_modality
                 candidate_node.vision_processed = input_data.vision_processed
                 candidate_node.recorded_at = input_data.timestamp
+                (
+                    candidate_node.origin_runtime, candidate_node.origin_source,
+                    candidate_node.project_key, candidate_node.session_key,
+                ) = _origin
                 if input_data.curated:
                     candidate_node.confidence = 1.0
                     candidate_node.metadata = {
@@ -746,6 +784,10 @@ class IngestionPipeline:
                         confidence=1.0 if input_data.curated else 0.8,
                         recorded_at=input_data.timestamp,
                         metadata={"curated": True} if input_data.curated else {},
+                        origin_runtime=_origin[0],
+                        origin_source=_origin[1],
+                        project_key=_origin[2],
+                        session_key=_origin[3],
                     ))
                     nodes_created += 1
                     self._register_entity(target)

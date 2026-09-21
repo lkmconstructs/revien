@@ -478,6 +478,9 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                 source_id=_HERMES_SOURCE_ID,
                 content=content,
                 content_type="note",
+                origin_runtime="hermes",
+                origin_source="live",
+                session_key=self._session_id or None,
             )
         )
         return {
@@ -580,6 +583,13 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                             content=item,
                             content_type=_CONVERSATION,
                             defer_embed=True,  # persist now, embed on drain/sweep
+                            origin_runtime="hermes",
+                            origin_source="live",
+                            # Hermes hands a session_id to initialize(); the
+                            # worker thread reads it off self (set once, read-
+                            # only here) rather than threading it through the
+                            # queue — one provider instance is one session.
+                            session_key=self._session_id or None,
                         )
                     )
             except Exception:  # noqa: BLE001 - a sync failure never breaks Hermes

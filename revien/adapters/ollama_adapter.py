@@ -183,6 +183,8 @@ class OllamaAdapter:
             content_type="conversation",
             timestamp=datetime.now(timezone.utc),
             metadata={"message_count": len(history)},
+            origin_runtime="ollama",
+            origin_source="live",
         )
 
         output = self.pipeline.ingest(input_data)
@@ -345,6 +347,8 @@ class OllamaAdapter:
                 "message_length": len(message),
                 "response_length": len(response),
             },
+            origin_runtime="ollama",
+            origin_source="live",
         )
 
         try:

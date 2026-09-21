@@ -218,6 +218,9 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                 content_type="conversation",
                 timestamp=datetime.now(timezone.utc),
                 metadata={**metadata, "role": "user"},
+                origin_runtime="langchain",
+                origin_source="live",
+                session_key=self.session_scope,
             )
 
             input_result = self._ingestion_pipeline.ingest(input_ingestion)
@@ -230,6 +233,9 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                 content_type="conversation",
                 timestamp=datetime.now(timezone.utc),
                 metadata={**metadata, "role": "assistant"},
+                origin_runtime="langchain",
+                origin_source="live",
+                session_key=self.session_scope,
             )
 
             output_result = self._ingestion_pipeline.ingest(output_ingestion)

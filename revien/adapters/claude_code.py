@@ -79,6 +79,12 @@ class ClaudeCodeAdapter(RevienAdapter):
                     # the key makes that re-ingest refresh the ONE existing
                     # context node instead of stacking a duplicate per sync.
                     "ingest_key": source_id,
+                    # Origin Layer (WS0): known at read time, no need to
+                    # round-trip through derive_origin(source_id) later.
+                    "origin_runtime": "claude-code",
+                    "origin_source": "live",
+                    "project_key": project_name,
+                    "session_key": jsonl_file.stem,
                 })
 
         return results

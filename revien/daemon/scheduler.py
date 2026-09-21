@@ -153,6 +153,13 @@ class SyncScheduler:
                 # the pipeline refreshes ONE context node instead of stacking
                 # duplicates every sync. Absent = append-forever, unchanged.
                 ingest_key=item.get("ingest_key"),
+                # Origin Layer (WS0): pass through whatever the adapter knows
+                # about its own provenance; None falls back to deriving it
+                # from source_id in the pipeline's stamp loop.
+                origin_runtime=item.get("origin_runtime"),
+                origin_source=item.get("origin_source"),
+                project_key=item.get("project_key"),
+                session_key=item.get("session_key"),
             )
             if input_data.content.strip():
                 self.pipeline.ingest(input_data)
