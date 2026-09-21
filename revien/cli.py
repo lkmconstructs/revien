@@ -12,7 +12,7 @@ import shutil
 import sys
 import sysconfig
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     import click
@@ -1176,6 +1176,135 @@ def watch(db: Optional[str], interval: float, keep: int, use_gzip: bool):
             time.sleep(interval * 60)
     except KeyboardInterrupt:
         click.echo("\nStopped.")
+
+
+# ── skills (thin WS3, leg D1) ──────────────────────────────────────────────
+# A group, not flat commands, so `propose`/`accept`/`decline` (leg D2, a
+# parallel worktree) can land as siblings of `ingest`/`list`/`show` without
+# touching anything above this line.
+
+@main.group()
+def skills():
+    """Manage skills (SKILL.md-style procedures) as first-class memory."""
+    pass
+
+
+@skills.command(name="ingest")
+@click.option("--path", "paths", multiple=True, type=click.Path(),
+              help="Skill root to scan (repeatable). Default: ./.claude/skills "
+                   "and ./.codex/skills.")
+@click.option("--global", "include_global", is_flag=True,
+              help="Also scan the global skill homes: ~/.claude/skills, "
+                   "~/.codex/skills, ~/.hermes/skills.")
+@click.option("--db", default=None, help="Database path")
+def skills_ingest(paths: Tuple[str, ...], include_global: bool, db: Optional[str]):
+    """Scan skill folders and ingest each SKILL.md as a SKILL node.
+
+    Idempotent by path: re-running refreshes an unchanged skill's node in
+    place (label/content/metadata) rather than duplicating it."""
+    from revien.graph.store import GraphStore
+    from revien.skills.ingest import ingest_roots
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        summary = ingest_roots(store, paths=list(paths) or None, include_global=include_global)
+    finally:
+        store.close()
+
+    if summary["scanned"] == 0:
+        click.echo("No SKILL.md files found under the scanned roots.")
+        return
+    click.echo(
+        f"Scanned {summary['scanned']} skill(s): {summary['created']} created, "
+        f"{summary['refreshed']} refreshed, {summary['edges']} entity/topic "
+        f"edge(s) linked."
+    )
+
+
+@skills.command(name="list")
+@click.option("--project", default=None, help="Filter to one project_key")
+@click.option("--status", default=None, help="Filter to one metadata status (e.g. active)")
+@click.option("--format", "output_format", type=click.Choice(["json", "toon"]),
+              default=None, help="Machine-readable output (default: human table)")
+@click.option("--db", default=None, help="Database path")
+def skills_list_cmd(project: Optional[str], status: Optional[str],
+                     output_format: Optional[str], db: Optional[str]):
+    """List ingested skills — name, origin, status, scope, version, project."""
+    from revien.graph.store import GraphStore
+    from revien.skills.ingest import list_skills
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        nodes = list_skills(store, project=project, status=status)
+    finally:
+        store.close()
+
+    rows = [
+        {
+            "name": n.label,
+            "origin": (n.metadata or {}).get("origin", ""),
+            "status": (n.metadata or {}).get("status", ""),
+            "scope": (n.metadata or {}).get("scope", ""),
+            "version": (n.metadata or {}).get("version", ""),
+            "project": n.project_key or "",
+        }
+        for n in nodes
+    ]
+
+    if output_format == "json":
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if output_format == "toon":
+        from revien.toon import encode
+        click.echo(encode({"skills": rows}))
+        return
+
+    if not rows:
+        click.echo("No skills ingested. Run 'revien skills ingest' first.")
+        return
+    for r in rows:
+        click.echo(
+            f"  {r['name']}  [{r['origin']}/{r['status']}/{r['scope']}]"
+            f"{' v' + r['version'] if r['version'] else ''}"
+            f"{' (' + r['project'] + ')' if r['project'] else ''}"
+        )
+
+
+@skills.command(name="show")
+@click.argument("name")
+@click.option("--db", default=None, help="Database path")
+def skills_show(name: str, db: Optional[str]):
+    """Print one skill's body markdown (user-authored wins over engine-proposed)."""
+    from revien.graph.store import GraphStore
+    from revien.skills.ingest import show_skill
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        node = show_skill(store, name)
+    finally:
+        store.close()
+
+    if node is None:
+        click.echo(f"No skill named '{name}'.")
+        sys.exit(1)
+    click.echo(node.content)
 
 
 if __name__ == "__main__":

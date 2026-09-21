@@ -109,9 +109,14 @@ class TestNodeCreation:
         result = store.add_node(node)
         assert result.node_type == NodeType.ACTION
 
+    def test_create_skill_node(self, store):
+        node = Node(node_type=NodeType.SKILL, label="fernweh-sync", content="Sync steps for Fernweh-Core.")
+        result = store.add_node(node)
+        assert result.node_type == NodeType.SKILL
+
     def test_all_node_types_covered(self):
         """Verify we test every NodeType."""
-        assert len(NodeType) == 8
+        assert len(NodeType) == 9
 
 
 # ── Edge Creation (every type) ────────────────────────────

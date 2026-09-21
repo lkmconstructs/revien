@@ -24,6 +24,12 @@ class NodeType(str, Enum):
     # records work still owed. Same lifecycle as every claim type
     # (dedup/recall/supersession apply unchanged).
     ACTION = "action"
+    # A skill definition (SKILL.md-style): a named, reusable procedure with
+    # trigger words, ingested from a skills folder (WS3, thin leg D1) or
+    # proposed by the engine from repeated ACTION sequences (leg D2). Content
+    # is the skill body verbatim; metadata carries description/triggers/
+    # version/origin/status/scope/path. Participates in recall like any node.
+    SKILL = "skill"
 
 
 class EdgeType(str, Enum):
