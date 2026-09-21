@@ -276,6 +276,30 @@ def list_skills(
     return sort_user_before_engine(nodes)
 
 
+def skill_index_row(node: Node) -> str:
+    """The one-line index-row text recall shows for a SKILL node's
+    `content` — NEVER the full body (that's what `skills show`/`revien
+    skills show` is for). D1 leftover, wired into
+    revien/retrieval/engine.py's result-building loop.
+
+    A human-authored (D1) skill carries description/triggers metadata:
+    "<description> — triggers: a, b". An engine proposal (D2) has no
+    description — it carries a `steps` list instead, so it gets the same
+    shape with its steps standing in for triggers. A node with neither
+    (shouldn't happen, but never crash recall over it) falls back to its
+    label."""
+    md = node.metadata or {}
+    description = md.get("description")
+    if description is not None:
+        triggers = md.get("triggers") or []
+        trig_str = ", ".join(triggers)
+        return f"{description} — triggers: {trig_str}" if trig_str else description
+    steps = md.get("steps") or []
+    if steps:
+        return f"proposed skill — steps: {', '.join(steps)}"
+    return node.label
+
+
 def show_skill(store: GraphStore, name: str) -> Optional[Node]:
     """The highest-precedence (user-before-engine) SKILL node matching
     `name` case-insensitively, or None."""

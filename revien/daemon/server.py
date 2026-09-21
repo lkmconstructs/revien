@@ -23,6 +23,8 @@ from revien.graph.clustering import CommunityDetector
 from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 from revien.semantic.index import SemanticIndex
+from revien.skills.ingest import sort_user_before_engine
+from revien.skills.proposals import accept_proposal, decline_proposal
 from revien.validation import ValidationError, validate_ingest, validate_recall
 
 
@@ -497,6 +499,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # one-line reason recall is running graph-only (degraded).
             "semantic_active": response.semantic_active,
             "semantic_note": response.semantic_note,
+            # Skills leg D2: draft engine-origin skill proposals relevant to
+            # this query. Always present, possibly [].
+            "skill_proposals": response.skill_proposals,
         }
         if request.format == "toon":
             # Same payload, TOON wire format (LEG P2). text/toon is the
@@ -988,6 +993,66 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def semantic_status():
         """Report whether the opt-in semantic/vector layer is active and why."""
         return semantic.status()
+
+    # ── Skills (leg D2: proposals) ─────────────────────
+    # GETs are open on loopback like every other read route; the two POSTs
+    # (accept/decline) are mutations and gated by require_mutation_auth —
+    # identical rule to /v1/ingest's check_capture_auth, mirrored under its
+    # own name (Leg C).
+
+    @app.get("/v1/skills")
+    async def list_skills_endpoint(
+        status: Optional[str] = Query(None),
+        origin: Optional[str] = Query(None),
+        project_key: Optional[str] = Query(None),
+    ):
+        """List SKILL nodes (ingested + proposed), user-before-engine
+        ordered. `status`/`origin` filter on metadata; `project_key` is a
+        SQL prefilter (store.list_nodes)."""
+        nodes = store.list_nodes(
+            node_type=NodeType.SKILL, limit=1000, project_key=project_key or None,
+        )
+        if status is not None:
+            nodes = [n for n in nodes if (n.metadata or {}).get("status") == status]
+        if origin is not None:
+            nodes = [n for n in nodes if (n.metadata or {}).get("origin") == origin]
+        nodes = sort_user_before_engine(nodes)
+        return [_node_to_response(n) for n in nodes]
+
+    @app.get("/v1/skills/{node_id}")
+    async def get_skill_endpoint(node_id: str):
+        """Get one SKILL node (ingested or proposed) by id."""
+        node = store.get_node(node_id)
+        if node is None or node.node_type != NodeType.SKILL:
+            raise HTTPException(404, f"Skill not found: {node_id}")
+        return _node_to_response(node)
+
+    @app.post("/v1/skills/{node_id}/accept")
+    async def accept_skill_endpoint(node_id: str, http_request: Request):
+        """Accept a proposal: status -> active, origin stays engine."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
+        try:
+            updated = accept_proposal(store, node_id)
+        except ValueError:
+            raise HTTPException(404, f"Skill not found: {node_id}")
+        return _node_to_response(updated)
+
+    @app.post("/v1/skills/{node_id}/decline")
+    async def decline_skill_endpoint(node_id: str, http_request: Request):
+        """Decline a proposal: declines += 1; the third decline soft-
+        invalidates it (GraphOperations.invalidate_node)."""
+        require_mutation_auth(
+            http_request.client.host if http_request.client else "",
+            http_request.headers.get("authorization", ""),
+        )
+        try:
+            updated = decline_proposal(store, node_id)
+        except ValueError:
+            raise HTTPException(404, f"Skill not found: {node_id}")
+        return _node_to_response(updated)
 
     return app
 

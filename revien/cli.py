@@ -527,6 +527,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                 "retrieval_time_ms": response.retrieval_time_ms,
                 "semantic_active": response.semantic_active,
                 "semantic_note": response.semantic_note,
+                "skill_proposals": response.skill_proposals,
             }
             click.echo(serialize_recall(payload))
         elif json_output:
@@ -548,6 +549,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                 ],
                 "nodes_examined": response.nodes_examined,
                 "retrieval_time_ms": response.retrieval_time_ms,
+                "skill_proposals": response.skill_proposals,
             }
             click.echo(json.dumps(output, indent=2))
         else:
@@ -566,6 +568,14 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                 click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f} "
                            f"| Runtime: {runtime}")
                 click.echo(f"      {r.content[:120]}{'...' if len(r.content) > 120 else ''}")
+                click.echo()
+
+            if response.skill_proposals:
+                click.echo(f"{len(response.skill_proposals)} draft skill "
+                           f"proposal(s) match this query:")
+                for p in response.skill_proposals:
+                    click.echo(f"  - {p['label']}  ({p['occurrences']}x across "
+                               f"{p['sessions']} sessions)")
                 click.echo()
     finally:
         store.close()
@@ -1334,6 +1344,98 @@ def skills_show(name: str, db: Optional[str]):
         click.echo(f"No skill named '{name}'.")
         sys.exit(1)
     click.echo(node.content)
+
+
+@skills.command(name="propose")
+@click.option("--min-occurrences", "min_occurrences", default=3, show_default=True,
+              help="Minimum total occurrences of a step-sequence to propose it.")
+@click.option("--min-sessions", "min_sessions", default=2, show_default=True,
+              help="Minimum distinct sessions a step-sequence must appear in.")
+@click.option("--db", default=None, help="Database path")
+def skills_propose(min_occurrences: int, min_sessions: int, db: Optional[str]):
+    """Detect repeated ACTION sequences and propose skills from them.
+
+    Idempotent: re-running refreshes an unchanged pattern's occurrence/
+    session counts in place rather than duplicating the proposal. Never
+    creates an active skill — proposals land with status=proposed,
+    origin=engine; accept them with 'revien skills accept <node_id>'."""
+    from revien.graph.store import GraphStore
+    from revien.skills.proposals import propose_skills
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        summary = propose_skills(
+            store, min_occurrences=min_occurrences, min_sessions=min_sessions,
+        )
+    finally:
+        store.close()
+
+    if summary["detected"] == 0:
+        click.echo("No repeated action sequences met the threshold.")
+        return
+    click.echo(
+        f"Detected {summary['detected']} pattern(s): {summary['created']} "
+        f"proposed, {summary['updated']} refreshed, {summary['edges']} "
+        f"derived-from edge(s) linked."
+    )
+    for node in summary["proposals"]:
+        click.echo(f"  {node.node_id}  {node.label}")
+
+
+@skills.command(name="accept")
+@click.argument("node_id")
+@click.option("--db", default=None, help="Database path")
+def skills_accept(node_id: str, db: Optional[str]):
+    """Accept a proposed skill: status -> active. Origin stays engine —
+    exactly one node_id per invocation, no bulk accept."""
+    from revien.graph.store import GraphStore
+    from revien.skills.proposals import accept_proposal
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        try:
+            node = accept_proposal(store, node_id)
+        except ValueError as e:
+            click.echo(str(e))
+            sys.exit(1)
+    finally:
+        store.close()
+    click.echo(f"Accepted: {node.label} (status={node.metadata.get('status')})")
+
+
+@skills.command(name="decline")
+@click.argument("node_id")
+@click.option("--db", default=None, help="Database path")
+def skills_decline(node_id: str, db: Optional[str]):
+    """Decline a proposed skill (declines += 1). The third decline
+    soft-invalidates it. Exactly one node_id per invocation, no bulk
+    decline."""
+    from revien.graph.store import GraphStore
+    from revien.skills.proposals import decline_proposal
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+
+    store = GraphStore(db_path=db_path)
+    try:
+        try:
+            node = decline_proposal(store, node_id)
+        except ValueError as e:
+            click.echo(str(e))
+            sys.exit(1)
+    finally:
+        store.close()
+    declines = (node.metadata or {}).get("declines", 0)
+    if node.invalidated_at is not None:
+        click.echo(f"Declined ({declines}x) and invalidated: {node.label}")
+    else:
+        click.echo(f"Declined ({declines}x): {node.label}")
 
 
 if __name__ == "__main__":

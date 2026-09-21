@@ -42,6 +42,8 @@ from revien.neural.training import TrainingLoop
 # recall() runs the unchanged graph path when it is absent or REVIEN_SEMANTIC=0.
 from revien.semantic.index import SemanticIndex
 from revien.semantic.rerank import CrossEncoderReranker
+from revien.skills.ingest import skill_index_row
+from revien.skills.proposals import matching_proposals
 from .bm25 import bm25_rank
 from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
@@ -125,6 +127,13 @@ class RetrievalResponse:
     # per-node final scores, and filter reasons. This is what per-query
     # retrieval failure analysis (extraction/seed/walk/ranking miss) reads.
     diagnostics: Optional[Dict[str, Any]] = None
+    # Skills leg D2: draft (LLM-authored, not the rule-based skeleton)
+    # engine-origin skill proposals whose steps share a keyword with this
+    # query. ALWAYS present (possibly empty) so a caller never has to
+    # special-case its absence — same convention as origin_runtime/
+    # origin_source/project_key on RetrievalResult. See
+    # revien/skills/proposals.py:matching_proposals for the match rule.
+    skill_proposals: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class RetrievalEngine:
@@ -847,7 +856,15 @@ class RetrievalEngine:
                 node_id=node.node_id,
                 node_type=node.node_type.value,
                 label=node.label,
-                content=node.content,
+                # D1 leftover: a SKILL result's `content` is the index-row
+                # text ("<description> — triggers: a, b"), never the full
+                # body — `skills show`/`revien skills show` is what returns
+                # the body. Every other node type is unchanged.
+                content=(
+                    skill_index_row(node)
+                    if node.node_type == NodeType.SKILL
+                    else node.content
+                ),
                 score=final_score,
                 score_breakdown=score_breakdown,
                 path=path_labels,
@@ -936,6 +953,10 @@ class RetrievalEngine:
                 self.semantic.inactive_reason() or self.semantic.pending_note()
             ),
             diagnostics=diagnostics,
+            # Skills leg D2: always computed, always present (possibly
+            # empty) — cheap (SKILL-typed nodes only) relative to the walk
+            # above, so there's no flag gating it off.
+            skill_proposals=matching_proposals(self.store, query),
         )
 
     def _attach_tensions(self, results: List[RetrievalResult]) -> None:
