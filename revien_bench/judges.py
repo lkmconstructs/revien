@@ -42,8 +42,9 @@ JUDGE_PROMPT_SHA256 = "9f64753745baf8b076ff61f251b3f89fe7f56531068877f754d958436
 # ~30 hidden reasoning tokens before the visible word) spend the budget
 # BEFORE emitting content. 8 was enough for gpt-4o and produced 185 empty
 # replies (finish_reason=length, content=None) on Terra. Measured floor 64;
-# 128 leaves headroom and costs nothing (usage is billed on what is spent).
-JUDGE_MAX_TOKENS = 128
+# 128 still left 35/1986 empty on temporal questions (date reasoning runs
+# longer); 512 costs nothing extra since usage bills only what is spent.
+JUDGE_MAX_TOKENS = 512
 
 
 def load_judge_prompt() -> str:
