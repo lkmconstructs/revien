@@ -479,3 +479,16 @@ def test_aggregate_judge_reports_accuracy_excluding_adversarial():
     only_adv = [r for r in per_q if r["is_adversarial"]]
     agg2 = R._aggregate_judge(only_adv, "stub:judge", "stub", network_calls=0, cost_usd=0.0)
     assert agg2["accuracy_excl_adversarial"] is None
+
+
+def test_judge_token_budget_survives_reasoning_models():
+    """Regression for the 185-empty-verdict Terra run: reasoning-capable
+    models spend ~30 hidden tokens before the visible word, so an 8-token
+    budget returns finish_reason=length with no content. Floor measured at
+    64; the constant must stay at or above it and be recorded in the report
+    block so a published row shows the budget it was judged under."""
+    from revien_bench import judges as J, runner as R
+
+    assert J.JUDGE_MAX_TOKENS >= 64
+    agg = R._aggregate_judge([], "stub:judge", "stub", network_calls=0, cost_usd=0.0)
+    assert agg["max_tokens"] == J.JUDGE_MAX_TOKENS

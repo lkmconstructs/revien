@@ -857,6 +857,7 @@ def _aggregate_judge(
         "spec": judge_spec,
         "model": judge_model_name,
         "prompt_sha256": J.JUDGE_PROMPT_SHA256,
+        "max_tokens": J.JUDGE_MAX_TOKENS,
         "accuracy_overall": accuracy_overall,
         "accuracy_denominator": accuracy_denominator,
         "n_correct": n_correct,

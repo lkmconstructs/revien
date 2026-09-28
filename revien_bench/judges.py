@@ -38,6 +38,12 @@ from . import answerers as A
 # if the on-disk file no longer matches this digest.
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge.txt"
 JUDGE_PROMPT_SHA256 = "9f64753745baf8b076ff61f251b3f89fe7f56531068877f754d958436d7c594c"
+# Verdict is one word, but reasoning-capable models (e.g. gpt-5.6-terra:
+# ~30 hidden reasoning tokens before the visible word) spend the budget
+# BEFORE emitting content. 8 was enough for gpt-4o and produced 185 empty
+# replies (finish_reason=length, content=None) on Terra. Measured floor 64;
+# 128 leaves headroom and costs nothing (usage is billed on what is spent).
+JUDGE_MAX_TOKENS = 128
 
 
 def load_judge_prompt() -> str:
@@ -238,7 +244,7 @@ class APIJudge:
             # timeout) still left the machine and must be counted as egress.
             attempted = True
             self.network_calls += 1
-            text, in_tok, out_tok = A._chat_once(cfg, prompt, max_tokens=8)
+            text, in_tok, out_tok = A._chat_once(cfg, prompt, max_tokens=JUDGE_MAX_TOKENS)
         except Exception as e:  # noqa: BLE001 - one bad judge call must not kill the run
             return Verdict(
                 correct=False,
