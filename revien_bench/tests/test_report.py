@@ -48,3 +48,57 @@ def test_footer_does_not_claim_deferred_when_judge_block_present():
     md = R.render(rep)
     assert "## End-to-end QA (LLM judge)" in md
     assert "deferred to track B" not in md
+
+
+# ── honest judge denominator: correct/denominator, judged, errors ─────────
+
+def test_judge_accuracy_line_shows_correct_over_denominator_judged_errors():
+    rep = _base_report(
+        reader={"spec": "extractive", "model": "extractive", "prompt_sha256": None},
+        judge={
+            "spec": "ollama:llama3", "model": "llama3", "prompt_sha256": "abc",
+            "accuracy_overall": 0.75, "accuracy_denominator": 4, "n_correct": 3,
+            "per_category_accuracy": {}, "judge_errors": 2, "n_judged": 6,
+            "network_calls": 0, "cost_usd": 0.0, "cost_usd_is_estimate": True,
+        },
+    )
+    md = R.render(rep)
+    assert "Overall accuracy: 0.75" in md
+    assert "correct/denominator = 3/4" in md
+    assert "judged 6" in md
+    assert "errors 2" in md
+
+
+def test_judge_accuracy_line_backfills_n_correct_when_absent():
+    """A report JSON written before n_correct existed must still render a
+    correct count, backed out from accuracy * denominator, rather than
+    crashing or printing 'None'."""
+    rep = _base_report(
+        reader={"spec": "extractive", "model": "extractive", "prompt_sha256": None},
+        judge={
+            "spec": "ollama:llama3", "model": "llama3", "prompt_sha256": "abc",
+            "accuracy_overall": 0.5, "accuracy_denominator": 2,
+            "per_category_accuracy": {}, "judge_errors": 0, "n_judged": 2,
+            "network_calls": 0, "cost_usd": 0.0, "cost_usd_is_estimate": True,
+        },
+    )
+    md = R.render(rep)
+    assert "correct/denominator = 1/2" in md
+
+
+def test_judge_accuracy_none_renders_as_no_judged_answers():
+    """When every judged question errored, accuracy_overall is None (F5) —
+    the report must say so plainly, never print 'None' or a fabricated
+    0.0."""
+    rep = _base_report(
+        reader={"spec": "extractive", "model": "extractive", "prompt_sha256": None},
+        judge={
+            "spec": "ollama:llama3", "model": "llama3", "prompt_sha256": "abc",
+            "accuracy_overall": None, "accuracy_denominator": 0, "n_correct": 0,
+            "per_category_accuracy": {}, "judge_errors": 3, "n_judged": 3,
+            "network_calls": 0, "cost_usd": 0.0, "cost_usd_is_estimate": True,
+        },
+    )
+    md = R.render(rep)
+    assert "Overall accuracy: n/a (no judged answers)" in md
+    assert "Overall accuracy: None" not in md

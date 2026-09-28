@@ -18,6 +18,8 @@ import csv
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -495,6 +497,48 @@ def test_readwise_distinct_highlights_same_text_get_distinct_source_ids(tmp_path
     assert units[0].source_id != units[1].source_id
 
 
+# ── readwise digest must be order-stable (not row-index-keyed) ───────────
+
+def test_readwise_digest_order_stable_across_prepended_row(tmp_path, store, pipeline):
+    """The source_id digest must depend only on highlight+location+note,
+    never on row position. If Readwise (or a re-export) prepends a new row
+    ahead of previously-imported highlights, those highlights' row_index
+    shifts by one — a row-index-keyed digest would change their source_id
+    and cause a full re-ingest (and eventually unbounded duplication)
+    instead of recognizing them as unchanged."""
+    row_a = {"Highlight": "Truth Before Self.", "Book Title": "Fernweh Atlas", "Location": "10"}
+    row_b = {"Highlight": "Consent Is Law.", "Book Title": "Fernweh Atlas", "Location": "20"}
+    row_c = {"Highlight": "Memory Is Sacred.", "Book Title": "Fernweh Atlas", "Location": "5"}
+
+    csv_path = tmp_path / "readwise.csv"
+    csv_path.write_text(_readwise_csv([row_a, row_b]), encoding="utf-8")
+
+    units_first = list(readwise_importer.iter_units(str(csv_path)))
+    report1 = run_import(units_first, pipeline, dry_run=False)
+    assert report1.units_ingested == 2
+    nodes_after_first = store.count_nodes()
+
+    # Prepend a third, brand-new row ahead of a and b — their row_index
+    # shifts from (0, 1) to (1, 2).
+    csv_path.write_text(_readwise_csv([row_c, row_a, row_b]), encoding="utf-8")
+    units_second = list(readwise_importer.iter_units(str(csv_path)))
+    report2 = run_import(units_second, pipeline, dry_run=False)
+
+    assert report2.units_ingested == 1, "only the new row should be ingested"
+    assert report2.units_unchanged == 2, "the shifted-but-identical rows must be recognized unchanged"
+
+    # Node count grew by exactly the new unit's nodes: one new CONTEXT node
+    # for "Memory Is Sacred." plus its extracted ENTITY node (the shared
+    # book ENTITY node already existed from the first import, so it's not
+    # re-created) — never the 3+ nodes a full re-ingest of all three rows
+    # would produce.
+    nodes_added = store.count_nodes() - nodes_after_first
+    ctx_nodes = store.list_nodes(node_type=NodeType.CONTEXT, limit=100)
+    new_ctx = [n for n in ctx_nodes if n.content.startswith("Memory Is Sacred")]
+    assert len(new_ctx) == 1
+    assert nodes_added == 2
+
+
 # ── F10: multiple conversations.json members in one zip ──────────────────
 
 def test_open_export_picks_shallowest_of_multiple_members(tmp_path, capsys):
@@ -520,3 +564,50 @@ def test_no_network_imports():
         for name in forbidden:
             assert f"import {name}" not in text, f"{py_file.name} imports {name}"
             assert f"from {name}" not in text, f"{py_file.name} imports from {name}"
+
+
+def test_no_network_imports_runtime(tmp_path):
+    """Source-text grep (above) only catches a direct `import httpx` line in
+    the importers themselves — it would miss a transitive pull-in through a
+    module an importer imports (e.g. importers/base.py's slugify reaching
+    into revien.adapters.obsidian, whose PACKAGE __init__ loads
+    generic_api.py/ollama_adapter.py, which import httpx). Run a full
+    Readwise import through the CLI, in a subprocess so this test's own
+    already-imported modules can't mask the result, and assert httpx never
+    lands in sys.modules.
+
+    REVIEN_SEMANTIC/REVIEN_RERANK are pinned off explicitly (not just
+    inherited from tests/conftest.py's autouse fixture, which wouldn't
+    reach a subprocess anyway if pytest's own env didn't happen to carry
+    it): the semantic/rerank layers pull in fastembed -> huggingface_hub
+    -> httpx on first use, which is a real, unrelated, already-accepted
+    dependency chain for that opt-in layer — not the regression this test
+    is targeting (revien.adapters' __init__ loading httpx just to reach a
+    slug helper)."""
+    csv_path = tmp_path / "readwise.csv"
+    csv_path.write_text(_readwise_csv([{
+        "Highlight": "Architecture Is Immutable.", "Book Title": "Fernweh Atlas",
+        "Highlighted at": "2021-05-04 10:32:00",
+    }]), encoding="utf-8")
+    db_path = tmp_path / "revien.db"
+
+    script = f"""
+import sys
+from click.testing import CliRunner
+from revien.cli import main
+
+runner = CliRunner()
+result = runner.invoke(main, ["import-readwise", {str(csv_path)!r}, "--db", {str(db_path)!r}])
+assert result.exit_code == 0, result.output
+assert "httpx" not in sys.modules, sorted(sys.modules.keys())
+assert "revien.adapters" not in sys.modules, sorted(sys.modules.keys())
+print("OK")
+"""
+    env = dict(os.environ, REVIEN_SEMANTIC="0", REVIEN_RERANK="0")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
+        env=env,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "OK" in proc.stdout

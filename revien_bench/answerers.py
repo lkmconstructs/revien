@@ -282,9 +282,18 @@ def resolve_ollama_host(url: Optional[str] = None) -> str:
 
 
 def is_loopback_url(url: str) -> bool:
-    """True if `url`'s hostname is loopback (127.0.0.1 / localhost / ::1)."""
+    """True if `url`'s hostname is loopback (127.0.0.1 / localhost / ::1).
+
+    OLLAMA_HOST is commonly set scheme-less ("127.0.0.1:11434", just
+    "localhost") — urlparse on a scheme-less "host:port" string misparses
+    the host as the scheme and the port as the path (e.g.
+    urlparse("127.0.0.1:11434").hostname is None), which would make a
+    genuinely-loopback host read as non-loopback. Prepend a scheme before
+    parsing whenever the input doesn't already carry one."""
     from urllib.parse import urlparse
 
+    if "://" not in url:
+        url = f"http://{url}"
     host = (urlparse(url).hostname or "").lower()
     return host in _LOOPBACK_HOSTS
 

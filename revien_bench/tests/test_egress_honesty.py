@@ -190,3 +190,32 @@ def test_egress_ollama_judge_non_loopback_host_fails_naming_it(monkeypatch):
     assert not check.passed, check.detail
     assert check.detail["judge_local"] is False
     assert any("ollama host is not loopback" in b for b in check.detail["cloud_backends"]), check.detail
+
+
+# ── is_loopback_url: tolerate scheme-less OLLAMA_HOST ──────────────────────
+@pytest.mark.parametrize("url,expected", [
+    ("127.0.0.1", True),
+    ("localhost", True),
+    ("127.0.0.1:11434", True),
+    ("[::1]:11434", True),
+    ("remote.example.net", False),
+    ("192.168.1.50", False),
+    ("127.0.0.1.evil.example", False),
+], ids=[
+    "bare-ip", "bare-localhost", "ip-with-port", "bracketed-ipv6-with-port",
+    "remote-host", "private-lan-ip", "loopback-lookalike-subdomain",
+])
+def test_is_loopback_url_scheme_less(url, expected):
+    assert A.is_loopback_url(url) is expected
+
+
+def test_egress_ollama_scheme_less_loopback_host_passes(monkeypatch):
+    # A scheme-less OLLAMA_HOST ("127.0.0.1:11434", no "http://") must be
+    # recognized as loopback, not misread as non-local because urlparse
+    # without a scheme treats the host as the scheme and the port as the
+    # path.
+    monkeypatch.setenv("OLLAMA_HOST", "127.0.0.1:11434")
+    with _with_env(REVIEN_EXTRACTOR="rule", REVIEN_EMBEDDER="fastembed"):
+        check = S.network_egress_zero(cloud_calls=0, answerer="ollama:llama3", judge="f1")
+    assert check.passed, check.detail
+    assert check.detail["answerer_local"] is True

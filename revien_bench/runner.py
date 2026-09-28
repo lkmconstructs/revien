@@ -825,8 +825,9 @@ def _aggregate_judge(
     # "0% accuracy".
     denom_rows = [r for r in rows if not r.get("judge_error")]
     accuracy_denominator = len(denom_rows)
+    n_correct = sum(1 for r in denom_rows if r["judge_correct"])
     accuracy_overall = (
-        round(sum(1 for r in denom_rows if r["judge_correct"]) / accuracy_denominator, 4)
+        round(n_correct / accuracy_denominator, 4)
         if accuracy_denominator else None
     )
 
@@ -848,6 +849,7 @@ def _aggregate_judge(
         "prompt_sha256": J.JUDGE_PROMPT_SHA256,
         "accuracy_overall": accuracy_overall,
         "accuracy_denominator": accuracy_denominator,
+        "n_correct": n_correct,
         "per_category_accuracy": per_category,
         "judge_errors": errors,
         "n_judged": n,

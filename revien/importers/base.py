@@ -66,13 +66,19 @@ def open_export(path: str) -> bytes:
 
 
 def slugify(text: str) -> str:
-    """S2: delegates to the obsidian adapter's public `slug` (one
-    implementation, not two copies) — 'untitled' fallback for
+    """S2: delegates to the shared leaf-module `slug` in revien.graph.text
+    (one implementation, not two copies) — 'untitled' fallback for
     empty/all-punctuation input (obsidian's own default is 'section'; nothing
     here is ever a section). Name kept for the importers that already import
-    it (readwise.py)."""
-    from revien.adapters.obsidian import slug as _obsidian_slug
-    return _obsidian_slug(text, empty="untitled")
+    it (readwise.py).
+
+    Deliberately imports from revien.graph.text, NOT revien.adapters.obsidian
+    or revien.adapters: importing revien.adapters' __init__ loads
+    generic_api/ollama_adapter, which pull in an HTTP client library —
+    importers must never load one (S no-network guarantee; see
+    test_no_network_imports)."""
+    from revien.graph.text import slug as _slug
+    return _slug(text, empty="untitled")
 
 
 def parse_iso_timestamp(value) -> Optional[datetime]:

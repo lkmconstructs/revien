@@ -425,6 +425,26 @@ def test_judge_accuracy_none_when_all_errors(monkeypatch, tmp_path):
     assert report["judge"]["judge_errors"] == 1
     assert report["judge"]["accuracy_denominator"] == 0
     assert report["judge"]["accuracy_overall"] is None  # not 0.0
+    assert report["judge"]["n_correct"] == 0
+
+
+def test_aggregate_judge_reports_n_correct():
+    """report.py's honest denominator line needs n_correct alongside
+    accuracy_overall/accuracy_denominator — assert _aggregate_judge folds
+    it in directly, not just via the round-trip accuracy*denominator."""
+    from revien_bench import runner as R
+
+    per_q = [
+        {"category": 1, "judge_correct": True, "judge_error": None},
+        {"category": 1, "judge_correct": False, "judge_error": None},
+        {"category": 2, "judge_correct": True, "judge_error": None},
+        {"category": 2, "judge_correct": None, "judge_error": "unparseable judge output: ''"},
+    ]
+    agg = R._aggregate_judge(per_q, "stub:judge", "stub", network_calls=0, cost_usd=0.0)
+    assert agg["n_correct"] == 2
+    assert agg["accuracy_denominator"] == 3
+    assert agg["n_judged"] == 3
+    assert agg["judge_errors"] == 0
 
 
 def test_checkpoint_path_includes_judge_spec(tmp_path):

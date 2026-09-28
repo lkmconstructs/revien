@@ -31,6 +31,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .base import RevienAdapter
+# slug lives in revien.graph.text (a leaf module with no adapter imports)
+# so importers/base.py can use it without dragging in revien.adapters'
+# __init__ (which loads generic_api/ollama_adapter -> httpx). Re-exported
+# here under both names: `slug` is this module's own public name, `_slug`
+# is the back-compat alias from before it became the shared helper.
+from revien.graph.text import slug
+_slug = slug
 
 # Vault folders that are never content.
 EXCLUDED_DIRS = {".obsidian", ".trash", ".git"}
@@ -103,19 +110,6 @@ def _parse_date(value: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
-
-
-def slug(text: str, empty: str = "section") -> str:
-    """Lowercase, non-alphanumeric runs collapsed to '-'. `empty` is the
-    fallback for empty/all-punctuation input — this module's own callers
-    want "section"; revien.importers.base wants "untitled" for the same
-    shape (S2: one slug function, not two copies)."""
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or empty
-
-
-# Back-compat alias — this module's own name before it became the shared
-# public helper other modules import.
-_slug = slug
 
 
 def chunk_note(body: str, note_title: str) -> List[Tuple[str, str]]:

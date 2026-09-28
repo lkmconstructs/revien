@@ -85,8 +85,22 @@ def render(report: Dict) -> str:
         lines.append(f"- **Cost:** ${judge.get('cost_usd')} · **Network calls:** "
                      f"{judge.get('network_calls')} · **Judge errors:** {judge.get('judge_errors')}")
         lines.append("")
-        lines.append(f"**Overall accuracy: {judge.get('accuracy_overall')}** "
-                     f"(n={judge.get('n_judged')})")
+        acc = judge.get("accuracy_overall")
+        if acc is None:
+            lines.append("**Overall accuracy: n/a (no judged answers)**")
+        else:
+            n_correct = judge.get("n_correct")
+            if n_correct is None:
+                # Older report JSON predating n_correct: back out the count
+                # from accuracy * denominator rather than mislabeling a
+                # missing value.
+                denom = judge.get("accuracy_denominator") or 0
+                n_correct = round(acc * denom)
+            lines.append(
+                f"**Overall accuracy: {acc}** (correct/denominator = "
+                f"{n_correct}/{judge.get('accuracy_denominator')}; "
+                f"judged {judge.get('n_judged')}, errors {judge.get('judge_errors')})"
+            )
         lines.append("")
         lines.append("| Category | N | Accuracy |")
         lines.append("|---|---:|---:|")

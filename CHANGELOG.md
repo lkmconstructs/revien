@@ -23,10 +23,11 @@ All notable changes to Revien are documented here. Format follows
   archive, never extracted to disk.
   - Known limits: (a) re-importing an EDITED conversation refreshes the
     verbatim text and adds new claims but does not retract claims extracted
-    from the old text — the pipeline's keyed refresh is add-only; (b) the
-    context fence strips everything after a recall-marker line, so a
-    conversation that itself contains Revien's memory-context marker loses
-    the tail of that turn.
+    from the old text — the pipeline's keyed refresh is add-only; (b) an
+    unclosed recall-marker (e.g. a truncated export, or a conversation that
+    itself quotes Revien's memory-context marker) makes the context fence
+    drop the whole remainder of that conversation's import unit from the
+    marker line onward, not just the turn the marker appears in.
 - **Benchmark: end-to-end LoCoMo LLM-judge track.** `revien_bench/judges.py` —
   a SEPARATE, never-blended binary CORRECT/WRONG accuracy score from an LLM
   comparing each predicted answer to the LoCoMo gold answer, alongside (not

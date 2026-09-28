@@ -70,7 +70,7 @@ def iter_units(path: str) -> Iterator[ImportUnit]:
     text = raw.decode("utf-8-sig")  # Excel-exported CSVs often carry a BOM
     reader = csv.DictReader(io.StringIO(text))
 
-    for row_index, row in enumerate(reader):
+    for row in reader:
         highlight = (row.get("Highlight") or "").strip()
         if not highlight:
             continue
@@ -84,13 +84,16 @@ def iter_units(path: str) -> Iterator[ImportUnit]:
         if note:
             content = f"{highlight}\n\nNote: {note}"
 
-        # F4: include the Note AND the row ordinal in the digest — two
-        # DISTINCT highlights sharing identical text+location (e.g. the same
-        # sentence highlighted twice with different notes, or Readwise
-        # omitting Location entirely) must never collide onto one source_id
-        # and silently overwrite each other on ingest.
+        # F4: include the Note in the digest — two DISTINCT highlights
+        # sharing identical text+location (e.g. the same sentence
+        # highlighted twice with different notes, or Readwise omitting
+        # Location entirely) must never collide onto one source_id and
+        # silently overwrite each other on ingest. Deliberately excludes
+        # row_index: the digest must be order-stable so inserting or
+        # reordering rows in the source CSV (e.g. Readwise prepending new
+        # exports) doesn't reshuffle source_ids for unchanged highlights.
         digest = hashlib.sha1(
-            f"{highlight}{location}{note}{row_index}".encode("utf-8")
+            f"{highlight}{location}{note}".encode("utf-8")
         ).hexdigest()[:12]
         book_slug = slugify(book_title) if book_title else "untitled"
         source_id = f"readwise:{book_slug}:{digest}"
