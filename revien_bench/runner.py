@@ -16,6 +16,17 @@ Answerer: only `extractive` (zero-LLM) is implemented in this build.
 Output results/<timestamp>_<config>.json carries: full config, dataset SHA,
 revien version, per-category + overall F1, recall@k / MRR / nDCG, latency
 p50/p90/p99, cost ($0), network_calls (0), sovereignty pass/fail, per-question rows.
+
+Optional end-to-end LLM-judge track (--judge, default 'f1' = off): a SEPARATE
+binary CORRECT/WRONG accuracy score from an LLM comparing each prediction to
+the gold answer (revien_bench.judges), added as report["judge"]/["reader"] and
+per-question judge_correct/judge_error — NEVER blended with F1 above. The two
+publishable rows (model names are placeholders — picking them is the owner's
+call):
+  local : --answerer ollama:<model> --judge ollama:<model>          (egress PASS)
+  cloud : --answerer openrouter:<model> --judge openrouter:<model>  (egress FAIL,
+          by design — a cloud reader/judge is data leaving the machine; the
+          sovereignty check labels this honestly rather than hiding it)
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ from revien.semantic.index import SemanticIndex
 
 from . import answerers as A
 from . import failure_analysis as FA
+from . import judges as J
 from . import metrics as M
 from . import sovereignty as S
 from .fetch_locomo import DATA_PATH, read_locked_hash
@@ -301,6 +313,7 @@ def _score_qa(
     conv: Conversation,
     answerer: A.Answerer,
     dia_map: Optional[Dict[str, List[str]]] = None,
+    judge=None,
 ) -> Dict:
     """Run one QA through recall -> extractive answer -> score."""
     now_dt = parse_session_date(conv.last_session_date) or datetime.now(timezone.utc)
@@ -362,6 +375,21 @@ def _score_qa(
     # Supporting node ids (for provenance check): top results that contributed.
     supporting_ids = [r.node_id for r in resp.results[:5]]
 
+    # End-to-end LLM-judge track — SEPARATE from F1, never blended (see
+    # judges.py header). None/None when no judge is configured (the default
+    # F1-only path); an older resumed checkpoint row simply lacks these keys,
+    # which .get() downstream tolerates.
+    judge_correct: Optional[bool] = None
+    judge_error: Optional[str] = None
+    if judge is not None:
+        try:
+            verdict = judge.judge(qa.question, qa.answer, prediction, qa.category_name)
+            judge_correct = verdict.correct
+            judge_error = verdict.error
+        except Exception as e:  # noqa: BLE001 - one bad judge call ≠ dead run
+            judge_correct = False
+            judge_error = f"{type(e).__name__}: {e}"
+
     return {
         "conv": conv.conv_id,
         "category": qa.category,
@@ -381,6 +409,8 @@ def _score_qa(
         "ndcg@10": round(ndcg, 4),
         "recall_latency_ms": round(recall_ms, 3),
         "answer_latency_ms": round(answer_ms, 3),
+        "judge_correct": judge_correct,
+        "judge_error": judge_error,
         "_supporting_ids": supporting_ids,
     }
 
@@ -394,12 +424,14 @@ def run_benchmark(
     max_qa: Optional[int] = None,
     fresh: bool = False,
     db_cache: Optional[Path] = None,
+    judge_name: str = "f1",
 ) -> Dict:
     cfg = _load_config(config_name)
     prev_env = _apply_env(cfg.get("env", {}))
 
     try:
         answerer = A.build_answerer(answerer_name)
+        judge_obj = J.build_judge(judge_name)
         conversations = load_locomo(dataset_path)
         if limit_convs is not None:
             conversations = conversations[:limit_convs]
@@ -441,6 +473,10 @@ def run_benchmark(
         # answerer's counters at the end so the aggregate covers resumed+new).
         resumed_cloud_calls = 0
         resumed_cost_usd = 0.0
+        # Same bookkeeping, for the judge track (0/0.0 when no judge is active
+        # or every resumed record predates the judge fields).
+        resumed_judge_calls = 0
+        resumed_judge_cost = 0.0
 
         # ── Replay resumed conversations into the accumulators FIRST ──────────
         # The final aggregate (F1, per-category, recall@k, latency, cost) must
@@ -463,6 +499,8 @@ def run_benchmark(
                 alias_pass_stats.append(rec["alias"])
             resumed_cloud_calls += int(rec.get("conv_network_calls", 0) or 0)
             resumed_cost_usd += float(rec.get("conv_cost_usd", 0.0) or 0.0)
+            resumed_judge_calls += int(rec.get("conv_judge_network_calls", 0) or 0)
+            resumed_judge_cost += float(rec.get("conv_judge_cost_usd", 0.0) or 0.0)
 
         # We keep ONE store alive at provenance-check time, so we sample the
         # first FRESHLY-RUN conversation's store for the provenance/audit
@@ -482,6 +520,8 @@ def run_benchmark(
             # cost/calls to THIS conversation's checkpoint record.
             calls_before = int(getattr(answerer, "network_calls", 0))
             cost_before = float(getattr(answerer, "cost_usd_estimate", 0.0))
+            judge_calls_before = int(getattr(judge_obj, "network_calls", 0)) if judge_obj else 0
+            judge_cost_before = float(getattr(judge_obj, "cost_usd_estimate", 0.0)) if judge_obj else 0.0
             is_first_fresh = provenance_store is None
 
             fd, db_path = tempfile.mkstemp(suffix=f"_{config_name}_{conv.conv_id}.db")
@@ -567,7 +607,10 @@ def run_benchmark(
 
                 conv_rows: List[Dict] = []
                 for qa in conv.qa:
-                    row = _score_qa(store, engine, qa, conv, answerer, dia_map=dia_map)
+                    row = _score_qa(
+                        store, engine, qa, conv, answerer,
+                        dia_map=dia_map, judge=judge_obj,
+                    )
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
                     conv_rows.append(row)
@@ -577,6 +620,14 @@ def run_benchmark(
                 # Per-conv cost/calls delta (cloud readers self-count globally).
                 conv_calls = int(getattr(answerer, "network_calls", 0)) - calls_before
                 conv_cost = float(getattr(answerer, "cost_usd_estimate", 0.0)) - cost_before
+                conv_judge_calls = (
+                    int(getattr(judge_obj, "network_calls", 0)) - judge_calls_before
+                    if judge_obj else 0
+                )
+                conv_judge_cost = (
+                    float(getattr(judge_obj, "cost_usd_estimate", 0.0)) - judge_cost_before
+                    if judge_obj else 0.0
+                )
 
                 # ── Persist this conversation's checkpoint line (flush+fsync) ──
                 # Written AFTER the conversation fully completes, so an
@@ -591,6 +642,8 @@ def run_benchmark(
                         "nodes_created": summary["nodes_created"],
                         "conv_network_calls": conv_calls,
                         "conv_cost_usd": round(conv_cost, 6),
+                        "conv_judge_network_calls": conv_judge_calls,
+                        "conv_judge_cost_usd": round(conv_judge_cost, 6),
                         "alias": alias_stats,
                     },
                 )
@@ -641,10 +694,24 @@ def run_benchmark(
         cost_usd_estimate = (
             float(getattr(answerer, "cost_usd_estimate", 0.0)) + resumed_cost_usd
         )
+        judge_calls_total = (
+            (int(getattr(judge_obj, "network_calls", 0)) if judge_obj else 0)
+            + resumed_judge_calls
+        )
+        judge_cost_total = (
+            (float(getattr(judge_obj, "cost_usd_estimate", 0.0)) if judge_obj else 0.0)
+            + resumed_judge_cost
+        )
 
-        # Honest egress check: config-derived, names any cloud backend.
+        # Honest egress check: config-derived, names any cloud backend. The
+        # measured-call secondary signal covers BOTH the reader and the judge —
+        # a cloud judge with reader calls at 0 must still trip the counter.
         checks.append(
-            S.network_egress_zero(cloud_calls=cloud_calls, answerer=answerer_name)
+            S.network_egress_zero(
+                cloud_calls=cloud_calls + judge_calls_total,
+                answerer=answerer_name,
+                judge=judge_name,
+            )
         )
         checks.extend(S.run_consent_subtests())
 
@@ -661,9 +728,25 @@ def run_benchmark(
             "env": cfg.get("env", {}),
             "cluster": bool(cfg.get("cluster")),
             "answerer": answerer.name,
+            "judge": judge_obj.name if judge_obj is not None else "f1",
             "recall_top_n": RECALL_TOP_N,
             "recall_ks": list(RECALL_KS),
         }
+        # End-to-end LLM-judge track — SEPARATE from F1 above, never blended.
+        # Present only when an LLM judge is actually configured (spec != 'f1');
+        # the default F1-only path's report shape is unchanged.
+        if judge_obj is not None:
+            reader_provider, _ = A.parse_provider(answerer_name)
+            report["reader"] = {
+                "spec": answerer_name,
+                "model": answerer.name,
+                "prompt_sha256": (
+                    None if reader_provider == "extractive" else A.ANSWER_PROMPT_SHA256
+                ),
+            }
+            report["judge"] = _aggregate_judge(
+                per_q, judge_name, judge_obj.name, judge_calls_total, judge_cost_total
+            )
         report["dataset"] = {
             "path": str(dataset_path),
             "sha256": read_locked_hash(),
@@ -705,6 +788,52 @@ def run_benchmark(
         return report
     finally:
         _restore_env(prev_env)
+
+
+def _aggregate_judge(
+    per_q: List[Dict],
+    judge_spec: str,
+    judge_model_name: str,
+    network_calls: int,
+    cost_usd: float,
+) -> Dict:
+    """Fold per-question judge_correct/judge_error rows into one run-level
+    judge block. SEPARATE from F1 (report["overall_f1"]/["per_category_f1"]) —
+    never blended, see judges.py header. Only rows carrying a non-None
+    judge_correct are counted, so an older resumed row from a pre-judge
+    checkpoint (or a run mixing a judge-less resume with a judged rerun) never
+    silently corrupts the accuracy denominator."""
+    rows = [r for r in per_q if r.get("judge_correct") is not None]
+    n = len(rows)
+    errors = sum(1 for r in rows if r.get("judge_error"))
+    accuracy_overall = (
+        sum(1 for r in rows if r["judge_correct"]) / n if n else 0.0
+    )
+
+    by_cat: Dict[int, List[Dict]] = {}
+    for r in rows:
+        by_cat.setdefault(r["category"], []).append(r)
+    per_category: Dict[str, Dict] = {}
+    for cat, crows in sorted(by_cat.items()):
+        per_category[CATEGORY_NAMES.get(cat, str(cat))] = {
+            "n": len(crows),
+            "accuracy": round(
+                sum(1 for x in crows if x["judge_correct"]) / len(crows), 4
+            ),
+        }
+
+    return {
+        "spec": judge_spec,
+        "model": judge_model_name,
+        "prompt_sha256": J.JUDGE_PROMPT_SHA256,
+        "accuracy_overall": round(accuracy_overall, 4),
+        "per_category_accuracy": per_category,
+        "judge_errors": errors,
+        "n_judged": n,
+        "network_calls": network_calls,
+        "cost_usd": round(cost_usd, 6),
+        "cost_usd_is_estimate": True,
+    }
 
 
 def _aggregate_alias(stats: List[Dict], enabled: bool) -> Dict:
@@ -783,6 +912,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="reader spec: extractive | ollama:<model> | "
                          "openai:<model> | openrouter:<model> | together:<model> | "
                          "claude:<model>")
+    ap.add_argument("--judge", default="f1",
+                    help="end-to-end LLM-judge spec (SEPARATE from F1, never "
+                         "blended): f1 (no LLM judge, default) | ollama:<model> "
+                         "(local, egress PASS) | openai:<model> | "
+                         "openrouter:<model> | together:<model> | claude:<model> "
+                         "(cloud, egress FAIL by design, labeled)")
     ap.add_argument("--out", default=str(_REPO_ROOT / "results"))
     ap.add_argument("--dataset", default=str(DATA_PATH))
     ap.add_argument("--limit", type=int, default=None,
@@ -816,6 +951,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_qa=args.max_qa,
         fresh=args.fresh,
         db_cache=Path(args.db_cache) if args.db_cache else None,
+        judge_name=args.judge,
     )
     _print_summary(report)
     return 0
@@ -857,6 +993,12 @@ def _print_summary(report: Dict) -> None:
         print(f"resume        : ran={res['conversations_ran']} "
               f"resumed={res['conversations_resumed']} "
               f"(checkpoint: {res['checkpoint_path']})")
+    judge = report.get("judge")
+    if judge:
+        print(f"judge (LLM)   : {judge['spec']} accuracy={judge['accuracy_overall']} "
+              f"n={judge['n_judged']} errors={judge['judge_errors']} "
+              f"cost=${judge['cost_usd']} calls={judge['network_calls']} "
+              f"— NOT comparable to the F1/retrieval numbers above")
     print(f"results JSON  : {report.get('_out_path')}")
 
 

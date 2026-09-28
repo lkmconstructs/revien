@@ -147,9 +147,13 @@ def network_egress_zero(
     # the local default reader.
     answerer_spec = (answerer or "extractive").strip()
     answerer_provider, _ = parse_provider(answerer_spec)
-    # The judge is local F1 in this build (no cloud-judge wiring yet); accept an
-    # explicit override so the assertion stays honest if one is ever added.
-    judge_name = (judge or "f1").strip().lower()
+    # The judge spec is a CLI arg shaped exactly like the answerer's ('f1' /
+    # 'ollama:<model>' / '<cloud-provider>:<model>') — parse out the provider
+    # the same way, so 'openai:gpt-4o-mini' is judged on 'openai', not on the
+    # unparsed spec string (which would never match a cloud/local set).
+    judge_spec = (judge or "f1").strip()
+    judge_provider, _ = parse_provider(judge_spec) if judge_spec.lower() != "f1" else ("f1", None)
+    judge_name = judge_provider.lower()
 
     # Local determination, per backend, from config.
     extractor_local = (extractor in _LOCAL_EXTRACTORS) and (extractor not in CLOUD_EXTRACTORS)
