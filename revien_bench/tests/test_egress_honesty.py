@@ -139,3 +139,54 @@ def test_estimate_cost_local_provider_is_zero():
     assert A.estimate_cost_usd("extractive", 9999, 9999) == 0.0
     assert A.estimate_cost_usd("ollama", 9999, 9999) == 0.0
     assert A.estimate_cost_usd("openai", 1000, 0) == pytest.approx(0.00015, rel=1e-6)
+
+
+# ── F7: network_calls increments BEFORE the request — a failed call still
+# left the machine, so it must be counted even when the HTTP call itself
+# raises (HTTP 500, timeout, malformed response). ─────────────────────────
+def test_cloud_answerer_counts_call_even_on_http_failure(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+    def raise_500(url, payload, headers):
+        raise RuntimeError("HTTP 500 from https://api.openai.com/v1: server error")
+
+    monkeypatch.setattr(A, "_http_post_json", raise_500)
+    ans = A.build_answerer("openai:gpt-4o-mini")
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        ans.answer(A.RetrievedContext(query="q", contents=["c"], labels=["l"]))
+    assert ans.network_calls == 1  # the failed call still left the machine
+
+
+# ── F9: OllamaAnswerer/OllamaJudge resolve OLLAMA_HOST fresh, and a
+# non-loopback OLLAMA_HOST makes network_egress_zero FAIL naming it. ──────
+def test_ollama_answerer_resolves_ollama_host_env(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:9999")
+    ans = A.build_answerer("ollama:llama3")
+    assert ans.url == "http://127.0.0.1:9999"
+
+
+def test_egress_ollama_loopback_passes(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    with _with_env(REVIEN_EXTRACTOR="rule", REVIEN_EMBEDDER="fastembed"):
+        check = S.network_egress_zero(cloud_calls=0, answerer="ollama:llama3", judge="ollama:llama3")
+    assert check.passed, check.detail
+    assert check.detail["answerer_local"] is True
+    assert check.detail["judge_local"] is True
+
+
+def test_egress_ollama_non_loopback_host_fails_naming_it(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "https://remote.example.net")
+    with _with_env(REVIEN_EXTRACTOR="rule", REVIEN_EMBEDDER="fastembed"):
+        check = S.network_egress_zero(cloud_calls=0, answerer="ollama:llama3", judge="f1")
+    assert not check.passed, check.detail
+    assert check.detail["answerer_local"] is False
+    assert any("ollama host is not loopback" in b for b in check.detail["cloud_backends"]), check.detail
+
+
+def test_egress_ollama_judge_non_loopback_host_fails_naming_it(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "https://remote.example.net")
+    with _with_env(REVIEN_EXTRACTOR="rule", REVIEN_EMBEDDER="fastembed"):
+        check = S.network_egress_zero(cloud_calls=0, answerer="extractive", judge="ollama:llama3")
+    assert not check.passed, check.detail
+    assert check.detail["judge_local"] is False
+    assert any("ollama host is not loopback" in b for b in check.detail["cloud_backends"]), check.detail

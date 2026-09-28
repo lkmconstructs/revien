@@ -116,9 +116,19 @@ def render(report: Dict) -> str:
 
     lines.append("---")
     lines.append("")
-    lines.append("_Headline track only: zero-LLM, zero-cloud, deterministic. "
-                 "Competitor comparison (Mem0 / LoCoMo-human / Letta) and LLM-judge "
-                 "accuracy are deferred to track B._")
+    # F8: the LLM-judge accuracy footer only makes sense when no judge ran
+    # (report["judge"] absent) — once a judge block exists above, "deferred to
+    # track B" is simply false. Competitor comparison (Mem0 / LoCoMo-human /
+    # Letta) is still out of scope for this report either way.
+    if judge:
+        lines.append("_Headline track: zero-LLM, zero-cloud, deterministic F1/retrieval "
+                     "(above) plus a separate end-to-end LLM-judge track (above). "
+                     "Competitor comparison (Mem0 / LoCoMo-human / Letta) is out of "
+                     "scope for this report._")
+    else:
+        lines.append("_Headline track only: zero-LLM, zero-cloud, deterministic. "
+                     "Competitor comparison (Mem0 / LoCoMo-human / Letta) and LLM-judge "
+                     "accuracy are deferred to track B._")
     lines.append("")
     return "\n".join(lines)
 

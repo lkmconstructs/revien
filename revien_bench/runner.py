@@ -204,13 +204,18 @@ def _run_fingerprint() -> str:
                                 "ingestion", "neural"))
 
 
-def _checkpoint_path(out_dir: Path, config_name: str, answerer_name: str) -> Path:
-    """Checkpoint path for this exact (config, answerer, env, code) identity.
-    A knob or code change yields a different filename — the old checkpoint
-    can never falsely resume; an identical relaunch resumes exactly as before."""
+def _checkpoint_path(
+    out_dir: Path, config_name: str, answerer_name: str, judge_name: str = "f1"
+) -> Path:
+    """Checkpoint path for this exact (config, answerer, judge, env, code)
+    identity. A knob or code change yields a different filename — the old
+    checkpoint can never falsely resume; an identical relaunch resumes exactly
+    as before. The judge spec is part of the identity (F5): resuming a
+    judge-less checkpoint under a NEW --judge would otherwise silently reuse
+    rows that were never judged, corrupting the judge accuracy denominator."""
     return out_dir / (
         f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}"
-        f"_{_run_fingerprint()}.jsonl"
+        f"_{_sanitize(judge_name)}_{_run_fingerprint()}.jsonl"
     )
 
 
@@ -444,7 +449,7 @@ def run_benchmark(
 
         # ── Checkpoint / resume setup ─────────────────────────────────────────
         dataset_sha = read_locked_hash()
-        ckpt_path = _checkpoint_path(out_dir, config_name, answerer_name)
+        ckpt_path = _checkpoint_path(out_dir, config_name, answerer_name, judge_name)
         if fresh:
             # --fresh: ignore + delete any prior checkpoint and start over.
             try:
@@ -755,9 +760,13 @@ def run_benchmark(
         # All-local headline run: cost_usd_estimate is 0.0 and cloud_calls is 0,
         # so this preserves the honest $0 / 0-calls local default. Cloud answerer
         # runs surface a non-zero, clearly-labelled cost ESTIMATE + real call count.
-        report["cost_usd"] = round(cost_usd_estimate, 6)
+        # Top-level cost_usd/network_calls (F1): must be the HONEST total across
+        # both the reader AND the judge — a report that only counted the reader
+        # while a cloud judge silently made calls understated both. The per-block
+        # breakdown (report["judge"]) still carries the judge-only figures.
+        report["cost_usd"] = round(cost_usd_estimate + judge_cost_total, 6)
         report["cost_usd_is_estimate"] = True
-        report["network_calls"] = cloud_calls
+        report["network_calls"] = cloud_calls + judge_calls_total
         report["environment"] = {
             "revien_version": revien.__version__,
             "python": platform.python_version(),
@@ -805,13 +814,24 @@ def _aggregate_judge(
     silently corrupts the accuracy denominator."""
     rows = [r for r in per_q if r.get("judge_correct") is not None]
     n = len(rows)
-    errors = sum(1 for r in rows if r.get("judge_error"))
+    error_rows = [r for r in rows if r.get("judge_error")]
+    errors = len(error_rows)
+    # F5: judge errors are excluded from the accuracy DENOMINATOR — an
+    # unparseable/failed verdict is neither a correct nor a wrong answer, it's
+    # a missing measurement, and folding it into the denominator as an
+    # implicit "wrong" understated accuracy. accuracy_denominator is the
+    # actually-judged (non-error) count; accuracy_overall is None (not 0.0)
+    # when nothing was judged, so a report reader can't mistake "no data" for
+    # "0% accuracy".
+    denom_rows = [r for r in rows if not r.get("judge_error")]
+    accuracy_denominator = len(denom_rows)
     accuracy_overall = (
-        sum(1 for r in rows if r["judge_correct"]) / n if n else 0.0
+        round(sum(1 for r in denom_rows if r["judge_correct"]) / accuracy_denominator, 4)
+        if accuracy_denominator else None
     )
 
     by_cat: Dict[int, List[Dict]] = {}
-    for r in rows:
+    for r in denom_rows:
         by_cat.setdefault(r["category"], []).append(r)
     per_category: Dict[str, Dict] = {}
     for cat, crows in sorted(by_cat.items()):
@@ -826,7 +846,8 @@ def _aggregate_judge(
         "spec": judge_spec,
         "model": judge_model_name,
         "prompt_sha256": J.JUDGE_PROMPT_SHA256,
-        "accuracy_overall": round(accuracy_overall, 4),
+        "accuracy_overall": accuracy_overall,
+        "accuracy_denominator": accuracy_denominator,
         "per_category_accuracy": per_category,
         "judge_errors": errors,
         "n_judged": n,

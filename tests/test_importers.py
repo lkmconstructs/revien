@@ -146,7 +146,7 @@ class TestChatGPTImporter:
     def test_epoch_to_utc_timestamp_and_origin(self, tmp_path, store, pipeline):
         zpath = _zip_json(tmp_path, "chatgpt.zip", [_chatgpt_conversation()])
         units = list(chatgpt_importer.iter_units(str(zpath)))
-        report = run_import(units, store, pipeline, dry_run=False)
+        report = run_import(units, pipeline, dry_run=False)
         assert report.units_ingested == 1
         assert report.units_seen == 1
 
@@ -208,7 +208,7 @@ class TestClaudeImporter:
     def test_origin_and_timestamp(self, store, pipeline, tmp_path):
         zpath = _zip_json(tmp_path, "claude.zip", [_claude_conversation()])
         units = list(claude_importer.iter_units(str(zpath)))
-        report = run_import(units, store, pipeline, dry_run=False)
+        report = run_import(units, pipeline, dry_run=False)
         assert report.units_ingested == 1
 
         nodes = store.list_nodes(source_id="claude:conversation:conv-theo-1", limit=100)
@@ -274,7 +274,7 @@ class TestReadwiseImporter:
         assert unit.timestamp.tzinfo is not None
         assert "Worth re-reading." in unit.content
 
-        report = run_import(units, store, pipeline, dry_run=False)
+        report = run_import(units, pipeline, dry_run=False)
         assert report.units_ingested == 1
 
         entities = store.list_nodes(node_type=NodeType.ENTITY, limit=100)
@@ -302,11 +302,8 @@ class TestReadwiseImporter:
 @pytest.mark.parametrize("build", [
     lambda tmp_path: (chatgpt_importer, _zip_json(tmp_path, "c.zip", [_chatgpt_conversation()])),
     lambda tmp_path: (claude_importer, _zip_json(tmp_path, "c.zip", [_claude_conversation()])),
-    lambda tmp_path: (
-        readwise_importer,
-        tmp_path / "r.csv",
-    ),
-])
+    lambda tmp_path: (readwise_importer, tmp_path / "r.csv"),
+], ids=["chatgpt", "claude", "readwise"])
 def test_second_run_is_unchanged(build, tmp_path, store, pipeline):
     module, path = build(tmp_path)
     if module is readwise_importer:
@@ -316,14 +313,14 @@ def test_second_run_is_unchanged(build, tmp_path, store, pipeline):
         }]), encoding="utf-8")
 
     units_first = list(module.iter_units(str(path)))
-    report1 = run_import(units_first, store, pipeline, dry_run=False)
+    report1 = run_import(units_first, pipeline, dry_run=False)
     assert report1.units_ingested == report1.units_seen
     assert report1.units_unchanged == 0
 
     nodes_after_first = store.count_nodes()
 
     units_second = list(module.iter_units(str(path)))
-    report2 = run_import(units_second, store, pipeline, dry_run=False)
+    report2 = run_import(units_second, pipeline, dry_run=False)
     assert report2.units_seen == report1.units_seen
     assert report2.units_unchanged == report2.units_seen
     assert report2.units_ingested == 0
@@ -338,7 +335,7 @@ def test_deny_list_blocks_one_unit(tmp_path, store, pipeline, monkeypatch):
     denied_source_id = units[0].source_id
 
     monkeypatch.setenv("REVIEN_INGEST_DENY", denied_source_id)
-    report = run_import(units, store, pipeline, dry_run=False)
+    report = run_import(units, pipeline, dry_run=False)
     assert report.units_denied == 1
     assert report.units_ingested == 0
 
@@ -353,7 +350,7 @@ def test_dry_run_writes_nothing(tmp_path, store, pipeline):
     units = list(chatgpt_importer.iter_units(str(zpath)))
 
     before = store.count_nodes()
-    report = run_import(units, store=None, pipeline=None, dry_run=True)
+    report = run_import(units, pipeline=None, dry_run=True)
     assert report.units_ingested == 1
     assert store.count_nodes() == before == 0
 
@@ -404,7 +401,116 @@ class TestCliSmoke:
         assert "ingested=1" in result.output
 
 
-# ── Zero egress ───────────────────────────────────────────
+# ── F2: refresh vs unchanged ──────────────────────────────
+
+def test_edited_conversation_is_ingested_not_unchanged(tmp_path, store, pipeline):
+    """A re-import of an EDITED conversation is a keyed REFRESH: it must
+    count as units_ingested (nodes created or refreshed), never
+    units_unchanged — even when re-extraction happens to add 0 brand-new
+    nodes/edges. Only a byte-identical re-import is unchanged."""
+    conv = _chatgpt_conversation()
+    zpath1 = _zip_json(tmp_path, "c1.zip", [conv])
+    units1 = list(chatgpt_importer.iter_units(str(zpath1)))
+    report1 = run_import(units1, pipeline, dry_run=False)
+    assert report1.units_ingested == 1
+    assert report1.units_unchanged == 0
+
+    # Edit one message's text (same conv id -> same source_id/ingest_key).
+    conv["mapping"]["a2"]["message"]["content"]["parts"] = [
+        "You're welcome, Theo will see this too. EDITED."
+    ]
+    zpath2 = _zip_json(tmp_path, "c2.zip", [conv])
+    units2 = list(chatgpt_importer.iter_units(str(zpath2)))
+    report2 = run_import(units2, pipeline, dry_run=False)
+    assert report2.units_ingested == 1, "an edited re-import must be ingested, not unchanged"
+    assert report2.units_unchanged == 0
+
+    # Re-running the EDITED content again (byte-identical this time) IS
+    # unchanged.
+    units3 = list(chatgpt_importer.iter_units(str(zpath2)))
+    report3 = run_import(units3, pipeline, dry_run=False)
+    assert report3.units_unchanged == 1
+    assert report3.units_ingested == 0
+
+
+# ── F3: a malformed conversation mid-batch is logged, not fatal ──────────
+
+def test_malformed_middle_conversation_is_logged_not_fatal(tmp_path, store, pipeline):
+    good1 = _chatgpt_conversation()
+    good1["id"] = "conv-good-1"
+    good2 = _chatgpt_conversation()
+    good2["id"] = "conv-good-2"
+    bad = {"id": "conv-bad", "title": "Bad", "create_time": 1.0,
+           "mapping": {"a": "not-a-dict"}, "current_node": "a"}
+
+    zpath = _zip_json(tmp_path, "mixed.zip", [good1, bad, good2])
+    units = list(chatgpt_importer.iter_units(str(zpath)))
+    assert len(units) == 3
+
+    report = run_import(units, pipeline, dry_run=False)
+    assert report.units_seen == 3
+    assert report.units_ingested == 2
+    assert len(report.errors) == 1
+    assert report.errors[0][0] == "chatgpt:conversation:error:1"
+
+
+def test_non_array_top_level_json_raises_value_error(tmp_path):
+    jpath = tmp_path / "conversations.json"
+    jpath.write_text(json.dumps({"not": "an array"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        list(chatgpt_importer.iter_units(str(jpath)))
+
+
+def test_chatgpt_cli_partial_import_exits_zero(tmp_path):
+    """F11: a partial import (2 ingested, 1 error) exits 0 — only a total
+    failure (errors > 0 AND nothing ingested/unchanged) is non-zero."""
+    good1 = _chatgpt_conversation()
+    good1["id"] = "conv-good-1"
+    good2 = _chatgpt_conversation()
+    good2["id"] = "conv-good-2"
+    bad = {"id": "conv-bad", "title": "Bad", "create_time": 1.0,
+           "mapping": {"a": "not-a-dict"}, "current_node": "a"}
+    zpath = _zip_json(tmp_path, "mixed.zip", [good1, bad, good2])
+    db_path = str(tmp_path / "revien.db")
+    runner = CliRunner()
+    result = runner.invoke(main, ["import-chatgpt", str(zpath), "--db", db_path])
+    assert result.exit_code == 0, result.output
+    assert "errors=1" in result.output
+    assert "ingested=2" in result.output
+
+
+# ── F4: readwise digest disambiguates identical-text highlights ──────────
+
+def test_readwise_distinct_highlights_same_text_get_distinct_source_ids(tmp_path):
+    text = _readwise_csv([
+        {"Highlight": "The map is not the territory.", "Book Title": "Fernweh Atlas",
+         "Note": "first note"},
+        {"Highlight": "The map is not the territory.", "Book Title": "Fernweh Atlas",
+         "Note": "second note, different"},
+    ])
+    csv_path = tmp_path / "readwise.csv"
+    csv_path.write_text(text, encoding="utf-8")
+    units = list(readwise_importer.iter_units(str(csv_path)))
+    assert len(units) == 2
+    assert units[0].source_id != units[1].source_id
+
+
+# ── F10: multiple conversations.json members in one zip ──────────────────
+
+def test_open_export_picks_shallowest_of_multiple_members(tmp_path, capsys):
+    from revien.importers.base import open_export
+
+    zpath = tmp_path / "double.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("nested/conversations.json", json.dumps([{"deep": True}]))
+        zf.writestr("conversations.json", json.dumps([{"shallow": True}]))
+    raw = open_export(str(zpath))
+    data = json.loads(raw)
+    assert data == [{"shallow": True}]
+    err = capsys.readouterr().err
+    assert "multiple conversations.json" in err
+    assert "nested/conversations.json" in err
+
 
 def test_no_network_imports():
     importers_dir = Path(__file__).resolve().parent.parent / "revien" / "importers"

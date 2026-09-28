@@ -152,7 +152,10 @@ def network_egress_zero(
     # the same way, so 'openai:gpt-4o-mini' is judged on 'openai', not on the
     # unparsed spec string (which would never match a cloud/local set).
     judge_spec = (judge or "f1").strip()
-    judge_provider, _ = parse_provider(judge_spec) if judge_spec.lower() != "f1" else ("f1", None)
+    # S6: parse_provider("f1") already returns ("f1", None) — no ":" to
+    # split — so the ternary this used to be was dead code with the same
+    # result either branch.
+    judge_provider, _ = parse_provider(judge_spec)
     judge_name = judge_provider.lower()
 
     # Local determination, per backend, from config.
@@ -161,6 +164,19 @@ def network_egress_zero(
     answerer_local = (answerer_provider in _LOCAL_ANSWERERS) and (answerer_provider not in CLOUD_ANSWERERS)
     judge_local = (judge_name in _LOCAL_JUDGES) and (judge_name not in CLOUD_ANSWERERS)
 
+    # F9: "ollama" is only actually local if OLLAMA_HOST resolves to a
+    # loopback address — a non-loopback OLLAMA_HOST means the Ollama server
+    # is on a DIFFERENT machine, which is real network egress regardless of
+    # the provider name. Resolved the same way OllamaAnswerer/OllamaJudge do
+    # (answerers.resolve_ollama_host), so this check can never drift from
+    # what the actual transport connects to.
+    from .answerers import is_loopback_url, resolve_ollama_host
+    ollama_loopback = is_loopback_url(resolve_ollama_host())
+    if answerer_provider == "ollama" and not ollama_loopback:
+        answerer_local = False
+    if judge_name == "ollama" and not ollama_loopback:
+        judge_local = False
+
     # Name every component that leaves the machine (config-derived).
     cloud_backends: List[str] = []
     if not extractor_local:
@@ -168,9 +184,17 @@ def network_egress_zero(
     if not embedder_local:
         cloud_backends.append(f"embedder={embedder}")
     if not answerer_local:
-        cloud_backends.append(f"answerer={answerer_provider}")
+        reason = (
+            "ollama host is not loopback" if answerer_provider == "ollama"
+            else answerer_provider
+        )
+        cloud_backends.append(f"answerer={reason}")
     if not judge_local:
-        cloud_backends.append(f"judge={judge_name}")
+        reason = (
+            "ollama host is not loopback" if judge_name == "ollama"
+            else judge_name
+        )
+        cloud_backends.append(f"judge={reason}")
 
     all_local = not cloud_backends
     # PASS requires every backend local AND no observed cloud call. A cloud

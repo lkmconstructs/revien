@@ -160,7 +160,9 @@ def test_claude_judge_parses_messages(monkeypatch):
 
 
 def test_cloud_judge_discloses_once(monkeypatch, capsys):
-    A._DISCLOSED_PROVIDERS.clear()
+    # F6: the judge track has its OWN disclosed-set, separate from the
+    # answerer's (A._DISCLOSED_PROVIDERS) — clear the judge's own set.
+    J._DISCLOSED_JUDGE_PROVIDERS.clear()
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setattr(
         A, "_http_post_json",
@@ -171,6 +173,29 @@ def test_cloud_judge_discloses_once(monkeypatch, capsys):
     judge.judge("q", "g", "p", "cat")  # second call must NOT re-disclose
     err = capsys.readouterr().err
     assert err.count("leaves your machine") == 1
+    assert "for judging" in err
+
+
+def test_cloud_judge_and_answerer_disclose_independently(monkeypatch, capsys):
+    """F6: --answerer openai:x --judge openai:x sends data to the SAME
+    provider for two DIFFERENT reasons — each gets its OWN one-time
+    disclosure. The answerer's prior disclosure must not silently swallow
+    the judge's (or vice versa)."""
+    A._DISCLOSED_PROVIDERS.clear()
+    J._DISCLOSED_JUDGE_PROVIDERS.clear()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        A, "_http_post_json",
+        lambda url, payload, headers: {"choices": [{"message": {"content": "CORRECT"}}]},
+    )
+    A.build_answerer("openai:gpt-4o-mini").answer(
+        A.RetrievedContext(query="q", contents=["c"], labels=["l"])
+    )
+    J.build_judge("openai:gpt-4o-mini").judge("q", "g", "p", "cat")
+    err = capsys.readouterr().err
+    assert err.count("leaves your machine") == 2
+    assert "for answering" in err
+    assert "for judging" in err
 
 
 def test_cloud_judge_missing_key_returns_error_verdict_not_raise(monkeypatch):
@@ -200,6 +225,8 @@ def test_egress_ollama_judge_passes():
 
 
 def test_egress_cloud_judge_fails_naming_itself():
+    # The credibility bug, judge edition: a cloud JUDGE with a local reader
+    # and cloud_calls measured at 0 must still FAIL, naming the judge.
     check = S.network_egress_zero(
         cloud_calls=0, answerer="extractive", judge="openrouter:some/model"
     )
@@ -207,25 +234,13 @@ def test_egress_cloud_judge_fails_naming_itself():
     assert any("judge=openrouter" in b for b in check.detail["cloud_backends"]), check.detail
     assert check.detail["judge"] == "openrouter"
     assert check.detail["judge_local"] is False
-
-
-def test_egress_cloud_judge_fails_even_with_zero_reader_calls():
-    # The credibility bug, judge edition: cloud JUDGE, but reader is local and
-    # the measured cloud_calls happens to read 0. Must still FAIL.
-    check = S.network_egress_zero(cloud_calls=0, answerer="extractive", judge="claude:haiku")
-    assert not check.passed, check.detail
     assert check.detail["answerer_local"] is True
-    assert check.detail["judge_local"] is False
 
 
-# ── runner smoke: --limit-convs 1 --max-qa 3, stub judge, judge block ─────────
-def test_runner_smoke_with_stub_judge_produces_judge_block(monkeypatch, tmp_path):
-    """OFFLINE: a synthetic 1-conversation dataset, extractive answerer, and a
-    monkeypatched judge (no real LLM/network). Proves the runner wiring: the
-    judge is called per question, per_question rows carry judge_correct/
-    judge_error, and the top-level report gains separate reader/judge blocks
-    without touching overall_f1 / per_category_f1."""
-    from revien_bench import runner as R
+def _single_qa_conv():
+    """S5: one synthetic 1-conversation/1-QA dataset, shared by both runner
+    smoke tests below (they differed only in what they did AFTER building
+    it)."""
     from revien_bench.loader import QA, Conversation, Turn
 
     conv = Conversation(conv_id="D1", speaker_a="Alice", speaker_b="Bob")
@@ -238,7 +253,19 @@ def test_runner_smoke_with_stub_judge_produces_judge_block(monkeypatch, tmp_path
         QA(question="What database did we deploy on?", answer="PostgreSQL",
            category=4, evidence=["D1:1"]),
     ]
+    return conv
 
+
+# ── runner smoke: --limit-convs 1 --max-qa 3, stub judge, judge block ─────────
+def test_runner_smoke_with_stub_judge_produces_judge_block(monkeypatch, tmp_path):
+    """OFFLINE: a synthetic 1-conversation dataset, extractive answerer, and a
+    monkeypatched judge (no real LLM/network). Proves the runner wiring: the
+    judge is called per question, per_question rows carry judge_correct/
+    judge_error, and the top-level report gains separate reader/judge blocks
+    without touching overall_f1 / per_category_f1."""
+    from revien_bench import runner as R
+
+    conv = _single_qa_conv()
     monkeypatch.setattr(R, "load_locomo", lambda _p: [conv])
     monkeypatch.setattr(R, "read_locked_hash", lambda: "deadbeef" * 8)
 
@@ -286,11 +313,11 @@ def test_runner_smoke_with_stub_judge_produces_judge_block(monkeypatch, tmp_path
     assert row["judge_error"] is None
     # F1/retrieval untouched by the judge track.
     assert "f1" in row and row["f1"] is not None
-
-    # Sovereignty: the (fake) 'stub' judge spec doesn't parse as a known
-    # provider, so build a real check directly against a real spec instead —
-    # the runner-level check itself is exercised by the egress tests above.
-    assert report["sovereignty"]["all_passed"] in (True, False)  # ran without raising
+    # Sovereignty ran without raising (the runner-level check itself is
+    # exercised in detail by the egress tests above; the fake 'stub' judge
+    # spec doesn't parse as a known provider so there's nothing more useful
+    # to assert about its content here — S5, drop the tautology).
+    assert "checks" in report["sovereignty"]
 
 
 def test_runner_default_judge_f1_omits_judge_block(monkeypatch, tmp_path):
@@ -298,18 +325,8 @@ def test_runner_default_judge_f1_omits_judge_block(monkeypatch, tmp_path):
     UNCHANGED — no 'judge' or 'reader' key at all, so existing results-schema
     expectations for the F1-only track keep holding."""
     from revien_bench import runner as R
-    from revien_bench.loader import QA, Conversation, Turn
 
-    conv = Conversation(conv_id="D1", speaker_a="Alice", speaker_b="Bob")
-    conv.session_dates = {1: "7 May 2023"}
-    conv.turns = [
-        Turn(dia_id="D1:1", speaker="Alice", session=1, session_date="7 May 2023",
-             text="We deployed the backend on PostgreSQL."),
-    ]
-    conv.qa = [
-        QA(question="What database did we deploy on?", answer="PostgreSQL",
-           category=4, evidence=["D1:1"]),
-    ]
+    conv = _single_qa_conv()
     monkeypatch.setattr(R, "load_locomo", lambda _p: [conv])
     monkeypatch.setattr(R, "read_locked_hash", lambda: "deadbeef" * 8)
 
@@ -327,3 +344,95 @@ def test_runner_default_judge_f1_omits_judge_block(monkeypatch, tmp_path):
     row = report["per_question"][0]
     assert row["judge_correct"] is None
     assert row["judge_error"] is None
+
+
+# ── F1: top-level cost_usd/network_calls must include the JUDGE's calls/cost
+# too, not just the reader's — the per-block breakdown (report["judge"])
+# still carries the judge-only figures. ────────────────────────────────────
+def test_top_level_cost_and_calls_include_judge(monkeypatch, tmp_path):
+    from revien_bench import runner as R
+
+    conv = _single_qa_conv()
+    monkeypatch.setattr(R, "load_locomo", lambda _p: [conv])
+    monkeypatch.setattr(R, "read_locked_hash", lambda: "deadbeef" * 8)
+
+    class _CountingStubJudge:
+        name = "stub:judge"
+
+        def __init__(self):
+            self.network_calls = 0
+            self.cost_usd_estimate = 0.0
+
+        def judge(self, question, gold, prediction, category_name):
+            self.network_calls += 1
+            self.cost_usd_estimate += 0.01
+            return J.Verdict(correct=True, raw="CORRECT", network_calls=1, cost_usd=0.01)
+
+    stub = _CountingStubJudge()
+    monkeypatch.setattr(R.J, "build_judge", lambda _spec: stub)
+
+    report = R.run_benchmark(
+        config_name="graph_only",
+        answerer_name="extractive",  # reader: 0 calls, $0 (local, not cloud)
+        dataset_path=tmp_path / "ds.json",
+        out_dir=tmp_path / "results",
+        limit_convs=1,
+        max_qa=3,
+        fresh=True,
+        judge_name="stub:judge",
+    )
+    # Reader contributed 0/$0 (extractive); judge contributed 1/$0.01. The
+    # TOP-LEVEL total must be the sum, not just the reader's (the old bug).
+    assert report["network_calls"] == 1
+    assert report["cost_usd"] == pytest.approx(0.01)
+    # The per-block breakdown still carries the judge-only figures.
+    assert report["judge"]["network_calls"] == 1
+    assert report["judge"]["cost_usd"] == pytest.approx(0.01)
+
+
+# ── F5: judge errors are excluded from the accuracy DENOMINATOR;
+# accuracy_overall is None (not 0.0) when nothing was successfully judged. ──
+def test_judge_accuracy_none_when_all_errors(monkeypatch, tmp_path):
+    from revien_bench import runner as R
+
+    conv = _single_qa_conv()
+    monkeypatch.setattr(R, "load_locomo", lambda _p: [conv])
+    monkeypatch.setattr(R, "read_locked_hash", lambda: "deadbeef" * 8)
+
+    class _AllErrorJudge:
+        name = "stub:judge"
+
+        def __init__(self):
+            self.network_calls = 0
+            self.cost_usd_estimate = 0.0
+
+        def judge(self, question, gold, prediction, category_name):
+            return J.Verdict(correct=False, raw="", error="unparseable judge output: ''")
+
+    monkeypatch.setattr(R.J, "build_judge", lambda _spec: _AllErrorJudge())
+
+    report = R.run_benchmark(
+        config_name="graph_only",
+        answerer_name="extractive",
+        dataset_path=tmp_path / "ds.json",
+        out_dir=tmp_path / "results",
+        limit_convs=1,
+        max_qa=3,
+        fresh=True,
+        judge_name="stub:judge",
+    )
+    assert report["judge"]["n_judged"] == 1
+    assert report["judge"]["judge_errors"] == 1
+    assert report["judge"]["accuracy_denominator"] == 0
+    assert report["judge"]["accuracy_overall"] is None  # not 0.0
+
+
+def test_checkpoint_path_includes_judge_spec(tmp_path):
+    """F5: the checkpoint fingerprint must include the judge spec — resuming
+    a judge-less checkpoint under a NEW --judge would otherwise silently
+    reuse rows that were never judged, corrupting the accuracy denominator."""
+    from revien_bench import runner as R
+
+    p_f1 = R._checkpoint_path(tmp_path, "graph_only", "extractive", "f1")
+    p_ollama = R._checkpoint_path(tmp_path, "graph_only", "extractive", "ollama:llama3")
+    assert p_f1 != p_ollama

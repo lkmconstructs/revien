@@ -105,8 +105,17 @@ def _parse_date(value: str) -> Optional[datetime]:
     return None
 
 
-def _slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"
+def slug(text: str, empty: str = "section") -> str:
+    """Lowercase, non-alphanumeric runs collapsed to '-'. `empty` is the
+    fallback for empty/all-punctuation input — this module's own callers
+    want "section"; revien.importers.base wants "untitled" for the same
+    shape (S2: one slug function, not two copies)."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or empty
+
+
+# Back-compat alias — this module's own name before it became the shared
+# public helper other modules import.
+_slug = slug
 
 
 def chunk_note(body: str, note_title: str) -> List[Tuple[str, str]]:

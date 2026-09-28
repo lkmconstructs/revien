@@ -16,52 +16,46 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional
 
-from revien.importers.base import ImportUnit, slugify
+from revien.importers.base import ImportUnit, parse_iso_timestamp, slugify
 
 _TAG_SPLIT_RE = re.compile(r"[,\s]+")
 
 
 def _parse_highlighted_at(value: Optional[str]) -> Optional[datetime]:
-    """ISO 8601 (with or without a trailing 'Z'), or Readwise's older
-    '%Y-%m-%d %H:%M:%S' export format. Naive results are UTC (Readwise
-    timestamps are always UTC on the wire); missing/unparseable -> None,
-    never guessed."""
+    """ISO 8601 (with or without a trailing 'Z', via the shared
+    base.parse_iso_timestamp — S4), or Readwise's older
+    '%Y-%m-%d %H:%M:%S' export format as a fallback. Naive results are UTC
+    (Readwise timestamps are always UTC on the wire); missing/unparseable
+    -> None, never guessed."""
     if not value or not value.strip():
         return None
-    text = value.strip()
-    candidates = [text]
-    if text.endswith("Z"):
-        candidates.append(text[:-1] + "+00:00")
-    for candidate in candidates:
-        try:
-            dt = datetime.fromisoformat(candidate)
-            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
+    dt = parse_iso_timestamp(value)
+    if dt is not None:
+        return dt
     try:
-        dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        dt = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
         return dt.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
 
-def _parse_tags(*raw_values: Optional[str]) -> List[str]:
+def _parse_tags(tags: Optional[str], document_tags: Optional[str]) -> List[str]:
     """Readwise carries tags in two columns (highlight-level "Tags",
     book-level "Document tags") — merge both. Split on comma OR
     whitespace (Readwise has exported both ", "-joined and space-joined
     lists across versions), strip a leading '#', drop empties, dedup
     while keeping first-seen order."""
     seen = set()
-    tags: List[str] = []
-    for raw in raw_values:
+    result: List[str] = []
+    for raw in (tags, document_tags):
         if not raw:
             continue
         for piece in _TAG_SPLIT_RE.split(raw.strip()):
             tag = piece.strip().lstrip("#").strip()
             if tag and tag not in seen:
                 seen.add(tag)
-                tags.append(tag)
-    return tags
+                result.append(tag)
+    return result
 
 
 def iter_units(path: str) -> Iterator[ImportUnit]:
@@ -76,8 +70,7 @@ def iter_units(path: str) -> Iterator[ImportUnit]:
     text = raw.decode("utf-8-sig")  # Excel-exported CSVs often carry a BOM
     reader = csv.DictReader(io.StringIO(text))
 
-    for row in reader:
-        row = row or {}
+    for row_index, row in enumerate(reader):
         highlight = (row.get("Highlight") or "").strip()
         if not highlight:
             continue
@@ -91,7 +84,14 @@ def iter_units(path: str) -> Iterator[ImportUnit]:
         if note:
             content = f"{highlight}\n\nNote: {note}"
 
-        digest = hashlib.sha1(f"{highlight}{location}".encode("utf-8")).hexdigest()[:12]
+        # F4: include the Note AND the row ordinal in the digest — two
+        # DISTINCT highlights sharing identical text+location (e.g. the same
+        # sentence highlighted twice with different notes, or Readwise
+        # omitting Location entirely) must never collide onto one source_id
+        # and silently overwrite each other on ingest.
+        digest = hashlib.sha1(
+            f"{highlight}{location}{note}{row_index}".encode("utf-8")
+        ).hexdigest()[:12]
         book_slug = slugify(book_title) if book_title else "untitled"
         source_id = f"readwise:{book_slug}:{digest}"
 
@@ -109,7 +109,6 @@ def iter_units(path: str) -> Iterator[ImportUnit]:
             content_type="document",
             timestamp=_parse_highlighted_at(row.get("Highlighted at")),
             origin_runtime="readwise",
-            origin_source="import",
             session_key=book_slug if book_title else None,
             links=[book_title] if book_title else [],
             metadata=metadata,

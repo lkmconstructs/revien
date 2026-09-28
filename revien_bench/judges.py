@@ -23,7 +23,9 @@ socket timeout, same coarse cost-per-1K-token estimate. stdlib urllib only.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,18 +39,12 @@ from . import answerers as A
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "judge.txt"
 JUDGE_PROMPT_SHA256 = "9f64753745baf8b076ff61f251b3f89fe7f56531068877f754d958436d7c594c"
 
-# Re-exported from answerers.py: ONE source of truth for which provider names
-# are cloud vs local. The judge track uses the exact same provider set as the
-# reader track (openai/openrouter/together/claude are cloud; ollama is local).
-CLOUD_PROVIDERS = A.CLOUD_PROVIDERS
-LOCAL_PROVIDERS = A.LOCAL_PROVIDERS
-
 
 def load_judge_prompt() -> str:
     """Read the frozen judge prompt, verifying its sha256 (mirrors
-    answerers.load_answer_prompt — see there for the CRLF-normalization note)."""
-    if not _PROMPT_PATH.exists():
-        raise FileNotFoundError(f"judge prompt missing at {_PROMPT_PATH}")
+    answerers.load_answer_prompt — see there for the CRLF-normalization note).
+    A missing file raises FileNotFoundError from read_bytes() itself — no
+    separate pre-read exists() check needed."""
     raw = _PROMPT_PATH.read_bytes().replace(b"\r\n", b"\n")
     digest = hashlib.sha256(raw).hexdigest()
     if digest != JUDGE_PROMPT_SHA256:
@@ -98,8 +94,15 @@ def _parse_verdict(raw: str) -> Tuple[bool, Optional[str]]:
     Anything else (empty, garbage, a hedge) is an error: correct=False, and the
     caller counts it toward judge_errors — a judge that can't be parsed is
     never silently scored as a pass.
+
+    F12: leading NON-LETTER characters (markdown bold "**", a list marker
+    "1.", a leading quote) are stripped before taking the first word, so
+    "**CORRECT**" and "1. CORRECT" parse cleanly. This only strips a prefix
+    — "The answer is CORRECT" still starts with a letter ('T'), so nothing
+    is stripped and it still errors (the model must lead with the verdict).
     """
     text = (raw or "").strip()
+    text = re.sub(r"^[^A-Za-z]+", "", text)
     m = re.match(r"[A-Za-z]+", text)
     word = (m.group(0) if m else "").upper()
     if word == "CORRECT":
@@ -109,16 +112,27 @@ def _parse_verdict(raw: str) -> Tuple[bool, Optional[str]]:
     return False, f"unparseable judge output: {text[:120]!r}"
 
 
-class NullJudge:
-    """Explicit, importable marker for 'no LLM judge' (spec 'f1').
+# ── Judge-specific cloud disclosure ────────────────────────────────────────
+# A SEPARATE disclosed-set from answerers._DISCLOSED_PROVIDERS (F6): a run
+# with --answerer openai:x --judge openai:x sends question+memory to OpenAI
+# TWICE, for two different reasons (answering vs judging), and each purpose
+# gets its own one-time disclosure — sharing the reader's set would silently
+# swallow the judge's disclosure whenever the reader had already fired one.
+_DISCLOSED_JUDGE_PROVIDERS: set = set()
 
-    build_judge('f1') returns None rather than an instance of this class —
-    the runner's `if judge is not None` gate is the single source of truth for
-    whether the judge track is active. This class exists only so 'no judge' has
-    a name other than a bare None scattered through call sites.
-    """
 
-    name = "f1"
+def _disclose_judge_cloud(provider: str) -> None:
+    """One-time stderr warning when the question/gold/prediction leave the
+    machine FOR JUDGING. Local judges (f1, ollama) never call this."""
+    if provider in _DISCLOSED_JUDGE_PROVIDERS:
+        return
+    _DISCLOSED_JUDGE_PROVIDERS.add(provider)
+    sys.stderr.write(
+        f"WARNING: Revien is sending the question, gold answer and prediction "
+        f"to {provider} for judging - this leaves your machine. Use "
+        f"--judge f1 to keep it local.\n"
+    )
+    sys.stderr.flush()
 
 
 class OllamaJudge:
@@ -131,7 +145,11 @@ class OllamaJudge:
 
     def __init__(self, model: str, url: Optional[str] = None):
         self.model = model
-        self.url = (url or A.OLLAMA_URL).rstrip("/")
+        # F9: resolve OLLAMA_HOST fresh (not a stale module-import-time
+        # value) via the shared answerers.resolve_ollama_host — sovereignty's
+        # network_egress_zero inspects this SAME resolution to decide whether
+        # this judge is actually local.
+        self.url = A.resolve_ollama_host(url)
         self.name = f"ollama:{model}"
         self.network_calls = 0
         self.cost_usd_estimate = 0.0
@@ -151,20 +169,14 @@ class OllamaJudge:
             data = A._http_post_json(f"{self.url}/api/chat", payload, headers={})
         except Exception as e:  # noqa: BLE001 - one bad judge call must not kill the run
             return Verdict(
-                correct=False,
-                raw="",
-                network_calls=0,
-                cost_usd=0.0,
+                correct=False, raw="",
                 latency_ms=(time.perf_counter() - t0) * 1000.0,
                 error=f"{type(e).__name__}: {e}",
             )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         msg = (data.get("message") or {}).get("content", "")
         correct, err = _parse_verdict(msg)
-        return Verdict(
-            correct=correct, raw=msg, network_calls=0, cost_usd=0.0,
-            latency_ms=latency_ms, error=err,
-        )
+        return Verdict(correct=correct, raw=msg, latency_ms=latency_ms, error=err)
 
 
 class APIJudge:
@@ -200,8 +212,6 @@ class APIJudge:
         self.cost_usd_estimate = 0.0
 
     def _api_key(self) -> str:
-        import os
-
         key = os.environ.get(self.key_env, "")
         if not key:
             raise RuntimeError(
@@ -214,61 +224,30 @@ class APIJudge:
     ) -> Verdict:
         prompt = assemble_judge_prompt(question, gold, prediction, category_name)
         # Disclose BEFORE the network call (fires even if the request fails).
-        A._disclose_cloud(self.provider)
+        # Judge-specific set/message (F6) — separate from the answerer's.
+        _disclose_judge_cloud(self.provider)
         t0 = time.perf_counter()
+        attempted = False
         try:
             key = self._api_key()
-            if self.is_anthropic:
-                payload = {
-                    "model": self.model,
-                    "max_tokens": 8,
-                    "temperature": 0.0,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-                headers = {
-                    "x-api-key": key,
-                    "anthropic-version": self.anthropic_version,
-                }
-                data = A._http_post_json(
-                    f"{self.base_url}/messages", payload, headers=headers
-                )
-                parts = data.get("content") or []
-                text = "".join(
-                    p.get("text", "") for p in parts if p.get("type") == "text"
-                )
-                usage = data.get("usage") or {}
-                in_tok = usage.get("input_tokens") or A._approx_tokens(prompt)
-                out_tok = usage.get("output_tokens") or A._approx_tokens(text)
-            else:
-                payload = {
-                    "model": self.model,
-                    "temperature": 0.0,
-                    "max_tokens": 8,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-                headers = {"Authorization": f"Bearer {key}"}
-                data = A._http_post_json(
-                    f"{self.base_url}/chat/completions", payload, headers=headers
-                )
-                choices = data.get("choices") or []
-                text = (
-                    (choices[0].get("message") or {}).get("content", "")
-                    if choices else ""
-                )
-                usage = data.get("usage") or {}
-                in_tok = usage.get("prompt_tokens") or A._approx_tokens(prompt)
-                out_tok = usage.get("completion_tokens") or A._approx_tokens(text)
+            cfg = A._ProviderCfg(
+                model=self.model, base_url=self.base_url, is_anthropic=self.is_anthropic,
+                anthropic_version=self.anthropic_version, api_key=key,
+            )
+            # F7: increment BEFORE the request — a failed call (HTTP 500,
+            # timeout) still left the machine and must be counted as egress.
+            attempted = True
+            self.network_calls += 1
+            text, in_tok, out_tok = A._chat_once(cfg, prompt, max_tokens=8)
         except Exception as e:  # noqa: BLE001 - one bad judge call must not kill the run
             return Verdict(
                 correct=False,
                 raw="",
-                network_calls=0,
-                cost_usd=0.0,
+                network_calls=1 if attempted else 0,
                 latency_ms=(time.perf_counter() - t0) * 1000.0,
                 error=f"{type(e).__name__}: {e}",
             )
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        self.network_calls += 1
         cost = A.estimate_cost_usd(self.provider, in_tok, out_tok)
         self.cost_usd_estimate += cost
         correct, err = _parse_verdict(text)

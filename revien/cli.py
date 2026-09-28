@@ -1173,8 +1173,6 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
     run them through run_import() under a progress bar, then print the
     same summary shape for all three so scripting against any of them
     looks identical."""
-    import itertools
-
     from revien.graph.store import GraphStore
     from revien.importers import chatgpt, claude, readwise
     from revien.importers.base import run_import
@@ -1189,12 +1187,12 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
         sys.exit(1)
 
     if limit is not None:
-        units = list(itertools.islice(units, limit))
+        units = units[:limit]
 
     if dry_run:
         # Never touch the store: no GraphStore/IngestionPipeline construction
         # at all, so a dry run can't accidentally create a fresh db file.
-        report = run_import(units, store=None, pipeline=None, dry_run=True)
+        report = run_import(units, pipeline=None, dry_run=True)
         click.echo("dry run: nothing written")
     else:
         config = _load_config()
@@ -1206,7 +1204,7 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
                 length=len(units), label=f"Importing ({runtime})"
             ) as bar:
                 report = run_import(
-                    units, store, pipeline, dry_run=False,
+                    units, pipeline, dry_run=False,
                     progress=lambda _unit: bar.update(1),
                 )
         finally:
@@ -1225,7 +1223,12 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
     for source_id, message in report.errors:
         click.echo(f"  error: {source_id}: {message}")
 
-    if report.errors and report.units_ingested == 0:
+    # F11: only a hard failure is non-zero — errors happened AND nothing at
+    # all was captured (ingested or confirmed-unchanged). A partial import
+    # (some conversations ingested, one malformed one logged as an error) or
+    # a clean idempotent re-run (all unchanged, 0 ingested, 0 errors) both
+    # exit 0.
+    if report.errors and (report.units_ingested + report.units_unchanged) == 0:
         sys.exit(1)
 
 

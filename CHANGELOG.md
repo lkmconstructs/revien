@@ -21,6 +21,12 @@ All notable changes to Revien are documented here. Format follows
   `origin_source="import"`. Zero new dependencies — stdlib `zipfile`/
   `csv`/`json` only, and an export .zip is read straight out of the
   archive, never extracted to disk.
+  - Known limits: (a) re-importing an EDITED conversation refreshes the
+    verbatim text and adds new claims but does not retract claims extracted
+    from the old text — the pipeline's keyed refresh is add-only; (b) the
+    context fence strips everything after a recall-marker line, so a
+    conversation that itself contains Revien's memory-context marker loses
+    the tail of that turn.
 - **Benchmark: end-to-end LoCoMo LLM-judge track.** `revien_bench/judges.py` —
   a SEPARATE, never-blended binary CORRECT/WRONG accuracy score from an LLM
   comparing each predicted answer to the LoCoMo gold answer, alongside (not

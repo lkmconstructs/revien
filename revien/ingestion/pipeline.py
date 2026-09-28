@@ -162,6 +162,13 @@ class IngestionOutput:
     # consumers construct their own response dicts field-by-field, so a new
     # dataclass field with a default is additive, not breaking.
     fenced_spans: int = 0
+    # True only when this ingest took the keyed REFRESH path (existing_ctx
+    # found, content hash changed) — i.e. run_import's importer classification
+    # (F2): a refresh is units_ingested ("nodes created or refreshed"), never
+    # units_unchanged, even when the refresh happened to add 0 new nodes/edges
+    # (e.g. re-extraction of edited text produced no NEW claims). The keyed
+    # true no-op path (unchanged content hash) leaves this False.
+    refreshed: bool = False
 
 
 class IngestionPipeline:
@@ -626,6 +633,7 @@ class IngestionPipeline:
             total_edges_in_graph=self.store.count_edges(),
             governance=governance,
             fenced_spans=fenced_spans,
+            refreshed=False,
         )
 
     def _find_adoptable_context(self, source_id: str) -> Optional[Node]:
@@ -876,6 +884,7 @@ class IngestionPipeline:
             total_edges_in_graph=self.store.count_edges(),
             governance=governance,
             fenced_spans=fenced_spans,
+            refreshed=True,
         )
 
     def _edge_exists(
