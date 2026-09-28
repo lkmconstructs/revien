@@ -456,3 +456,26 @@ def test_checkpoint_path_includes_judge_spec(tmp_path):
     p_f1 = R._checkpoint_path(tmp_path, "graph_only", "extractive", "f1")
     p_ollama = R._checkpoint_path(tmp_path, "graph_only", "extractive", "ollama:llama3")
     assert p_f1 != p_ollama
+
+
+def test_aggregate_judge_reports_accuracy_excluding_adversarial():
+    """LoCoMo category 5 gold is the adversarial WRONG answer; a refusal is
+    the right behaviour and a gold-comparison judge marks it WRONG. The
+    comparable figure (what published rows report) excludes the category,
+    and is reported ALONGSIDE accuracy_overall, never instead of it."""
+    from revien_bench import runner as R
+
+    per_q = [
+        {"category": 1, "is_adversarial": False, "judge_correct": True, "judge_error": None},
+        {"category": 1, "is_adversarial": False, "judge_correct": False, "judge_error": None},
+        {"category": 5, "is_adversarial": True, "judge_correct": False, "judge_error": None},
+        {"category": 5, "is_adversarial": True, "judge_correct": False, "judge_error": None},
+    ]
+    agg = R._aggregate_judge(per_q, "stub:judge", "stub", network_calls=0, cost_usd=0.0)
+    assert agg["accuracy_overall"] == 0.25
+    assert agg["accuracy_excl_adversarial"] == 0.5
+    assert agg["n_excl_adversarial"] == 2
+    # Nothing but adversarial rows -> no comparable figure, not 0.0.
+    only_adv = [r for r in per_q if r["is_adversarial"]]
+    agg2 = R._aggregate_judge(only_adv, "stub:judge", "stub", network_calls=0, cost_usd=0.0)
+    assert agg2["accuracy_excl_adversarial"] is None

@@ -101,6 +101,14 @@ def render(report: Dict) -> str:
                 f"{n_correct}/{judge.get('accuracy_denominator')}; "
                 f"judged {judge.get('n_judged')}, errors {judge.get('judge_errors')})"
             )
+        excl = judge.get("accuracy_excl_adversarial")
+        if excl is not None:
+            lines.append(
+                f"**Accuracy excluding adversarial: {excl}** "
+                f"(n={judge.get('n_excl_adversarial')}) - the figure comparable to "
+                "published LoCoMo LLM-judge rows, which drop category 5 because its "
+                "gold is the adversarial wrong answer and the right behaviour is refusal."
+            )
         lines.append("")
         lines.append("| Category | N | Accuracy |")
         lines.append("|---|---:|---:|")

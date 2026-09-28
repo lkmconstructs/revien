@@ -843,6 +843,16 @@ def _aggregate_judge(
             ),
         }
 
+    # LoCoMo category 5 (adversarial) gold is the WRONG answer by construction;
+    # the right behaviour is a refusal, which a gold-comparison judge marks
+    # WRONG. Published LLM-judge accuracies exclude the category for that
+    # reason, so the comparable figure is reported alongside, never instead.
+    non_adv = [r for r in denom_rows if not r.get("is_adversarial")]
+    n_correct_excl_adv = sum(1 for r in non_adv if r["judge_correct"])
+    accuracy_excl_adversarial = (
+        round(n_correct_excl_adv / len(non_adv), 4) if non_adv else None
+    )
+
     return {
         "spec": judge_spec,
         "model": judge_model_name,
@@ -850,6 +860,8 @@ def _aggregate_judge(
         "accuracy_overall": accuracy_overall,
         "accuracy_denominator": accuracy_denominator,
         "n_correct": n_correct,
+        "accuracy_excl_adversarial": accuracy_excl_adversarial,
+        "n_excl_adversarial": len(non_adv),
         "per_category_accuracy": per_category,
         "judge_errors": errors,
         "n_judged": n,
@@ -1019,6 +1031,8 @@ def _print_summary(report: Dict) -> None:
     judge = report.get("judge")
     if judge:
         print(f"judge (LLM)   : {judge['spec']} accuracy={judge['accuracy_overall']} "
+              f"(excl. adversarial: {judge.get('accuracy_excl_adversarial')}, "
+              f"n={judge.get('n_excl_adversarial')}) "
               f"n={judge['n_judged']} errors={judge['judge_errors']} "
               f"cost=${judge['cost_usd']} calls={judge['network_calls']} "
               f"— NOT comparable to the F1/retrieval numbers above")
