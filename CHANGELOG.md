@@ -21,6 +21,23 @@ All notable changes to Revien are documented here. Format follows
   `origin_source="import"`. Zero new dependencies — stdlib `zipfile`/
   `csv`/`json` only, and an export .zip is read straight out of the
   archive, never extracted to disk.
+- **Benchmark: end-to-end LoCoMo LLM-judge track.** `revien_bench/judges.py` —
+  a SEPARATE, never-blended binary CORRECT/WRONG accuracy score from an LLM
+  comparing each predicted answer to the LoCoMo gold answer, alongside (not
+  instead of) the official token-F1 metric. `runner.py --judge {f1|ollama:<m>|
+  openai:<m>|openrouter:<m>|together:<m>|claude:<m>}` (default `f1` = no LLM
+  judge, report shape unchanged). Mirrors the LLM-reader track's transport,
+  once-to-stderr cloud disclosure, cost-ESTIMATE table, and frozen/sha256-gated
+  prompt (`prompts/judge.txt`) exactly — same env vars, same egress honesty.
+  `sovereignty.network_egress_zero` now judges the `--judge` spec the same way
+  it already judged `--answerer`: a cloud judge FAILS and is named, even at 0
+  measured calls; `ollama:<model>` is loopback-local and PASSes. Report gains
+  `judge` (spec, model, prompt sha256, overall + per-category accuracy, judge
+  errors, network_calls, cost_usd) and `reader` blocks, and `report.py` renders
+  them as a separate "End-to-end QA (LLM judge)" table explicitly labeled "not
+  comparable to the retrieval metrics above." Per-question rows gain
+  `judge_correct`/`judge_error`; older checkpoints without these keys resume
+  fine (tolerated as absent, not corrupting the aggregate).
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/

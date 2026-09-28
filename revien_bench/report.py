@@ -75,6 +75,30 @@ def render(report: Dict) -> str:
     )
     lines.append("")
 
+    # ── End-to-end QA (LLM judge) — SEPARATE track, never blended with F1 ─────
+    judge = report.get("judge")
+    if judge:
+        reader = report.get("reader", {})
+        lines.append("## End-to-end QA (LLM judge)")
+        lines.append("")
+        lines.append(f"- **Reader:** `{reader.get('spec')}` · **Judge:** `{judge.get('spec')}`")
+        lines.append(f"- **Cost:** ${judge.get('cost_usd')} · **Network calls:** "
+                     f"{judge.get('network_calls')} · **Judge errors:** {judge.get('judge_errors')}")
+        lines.append("")
+        lines.append(f"**Overall accuracy: {judge.get('accuracy_overall')}** "
+                     f"(n={judge.get('n_judged')})")
+        lines.append("")
+        lines.append("| Category | N | Accuracy |")
+        lines.append("|---|---:|---:|")
+        for cat, v in judge.get("per_category_accuracy", {}).items():
+            lines.append(f"| {cat} | {v['n']} | {v['accuracy']} |")
+        lines.append("")
+        lines.append("> **Not comparable to the retrieval / F1 metrics above.** This is a "
+                     "separate end-to-end judgment of whether the final answer matches the "
+                     "gold answer's meaning, scored by an LLM judge rather than lexical "
+                     "token-overlap — the two tracks are never blended into one number.")
+        lines.append("")
+
     # ── Sovereignty ───────────────────────────────────────────────────────────
     sov = report.get("sovereignty", {})
     lines.append("## Sovereignty assertions (THE DIFFERENTIATOR)")
