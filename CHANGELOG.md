@@ -6,6 +6,21 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **Importers — `revien import-chatgpt` / `import-claude` / `import-readwise`.**
+  Batch-import a ChatGPT export, a Claude.ai export, or a Readwise
+  highlights CSV through the same ingestion pipeline every live adapter
+  uses (`revien/importers/`): deny list, context fence, dedup, and
+  idempotent `ingest_key` refresh all apply, so re-running an unchanged
+  export is a no-op. ChatGPT and Claude each become one unit per
+  conversation; for ChatGPT the unit is the thread actually displayed
+  (`current_node`'s parent chain back to root) — a message on an edited-
+  away branch is never ingested. Readwise becomes one unit per highlight,
+  linked to its book via a declared entity edge. Every command accepts
+  `--dry-run` (parses and reports counts, writes nothing) and `--limit N`.
+  Origin fields are stamped `chatgpt` / `claude` / `readwise` with
+  `origin_source="import"`. Zero new dependencies — stdlib `zipfile`/
+  `csv`/`json` only, and an export .zip is read straight out of the
+  archive, never extracted to disk.
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/

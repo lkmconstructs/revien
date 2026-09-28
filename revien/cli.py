@@ -1165,6 +1165,115 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
         store.close()
 
 
+def _run_export_import(runtime: str, file: str, db: Optional[str],
+                        dry_run: bool, limit: Optional[int]) -> None:
+    """Shared body for import-chatgpt / import-claude / import-readwise:
+    resolve the store/pipeline the same way `ingest` does (cli.py's own
+    ingest command, above), stream units from the right importer module,
+    run them through run_import() under a progress bar, then print the
+    same summary shape for all three so scripting against any of them
+    looks identical."""
+    import itertools
+
+    from revien.graph.store import GraphStore
+    from revien.importers import chatgpt, claude, readwise
+    from revien.importers.base import run_import
+    from revien.ingestion.pipeline import IngestionPipeline
+
+    module = {"chatgpt": chatgpt, "claude": claude, "readwise": readwise}[runtime]
+
+    try:
+        units = list(module.iter_units(file))
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(str(e))
+        sys.exit(1)
+
+    if limit is not None:
+        units = list(itertools.islice(units, limit))
+
+    if dry_run:
+        # Never touch the store: no GraphStore/IngestionPipeline construction
+        # at all, so a dry run can't accidentally create a fresh db file.
+        report = run_import(units, store=None, pipeline=None, dry_run=True)
+        click.echo("dry run: nothing written")
+    else:
+        config = _load_config()
+        db_path = db or config.get("db_path", _default_db_path())
+        store = GraphStore(db_path=db_path)
+        pipeline = IngestionPipeline(store)
+        try:
+            with click.progressbar(
+                length=len(units), label=f"Importing ({runtime})"
+            ) as bar:
+                report = run_import(
+                    units, store, pipeline, dry_run=False,
+                    progress=lambda _unit: bar.update(1),
+                )
+        finally:
+            store.close()
+
+    click.echo(
+        f"seen={report.units_seen} ingested={report.units_ingested} "
+        f"unchanged={report.units_unchanged} denied={report.units_denied} "
+        f"empty={report.units_skipped_empty} errors={len(report.errors)}"
+    )
+    if not dry_run:
+        click.echo(
+            f"nodes_created={report.nodes_created} "
+            f"edges_created={report.edges_created}"
+        )
+    for source_id, message in report.errors:
+        click.echo(f"  error: {source_id}: {message}")
+
+    if report.errors and report.units_ingested == 0:
+        sys.exit(1)
+
+
+@main.command(name="import-chatgpt")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--dry-run", is_flag=True,
+              help="Parse and report counts; write nothing")
+@click.option("--limit", default=None, type=int,
+              help="Only process the first N conversations")
+def import_chatgpt(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+    """Import a ChatGPT export (conversations.json, or the .zip you
+    downloaded straight from ChatGPT's Settings -> Data controls -> Export)
+    through the ingestion pipeline: one unit per conversation, on the
+    thread actually shown (edited-away branches are not ingested).
+    Idempotent — re-running an unchanged export is a no-op."""
+    _run_export_import("chatgpt", file, db, dry_run, limit)
+
+
+@main.command(name="import-claude")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--dry-run", is_flag=True,
+              help="Parse and report counts; write nothing")
+@click.option("--limit", default=None, type=int,
+              help="Only process the first N conversations")
+def import_claude(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+    """Import a Claude.ai export (conversations.json, or the .zip from
+    Claude.ai's Settings -> Account -> Export data) through the ingestion
+    pipeline: one unit per conversation. Idempotent — re-running an
+    unchanged export is a no-op."""
+    _run_export_import("claude", file, db, dry_run, limit)
+
+
+@main.command(name="import-readwise")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--dry-run", is_flag=True,
+              help="Parse and report counts; write nothing")
+@click.option("--limit", default=None, type=int,
+              help="Only process the first N highlights")
+def import_readwise(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+    """Import a Readwise highlights CSV export through the ingestion
+    pipeline: one unit per highlight, linked to its book by an entity
+    edge. Idempotent — re-running an unchanged export is a no-op."""
+    _run_export_import("readwise", file, db, dry_run, limit)
+
+
 @main.command()
 @click.option("--db", default=None, help="Database path")
 @click.option("--interval", default=60.0, show_default=True,

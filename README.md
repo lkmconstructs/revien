@@ -48,6 +48,7 @@ A few more things worth knowing early on:
 
 - `revien recall --source claude-code "what did we decide about the database?"` narrows results to memory from one connected tool — handy once you've got more than one adapter feeding the graph.
 - `revien skills ingest` reads any `SKILL.md` files under `.claude/skills` or `.codex/skills` (add `--global` for your user-wide skill folders) into memory, so recall can surface them alongside everything else.
+- Already have history elsewhere? `revien import-chatgpt export.zip`, `revien import-claude export.zip`, and `revien import-readwise highlights.csv` bring a ChatGPT export, a Claude.ai export, or a Readwise highlights CSV into memory through the same pipeline — add `--dry-run` to preview counts first.
 - `revien token` mints (or prints) the pairing token a remote client — a memory panel on another machine, say — needs to authenticate against your Revien host.
 
 ---
