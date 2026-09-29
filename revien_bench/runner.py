@@ -49,6 +49,7 @@ from revien.graph.clustering import CommunityDetector
 from revien.graph.store import GraphStore
 from revien.retrieval.engine import RetrievalEngine
 from revien.semantic.index import SemanticIndex
+from revien.semantic.rerank import CrossEncoderReranker
 
 from . import answerers as A
 from . import failure_analysis as FA
@@ -278,7 +279,38 @@ def _cache_paths(db_cache: Path, config_name: str, conv_id: str) -> tuple:
     return base, Path(str(base) + ".meta.json")
 
 
-def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Dict]:
+_TRUTHY = ("1", "true", "yes", "on", "require", "required", "strict")
+
+
+def _semantic_requested(cfg: Dict) -> bool:
+    """Did the run's CONFIG ask for the semantic layer (REVIEN_SEMANTIC truthy)?"""
+    return str((cfg.get("env") or {}).get("REVIEN_SEMANTIC", "0")).strip().lower() in _TRUTHY
+
+
+def _layer_status(semantic, reranker=None) -> Dict:
+    """Real layer state, read off the live objects (never env vars):
+    SemanticIndex.is_enabled/inactive_reason()/status() (revien/semantic/index.py
+    -- flips False in `_safe_disable` after a runtime error) and
+    CrossEncoderReranker.is_enabled (revien/semantic/rerank.py)."""
+    active = bool(getattr(semantic, "is_enabled", False))
+    reason = None if active else (
+        semantic.inactive_reason() if hasattr(semantic, "inactive_reason")
+        else "semantic layer absent")
+    try:
+        embedder = str(semantic.status().get("embedder", "unknown"))
+    except Exception:
+        embedder = "unknown"
+    rr = bool(getattr(reranker, "is_enabled", False)) if reranker is not None else False
+    return {
+        "semantic_active": active,
+        "rerank_active": rr,
+        "embedder": embedder,
+        "semantic_inactive_reason": reason,
+    }
+
+
+def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
+                     semantic_requested: bool = False) -> Optional[Dict]:
     """Meta for a cached DB, or None when absent/SHA-mismatched (never falsely
     reuse a cache built from a different dataset) or ingest-identity-mismatched
     (never falsely reuse an ingest built by different code or ingest env —
@@ -292,6 +324,12 @@ def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Di
     if dataset_sha is not None and meta.get("dataset_sha") != dataset_sha:
         return None
     if meta.get("ingest_fp") != _ingest_fingerprint():
+        return None
+    ls = meta.get("layer_status")
+    if not isinstance(ls, dict) or (semantic_requested and not ls.get("semantic_active")):
+        why = ("no layer_status recorded" if not isinstance(ls, dict)
+               else "semantic layer was inactive during its ingest")
+        print(f"[bench] db-cache: ignoring stale snapshot {meta_path.name} - {why}")
         return None
     return meta
 
@@ -430,8 +468,11 @@ def run_benchmark(
     fresh: bool = False,
     db_cache: Optional[Path] = None,
     judge_name: str = "f1",
+    allow_degraded: bool = False,
 ) -> Dict:
     cfg = _load_config(config_name)
+    want_semantic = _semantic_requested(cfg)
+    layer_statuses: List[Dict] = []
     prev_env = _apply_env(cfg.get("env", {}))
 
     try:
@@ -538,7 +579,7 @@ def run_benchmark(
             cache_db = cache_meta_path = None
             if db_cache is not None:
                 cache_db, cache_meta_path = _cache_paths(db_cache, config_name, conv.conv_id)
-                cached_meta = _cache_load_meta(cache_meta_path, dataset_sha)
+                cached_meta = _cache_load_meta(cache_meta_path, dataset_sha, want_semantic)
                 if cached_meta is not None and cache_db.exists():
                     shutil.copyfile(cache_db, db_path)
                 else:
@@ -549,8 +590,14 @@ def run_benchmark(
             try:
                 semantic = SemanticIndex(store)  # self-disables without the extra
 
+                if cached_meta is None and want_semantic and not allow_degraded:
+                    _st = _layer_status(semantic)
+                    if not _st["semantic_active"]:
+                        _degraded_exit(conv.conv_id, _st, "before ingest")
+
                 conv_ingest_rate = 0.0
                 if cached_meta is not None:
+                    layer_statuses.append(cached_meta["layer_status"])
                     summary = {
                         "turns_ingested": cached_meta["turns_ingested"],
                         "nodes_created": cached_meta["nodes_created"],
@@ -567,7 +614,17 @@ def run_benchmark(
                     if ingest_s > 0 and summary["turns_ingested"]:
                         conv_ingest_rate = summary["turns_ingested"] / ingest_s
                         ingest_rates.append(conv_ingest_rate)
-                    if db_cache is not None:
+                    status = _layer_status(semantic, CrossEncoderReranker())
+                    layer_statuses.append(status)
+                    degraded = want_semantic and not status["semantic_active"]
+                    if degraded:
+                        if db_cache is not None:
+                            print(f"[bench] db-cache: NOT caching {conv.conv_id} — "
+                                  f"semantic layer inactive during ingest "
+                                  f"({status['semantic_inactive_reason']})")
+                        if not allow_degraded:
+                            _degraded_exit(conv.conv_id, status, "during ingest")
+                    if db_cache is not None and not degraded:
                         # Snapshot the pristine post-ingest state via SQLite's
                         # backup API (safe on a live connection, WAL included),
                         # then the meta sidecar with the SHA guard.
@@ -585,6 +642,7 @@ def run_benchmark(
                             "turns_ingested": summary["turns_ingested"],
                             "nodes_created": summary["nodes_created"],
                             "ingest_rate": round(conv_ingest_rate, 4),
+                            "layer_status": status,
                         }), encoding="utf-8")
                 total_audit_creates_expected += summary["nodes_created"]
 
@@ -728,6 +786,8 @@ def run_benchmark(
         report["alias"] = _aggregate_alias(alias_pass_stats, enabled=_bench_alias_enabled())
         report["normalization_merges_sample"] = norm_merges_sample
         report["sovereignty"] = S.checks_to_dict(checks)
+        report["layer_status"] = _aggregate_layer_status(layer_statuses, want_semantic)
+        report["layer_status"]["allow_degraded"] = bool(allow_degraded)
         report["config"] = {
             "name": config_name,
             "env": cfg.get("env", {}),
@@ -872,6 +932,30 @@ def _aggregate_judge(
     }
 
 
+def _degraded_exit(conv_id: str, status: Dict, when: str) -> None:
+    print(f"[bench] ERROR: config requests the semantic layer but it is inactive "
+          f"{when} ({conv_id}): {status.get('semantic_inactive_reason')}. "
+          f"Refusing to produce a degraded number; pass --allow-degraded to override.")
+    raise SystemExit(3)
+
+
+def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
+    """Run-level layer status: active only if EVERY observed conversation was."""
+    if not statuses:
+        return {"semantic_requested": requested, "semantic_active": None,
+                "rerank_active": None, "embedder": None,
+                "semantic_inactive_reason": None}
+    reasons = sorted({s["semantic_inactive_reason"] for s in statuses
+                      if s.get("semantic_inactive_reason")})
+    return {
+        "semantic_requested": requested,
+        "semantic_active": all(s.get("semantic_active") for s in statuses),
+        "rerank_active": all(s.get("rerank_active") for s in statuses),
+        "embedder": statuses[-1].get("embedder"),
+        "semantic_inactive_reason": "; ".join(reasons) or None,
+    }
+
+
 def _aggregate_alias(stats: List[Dict], enabled: bool) -> Dict:
     """Fold per-conversation alias-pass stats (REVIEN_BENCH_ALIAS=1) into one
     run-level report section. Present-but-empty when the hook never ran (env
@@ -970,6 +1054,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "skipped and recall runs against a temp COPY — the cache "
                          "is never mutated. Cuts sweep iterations from ~10min to "
                          "recall-only time.")
+    ap.add_argument("--allow-degraded", action="store_true", dest="allow_degraded",
+                    help="continue even when the config requests the semantic "
+                         "layer but it is inactive (result is labelled degraded). "
+                         "Default: exit 3 rather than emit a degraded number.")
     args = ap.parse_args(argv)
 
     dataset_path = Path(args.dataset)
@@ -988,6 +1076,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         fresh=args.fresh,
         db_cache=Path(args.db_cache) if args.db_cache else None,
         judge_name=args.judge,
+        allow_degraded=args.allow_degraded,
     )
     _print_summary(report)
     return 0
@@ -997,6 +1086,9 @@ def _print_summary(report: Dict) -> None:
     print("\n=== Revien LoCoMo benchmark ===")
     print(f"config        : {report['config']['name']} / {report['config']['answerer']}")
     print(f"questions     : {report['n_questions']}")
+    ls = report.get("layer_status") or {}
+    print(f"layers        : semantic={ls.get('semantic_active')} "
+          f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')}")
     print(f"overall F1    : {report['overall_f1']}")
     print("per-category F1:")
     for cat, v in report["per_category_f1"].items():

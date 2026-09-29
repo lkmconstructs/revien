@@ -26,6 +26,12 @@ def render(report: Dict) -> str:
     lines.append("")
     lines.append(f"- **Config:** `{cfg.get('name')}` / answerer `{cfg.get('answerer')}` "
                  f"(cluster={cfg.get('cluster')})")
+    ls = report.get("layer_status") or {}
+    lines.append(f"- **Layers:** semantic={ls.get('semantic_active')} "
+                 f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')}"
+                 + (f" — DEGRADED: {ls['semantic_inactive_reason']}"
+                    if ls.get("semantic_requested") and ls.get("semantic_active") is False
+                    else ""))
     lines.append(f"- **Timestamp:** {report.get('timestamp')}")
     lines.append(f"- **Dataset:** `{ds.get('path')}` "
                  f"({ds.get('conversations')} conversations) — SHA-256 `{ds.get('sha256')}`")
