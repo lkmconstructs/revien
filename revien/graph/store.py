@@ -541,6 +541,12 @@ class GraphStore:
                 "CREATE INDEX IF NOT EXISTS idx_nodes_project "
                 "ON nodes(project_key, created_at DESC)"
             )
+            # previous_context_in_session: session_key equality, then order.
+            # recorded_at exists by now (temporal migration runs first).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_session "
+                "ON nodes(session_key, recorded_at)"
+            )
             self._commit(conn)
 
             user_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -871,6 +877,28 @@ class GraphStore:
 
     # SQLite's default parameter limit is 999; chunk IN() queries below it.
     _IN_CHUNK = 500
+
+    @_locked
+    def previous_context_in_session(self, node: Node) -> Optional[Node]:
+        """The CONTEXT node immediately before ``node`` in its session: same
+        non-null session_key, greatest (recorded_at, created_at) strictly
+        before the node's. Ties (a session whose turns share a coarse
+        recorded_at AND created_at) fall back to insertion order (rowid).
+        None when the node has no session_key or is the session's first."""
+        if not node.session_key:
+            return None
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
+            "AND node_id != ? AND (COALESCE(recorded_at, ''), created_at, rowid) "
+            "< (?, ?, (SELECT rowid FROM nodes WHERE node_id = ?)) "
+            "ORDER BY COALESCE(recorded_at, '') DESC, created_at DESC, rowid DESC "
+            "LIMIT 1",
+            (node.session_key, NodeType.CONTEXT.value, node.node_id,
+             node.recorded_at.isoformat() if node.recorded_at else "",
+             node.created_at.isoformat(), node.node_id),
+        ).fetchone()
+        return self._row_to_node(row) if row else None
 
     @_locked
     def get_nodes_bulk(self, node_ids) -> dict:

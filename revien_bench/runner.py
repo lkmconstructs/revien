@@ -48,7 +48,7 @@ import revien
 from revien.graph.clustering import CommunityDetector
 from revien.graph.store import GraphStore
 from revien.retrieval.engine import RetrievalEngine
-from revien.semantic.index import SemanticIndex, build_embedder
+from revien.semantic.index import SemanticIndex, build_embedder, embed_context_mode
 from revien.semantic.rerank import CrossEncoderReranker
 
 from . import answerers as A
@@ -305,13 +305,14 @@ def _layer_status(semantic, reranker=None) -> Dict:
     reason = None if active else (
         semantic.inactive_reason() if hasattr(semantic, "inactive_reason")
         else "semantic layer absent")
-    embed_model = embed_dim = None
+    embed_model = embed_dim = embed_context = None
     try:
         sem_status = semantic.status()
         embedder = str(sem_status.get("embedder", "unknown"))
         if active:
             embed_model = sem_status.get("embed_model")
             embed_dim = sem_status.get("embed_dim")
+            embed_context = sem_status.get("embed_context")
     except Exception:
         embedder = "unknown"
     rr = bool(getattr(reranker, "is_enabled", False)) if reranker is not None else False
@@ -325,6 +326,7 @@ def _layer_status(semantic, reranker=None) -> Dict:
         "embedder": embedder,
         "embed_model": embed_model,
         "embed_dim": embed_dim,
+        "embed_context": embed_context,
         "semantic_inactive_reason": reason,
     }
 
@@ -343,7 +345,8 @@ def _resolve_embed_model() -> Optional[str]:
 def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
                      semantic_requested: bool = False,
                      embed_model: Optional[str] = None,
-                     embed_dim: Optional[int] = None) -> Optional[Dict]:
+                     embed_dim: Optional[int] = None,
+                     embed_context: Optional[str] = None) -> Optional[Dict]:
     """Meta for a cached DB, or None when absent/SHA-mismatched (never falsely
     reuse a cache built from a different dataset) or ingest-identity-mismatched
     (never falsely reuse an ingest built by different code or ingest env —
@@ -374,6 +377,11 @@ def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
             why = f"embedded with {snap_model}, this run uses {embed_model}"
         elif embed_dim is not None and snap_dim is not None and snap_dim != embed_dim:
             why = f"embedded at dim {snap_dim}, this run uses dim {embed_dim}"
+        elif (embed_context is not None
+              and (ls.get("embed_context") or "off") != embed_context):
+            # A snapshot from before the knob existed was built with "off".
+            why = (f"embedded with REVIEN_EMBED_CONTEXT={ls.get('embed_context') or 'off'}, "
+                   f"this run uses {embed_context}")
         if why:
             print(f"[bench] db-cache: ignoring stale snapshot {meta_path.name} - {why}")
             return None
@@ -632,7 +640,8 @@ def run_benchmark(
                 cache_db, cache_meta_path = _cache_paths(db_cache, config_name, conv.conv_id)
                 cached_meta = _cache_load_meta(
                     cache_meta_path, dataset_sha, want_semantic,
-                    embed_model=_resolve_embed_model() if want_semantic else None)
+                    embed_model=_resolve_embed_model() if want_semantic else None,
+                    embed_context=embed_context_mode() if want_semantic else None)
                 if cached_meta is not None and cache_db.exists():
                     shutil.copyfile(cache_db, db_path)
                 else:
@@ -1013,6 +1022,7 @@ def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
         return {"semantic_requested": requested, "semantic_active": None,
                 "rerank_active": None, "rerank_top_k": None, "rerank_model": None,
                 "embedder": None, "embed_model": None, "embed_dim": None,
+                "embed_context": None,
                 "semantic_inactive_reason": None}
     reasons = sorted({s["semantic_inactive_reason"] for s in statuses
                       if s.get("semantic_inactive_reason")})
@@ -1025,6 +1035,7 @@ def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
         "embedder": statuses[-1].get("embedder"),
         "embed_model": statuses[-1].get("embed_model"),
         "embed_dim": statuses[-1].get("embed_dim"),
+        "embed_context": statuses[-1].get("embed_context"),
         "semantic_inactive_reason": "; ".join(reasons) or None,
     }
 

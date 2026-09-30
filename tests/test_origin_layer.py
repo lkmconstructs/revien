@@ -923,7 +923,7 @@ class TestOriginBackfillUserVersionMarker:
             s.close()
 
             conn = sqlite3.connect(path)
-            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project"):
+            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project", "idx_nodes_session"):
                 conn.execute(f"DROP INDEX IF EXISTS {ix}")
             for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
                 conn.execute(f"ALTER TABLE nodes DROP COLUMN {col}")
@@ -955,7 +955,7 @@ class TestOriginBackfillUserVersionMarker:
             s = GraphStore(db_path=path)
             s.close()
             conn = sqlite3.connect(path)
-            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project"):
+            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project", "idx_nodes_session"):
                 conn.execute(f"DROP INDEX IF EXISTS {ix}")
             for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
                 conn.execute(f"ALTER TABLE nodes DROP COLUMN {col}")

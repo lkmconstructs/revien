@@ -121,6 +121,47 @@ def _semantic_required() -> bool:
     return raw.strip().lower() in ("require", "required", "strict")
 
 
+# ── Embed-context recipe (REVIEN_EMBED_CONTEXT) ───────────────────────
+# What gets embedded for a CONTEXT (verbatim turn) node. "off" (default) is the
+# node alone, exactly as before. "prev" prepends the preceding CONTEXT node of
+# the same session_key so "I ran it last Saturday" carries its referent. Only
+# the string handed to the embedder changes; stored node content never does.
+EMBED_CONTEXT_OFF = "off"
+EMBED_CONTEXT_PREV = "prev"
+EMBED_CONTEXT_MAX_CHARS = 1200   # combined cap; the PREVIOUS turn is trimmed, never the current
+_EMBED_CONTEXT_OFF_VALUES = ("", "0", "off", "false", "no", "none")
+
+
+def embed_context_mode() -> str:
+    """Current REVIEN_EMBED_CONTEXT setting: "off" (default) or "prev".
+    Read per call so the env can change between operations. An unrecognised
+    value is loud and treated as off."""
+    raw = os.environ.get("REVIEN_EMBED_CONTEXT", "").strip().lower()
+    if raw in _EMBED_CONTEXT_OFF_VALUES:
+        return EMBED_CONTEXT_OFF
+    if raw == EMBED_CONTEXT_PREV:
+        return EMBED_CONTEXT_PREV
+    sys.stderr.write(
+        f"[revien.semantic] Unknown REVIEN_EMBED_CONTEXT={raw!r}; "
+        f"valid: off, prev. Treating as off.\n"
+    )
+    return EMBED_CONTEXT_OFF
+
+
+def _with_previous_turn(prev_content: str, content: str) -> str:
+    """prev + newline + content, capped at EMBED_CONTEXT_MAX_CHARS. Over the
+    cap, the previous turn loses characters from its LEFT (its tail survives);
+    the current turn is never cut."""
+    prev_content = (prev_content or "").strip()
+    content = (content or "").strip()
+    if not prev_content:
+        return content
+    room = EMBED_CONTEXT_MAX_CHARS - len(content) - 1
+    if room <= 0:
+        return content
+    return f"{prev_content[-room:]}\n{content}"
+
+
 # ── Cloud disclosure (mirrors leg-4 extractor_llm._disclose_cloud) ─────
 _DISCLOSED_PROVIDERS: set = set()
 
@@ -313,6 +354,9 @@ class SemanticIndex:
     # Per-search drain bound: keeps a pathological backlog from turning one
     # recall into a bulk reindex. Normal capture volume drains in one batch.
     PENDING_DRAIN_BATCH = 256
+    # Recipe record: one key/value table in the same db. Holds the
+    # embed-context mode the vectors in TABLE were built under.
+    META_TABLE = "semantic_meta"
 
     def __init__(
         self,
@@ -356,6 +400,7 @@ class SemanticIndex:
         # any live instance can serve).
         if self._enabled:
             self._register_store_listener()
+            self._warn_on_embed_context_mismatch()
 
     def _register_store_listener(self) -> None:
         """Wire this index to the store's content-change/delete hooks.
@@ -395,6 +440,10 @@ class SemanticIndex:
                             if self.is_enabled else None),
             "embed_dim": (getattr(self._embedder, "dim", None)
                           if self.is_enabled and self._embedder is not None else None),
+            # The CURRENT REVIEN_EMBED_CONTEXT recipe (what new vectors use).
+            # The recipe the stored vectors were built under is in
+            # semantic_meta; a difference is warned about at open.
+            "embed_context": embed_context_mode() if self.is_enabled else None,
         }
 
     def inactive_reason(self) -> Optional[str]:
@@ -440,6 +489,10 @@ class SemanticIndex:
         with self._db():
             conn = self.store._get_conn()
             self._load_extension(conn)
+            fresh = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.TABLE,),
+            ).fetchone() is None
             # Cosine distance: bge-small (and most sentence embedders) are trained
             # for cosine similarity. The default L2 metric compresses every pair
             # into a narrow band on these dense vectors, killing discrimination;
@@ -450,6 +503,8 @@ class SemanticIndex:
                 f"embedding float[{dim}] distance_metric=cosine)"
             )
             conn.commit()
+            if fresh:
+                self._record_embed_context(embed_context_mode())
         self._dim = dim
         self._table_ready = True
 
@@ -530,6 +585,80 @@ class SemanticIndex:
         except Exception as e:  # noqa: BLE001 - cleanup must not break deletes
             self._safe_disable(e)
 
+    # ── Embed recipe record ────────────────────────────────
+    def _recorded_embed_context(self) -> Optional[str]:
+        """Mode the stored vectors were built under, or None when there are no
+        vectors. A vec table with no recorded mode predates the knob: "off"."""
+        with self._db():
+            conn = self.store._get_conn()
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.TABLE,),
+            ).fetchone() is None:
+                return None
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.META_TABLE,),
+            ).fetchone() is None:
+                return EMBED_CONTEXT_OFF
+            row = conn.execute(
+                f"SELECT value FROM {self.META_TABLE} WHERE key = 'embed_context'"
+            ).fetchone()
+            return row[0] if row else EMBED_CONTEXT_OFF
+
+    def _record_embed_context(self, mode: str) -> None:
+        with self._db():
+            conn = self.store._get_conn()
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.META_TABLE} "
+                f"(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.execute(
+                f"INSERT OR REPLACE INTO {self.META_TABLE}(key, value) "
+                f"VALUES ('embed_context', ?)",
+                (mode,),
+            )
+            conn.commit()
+
+    def _warn_on_embed_context_mismatch(self) -> None:
+        """One loud line at open when the stored vectors were built under a
+        different REVIEN_EMBED_CONTEXT than the current one. Never rebuilds."""
+        try:
+            recorded = self._recorded_embed_context()
+        except Exception:  # noqa: BLE001 - bare/mock stores, closed db
+            return
+        current = embed_context_mode()
+        if recorded is not None and recorded != current:
+            sys.stderr.write(
+                f"[revien.semantic] WARNING: vectors were built under "
+                f"REVIEN_EMBED_CONTEXT={recorded} but the current setting is "
+                f"{current}. Mixed recipes degrade recall; run `revien reindex` "
+                f"to rebuild under the current setting.\n"
+            )
+            sys.stderr.flush()
+
+    def _embed_texts(self, items: Sequence[Tuple[str, str, str]]) -> List[str]:
+        """The single place embed text is derived for stored nodes. Off: the
+        node's own text (unchanged). prev: a CONTEXT node with a session_key
+        is embedded as previous-turn + newline + this turn. Stored content is
+        never touched. Claim nodes, session-less nodes and a session's first
+        turn embed alone."""
+        texts = [self._node_text(lbl, ct) for (_id, lbl, ct) in items]
+        if embed_context_mode() != EMBED_CONTEXT_PREV or not items:
+            return texts
+        from revien.graph.schema import NodeType
+
+        nodes = self.store.get_nodes_bulk([nid for (nid, _l, _c) in items])
+        for i, (nid, _lbl, ct) in enumerate(items):
+            node = nodes.get(nid)
+            if (node is None or node.node_type != NodeType.CONTEXT
+                    or not node.session_key or not (ct or "").strip()):
+                continue
+            prev = self.store.previous_context_in_session(node)
+            if prev is not None:
+                texts[i] = _with_previous_turn(prev.content, ct)
+        return texts
+
     @staticmethod
     def _node_text(label: str, content: str) -> str:
         """Embedding text for a node: label carries the signal, content adds
@@ -550,7 +679,7 @@ class SemanticIndex:
         if not self.is_enabled:
             return False
         try:
-            text = self._node_text(label, content)
+            text = self._embed_texts([(node_id, label, content)])[0]
             if not text:
                 return False
             embedder = self._get_embedder()
@@ -582,7 +711,7 @@ class SemanticIndex:
         if not self.is_enabled or not nodes:
             return 0
         try:
-            texts = [self._node_text(lbl, ct) for (_id, lbl, ct) in nodes]
+            texts = self._embed_texts(nodes)
             keep = [(nid, t) for (nid, _l, _c), t in zip(nodes, texts) if t]
             if not keep:
                 return 0
@@ -765,6 +894,8 @@ class SemanticIndex:
                     batch = []
             if batch:
                 total += self.index_nodes(batch)
+            if self._table_ready:
+                self._record_embed_context(embed_context_mode())
             return {"status": "ok", "indexed": total, **self.status()}
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
