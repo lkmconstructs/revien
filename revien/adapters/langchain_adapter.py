@@ -347,6 +347,10 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
         lines = [
             f"## Relevant Context (from {len(response.results)} nodes)\n"
         ]
+        if any(r.recorded_at for r in response.results):
+            lines.append(
+                "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)"
+            )
 
         for i, result in enumerate(response.results, 1):
             lines.append(f"### Result {i}: {result.label}")

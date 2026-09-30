@@ -67,7 +67,7 @@ def test_fingerprint_changes_with_reader_context(monkeypatch):
     monkeypatch.setattr(R, "READER_CONTEXT", "undated")
     assert R._run_fingerprint() != dated_fp
     other = R._checkpoint_path(Path("x"), "c", "a")
-    monkeypatch.setattr(R, "READER_CONTEXT", "dated")
+    monkeypatch.setattr(R, "READER_CONTEXT", "dated-resolved")
     assert R._checkpoint_path(Path("x"), "c", "a") != other
 
 
@@ -105,9 +105,9 @@ def test_results_json_records_reader_context_and_runner_fills_dates(
         dataset_path=work_dir / "ds.json", out_dir=work_dir / "results",
         fresh=True,
     )
-    assert report["reader_context"] == "dated"
+    assert report["reader_context"] == "dated-resolved"
     written = sorted((work_dir / "results").glob("*.json"))
-    assert json.loads(written[-1].read_text(encoding="utf-8"))["reader_context"] == "dated"
+    assert json.loads(written[-1].read_text(encoding="utf-8"))["reader_context"] == "dated-resolved"
     assert seen and all(len(c.dates) == len(c.contents) for c in seen)
 
 

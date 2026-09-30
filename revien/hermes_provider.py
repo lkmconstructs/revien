@@ -639,11 +639,18 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
         if not getattr(response, "results", None):
             return ""
         lines = ["## Relevant memory (Revien)"]
+        body = []
         for r in response.results:
             said = getattr(r, "recorded_at", None)
             prefix = f"[{said[:10]}] " if said else ""
-            lines.append(f"- {prefix}{r.content}")
+            body.append(f"- {prefix}{r.content}")
+        if any(getattr(r, "recorded_at", None) for r in response.results):
+            lines.append(DATE_NOTE)
+        lines.extend(body)
         return "\n".join(lines)
+
+
+DATE_NOTE = "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)"
 
 
 def register(ctx: Any) -> None:

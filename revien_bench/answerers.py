@@ -165,7 +165,7 @@ class ExtractiveAnswerer:
 # edit (which would change every LLM answer) is caught: load_answer_prompt()
 # raises if the on-disk file no longer matches this digest.
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "answerer.txt"
-ANSWER_PROMPT_SHA256 = "eaab3885c6591c81491c08ab762fbeeab6d2893c1d49922cb887b29a8fe5e487"
+ANSWER_PROMPT_SHA256 = "12df41d69387d3ce5abe387007fafa6cfea9c4da3b351cafe0a5a485da95db50"
 
 # How much retrieved context to hand the model. The retrieved node contents are
 # already the top-K from recall(); we cap total characters so a pathological

@@ -124,6 +124,7 @@ class TestPromptRendering:
         fmt = RevienMemoryProvider._format_context
         assert fmt(_resp(ISO)).splitlines() == [
             "## Relevant memory (Revien)",
+            TestDateNote.NOTE,
             "- [2023-05-07] Mara moved billing to Postgres.",
         ]
         assert "- Mara moved billing to Postgres." in fmt(_resp(None)).splitlines()
@@ -169,6 +170,45 @@ class TestPromptRendering:
         assert lines
         assert all(l.startswith("- [Score: ") for l in lines)
         assert "ago" not in ctx and "unknown time" not in ctx
+
+
+class TestDateNote:
+    NOTE = ("(dates in brackets are when each memory was said; "
+            "resolve 'yesterday' etc. against them)")
+
+    def test_hermes(self):
+        fmt = RevienMemoryProvider._format_context
+        assert fmt(_resp(ISO)).splitlines()[1] == self.NOTE
+        assert self.NOTE not in fmt(_resp(None))
+
+    def test_langchain(self):
+        fmt = RevienMemory._format_retrieval_response
+        dated = fmt(object(), _resp(ISO)).splitlines()
+        assert self.NOTE in dated[1:3]
+        assert self.NOTE not in fmt(object(), _resp(None))
+
+    def test_ollama(self, db_path):
+        adapter = OllamaAdapter(graph_path=db_path)
+        adapter.pipeline.ingest(
+            IngestionInput(source_id="s1", content=TEXT, timestamp=SAID))
+        dated = adapter.get_context_for_prompt(QUERY).splitlines()
+        assert dated[0] == "[Revien Memory Context]"
+        assert self.NOTE in dated[1:4]
+        assert dated[-1] == "[End Memory Context]"
+
+    def test_ollama_undated(self, db_path):
+        adapter = OllamaAdapter(graph_path=db_path)
+        adapter.pipeline.ingest(
+            IngestionInput(source_id="s1", content=TEXT, timestamp=None))
+        assert self.NOTE not in adapter.get_context_for_prompt(QUERY)
+
+    def test_fence_strips_note(self):
+        for ctx in (
+            RevienMemoryProvider._format_context(_resp(ISO)),
+            RevienMemory._format_retrieval_response(object(), _resp(ISO)),
+        ):
+            out = fence_content("User: hi\n" + ctx + "\nAssistant: ok").content
+            assert "dates in brackets" not in out and "Postgres" not in out
 
 
 class TestNoAgeFromIngestTime:

@@ -226,6 +226,11 @@ class OllamaAdapter:
             "The following context is retrieved from persistent memory based on relevance to the current query:\n",
         ]
 
+        if any(r.recorded_at for r in response.results):
+            lines.append(
+                "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)"
+            )
+
         for result in response.results:
             # Format score as percentage
             score_pct = int(result.score * 100)

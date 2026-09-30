@@ -65,7 +65,7 @@ _MEMORY_CONTEXT_OPEN = re.compile(r"\[Revien Memory Context\]")
 # not), so the block would silently swallow one stray newline past every
 # real boundary line instead of stopping cleanly.
 _HERMES_HEADER_BLOCK = re.compile(
-    r"^## Relevant memory \(Revien\).*(?:\n(?:-[ ].*|[ \t]*(?=\n|$)))*",
+    r"^## Relevant memory \(Revien\).*(?:\n(?:-[ ].*|\(dates in brackets .*|[ \t]*(?=\n|$)))*",
     re.MULTILINE,
 )
 

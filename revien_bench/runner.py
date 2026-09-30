@@ -159,7 +159,7 @@ def _sanitize(text: str) -> str:
 # How LLM readers render retrieved memories: "dated" = each memory prefixed
 # with the day it was said. Recorded in the results JSON and folded into the
 # checkpoint fingerprint.
-READER_CONTEXT = "dated"
+READER_CONTEXT = "dated-resolved"
 
 
 def _env_fingerprint(prefix_allowlist: Optional[tuple] = None) -> str:
