@@ -622,7 +622,7 @@ def tensions(db: Optional[str], include_history: bool, json_output: bool):
             click.echo(f"  [{i}] {a['content'][:100]}")
             click.echo(f"   ⇄  {b['content'][:100]}")
             if p.get("source_context"):
-                click.echo(f"      ({p['source_context']}, {p['created_at'][:10]})")
+                click.echo(f"      ({p['source_context']}, recognized {p['created_at'][:10]})")
             click.echo()
     finally:
         store.close()

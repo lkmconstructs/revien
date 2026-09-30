@@ -7,6 +7,7 @@ All notable changes to Revien are documented here. Format follows
 
 ### Added
 - **Recall results carry `recorded_at`.** Every recall result now has `recorded_at` (when the memory was said, ISO-8601 UTC, or null when unknown) across the daemon, MCP, CLI and TOON; memory-context blocks show each memory's date as `[YYYY-MM-DD]` so a consuming model can resolve "yesterday" or "next month".
+- **Relative ages follow when a memory was said.** Any age shown to a reader or model is computed from `recorded_at`, never from ingest time (`created_at`), and is omitted when unknown; the Ollama memory-context line now shows the `[YYYY-MM-DD]` date instead of a misleading "N days ago".
 - **Importers — `revien import-chatgpt` / `import-claude` / `import-readwise`.**
   Batch-import a ChatGPT export, a Claude.ai export, or a Readwise
   highlights CSV through the same ingestion pipeline every live adapter

@@ -7,7 +7,7 @@ recorded_at (from IngestionInput.timestamp), never created_at (ingest time).
 
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -146,6 +146,62 @@ class TestPromptRendering:
         assert ctx.endswith("[End Memory Context]")
         assert any(l.startswith("- [2023-05-07] [Score: ")
                    for l in ctx.splitlines())
+
+    def test_ollama_age_never_from_ingest_time(self, db_path):
+        # said a year ago, ingested just now: no "N days ago" from created_at
+        said = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=365)
+        adapter = OllamaAdapter(graph_path=db_path)
+        adapter.pipeline.ingest(
+            IngestionInput(source_id="s1", content=TEXT, timestamp=said))
+        ctx = adapter.get_context_for_prompt(QUERY)
+        lines = [l for l in ctx.splitlines() if l.startswith("- ")]
+        assert lines
+        assert all(l.startswith(f"- [{said.date().isoformat()}] [Score: ")
+                   for l in lines)
+        assert "ago" not in ctx
+
+    def test_ollama_undated_has_no_age(self, db_path):
+        adapter = OllamaAdapter(graph_path=db_path)
+        adapter.pipeline.ingest(
+            IngestionInput(source_id="s1", content=TEXT, timestamp=None))
+        ctx = adapter.get_context_for_prompt(QUERY)
+        lines = [l for l in ctx.splitlines() if l.startswith("- ")]
+        assert lines
+        assert all(l.startswith("- [Score: ") for l in lines)
+        assert "ago" not in ctx and "unknown time" not in ctx
+
+
+class TestNoAgeFromIngestTime:
+    """Every rendering surface: recorded_at a year ago, created_at now."""
+
+    def _old(self):
+        return datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=365)
+
+    def test_hermes_and_langchain_show_date_not_age(self):
+        said = self._old().isoformat()
+        hermes = RevienMemoryProvider._format_context(_resp(said))
+        assert said[:10] in hermes and "ago" not in hermes
+        undated = RevienMemoryProvider._format_context(_resp(None))
+        assert "ago" not in undated and "[20" not in undated
+
+    def test_cli_recall_and_tensions_no_relative_age(self, db_path):
+        from click.testing import CliRunner
+        from revien.cli import main
+        store = _seed(db_path, self._old())
+        store.close()
+        out = CliRunner().invoke(main, ["recall", QUERY, "--db", db_path])
+        assert "ago" not in out.output
+        out = CliRunner().invoke(main, ["tensions", "--db", db_path])
+        assert "ago" not in out.output
+
+    def test_daemon_and_mcp_carry_no_age(self, db_path):
+        _seed(db_path, self._old()).close()
+        with TestClient(create_app(db_path=db_path)) as client:
+            body = client.post("/v1/recall", json={"query": QUERY}).text
+        assert "ago" not in body.lower()
+        server = build_mcp_server(db_path=db_path)
+        out = _call(server, "revien_recall", {"query": QUERY})
+        assert "ago" not in str(out).lower()
 
 
 class TestFenceStillMatches:
