@@ -135,3 +135,56 @@ def test_layer_status_reads_live_object():
     assert st["semantic_active"] is False
     assert "boom" in st["semantic_inactive_reason"]
     assert st["embedder"] == "local:fastembed"
+
+
+class _StubSem:
+    is_enabled = True
+    def status(self): return {"embedder": "local:fastembed"}
+
+
+def test_layer_status_reports_rerank_depth_and_model_from_reranker(monkeypatch):
+    monkeypatch.setenv("REVIEN_RERANK", "0")  # opt-out => disabled reranker
+    from revien.semantic.rerank import CrossEncoderReranker
+    rr = CrossEncoderReranker(model_name="stub/model", top_k=77,
+                              scorer=lambda q, t: [0.0] * len(t))
+    status = R._layer_status(_StubSem(), rr)
+    assert status["rerank_active"] is True
+    assert status["rerank_top_k"] == 77 and status["rerank_model"] == "stub/model"
+    for none in (None, CrossEncoderReranker(top_k=5)):  # absent / disabled
+        status = R._layer_status(_StubSem(), none)
+        assert status["rerank_top_k"] is None and status["rerank_model"] is None
+
+
+def test_snapshot_written_at_one_depth_is_hit_at_another(work_dir, monkeypatch):
+    m = work_dir / "d.db.meta.json"
+    _write_meta(m, layer_status={**ACTIVE, "rerank_active": True,
+                                 "rerank_top_k": 20, "rerank_model": "a"})
+    monkeypatch.setenv("REVIEN_RERANK_TOP_K", "100")
+    assert R._cache_load_meta(m, _FAKE_SHA, semantic_requested=True) is not None
+
+
+def test_env_overrides_capture_out_of_config_only(env, monkeypatch):
+    monkeypatch.setenv("REVIEN_RERANK_TOP_K", "100")
+    monkeypatch.setenv("REVIEN_BENCH_ALIAS", "0")  # process-only knob
+    monkeypatch.setenv("NOT_REVIEN_X", "1")
+    cfg_key = next(iter(R._load_config("graph_only").get("env") or {}), None)
+    if cfg_key:  # config-set var: must be omitted even if also in process env
+        monkeypatch.setenv(cfg_key, "zz")
+    report = _run(env, config="graph_only")
+    eo = report["env_overrides"]
+    assert eo.get("REVIEN_RERANK_TOP_K") == "100"
+    assert "NOT_REVIEN_X" not in eo and cfg_key not in eo
+    assert eo.get("REVIEN_BENCH_ALIAS") == "0"
+    assert "rerank_top_k" in report["layer_status"]
+
+
+def test_report_renders_depth_and_env_overrides():
+    from revien_bench import report as RP
+    from revien_bench.tests.test_report import _base_report
+    md = RP.render(_base_report(
+        layer_status={"semantic_active": True, "rerank_active": True,
+                      "rerank_top_k": 100, "embedder": "e"},
+        env_overrides={"REVIEN_RERANK_TOP_K": "100"}))
+    assert "rerank_top_k=100" in md
+    assert "Env overrides" in md and "REVIEN_RERANK_TOP_K=100" in md
+    assert "Env overrides" not in RP.render(_base_report())

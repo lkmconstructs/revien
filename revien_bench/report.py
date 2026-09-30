@@ -28,10 +28,14 @@ def render(report: Dict) -> str:
                  f"(cluster={cfg.get('cluster')})")
     ls = report.get("layer_status") or {}
     lines.append(f"- **Layers:** semantic={ls.get('semantic_active')} "
-                 f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')}"
+                 f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')} "
+                 f"rerank_top_k={ls.get('rerank_top_k')}"
                  + (f" — DEGRADED: {ls['semantic_inactive_reason']}"
                     if ls.get("semantic_requested") and ls.get("semantic_active") is False
                     else ""))
+    if report.get("env_overrides"):
+        lines.append("- **Env overrides:** " + ", ".join(
+            f"`{k}={v}`" for k, v in report["env_overrides"].items()))
     lines.append(f"- **Timestamp:** {report.get('timestamp')}")
     lines.append(f"- **Dataset:** `{ds.get('path')}` "
                  f"({ds.get('conversations')} conversations) — SHA-256 `{ds.get('sha256')}`")

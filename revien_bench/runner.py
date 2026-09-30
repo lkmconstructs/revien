@@ -301,9 +301,13 @@ def _layer_status(semantic, reranker=None) -> Dict:
     except Exception:
         embedder = "unknown"
     rr = bool(getattr(reranker, "is_enabled", False)) if reranker is not None else False
+    # Resolved depth/model live on CrossEncoderReranker.top_k / .model_name
+    # (rerank.py __init__); None when there is no reranker or it is disabled.
     return {
         "semantic_active": active,
         "rerank_active": rr,
+        "rerank_top_k": getattr(reranker, "top_k", None) if rr else None,
+        "rerank_model": getattr(reranker, "model_name", None) if rr else None,
         "embedder": embedder,
         "semantic_inactive_reason": reason,
     }
@@ -473,6 +477,10 @@ def run_benchmark(
     cfg = _load_config(config_name)
     want_semantic = _semantic_requested(cfg)
     layer_statuses: List[Dict] = []
+    # Out-of-config knobs: REVIEN_* already in the process env that the config
+    # file does not set (snapshot BEFORE the config env is applied).
+    env_overrides = {k: v for k, v in sorted(os.environ.items())
+                     if k.startswith("REVIEN_") and k not in (cfg.get("env") or {})}
     prev_env = _apply_env(cfg.get("env", {}))
 
     try:
@@ -597,7 +605,14 @@ def run_benchmark(
 
                 conv_ingest_rate = 0.0
                 if cached_meta is not None:
-                    layer_statuses.append(cached_meta["layer_status"])
+                    # Rerank is retrieval-time: report THIS run's depth/model,
+                    # not whatever the snapshot was ingested under.
+                    layer_statuses.append({
+                        **cached_meta["layer_status"],
+                        **{k: v for k, v in
+                           _layer_status(semantic, CrossEncoderReranker()).items()
+                           if k.startswith("rerank_")},
+                    })
                     summary = {
                         "turns_ingested": cached_meta["turns_ingested"],
                         "nodes_created": cached_meta["nodes_created"],
@@ -788,6 +803,7 @@ def run_benchmark(
         report["sovereignty"] = S.checks_to_dict(checks)
         report["layer_status"] = _aggregate_layer_status(layer_statuses, want_semantic)
         report["layer_status"]["allow_degraded"] = bool(allow_degraded)
+        report["env_overrides"] = env_overrides
         report["config"] = {
             "name": config_name,
             "env": cfg.get("env", {}),
@@ -943,14 +959,16 @@ def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
     """Run-level layer status: active only if EVERY observed conversation was."""
     if not statuses:
         return {"semantic_requested": requested, "semantic_active": None,
-                "rerank_active": None, "embedder": None,
-                "semantic_inactive_reason": None}
+                "rerank_active": None, "rerank_top_k": None, "rerank_model": None,
+                "embedder": None, "semantic_inactive_reason": None}
     reasons = sorted({s["semantic_inactive_reason"] for s in statuses
                       if s.get("semantic_inactive_reason")})
     return {
         "semantic_requested": requested,
         "semantic_active": all(s.get("semantic_active") for s in statuses),
         "rerank_active": all(s.get("rerank_active") for s in statuses),
+        "rerank_top_k": statuses[-1].get("rerank_top_k"),
+        "rerank_model": statuses[-1].get("rerank_model"),
         "embedder": statuses[-1].get("embedder"),
         "semantic_inactive_reason": "; ".join(reasons) or None,
     }
@@ -1088,7 +1106,11 @@ def _print_summary(report: Dict) -> None:
     print(f"questions     : {report['n_questions']}")
     ls = report.get("layer_status") or {}
     print(f"layers        : semantic={ls.get('semantic_active')} "
-          f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')}")
+          f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')} "
+          f"rerank_top_k={ls.get('rerank_top_k')}")
+    if report.get("env_overrides"):
+        print("Env overrides : " + " ".join(
+            f"{k}={v}" for k, v in report["env_overrides"].items()))
     print(f"overall F1    : {report['overall_f1']}")
     print("per-category F1:")
     for cat, v in report["per_category_f1"].items():
