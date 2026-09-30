@@ -48,7 +48,7 @@ import revien
 from revien.graph.clustering import CommunityDetector
 from revien.graph.store import GraphStore
 from revien.retrieval.engine import RetrievalEngine
-from revien.semantic.index import SemanticIndex
+from revien.semantic.index import SemanticIndex, build_embedder
 from revien.semantic.rerank import CrossEncoderReranker
 
 from . import answerers as A
@@ -296,8 +296,13 @@ def _layer_status(semantic, reranker=None) -> Dict:
     reason = None if active else (
         semantic.inactive_reason() if hasattr(semantic, "inactive_reason")
         else "semantic layer absent")
+    embed_model = embed_dim = None
     try:
-        embedder = str(semantic.status().get("embedder", "unknown"))
+        sem_status = semantic.status()
+        embedder = str(sem_status.get("embedder", "unknown"))
+        if active:
+            embed_model = sem_status.get("embed_model")
+            embed_dim = sem_status.get("embed_dim")
     except Exception:
         embedder = "unknown"
     rr = bool(getattr(reranker, "is_enabled", False)) if reranker is not None else False
@@ -309,12 +314,27 @@ def _layer_status(semantic, reranker=None) -> Dict:
         "rerank_top_k": getattr(reranker, "top_k", None) if rr else None,
         "rerank_model": getattr(reranker, "model_name", None) if rr else None,
         "embedder": embedder,
+        "embed_model": embed_model,
+        "embed_dim": embed_dim,
         "semantic_inactive_reason": reason,
     }
 
 
+def _resolve_embed_model() -> Optional[str]:
+    """Model name the CURRENT run's semantic index will use, read off the same
+    provider factory SemanticIndex uses (revien/semantic/index.py build_embedder).
+    Provider construction is lazy -- no model load. Dim is NOT resolved here:
+    it is a pre-load default until the first embed, so only the name is trusted."""
+    try:
+        return getattr(build_embedder(), "model_name", None)
+    except Exception:
+        return None
+
+
 def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
-                     semantic_requested: bool = False) -> Optional[Dict]:
+                     semantic_requested: bool = False,
+                     embed_model: Optional[str] = None,
+                     embed_dim: Optional[int] = None) -> Optional[Dict]:
     """Meta for a cached DB, or None when absent/SHA-mismatched (never falsely
     reuse a cache built from a different dataset) or ingest-identity-mismatched
     (never falsely reuse an ingest built by different code or ingest env —
@@ -335,6 +355,19 @@ def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
                else "semantic layer was inactive during its ingest")
         print(f"[bench] db-cache: ignoring stale snapshot {meta_path.name} - {why}")
         return None
+    if semantic_requested:
+        # Snapshot vectors belong to the model that embedded them.
+        snap_model, snap_dim = ls.get("embed_model"), ls.get("embed_dim")
+        why = None
+        if snap_model is None:
+            why = "no embed_model recorded (legacy snapshot)"
+        elif embed_model is not None and snap_model != embed_model:
+            why = f"embedded with {snap_model}, this run uses {embed_model}"
+        elif embed_dim is not None and snap_dim is not None and snap_dim != embed_dim:
+            why = f"embedded at dim {snap_dim}, this run uses dim {embed_dim}"
+        if why:
+            print(f"[bench] db-cache: ignoring stale snapshot {meta_path.name} - {why}")
+            return None
     return meta
 
 
@@ -587,7 +620,9 @@ def run_benchmark(
             cache_db = cache_meta_path = None
             if db_cache is not None:
                 cache_db, cache_meta_path = _cache_paths(db_cache, config_name, conv.conv_id)
-                cached_meta = _cache_load_meta(cache_meta_path, dataset_sha, want_semantic)
+                cached_meta = _cache_load_meta(
+                    cache_meta_path, dataset_sha, want_semantic,
+                    embed_model=_resolve_embed_model() if want_semantic else None)
                 if cached_meta is not None and cache_db.exists():
                     shutil.copyfile(cache_db, db_path)
                 else:
@@ -955,12 +990,19 @@ def _degraded_exit(conv_id: str, status: Dict, when: str) -> None:
     raise SystemExit(3)
 
 
+def _embedder_label(ls: Dict) -> str:
+    """`<provider>:<model>` for the Layers line (provider alone when unknown)."""
+    emb, model = ls.get("embedder"), ls.get("embed_model")
+    return f"{emb}:{model}" if model else f"{emb}"
+
+
 def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
     """Run-level layer status: active only if EVERY observed conversation was."""
     if not statuses:
         return {"semantic_requested": requested, "semantic_active": None,
                 "rerank_active": None, "rerank_top_k": None, "rerank_model": None,
-                "embedder": None, "semantic_inactive_reason": None}
+                "embedder": None, "embed_model": None, "embed_dim": None,
+                "semantic_inactive_reason": None}
     reasons = sorted({s["semantic_inactive_reason"] for s in statuses
                       if s.get("semantic_inactive_reason")})
     return {
@@ -970,6 +1012,8 @@ def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
         "rerank_top_k": statuses[-1].get("rerank_top_k"),
         "rerank_model": statuses[-1].get("rerank_model"),
         "embedder": statuses[-1].get("embedder"),
+        "embed_model": statuses[-1].get("embed_model"),
+        "embed_dim": statuses[-1].get("embed_dim"),
         "semantic_inactive_reason": "; ".join(reasons) or None,
     }
 
@@ -1106,7 +1150,7 @@ def _print_summary(report: Dict) -> None:
     print(f"questions     : {report['n_questions']}")
     ls = report.get("layer_status") or {}
     print(f"layers        : semantic={ls.get('semantic_active')} "
-          f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')} "
+          f"rerank={ls.get('rerank_active')} embedder={_embedder_label(ls)} "
           f"rerank_top_k={ls.get('rerank_top_k')}")
     if report.get("env_overrides"):
         print("Env overrides : " + " ".join(

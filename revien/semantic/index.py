@@ -389,6 +389,12 @@ class SemanticIndex:
             "broken_reason": self._broken_reason,
             "required": _semantic_required(),
             "dim": self._dim,
+            # Live provider state (None until built / when inactive). dim is
+            # the provider's, refined after the first real embed.
+            "embed_model": (getattr(self._embedder, "model_name", None)
+                            if self.is_enabled else None),
+            "embed_dim": (getattr(self._embedder, "dim", None)
+                          if self.is_enabled and self._embedder is not None else None),
         }
 
     def inactive_reason(self) -> Optional[str]:

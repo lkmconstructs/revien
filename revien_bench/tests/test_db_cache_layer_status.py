@@ -17,7 +17,8 @@ from revien_bench import runner as R
 from revien_bench.tests.test_checkpoint_resume import _SpyAnswerer, _two_convs, _FAKE_SHA
 
 ACTIVE = {"semantic_active": True, "rerank_active": False,
-          "embedder": "local:fastembed", "semantic_inactive_reason": None}
+          "embedder": "local:fastembed", "embed_model": "model-a",
+          "embed_dim": 384, "semantic_inactive_reason": None}
 INACTIVE = {"semantic_active": False, "rerank_active": False,
             "embedder": "unbuilt",
             "semantic_inactive_reason": "disabled after runtime error: NoSuchFile"}
@@ -188,3 +189,84 @@ def test_report_renders_depth_and_env_overrides():
     assert "rerank_top_k=100" in md
     assert "Env overrides" in md and "REVIEN_RERANK_TOP_K=100" in md
     assert "Env overrides" not in RP.render(_base_report())
+
+
+# ── embedding-model key ─────────────────────────────────────────────
+
+
+def test_snapshot_miss_under_other_model_hit_under_same(work_dir, capsys):
+    m = work_dir / "m.db.meta.json"
+    _write_meta(m, layer_status=ACTIVE)  # recorded with model-a
+    assert R._cache_load_meta(m, _FAKE_SHA, True, embed_model="model-b") is None
+    out = capsys.readouterr().out
+    assert "m.db.meta.json" in out and "model-a" in out and "model-b" in out
+    assert m.exists()  # never deleted
+    assert R._cache_load_meta(m, _FAKE_SHA, True, embed_model="model-a") is not None
+
+
+def test_dim_compared_only_when_both_known(work_dir):
+    m = work_dir / "d.db.meta.json"
+    _write_meta(m, layer_status=ACTIVE)
+    assert R._cache_load_meta(m, _FAKE_SHA, True, "model-a", 768) is None
+    assert R._cache_load_meta(m, _FAKE_SHA, True, "model-a", 384) is not None
+    assert R._cache_load_meta(m, _FAKE_SHA, True, "model-a", None) is not None
+
+
+def test_legacy_meta_without_embed_model_is_miss_under_semantic(work_dir, capsys):
+    m = work_dir / "l.db.meta.json"
+    legacy = {k: v for k, v in ACTIVE.items() if not k.startswith("embed_")}
+    _write_meta(m, layer_status=legacy)
+    assert R._cache_load_meta(m, _FAKE_SHA, True, embed_model="model-a") is None
+    assert "no embed_model" in capsys.readouterr().out
+
+
+def test_graph_only_ignores_embed_model(work_dir):
+    m = work_dir / "g.db.meta.json"
+    _write_meta(m, layer_status=INACTIVE)
+    assert R._cache_load_meta(m, _FAKE_SHA, False, embed_model="model-b") is not None
+
+
+def test_layer_status_reads_live_index_state():
+    class _Idx:
+        is_enabled = True
+
+        def status(self):
+            return {"embedder": "local:fastembed", "embed_model": "model-x",
+                    "embed_dim": 512}
+
+    live = R._layer_status(_Idx())
+    assert (live["embed_model"], live["embed_dim"]) == ("model-x", 512)
+
+    class _Off(_Idx):
+        is_enabled = False
+
+        def inactive_reason(self):
+            return "off"
+
+    off = R._layer_status(_Off())
+    assert off["embed_model"] is None and off["embed_dim"] is None
+
+
+def test_run_end_to_end_model_switch_reingests(env, monkeypatch, capsys):
+    class _Prov:
+        def __init__(self, name):
+            self.model_name = name
+
+    monkeypatch.setattr(R, "_layer_status", lambda *a, **k: dict(ACTIVE))
+    monkeypatch.setattr(R, "build_embedder", lambda: _Prov("model-a"))
+    _run(env)
+    capsys.readouterr()
+    monkeypatch.setattr(R, "build_embedder", lambda: _Prov("model-b"))
+    R.run_benchmark(
+        config_name="semantic", answerer_name="extractive",
+        dataset_path=env / "ds.json", out_dir=env / "results2",
+        fresh=True, db_cache=env / "cache")
+    assert "model-a, this run uses model-b" in capsys.readouterr().out
+
+
+def test_report_renders_embed_model():
+    from revien_bench import report as RP
+    rep = {"layer_status": {"semantic_active": True, "rerank_active": False,
+                            "embedder": "local:fastembed", "embed_model": "model-a"}}
+    assert "embedder=local:fastembed:model-a" in RP.render(rep)
+    assert R._embedder_label(rep["layer_status"]) == "local:fastembed:model-a"
