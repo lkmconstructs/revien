@@ -32,6 +32,7 @@ call):
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 import hashlib
 import json
 import os
@@ -54,6 +55,7 @@ from revien.semantic.rerank import CrossEncoderReranker
 from . import answerers as A
 from . import failure_analysis as FA
 from . import judges as J
+from . import decompose as D
 from . import metrics as M
 from . import sovereignty as S
 from .fetch_locomo import DATA_PATH, read_locked_hash
@@ -203,19 +205,26 @@ def _ingest_fingerprint() -> str:
             + _code_fingerprint("ingestion", "graph", "semantic", "adapters"))
 
 
-def _run_fingerprint() -> str:
+def _run_fingerprint(decompose: str = "none") -> str:
     """Full run identity for checkpoints: ALL REVIEN_* env (ranking knobs
-    included — that's trap #1) + retrieval-affecting code."""
+    included — that's trap #1) + retrieval-affecting code. A decompose spec
+    other than 'none' is part of the identity (sub-query recalls change every
+    row); 'none' adds nothing, so pre-existing checkpoints keep resuming."""
+    dec = (decompose or "none").strip()
+    dec_fp = ("" if dec.lower() == "none"
+              else hashlib.sha256(dec.encode("utf-8")).hexdigest()[:4])
     return (_env_fingerprint()
             + _code_fingerprint("retrieval", "semantic", "graph",
                                 "ingestion", "neural")
             # How the LLM readers see context is part of run identity: an
             # old undated checkpoint must never resume into a dated run.
-            + hashlib.sha256(READER_CONTEXT.encode("utf-8")).hexdigest()[:4])
+            + hashlib.sha256(READER_CONTEXT.encode("utf-8")).hexdigest()[:4]
+            + dec_fp)
 
 
 def _checkpoint_path(
-    out_dir: Path, config_name: str, answerer_name: str, judge_name: str = "f1"
+    out_dir: Path, config_name: str, answerer_name: str, judge_name: str = "f1",
+    decompose_name: str = "none",
 ) -> Path:
     """Checkpoint path for this exact (config, answerer, judge, env, code)
     identity. A knob or code change yields a different filename — the old
@@ -225,7 +234,7 @@ def _checkpoint_path(
     rows that were never judged, corrupting the judge accuracy denominator."""
     return out_dir / (
         f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}"
-        f"_{_sanitize(judge_name)}_{_run_fingerprint()}.jsonl"
+        f"_{_sanitize(judge_name)}_{_run_fingerprint(decompose_name)}.jsonl"
     )
 
 
@@ -403,6 +412,44 @@ def _retrieved_dia_ids(store: GraphStore, results) -> List[str]:
     return ordered
 
 
+def _fuse_responses(resps: List, top_n: int):
+    """UNION sub-query recalls by node_id, keeping each node's best score,
+    sorted by score descending (stable: the original query's recall is first,
+    so ties favour it), truncated to top_n. Returns (results, diagnostics).
+
+    Diagnostics are merged for the miss taxonomy: per-node scores take the
+    max across recalls, filter reasons come from the first recall that saw the
+    node, anchor ids are unioned. Only the keys failure_analysis reads are
+    kept. Caveat: scores from different queries are pooled, so the taxonomy's
+    best_rank under decomposition is a pooled-score rank."""
+    best: Dict[str, object] = {}
+    for resp in resps:
+        for r in resp.results:
+            cur = best.get(r.node_id)
+            if cur is None or r.score > cur.score:
+                best[r.node_id] = r
+    results = sorted(best.values(), key=lambda r: r.score, reverse=True)[:top_n]
+
+    diags = [r.diagnostics for r in resps if r.diagnostics]
+    merged: Optional[Dict] = None
+    if diags:
+        scores: Dict[str, float] = {}
+        filtered: Dict[str, str] = {}
+        anchors: Dict[str, List[str]] = {}
+        for d in diags:
+            for nid, sc in (d.get("scores") or {}).items():
+                if nid not in scores or sc > scores[nid]:
+                    scores[nid] = sc
+            for nid, why in (d.get("filtered") or {}).items():
+                filtered.setdefault(nid, why)
+            for kind, ids in (d.get("anchors") or {}).items():
+                seen = anchors.setdefault(kind, [])
+                seen.extend(i for i in ids if i not in seen)
+        merged = {"scores": scores, "filtered": filtered, "anchors": anchors,
+                  "decompose_merged": True}
+    return results, merged
+
+
 def _score_qa(
     store: GraphStore,
     engine: RetrievalEngine,
@@ -411,9 +458,24 @@ def _score_qa(
     answerer: A.Answerer,
     dia_map: Optional[Dict[str, List[str]]] = None,
     judge=None,
+    decomposer=None,
 ) -> Dict:
     """Run one QA through recall -> extractive answer -> score."""
     now_dt = parse_session_date(conv.last_session_date) or datetime.now(timezone.utc)
+
+    # Benchmark-only decompose row: split the question first (an LLM call for a
+    # cloud spec, NOT counted in recall latency), then recall every part.
+    queries = [qa.question]
+    decompose_error: Optional[str] = None
+    decompose_ms = 0.0
+    if decomposer is not None:
+        try:
+            dec = decomposer.decompose(qa.question)
+            queries = list(dec.queries) or [qa.question]
+            decompose_error = dec.error
+            decompose_ms = dec.latency_ms
+        except Exception as e:  # noqa: BLE001 - fall back to the original query
+            decompose_error = f"{type(e).__name__}: {e}"
 
     t0 = time.perf_counter()
     # Surface verbatim turns (CONTEXT nodes): for conversational QA the answer
@@ -421,10 +483,16 @@ def _score_qa(
     # debug=True: per-node scores/filters/anchors feed the miss classification
     # below. Overhead is a few dict copies — negligible vs the ~350ms p50, and
     # it's applied to EVERY config equally so latency comparisons stay fair.
-    resp = engine.recall(
-        qa.question, top_n=RECALL_TOP_N, now=now_dt, include_context=True, debug=True
-    )
-    recall_ms = (time.perf_counter() - t0) * 1000.0
+    resps = [
+        engine.recall(q, top_n=RECALL_TOP_N, now=now_dt, include_context=True, debug=True)
+        for q in queries
+    ]
+    recall_ms = (time.perf_counter() - t0) * 1000.0  # wall time across ALL sub-recalls
+    if len(resps) == 1:
+        resp = resps[0]
+    else:
+        f_results, f_diag = _fuse_responses(resps, RECALL_TOP_N)
+        resp = SimpleNamespace(results=f_results, diagnostics=f_diag)
 
     ctx = A.RetrievedContext(
         query=qa.question,
@@ -488,6 +556,13 @@ def _score_qa(
             judge_correct = False
             judge_error = f"{type(e).__name__}: {e}"
 
+    dec_fields: Dict = {}
+    if decomposer is not None:
+        dec_fields = {
+            "n_subqueries": len(queries),
+            "decompose_error": decompose_error,
+            "decompose_latency_ms": round(decompose_ms, 3),
+        }
     return {
         "conv": conv.conv_id,
         "category": qa.category,
@@ -509,6 +584,7 @@ def _score_qa(
         "answer_latency_ms": round(answer_ms, 3),
         "judge_correct": judge_correct,
         "judge_error": judge_error,
+        **dec_fields,
         "_supporting_ids": supporting_ids,
     }
 
@@ -524,6 +600,7 @@ def run_benchmark(
     db_cache: Optional[Path] = None,
     judge_name: str = "f1",
     allow_degraded: bool = False,
+    decompose_name: str = "none",
 ) -> Dict:
     cfg = _load_config(config_name)
     want_semantic = _semantic_requested(cfg)
@@ -537,6 +614,7 @@ def run_benchmark(
     try:
         answerer = A.build_answerer(answerer_name)
         judge_obj = J.build_judge(judge_name)
+        decomposer = D.build_decomposer(decompose_name)
         conversations = load_locomo(dataset_path)
         if limit_convs is not None:
             conversations = conversations[:limit_convs]
@@ -549,7 +627,8 @@ def run_benchmark(
 
         # ── Checkpoint / resume setup ─────────────────────────────────────────
         dataset_sha = read_locked_hash()
-        ckpt_path = _checkpoint_path(out_dir, config_name, answerer_name, judge_name)
+        ckpt_path = _checkpoint_path(
+            out_dir, config_name, answerer_name, judge_name, decompose_name)
         if fresh:
             # --fresh: ignore + delete any prior checkpoint and start over.
             try:
@@ -582,6 +661,8 @@ def run_benchmark(
         # or every resumed record predates the judge fields).
         resumed_judge_calls = 0
         resumed_judge_cost = 0.0
+        resumed_dec_calls = 0
+        resumed_dec_cost = 0.0
 
         # ── Replay resumed conversations into the accumulators FIRST ──────────
         # The final aggregate (F1, per-category, recall@k, latency, cost) must
@@ -606,6 +687,8 @@ def run_benchmark(
             resumed_cost_usd += float(rec.get("conv_cost_usd", 0.0) or 0.0)
             resumed_judge_calls += int(rec.get("conv_judge_network_calls", 0) or 0)
             resumed_judge_cost += float(rec.get("conv_judge_cost_usd", 0.0) or 0.0)
+            resumed_dec_calls += int(rec.get("conv_decompose_network_calls", 0) or 0)
+            resumed_dec_cost += float(rec.get("conv_decompose_cost_usd", 0.0) or 0.0)
 
         # We keep ONE store alive at provenance-check time, so we sample the
         # first FRESHLY-RUN conversation's store for the provenance/audit
@@ -627,6 +710,8 @@ def run_benchmark(
             cost_before = float(getattr(answerer, "cost_usd_estimate", 0.0))
             judge_calls_before = int(getattr(judge_obj, "network_calls", 0)) if judge_obj else 0
             judge_cost_before = float(getattr(judge_obj, "cost_usd_estimate", 0.0)) if judge_obj else 0.0
+            dec_calls_before = int(getattr(decomposer, "network_calls", 0))
+            dec_cost_before = float(getattr(decomposer, "cost_usd_estimate", 0.0))
             is_first_fresh = provenance_store is None
 
             fd, db_path = tempfile.mkstemp(suffix=f"_{config_name}_{conv.conv_id}.db")
@@ -742,6 +827,7 @@ def run_benchmark(
                     row = _score_qa(
                         store, engine, qa, conv, answerer,
                         dia_map=dia_map, judge=judge_obj,
+                        decomposer=decomposer,
                     )
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
@@ -761,6 +847,9 @@ def run_benchmark(
                     if judge_obj else 0.0
                 )
 
+                conv_dec_calls = int(getattr(decomposer, "network_calls", 0)) - dec_calls_before
+                conv_dec_cost = float(getattr(decomposer, "cost_usd_estimate", 0.0)) - dec_cost_before
+
                 # ── Persist this conversation's checkpoint line (flush+fsync) ──
                 # Written AFTER the conversation fully completes, so an
                 # interruption loses at most the in-progress conversation.
@@ -776,6 +865,8 @@ def run_benchmark(
                         "conv_cost_usd": round(conv_cost, 6),
                         "conv_judge_network_calls": conv_judge_calls,
                         "conv_judge_cost_usd": round(conv_judge_cost, 6),
+                        "conv_decompose_network_calls": conv_dec_calls,
+                        "conv_decompose_cost_usd": round(conv_dec_cost, 6),
                         "alias": alias_stats,
                     },
                 )
@@ -835,14 +926,18 @@ def run_benchmark(
             + resumed_judge_cost
         )
 
+        dec_calls_total = int(getattr(decomposer, "network_calls", 0)) + resumed_dec_calls
+        dec_cost_total = float(getattr(decomposer, "cost_usd_estimate", 0.0)) + resumed_dec_cost
+
         # Honest egress check: config-derived, names any cloud backend. The
         # measured-call secondary signal covers BOTH the reader and the judge —
         # a cloud judge with reader calls at 0 must still trip the counter.
         checks.append(
             S.network_egress_zero(
-                cloud_calls=cloud_calls + judge_calls_total,
+                cloud_calls=cloud_calls + judge_calls_total + dec_calls_total,
                 answerer=answerer_name,
                 judge=judge_name,
+                decompose=decompose_name,
             )
         )
         checks.extend(S.run_consent_subtests())
@@ -864,6 +959,7 @@ def run_benchmark(
             "cluster": bool(cfg.get("cluster")),
             "answerer": answerer.name,
             "judge": judge_obj.name if judge_obj is not None else "f1",
+            "decompose": decomposer.name if decomposer is not None else "none",
             "recall_top_n": RECALL_TOP_N,
             "recall_ks": list(RECALL_KS),
         }
@@ -882,6 +978,24 @@ def run_benchmark(
             report["judge"] = _aggregate_judge(
                 per_q, judge_name, judge_obj.name, judge_calls_total, judge_cost_total
             )
+        if decomposer is not None:
+            dec_rows = [r for r in per_q if r.get("n_subqueries") is not None]
+            report["decompose"] = {
+                "spec": decompose_name,
+                "model": decomposer.name,
+                "prompt_sha256": D.DECOMPOSE_PROMPT_SHA256,
+                "network_calls": dec_calls_total,
+                "cost_usd": round(dec_cost_total, 6),
+                "cost_usd_is_estimate": True,
+                "decompose_errors": sum(1 for r in dec_rows if r.get("decompose_error")),
+                # Sub-queries include the original question, so this is >= 1.
+                "mean_subqueries": (
+                    round(sum(r["n_subqueries"] for r in dec_rows) / len(dec_rows), 3)
+                    if dec_rows else None
+                ),
+                "n_questions": len(dec_rows),
+                "taxonomy_basis": "merged_subrecall_diagnostics",
+            }
         report["reader_context"] = READER_CONTEXT
         report["dataset"] = {
             "path": str(dataset_path),
@@ -895,9 +1009,9 @@ def run_benchmark(
         # both the reader AND the judge — a report that only counted the reader
         # while a cloud judge silently made calls understated both. The per-block
         # breakdown (report["judge"]) still carries the judge-only figures.
-        report["cost_usd"] = round(cost_usd_estimate + judge_cost_total, 6)
+        report["cost_usd"] = round(cost_usd_estimate + judge_cost_total + dec_cost_total, 6)
         report["cost_usd_is_estimate"] = True
-        report["network_calls"] = cloud_calls + judge_calls_total
+        report["network_calls"] = cloud_calls + judge_calls_total + dec_calls_total
         report["environment"] = {
             "revien_version": revien.__version__,
             "python": platform.python_version(),
@@ -1122,6 +1236,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(local, egress PASS) | openai:<model> | "
                          "openrouter:<model> | together:<model> | claude:<model> "
                          "(cloud, egress FAIL by design, labeled)")
+    ap.add_argument("--decompose", default="none",
+                    help="BENCHMARK-ONLY query decomposition row: none (default) | "
+                         "ollama:<model> (local, egress PASS if loopback) | "
+                         "openai|openrouter|together|claude:<model> (cloud, egress "
+                         "FAIL by design, labeled). Splits each question into "
+                         "sub-questions, recalls each, unions before the reader.")
     ap.add_argument("--out", default=str(_REPO_ROOT / "results"))
     ap.add_argument("--dataset", default=str(DATA_PATH))
     ap.add_argument("--limit", type=int, default=None,
@@ -1161,6 +1281,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         db_cache=Path(args.db_cache) if args.db_cache else None,
         judge_name=args.judge,
         allow_degraded=args.allow_degraded,
+        decompose_name=args.decompose,
     )
     _print_summary(report)
     return 0
@@ -1209,6 +1330,11 @@ def _print_summary(report: Dict) -> None:
         print(f"resume        : ran={res['conversations_ran']} "
               f"resumed={res['conversations_resumed']} "
               f"(checkpoint: {res['checkpoint_path']})")
+    dec = report.get("decompose")
+    if dec:
+        print(f"decompose     : {dec['model']} calls={dec['network_calls']} "
+              f"cost=${dec['cost_usd']} mean_subqueries={dec['mean_subqueries']} "
+              f"errors={dec['decompose_errors']}")
     judge = report.get("judge")
     if judge:
         print(f"judge (LLM)   : {judge['spec']} accuracy={judge['accuracy_overall']} "

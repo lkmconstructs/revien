@@ -127,6 +127,7 @@ def network_egress_zero(
     cloud_calls: int = 0,
     answerer: Optional[str] = None,
     judge: Optional[str] = None,
+    decompose: Optional[str] = None,
 ) -> Check:
     """PASS only if EVERY active backend is local; FAIL naming any cloud backend.
 
@@ -177,6 +178,13 @@ def network_egress_zero(
     if judge_name == "ollama" and not ollama_loopback:
         judge_local = False
 
+    # Benchmark-only query decomposer (revien_bench.decompose): 'none' or
+    # unset = no decomposer; ollama only if loopback; anything else is cloud.
+    decompose_name = parse_provider((decompose or "none").strip())[0].lower()
+    decompose_local = decompose_name in ("none", "", "local") or (
+        decompose_name == "ollama" and ollama_loopback
+    )
+
     # Name every component that leaves the machine (config-derived).
     cloud_backends: List[str] = []
     if not extractor_local:
@@ -195,6 +203,12 @@ def network_egress_zero(
             else judge_name
         )
         cloud_backends.append(f"judge={reason}")
+    if not decompose_local:
+        reason = (
+            "ollama host is not loopback" if decompose_name == "ollama"
+            else decompose_name
+        )
+        cloud_backends.append(f"decompose={reason}")
 
     all_local = not cloud_backends
     # PASS requires every backend local AND no observed cloud call. A cloud
@@ -213,6 +227,8 @@ def network_egress_zero(
             "answerer_local": answerer_local,
             "judge": judge_name,
             "judge_local": judge_local,
+            "decompose": decompose_name,
+            "decompose_local": decompose_local,
             "all_backends_local": all_local,
             "cloud_backends": cloud_backends,
             "cloud_calls": cloud_calls,

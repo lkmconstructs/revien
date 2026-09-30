@@ -44,6 +44,12 @@ def render(report: Dict) -> str:
     lines.append(f"- **Questions scored:** {report.get('n_questions')}")
     lines.append(f"- **Cost:** ${report.get('cost_usd')} · **Network calls:** "
                  f"{report.get('network_calls')}")
+    dec = report.get("decompose")
+    if dec:
+        lines.append(f"- **Decompose (benchmark-only row):** `{dec.get('model')}` · "
+                     f"calls {dec.get('network_calls')} · cost ${dec.get('cost_usd')} (est.) · "
+                     f"mean sub-queries {dec.get('mean_subqueries')} (incl. original) · "
+                     f"errors {dec.get('decompose_errors')}")
     lines.append("")
 
     # ── Headline F1 ───────────────────────────────────────────────────────────
