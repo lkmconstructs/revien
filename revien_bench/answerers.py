@@ -40,6 +40,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple
 
 # Canonical refusal string. Contains BOTH official adversarial markers so the
@@ -75,6 +76,10 @@ class RetrievedContext:
     query: str
     contents: List[str] = field(default_factory=list)  # ranked node contents
     labels: List[str] = field(default_factory=list)      # parallel node labels
+    # Parallel to contents: when each memory was said (ISO-8601, from
+    # RetrievalResult.recorded_at) or None. Only the LLM readers' prompt
+    # rendering reads it; the extractive path uses plain contents.
+    dates: List[Optional[str]] = field(default_factory=list)
 
     def sentences(self) -> List[str]:
         """Flatten retrieved contents into candidate sentences, rank-preserving."""
@@ -324,6 +329,18 @@ def load_answer_prompt() -> str:
     return raw.decode("utf-8")
 
 
+def _reader_date(iso: Optional[str]) -> Optional[str]:
+    """ISO-8601 -> LoCoMo gold style '7 May 2023' (no leading zero); None if
+    absent or unparseable."""
+    if not iso:
+        return None
+    try:
+        d = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    return f"{d.day} {d:%B} {d.year}"
+
+
 def _format_context(ctx: RetrievedContext) -> str:
     """Render the retrieved nodes into a compact, ranked context block.
 
@@ -337,6 +354,9 @@ def _format_context(ctx: RetrievedContext) -> str:
         if not text:
             continue
         label = ctx.labels[i] if i < len(ctx.labels) else ""
+        said = _reader_date(ctx.dates[i]) if i < len(ctx.dates) else None
+        if said:
+            text = f"[{said}] {text}"
         prefix = f"[{i + 1}] " + (f"({label}) " if label else "")
         entry = prefix + text
         if total + len(entry) > MAX_CONTEXT_CHARS:

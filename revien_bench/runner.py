@@ -154,6 +154,12 @@ def _sanitize(text: str) -> str:
 # META (mismatch = rebuild, same as a dataset-SHA change). Stale files are
 # left behind rather than deleted — they are small, and history is history.
 
+# How LLM readers render retrieved memories: "dated" = each memory prefixed
+# with the day it was said. Recorded in the results JSON and folded into the
+# checkpoint fingerprint.
+READER_CONTEXT = "dated"
+
+
 def _env_fingerprint(prefix_allowlist: Optional[tuple] = None) -> str:
     """Fingerprint of the REVIEN_* environment (or an allowlisted subset)."""
     items = sorted(
@@ -202,7 +208,10 @@ def _run_fingerprint() -> str:
     included — that's trap #1) + retrieval-affecting code."""
     return (_env_fingerprint()
             + _code_fingerprint("retrieval", "semantic", "graph",
-                                "ingestion", "neural"))
+                                "ingestion", "neural")
+            # How the LLM readers see context is part of run identity: an
+            # old undated checkpoint must never resume into a dated run.
+            + hashlib.sha256(READER_CONTEXT.encode("utf-8")).hexdigest()[:4])
 
 
 def _checkpoint_path(
@@ -413,6 +422,7 @@ def _score_qa(
         query=qa.question,
         contents=[r.content for r in resp.results],
         labels=[r.label for r in resp.results],
+        dates=[r.recorded_at for r in resp.results],
     )
     t1 = time.perf_counter()
     # A single hung/failing answerer call (socket timeout, HTTP error, malformed
@@ -863,6 +873,7 @@ def run_benchmark(
             report["judge"] = _aggregate_judge(
                 per_q, judge_name, judge_obj.name, judge_calls_total, judge_cost_total
             )
+        report["reader_context"] = READER_CONTEXT
         report["dataset"] = {
             "path": str(dataset_path),
             "sha256": read_locked_hash(),
