@@ -33,6 +33,7 @@ def base_result(**overrides):
         "origin_runtime": "claude-code",
         "origin_source": "live",
         "project_key": "Fernweh-Core",
+        "recorded_at": "2023-05-07T00:00:00+00:00",
     }
     r.update(overrides)
     return r

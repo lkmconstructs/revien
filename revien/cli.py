@@ -520,6 +520,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "origin_runtime": r.origin_runtime,
                         "origin_source": r.origin_source,
                         "project_key": r.project_key,
+                        "recorded_at": r.recorded_at,
                     }
                     for r in response.results
                 ],
@@ -544,6 +545,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "origin_runtime": r.origin_runtime,
                         "origin_source": r.origin_source,
                         "project_key": r.project_key,
+                        "recorded_at": r.recorded_at,
                     }
                     for r in response.results
                 ],
@@ -564,9 +566,10 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
 
             for i, r in enumerate(response.results, 1):
                 runtime = r.origin_runtime or "unknown"
+                said = r.recorded_at[:10] if r.recorded_at else "-"
                 click.echo(f"  [{i}] {r.label}")
                 click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f} "
-                           f"| Runtime: {runtime}")
+                           f"| Runtime: {runtime} | Date: {said}")
                 click.echo(f"      {r.content[:120]}{'...' if len(r.content) > 120 else ''}")
                 click.echo()
 

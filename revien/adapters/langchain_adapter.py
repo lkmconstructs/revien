@@ -364,7 +364,8 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
             if result.path:
                 lines.append(f"Path: {' → '.join(result.path)}")
 
-            lines.append(f"\n{result.content}\n")
+            said = f"[{result.recorded_at[:10]}] " if result.recorded_at else ""
+            lines.append(f"\n{said}{result.content}\n")
 
         lines.append(f"[Retrieved in {response.retrieval_time_ms:.2f}ms]")
         return "\n".join(lines)

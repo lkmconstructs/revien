@@ -541,6 +541,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "origin_runtime": r.origin_runtime,
                     "origin_source": r.origin_source,
                     "project_key": r.project_key,
+                    # When it was said (ISO-8601 UTC) or None; always present.
+                    "recorded_at": r.recorded_at,
                     # Only present when asked for — the flag-off response
                     # shape is byte-identical to pre-B1.
                     **({"tensions": r.tensions} if request.include_tensions else {}),

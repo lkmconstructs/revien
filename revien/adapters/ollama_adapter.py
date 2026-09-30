@@ -244,7 +244,8 @@ class OllamaAdapter:
             if len(result.content) > 100:
                 content_preview += "..."
 
-            line = f"- [Score: {score_pct}%] ({time_delta}) {label}: {content_preview}"
+            said = f"[{result.recorded_at[:10]}] " if result.recorded_at else ""
+            line = f"- {said}[Score: {score_pct}%] ({time_delta}) {label}: {content_preview}"
             lines.append(line)
 
         lines.append("\n[End Memory Context]")

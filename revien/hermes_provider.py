@@ -640,7 +640,9 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
             return ""
         lines = ["## Relevant memory (Revien)"]
         for r in response.results:
-            lines.append(f"- {r.content}")
+            said = getattr(r, "recorded_at", None)
+            prefix = f"[{said[:10]}] " if said else ""
+            lines.append(f"- {prefix}{r.content}")
         return "\n".join(lines)
 
 

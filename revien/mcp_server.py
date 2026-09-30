@@ -202,6 +202,7 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                     "origin_runtime": r.origin_runtime,
                     "origin_source": r.origin_source,
                     "project_key": r.project_key,
+                    "recorded_at": r.recorded_at,
                 }
                 for r in response.results
             ],
