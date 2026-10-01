@@ -94,7 +94,7 @@ def ingest_corpus(store: GraphStore, semantic: SemanticIndex) -> Dict:
             content=item["content"],
             content_type="note",
             timestamp=ts,
-            timestamp_source="content",
+            timestamp_source=item.get("timestamp_source") or "mtime",
             metadata=item.get("metadata", {}),
             links=item.get("links", []),
             curated=True,

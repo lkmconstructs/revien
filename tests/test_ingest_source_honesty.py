@@ -78,8 +78,8 @@ def test_cli_ingest_is_capture(tmp_path):
             "where node_type='context'")}
     finally:
         conn.close()
-    # CLI ingest passes no timestamp: nothing to label, nothing mislabeled.
-    assert got <= {None, "capture"}
+    # Manual CLI capture stamps now() as the capture time.
+    assert got == {"capture"}
 
 
 def test_daemon_ingest_source_field(tmp_path):
@@ -318,3 +318,17 @@ def test_old_narrow_session_index_is_upgraded(tmp_path):
     assert "created_at" in sql
     store.close()
     GraphStore(db_path=db).close()  # idempotent reopen
+
+
+def test_daemon_ingest_rejects_unknown_source_with_400(tmp_path):
+    """An unknown timestamp_source must be refused at the API boundary (400),
+    not surface as a 500 from the dataclass check."""
+    from fastapi.testclient import TestClient
+    from revien.daemon.server import create_app
+    app = create_app(db_path=str(tmp_path / "d.db"))
+    with TestClient(app) as client:
+        res = client.post("/v1/ingest", json={
+            "source_id": "api:test", "content": "Theo picked Fernweh-Core.",
+            "timestamp_source": "bogus"})
+    assert res.status_code == 400, res.text
+    assert "timestamp_source" in res.text

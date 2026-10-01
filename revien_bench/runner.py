@@ -207,7 +207,10 @@ def _ingest_files_fingerprint() -> str:
     import revien
     h = hashlib.sha256()
     for path in (Path(revien.__file__).resolve().parent / "dates.py",
-                 Path(__file__).resolve().parent / "ingest_locomo.py"):
+                 Path(revien.__file__).resolve().parent / "claims.py",
+                 Path(revien.__file__).resolve().parent / "supersession.py",
+                 Path(__file__).resolve().parent / "ingest_locomo.py",
+                 Path(__file__).resolve().parent / "loader.py"):
         h.update(path.name.encode("utf-8"))
         if path.is_file():
             h.update(path.read_bytes())

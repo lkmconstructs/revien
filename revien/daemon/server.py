@@ -20,7 +20,7 @@ from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 from revien.graph.clustering import CommunityDetector
-from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
+from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline, TIMESTAMP_SOURCES
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 from revien.semantic.index import SemanticIndex
 from revien.skills.ingest import sort_user_before_engine
@@ -460,6 +460,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         except ValidationError as e:
             raise HTTPException(400, str(e))
 
+        if request.timestamp_source is not None and request.timestamp_source not in TIMESTAMP_SOURCES:
+            raise HTTPException(
+                400, f"Unknown timestamp_source {request.timestamp_source!r}; "
+                     f"expected one of {sorted(TIMESTAMP_SOURCES)}")
         input_data = IngestionInput(
             source_id=request.source_id,
             content=request.content,

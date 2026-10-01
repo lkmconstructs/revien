@@ -13,6 +13,7 @@ import sys
 import sysconfig
 from pathlib import Path
 from typing import Optional, Tuple
+from datetime import datetime, timezone
 
 try:
     import click
@@ -779,9 +780,11 @@ def ingest(content: str, source: str, db: Optional[str]):
     pipeline = IngestionPipeline(store)
 
     try:
+        # Manual capture: when it was said is now, and that is what we stamp.
         result = pipeline.ingest(IngestionInput(
             source_id=source,
             content=content,
+            timestamp=datetime.now(timezone.utc),
             timestamp_source="capture",
         ))
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
