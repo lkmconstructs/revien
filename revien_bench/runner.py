@@ -229,7 +229,19 @@ def _run_fingerprint(decompose: str = "none", decompose_fuse: str = "rrf") -> st
             # How the LLM readers see context is part of run identity: an
             # old undated checkpoint must never resume into a dated run.
             + hashlib.sha256(READER_CONTEXT.encode("utf-8")).hexdigest()[:4]
+            + _bench_code_fingerprint()
             + dec_fp)
+
+
+def _bench_code_fingerprint() -> str:
+    """Content hash of the revien_bench source itself (fusion, prompts, readers,
+    scoring): a change there must never resume rows produced by older code.
+    Top-level modules only; tests and generated results are not part of identity."""
+    h = hashlib.sha256()
+    for py in sorted(Path(__file__).resolve().parent.glob("*.py")):
+        h.update(py.name.encode("utf-8"))
+        h.update(py.read_bytes())
+    return h.hexdigest()[:8]
 
 
 def _checkpoint_path(
@@ -359,6 +371,22 @@ def _resolve_embed_model() -> Optional[str]:
         return getattr(build_embedder(), "model_name", None)
     except Exception:
         return None
+
+
+def _resolve_embed_dim() -> Optional[int]:
+    """Dim the CURRENT run's embedder will produce, only when it is knowable
+    without loading the model: the pre-load `dim` is a default that is correct
+    solely for the provider's default model. Any other model -> None (the
+    snapshot's dim is then not compared; the model-name check still is)."""
+    try:
+        from revien.semantic import index as _si
+        emb = build_embedder()
+        name = getattr(emb, "model_name", None)
+        if name in (_si.DEFAULT_LOCAL_MODEL, _si.DEFAULT_OPENAI_MODEL):
+            return int(emb.dim)
+    except Exception:
+        pass
+    return None
 
 
 def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
@@ -771,6 +799,7 @@ def run_benchmark(
                 cached_meta = _cache_load_meta(
                     cache_meta_path, dataset_sha, want_semantic,
                     embed_model=_resolve_embed_model() if want_semantic else None,
+                    embed_dim=_resolve_embed_dim() if want_semantic else None,
                     embed_context=embed_context_mode() if want_semantic else None)
                 if cached_meta is not None and cache_db.exists():
                     shutil.copyfile(cache_db, db_path)
@@ -791,12 +820,6 @@ def run_benchmark(
                 if cached_meta is not None:
                     # Rerank is retrieval-time: report THIS run's depth/model,
                     # not whatever the snapshot was ingested under.
-                    layer_statuses.append({
-                        **cached_meta["layer_status"],
-                        **{k: v for k, v in
-                           _layer_status(semantic, CrossEncoderReranker()).items()
-                           if k.startswith("rerank_")},
-                    })
                     summary = {
                         "turns_ingested": cached_meta["turns_ingested"],
                         "nodes_created": cached_meta["nodes_created"],
@@ -814,7 +837,6 @@ def run_benchmark(
                         conv_ingest_rate = summary["turns_ingested"] / ingest_s
                         ingest_rates.append(conv_ingest_rate)
                     status = _layer_status(semantic, CrossEncoderReranker())
-                    layer_statuses.append(status)
                     degraded = want_semantic and not status["semantic_active"]
                     if degraded:
                         if db_cache is not None:
@@ -878,6 +900,15 @@ def run_benchmark(
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
                     conv_rows.append(row)
+
+                # Layer status is read LIVE after the QA loop on BOTH the
+                # cache-hit and cache-miss paths: a snapshot's recorded status
+                # says what ingest saw, not whether recall actually used the
+                # semantic layer (it can be disabled mid-run by a runtime error).
+                live_status = _layer_status(semantic, CrossEncoderReranker())
+                layer_statuses.append(live_status)
+                if want_semantic and not live_status["semantic_active"] and not allow_degraded:
+                    _degraded_exit(conv.conv_id, live_status, "during recall")
 
                 n_ran += 1
 

@@ -885,6 +885,7 @@ class SemanticIndex:
             all_nodes = self.store.list_nodes(limit=999999)
             batch: List[Tuple[str, str, str]] = []
             total = 0
+            failed = False
             for node in all_nodes:
                 # Index every node, including CONTEXT (verbatim turns) — the
                 # coherent answer-bearing content for conversational memory.
@@ -892,8 +893,24 @@ class SemanticIndex:
                 if len(batch) >= batch_size:
                     total += self.index_nodes(batch)
                     batch = []
-            if batch:
+                    if not self.is_enabled:
+                        failed = True
+                        break
+            if batch and not failed:
                 total += self.index_nodes(batch)
+            if not self.is_enabled:
+                failed = True
+            if failed:
+                # A failed batch self-disables the layer. The embed recipe is
+                # recorded ONLY when every batch succeeded: a half-built index
+                # must never claim to be built under the new recipe.
+                msg = (f"reindex FAILED part-way after {total} node(s): "
+                       f"{self._broken_reason}. The embed recipe was NOT "
+                       f"updated; vectors are a mix of old and new.")
+                sys.stderr.write(f"[revien.semantic] ERROR: {msg}\n")
+                sys.stderr.flush()
+                return {"status": "partial", "indexed": total,
+                        "error": self._broken_reason, **self.status()}
             if self._table_ready:
                 self._record_embed_context(embed_context_mode())
             return {"status": "ok", "indexed": total, **self.status()}
