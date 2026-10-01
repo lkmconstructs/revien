@@ -412,6 +412,7 @@ class SemanticIndex:
             self._register_store_listener()
             self._warn_on_embed_context_mismatch()
             self._warn_on_embedder_mismatch()
+            self._warn_on_incomplete_reindex()
 
     def _register_store_listener(self) -> None:
         """Wire this index to the store's content-change/delete hooks.
@@ -421,7 +422,11 @@ class SemanticIndex:
                 "semantic_index",
                 on_content_change=self._on_node_content_change,
                 on_delete=self.remove_node,
-                on_successor_change=self._on_successor_change,
+                # Only under prev: the store skips its successor lookup when
+                # nobody listens, so the knob-off hot path pays nothing.
+                on_successor_change=(
+                    self._on_successor_change
+                    if embed_context_mode() == EMBED_CONTEXT_PREV else None),
             )
 
     # ── State ──────────────────────────────────────────────
@@ -543,7 +548,18 @@ class SemanticIndex:
                 f"embedding float[{dim}] distance_metric=cosine)"
             )
             conn.commit()
-            if fresh:
+            if fresh and self._rebuilding:
+                # A full reindex owns the recipe: record only the INTENDED
+                # model/dim now and the final recipe once every batch has
+                # succeeded (reindex_all). A failure part-way must not leave
+                # meta claiming the new model with a fraction of the vectors.
+                model = getattr(self._embedder, "model_name", None)
+                pairs = {"embed_state": "rebuilding",
+                         "embed_dim_intended": int(dim)}
+                if model:
+                    pairs["embed_model_intended"] = model
+                self._record_meta(**pairs)
+            elif fresh:
                 self._record_embed_context(embed_context_mode())
                 self._record_embedder(dim)
         self._dim = dim
@@ -711,6 +727,22 @@ class SemanticIndex:
                    f"the current setting.")
             self._open_warnings.append(msg)
             sys.stderr.write(f"[revien.semantic] WARNING: {msg}\n")
+            sys.stderr.flush()
+
+    _PARTIAL_MSG = ("a previous `revien reindex` did not finish; the stored "
+                    "vectors are a mix of old and new. Run `revien reindex` "
+                    "again until it completes.")
+
+    def _warn_on_incomplete_reindex(self) -> None:
+        """At open: a reindex started and never finished (failed part-way, or
+        the process died). Stays until a full reindex succeeds."""
+        try:
+            state = self._recorded_meta("embed_state")
+        except Exception:  # noqa: BLE001 - bare/mock stores, closed db
+            return
+        if state in ("rebuilding", "partial"):
+            self._open_warnings.append(self._PARTIAL_MSG)
+            sys.stderr.write(f"[revien.semantic] WARNING: {self._PARTIAL_MSG}\n")
             sys.stderr.flush()
 
     def _warn_on_embedder_mismatch(self) -> None:
@@ -991,6 +1023,7 @@ class SemanticIndex:
             self._dim = None
         self._rebuilding = True
         try:
+            self._record_meta(embed_state="rebuilding")
             all_nodes = self.store.list_nodes(limit=999999)
             batch: List[Tuple[str, str, str]] = []
             total = 0
@@ -1015,12 +1048,24 @@ class SemanticIndex:
                        f"updated; vectors are a mix of old and new.")
                 sys.stderr.write(f"[revien.semantic] ERROR: {msg}\n")
                 sys.stderr.flush()
+                try:
+                    self._record_meta(embed_state="partial")
+                except Exception:  # noqa: BLE001 - state write is best-effort here
+                    pass
+                if self._PARTIAL_MSG not in self._open_warnings:
+                    self._open_warnings.append(self._PARTIAL_MSG)
                 return {"status": "partial", "indexed": total,
                         "error": self._broken_reason, **self.status()}
             if self._table_ready:
                 self._record_embed_context(embed_context_mode())
                 if self._dim:
                     self._record_embedder(self._dim)
+            self._record_meta(embed_state="ok")
+            with self._db():
+                conn = self.store._get_conn()
+                conn.execute(f"DELETE FROM {self.META_TABLE} WHERE key IN "
+                             f"('embed_model_intended','embed_dim_intended')")
+                conn.commit()
             self._open_warnings = []
             return {"status": "ok", "indexed": total, **self.status()}
         except Exception as e:  # noqa: BLE001

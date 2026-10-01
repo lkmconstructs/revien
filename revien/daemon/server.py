@@ -35,6 +35,9 @@ class IngestRequest(BaseModel):
     content: str
     content_type: str = "conversation"
     timestamp: Optional[str] = None
+    # Where `timestamp` came from (content/capture/mtime/import). Omitted:
+    # "content" when the caller supplied a timestamp, else "capture".
+    timestamp_source: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     # Capture path: persist now, embed later — the response returns before any
     # embedding-model load. Queued nodes become recallable at the next semantic
@@ -462,6 +465,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             content=request.content,
             content_type=request.content_type,
             timestamp=ts,
+            timestamp_source=request.timestamp_source
+            or ("content" if ts is not None else "capture"),
             metadata=request.metadata,
             defer_embed=request.defer_embed,
             origin_runtime=request.origin_runtime,

@@ -94,6 +94,7 @@ def ingest_corpus(store: GraphStore, semantic: SemanticIndex) -> Dict:
             content=item["content"],
             content_type="note",
             timestamp=ts,
+            timestamp_source="content",
             metadata=item.get("metadata", {}),
             links=item.get("links", []),
             curated=True,
@@ -106,6 +107,7 @@ def ingest_corpus(store: GraphStore, semantic: SemanticIndex) -> Dict:
             content=turn["text"],
             content_type="conversation",
             timestamp=datetime.fromisoformat(turn["timestamp"]),
+            timestamp_source="content",
             metadata={"conv": convs["conversation_id"]},
         ))
 

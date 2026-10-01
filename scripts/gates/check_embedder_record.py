@@ -166,7 +166,9 @@ def main_check(tmp):
     finally:
         os.environ.pop("REVIEN_EMBED_CONTEXT", None)
     after = raw_meta(db2)
-    check(after == before, f"partial reindex changed the recorded recipe: {before} -> {after}")
+    check(after.get("embed_state") == "partial", f"partial reindex left embed_state {after.get('embed_state')!r}")
+    recipe = lambda m: {k: v for k, v in m.items() if k != "embed_state"}
+    check(recipe(after) == recipe(before), f"partial reindex changed the recorded recipe: {before} -> {after}")
     check(after.get("embed_context") == "off" and after.get("embed_model") == "stub-a",
           "partial reindex left the wrong recipe")
 

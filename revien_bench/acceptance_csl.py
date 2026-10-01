@@ -51,7 +51,8 @@ def _fresh():
 
 def _ingest(pipe, text):
     out = pipe.ingest(IngestionInput(
-        source_id="accept", content=text, timestamp=datetime.now(timezone.utc)))
+        source_id="accept", content=text, timestamp=datetime.now(timezone.utc),
+        timestamp_source="content"))
     return out.context_node_id, out.governance
 
 

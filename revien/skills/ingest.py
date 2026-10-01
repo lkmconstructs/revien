@@ -125,6 +125,8 @@ def build_skill_node(
         # skills are safe today because SKILL nodes bypass the pipeline
         # entirely and dedup is same-type only.
         "curated": True,
+        # recorded_at below is ingest time, not a said-at time.
+        "recorded_at_source": "capture",
         "status": status,
         "scope": scope,
         "path": str(skill_md_path.resolve()),

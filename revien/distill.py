@@ -37,6 +37,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from revien.dates import said_date
 from revien.graph.schema import Node, NodeType
 from revien.graph.store import GraphStore
 
@@ -93,8 +94,13 @@ def _provenance(node: Node) -> str:
         adapter = md.get("adapter")
         source = adapter if adapter else "conversation"
     parts = [source]
-    if node.recorded_at is not None:
-        parts.append(node.recorded_at.strftime("%Y-%m-%d"))
+    # Source-aware: an mtime / unlabeled date is not "when it was said".
+    day = said_date(
+        node.recorded_at.isoformat() if node.recorded_at is not None else None,
+        md.get("recorded_at_source"),
+    )
+    if day:
+        parts.append(day)
     parts.append(f"confidence {node.confidence:.2f}")
     return ", ".join(parts)
 
@@ -532,7 +538,8 @@ class VaultReconciler:
             created_at=now,
             last_accessed=now,
             recorded_at=now,
-            metadata={"curated": True, "source": "vault_reconcile"},
+            metadata={"curated": True, "source": "vault_reconcile",
+                      "recorded_at_source": "capture"},
         ))
         # Attach to the note's entity so it renders on the entity's note and is
         # reachable in the graph walk.

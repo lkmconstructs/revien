@@ -201,9 +201,23 @@ _INGEST_ENV_KEYS = (
 )
 
 
+def _ingest_files_fingerprint() -> str:
+    """Hash of single files that shape what an ingest stores: the date source
+    vocabulary (revien/dates.py) and the LoCoMo ingest driver itself."""
+    import revien
+    h = hashlib.sha256()
+    for path in (Path(revien.__file__).resolve().parent / "dates.py",
+                 Path(__file__).resolve().parent / "ingest_locomo.py"):
+        h.update(path.name.encode("utf-8"))
+        if path.is_file():
+            h.update(path.read_bytes())
+    return h.hexdigest()[:8]
+
+
 def _ingest_fingerprint() -> str:
     return (_env_fingerprint(_INGEST_ENV_KEYS)
-            + _code_fingerprint("ingestion", "graph", "semantic", "adapters"))
+            + _code_fingerprint("ingestion", "graph", "semantic", "adapters")
+            + _ingest_files_fingerprint())
 
 
 DECOMPOSE_FUSIONS = ("rrf", "max")

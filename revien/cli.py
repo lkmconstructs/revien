@@ -782,6 +782,7 @@ def ingest(content: str, source: str, db: Optional[str]):
         result = pipeline.ingest(IngestionInput(
             source_id=source,
             content=content,
+            timestamp_source="capture",
         ))
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
@@ -850,6 +851,9 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
                 content=item["content"],
                 content_type=item.get("content_type", "note"),
                 timestamp=ts,
+                # The adapter says whether the date is a frontmatter date
+                # ("content") or just the file mtime; never assume.
+                timestamp_source=item.get("timestamp_source") or "mtime",
                 metadata=item.get("metadata", {}),
                 links=item.get("links", []),
                 curated=True,
@@ -972,6 +976,10 @@ def reindex(db: Optional[str]):
         result = semantic.reindex_all()
         click.echo(f"Reindexed {result.get('indexed', 0)} nodes "
                    f"(status: {result.get('status')}).")
+        if result.get("status") != "ok":
+            click.echo(f"Reindex did NOT complete: {result.get('error')}. "
+                       f"Run `revien reindex` again.", err=True)
+            sys.exit(1)
     finally:
         store.close()
 
@@ -1019,7 +1027,8 @@ def status(db: Optional[str]):
         if by_source:
             click.echo("Nodes by recorded_at_source:")
             for src, count in by_source.items():
-                click.echo(f"  {src}: {count}")
+                note = " (date not shown)" if src in ("mtime", "unlabeled", "undated") else ""
+                click.echo(f"  {src}: {count}{note}")
 
         click.echo(f"Pairing token: {_pairing_token_status()}")
     finally:

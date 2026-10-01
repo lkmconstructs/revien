@@ -193,4 +193,5 @@ def test_status_counts_by_recorded_at_source(tmp_path):
     path = _legacy_db(tmp_path)
     out = CliRunner().invoke(main, ["status", "--db", path]).output
     assert "Nodes by recorded_at_source:" in out
-    assert "  mtime: 4" in out and "  unknown: 5" in out
+    assert "  mtime: 4 (date not shown)" in out
+    assert "unknown" not in out.split("Nodes by recorded_at_source:")[1]

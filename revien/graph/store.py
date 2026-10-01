@@ -595,9 +595,16 @@ class GraphStore:
             )
             # previous_context_in_session: session_key equality, then order.
             # recorded_at exists by now (temporal migration runs first).
+            # Older DBs carry (session_key, recorded_at); neighbour lookups
+            # need created_at in the key too. Drop the narrow one (idempotent).
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_nodes_session'").fetchone()
+            if row and "created_at" not in (row[0] or ""):
+                conn.execute("DROP INDEX idx_nodes_session")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_session "
-                "ON nodes(session_key, recorded_at)"
+                "ON nodes(session_key, recorded_at, created_at)"
             )
             self._commit(conn)
 
@@ -930,6 +937,51 @@ class GraphStore:
     # SQLite's default parameter limit is 999; chunk IN() queries below it.
     _IN_CHUNK = 500
 
+    def _context_neighbour(self, node: Node, forward: bool) -> Optional[Node]:
+        """Shared body of previous/next_context_in_session. The order key is
+        (recorded_at, created_at, rowid) with NULL recorded_at sorting first.
+        Written as plain column comparisons so SQLite range-scans
+        idx_nodes_session (session_key, recorded_at, created_at); a COALESCE
+        or a computed ORDER BY would force a scan of the whole session."""
+        if not node.session_key:
+            return None
+        conn = self._get_conn()
+        rid = conn.execute(
+            "SELECT rowid FROM nodes WHERE node_id = ?", (node.node_id,)
+        ).fetchone()
+        rid = rid[0] if rid else None
+        if rid is None:
+            return None
+        op, direction = (">", "ASC") if forward else ("<", "DESC")
+        base = ("SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
+                "AND node_id != ? AND ")
+        order = (f" ORDER BY recorded_at {direction}, created_at {direction}, "
+                 f"rowid {direction} LIMIT 1")
+        head = (node.session_key, NodeType.CONTEXT.value, node.node_id)
+        created = node.created_at.isoformat()
+        rec = node.recorded_at.isoformat() if node.recorded_at else None
+        # Candidate groups in order of proximity. A dated node's neighbour is
+        # first among dated rows past it; NULL-dated rows sort before every
+        # dated one, so going backward they are the fallback group, going
+        # forward from a NULL-dated node the dated rows are.
+        queries = []
+        if rec is not None:
+            queries.append((base + f"(recorded_at, created_at, rowid) {op} (?, ?, ?)"
+                            + order, head + (rec, created, rid)))
+            if not forward:
+                queries.append((base + "recorded_at IS NULL" + order, head))
+        else:
+            queries.append((base + "recorded_at IS NULL AND "
+                            f"(created_at, rowid) {op} (?, ?)" + order,
+                            head + (created, rid)))
+            if forward:
+                queries.append((base + "recorded_at IS NOT NULL" + order, head))
+        for sql, args in queries:
+            row = conn.execute(sql, args).fetchone()
+            if row:
+                return self._row_to_node(row)
+        return None
+
     @_locked
     def previous_context_in_session(self, node: Node) -> Optional[Node]:
         """The CONTEXT node immediately before ``node`` in its session: same
@@ -937,45 +989,22 @@ class GraphStore:
         before the node's. Ties (a session whose turns share a coarse
         recorded_at AND created_at) fall back to insertion order (rowid).
         None when the node has no session_key or is the session's first."""
-        if not node.session_key:
-            return None
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
-            "AND node_id != ? AND (COALESCE(recorded_at, ''), created_at, rowid) "
-            "< (?, ?, (SELECT rowid FROM nodes WHERE node_id = ?)) "
-            "ORDER BY COALESCE(recorded_at, '') DESC, created_at DESC, rowid DESC "
-            "LIMIT 1",
-            (node.session_key, NodeType.CONTEXT.value, node.node_id,
-             node.recorded_at.isoformat() if node.recorded_at else "",
-             node.created_at.isoformat(), node.node_id),
-        ).fetchone()
-        return self._row_to_node(row) if row else None
+        return self._context_neighbour(node, forward=False)
 
     @_locked
     def next_context_in_session(self, node: Node) -> Optional[Node]:
         """Mirror of previous_context_in_session: the CONTEXT node
         immediately AFTER ``node`` in its session (same ordering key,
         reversed). None when the node has no session_key or is the last."""
-        if not node.session_key:
-            return None
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
-            "AND node_id != ? AND (COALESCE(recorded_at, ''), created_at, rowid) "
-            "> (?, ?, (SELECT rowid FROM nodes WHERE node_id = ?)) "
-            "ORDER BY COALESCE(recorded_at, '') ASC, created_at ASC, rowid ASC "
-            "LIMIT 1",
-            (node.session_key, NodeType.CONTEXT.value, node.node_id,
-             node.recorded_at.isoformat() if node.recorded_at else "",
-             node.created_at.isoformat(), node.node_id),
-        ).fetchone()
-        return self._row_to_node(row) if row else None
+        return self._context_neighbour(node, forward=True)
+
+    def _has_successor_listener(self) -> bool:
+        return any(v[2] is not None for v in self._content_listeners.values())
 
     def _notify_successor(self, node: Node) -> None:
         """Tell listeners the CONTEXT node after ``node`` has a stale
         predecessor (node edited, or about to vanish)."""
-        if node.node_type != NodeType.CONTEXT:
+        if node.node_type != NodeType.CONTEXT or not self._has_successor_listener():
             return
         succ = self.next_context_in_session(node)
         if succ is not None:
@@ -1386,10 +1415,14 @@ class GraphStore:
         """Delete a node and all its connected edges. Returns True if deleted."""
         # The successor must be found while the row still exists; its stored
         # vector (prev-context embeds) carries the text being forgotten.
-        doomed = self.get_node(node_id)
-        successor = (self.next_context_in_session(doomed)
-                     if doomed is not None and doomed.node_type == NodeType.CONTEXT
-                     else None)
+        # Only when a layer actually listens for successor changes (the
+        # semantic index registers one only under REVIEN_EMBED_CONTEXT=prev):
+        # otherwise this is a SELECT + get_node on every delete for nothing.
+        successor = None
+        if self._has_successor_listener():
+            doomed = self.get_node(node_id)
+            if doomed is not None and doomed.node_type == NodeType.CONTEXT:
+                successor = self.next_context_in_session(doomed)
         with self.transaction() as conn:
             # Edges cascade via FK, but be explicit for safety
             conn.execute(
@@ -1474,11 +1507,13 @@ class GraphStore:
 
     @_locked
     def count_nodes_by_recorded_at_source(self) -> dict:
-        """Node counts per metadata recorded_at_source; unlabeled rows (no key,
-        or no recorded_at) group under "unknown"."""
+        """Node counts per metadata recorded_at_source. Two honest buckets
+        instead of one "unknown": "undated" (recorded_at NULL) and
+        "unlabeled" (recorded_at set, no source recorded)."""
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT COALESCE(json_extract(metadata, '$.recorded_at_source'), 'unknown'), "
+            "SELECT CASE WHEN recorded_at IS NULL THEN 'undated' ELSE "
+            "COALESCE(json_extract(metadata, '$.recorded_at_source'), 'unlabeled') END, "
             "COUNT(*) FROM nodes GROUP BY 1 ORDER BY COUNT(*) DESC"
         ).fetchall()
         return {src: count for src, count in rows}

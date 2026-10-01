@@ -228,6 +228,7 @@ def run_import(
                     content=unit.content,
                     content_type=unit.content_type,
                     timestamp=unit.timestamp,
+                    timestamp_source="content",
                     metadata=unit.metadata,
                     links=unit.links,
                     ingest_key=unit.ingest_key,

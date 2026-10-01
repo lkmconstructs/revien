@@ -407,6 +407,7 @@ def propose_skills(
                     session_key=None,
                     recorded_at=datetime.now(timezone.utc),
                 )
+                node.metadata = {**(node.metadata or {}), "recorded_at_source": "capture"}
                 node = store.add_node(node)
                 store.record_audit(
                     node.node_id, "skill_propose",
