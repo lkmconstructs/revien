@@ -236,7 +236,7 @@ class TestMtimeNeverRendered:
         assert said_date(iso, "content") == "2023-05-07"
         assert said_date(iso, "capture") == "2023-05-07"
         assert said_date(iso, "import") == "2023-05-07"
-        assert said_date(iso, None) == "2023-05-07"  # pre-source rows keep prior behaviour
+        assert said_date(iso, None) is None  # unknown source: never dated
         assert said_date(iso, "mtime") is None
         assert said_date(None, "content") is None
 

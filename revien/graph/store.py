@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Union
 
-from .origin import derive_origin
+from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -304,6 +304,8 @@ class GraphStore:
         # Origin Layer (WS0): add origin columns to older DBs and backfill
         # from source_id wherever derive_origin recognizes it.
         self._migrate_add_origin_columns(conn)
+        # recorded_at_source backfill (user_version 4); needs origin columns.
+        self._migrate_backfill_recorded_at_source(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -506,6 +508,34 @@ class GraphStore:
                 print(f"Migration note: {e}")
             else:
                 raise
+
+    def _migrate_backfill_recorded_at_source(self, conn: sqlite3.Connection) -> None:
+        """Label pre-existing dated rows with metadata["recorded_at_source"]
+        derived from their origin (derive_recorded_at_source). Rows that derive
+        None stay unlabeled (unknown, rendered undated). One transaction;
+        idempotent (only rows lacking the key are touched); skipped once
+        ``PRAGMA user_version`` >= 4."""
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 4:
+            return
+        rows = conn.execute(
+            "SELECT node_id, metadata, origin_runtime, origin_source FROM nodes "
+            "WHERE recorded_at IS NOT NULL"
+        ).fetchall()
+        for node_id, raw, runtime, source in rows:
+            try:
+                meta = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict) or "recorded_at_source" in meta:
+                continue
+            derived = derive_recorded_at_source(runtime, source)
+            if derived is None:
+                continue
+            meta["recorded_at_source"] = derived
+            conn.execute("UPDATE nodes SET metadata = ? WHERE node_id = ?",
+                         (json.dumps(meta), node_id))
+        conn.execute("PRAGMA user_version = 4")
+        self._commit(conn)
 
     def _migrate_add_origin_columns(self, conn: sqlite3.Connection) -> None:
         """Add Origin Layer (WS0) columns to existing DBs, then backfill.
@@ -1441,6 +1471,17 @@ class GraphStore:
     def count_nodes(self) -> int:
         conn = self._get_conn()
         return conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+
+    @_locked
+    def count_nodes_by_recorded_at_source(self) -> dict:
+        """Node counts per metadata recorded_at_source; unlabeled rows (no key,
+        or no recorded_at) group under "unknown"."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT COALESCE(json_extract(metadata, '$.recorded_at_source'), 'unknown'), "
+            "COUNT(*) FROM nodes GROUP BY 1 ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        return {src: count for src, count in rows}
 
     @_locked
     def count_nodes_by_origin_runtime(self) -> dict:

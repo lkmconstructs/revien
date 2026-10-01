@@ -114,10 +114,11 @@ class TestToon:
         assert back["results"][0]["recorded_at"] == value
 
 
-def _resp(recorded_at, content="Mara moved billing to Postgres."):
+def _resp(recorded_at, content="Mara moved billing to Postgres.", source="content"):
     r = SimpleNamespace(
         node_id="n-1", node_type="fact", label="Billing", content=content,
         score=0.8, score_breakdown={}, path=[], recorded_at=recorded_at,
+        recorded_at_source=source,
     )
     return SimpleNamespace(results=[r], retrieval_time_ms=1.0)
 

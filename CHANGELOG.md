@@ -6,6 +6,7 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **Pre-existing rows are labeled with `recorded_at_source`; an unknown or mtime date is never shown as "when said".** A `user_version` 4 backfill (and standalone migration 004) derives the source from each row's origin; `said_date()` renders a date and the note only for content/capture/import, so unlabeled and mtime rows are undated; `revien status` counts nodes by source.
 - **Recall results carry `recorded_at`.** Every recall result now has `recorded_at` (when the memory was said, ISO-8601 in the speaker's own UTC offset, or null when unknown) across the daemon, MCP, CLI and TOON; memory-context blocks show each memory's date as `[YYYY-MM-DD]` so a consuming model can resolve "yesterday" or "next month".
 - **No relative age is shown to a reader or model.** Memory blocks show the absolute `[YYYY-MM-DD]` date of when a memory was said (`recorded_at`), never an age computed from ingest time (`created_at`); the date is omitted when unknown, and the Ollama memory-context line now shows it instead of a misleading "N days ago".
 - **TOON recall gains `recorded_at` and `recorded_at_source` columns.** The tabular recall rows carry when each memory was said and where that time came from; `parse_recall` tolerates TOON from an older daemon that has neither column.

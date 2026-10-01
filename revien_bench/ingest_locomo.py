@@ -154,6 +154,7 @@ def ingest_conversation(
                 content=content,
                 content_type="conversation",
                 timestamp=ts,
+                timestamp_source="content",
                 # Session identity for REVIEN_EMBED_CONTEXT=prev (harmless when
                 # off). No origin_runtime: derive_origin gives none for
                 # "conv:dia_id" and a declared session_key is legal without one.

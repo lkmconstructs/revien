@@ -13,8 +13,10 @@ recorded_at_source vocabulary (IngestionInput.timestamp_source):
     import   carried in from an import (the exported record's own time)
     mtime    file modification time - NOT a said-at time, never rendered
 
-A result with no recorded source (rows ingested before the source existed)
-keeps the prior behaviour: its date is rendered.
+A result with no recorded source is unknown: no date, no note. Rows ingested
+before the source existed are labeled by the user_version 4 backfill
+(graph/origin.derive_recorded_at_source); those it cannot derive stay
+unlabeled and undated.
 """
 
 from typing import Optional
@@ -33,6 +35,6 @@ def said_date(recorded_at: Optional[str], source: Optional[str] = None) -> Optio
     only date we hold is a file mtime. recorded_at keeps the speaker's own UTC
     offset (see engine._iso_utc), so its first ten characters are the
     speaker's calendar day."""
-    if not recorded_at or (source is not None and source not in DATED_SOURCES):
+    if not recorded_at or source not in DATED_SOURCES:
         return None
     return recorded_at[:10]

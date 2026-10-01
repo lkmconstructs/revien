@@ -1015,6 +1015,12 @@ def status(db: Optional[str]):
             for runtime, count in by_runtime.items():
                 click.echo(f"  {runtime}: {count}")
 
+        by_source = store.count_nodes_by_recorded_at_source()
+        if by_source:
+            click.echo("Nodes by recorded_at_source:")
+            for src, count in by_source.items():
+                click.echo(f"  {src}: {count}")
+
         click.echo(f"Pairing token: {_pairing_token_status()}")
     finally:
         store.close()

@@ -22,6 +22,7 @@ def _ctx(dates):
         contents=["Alice went to the lake yesterday.", "Bob likes tea."],
         labels=["trip", ""],
         dates=dates,
+        date_sources=["content" if d else None for d in dates],
     )
 
 
