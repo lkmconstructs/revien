@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 from types import SimpleNamespace
+import copy
 import hashlib
 import json
 import os
@@ -205,12 +206,21 @@ def _ingest_fingerprint() -> str:
             + _code_fingerprint("ingestion", "graph", "semantic", "adapters"))
 
 
-def _run_fingerprint(decompose: str = "none") -> str:
+DECOMPOSE_FUSIONS = ("rrf", "max")
+RRF_K = 60
+RRF_ORIGINAL_WEIGHT = 2.0
+
+
+def _run_fingerprint(decompose: str = "none", decompose_fuse: str = "rrf") -> str:
     """Full run identity for checkpoints: ALL REVIEN_* env (ranking knobs
     included — that's trap #1) + retrieval-affecting code. A decompose spec
     other than 'none' is part of the identity (sub-query recalls change every
-    row); 'none' adds nothing, so pre-existing checkpoints keep resuming."""
+    row); 'none' adds nothing, so pre-existing checkpoints keep resuming. The
+    fusion mode is folded in too; 'max' (the original raw-score union) hashes
+    the bare spec, so pre-rrf decompose checkpoints still resume."""
     dec = (decompose or "none").strip()
+    if dec.lower() != "none" and decompose_fuse != "max":
+        dec = f"{dec}|fuse={decompose_fuse}"
     dec_fp = ("" if dec.lower() == "none"
               else hashlib.sha256(dec.encode("utf-8")).hexdigest()[:4])
     return (_env_fingerprint()
@@ -224,7 +234,7 @@ def _run_fingerprint(decompose: str = "none") -> str:
 
 def _checkpoint_path(
     out_dir: Path, config_name: str, answerer_name: str, judge_name: str = "f1",
-    decompose_name: str = "none",
+    decompose_name: str = "none", decompose_fuse: str = "rrf",
 ) -> Path:
     """Checkpoint path for this exact (config, answerer, judge, env, code)
     identity. A knob or code change yields a different filename — the old
@@ -234,7 +244,7 @@ def _checkpoint_path(
     rows that were never judged, corrupting the judge accuracy denominator."""
     return out_dir / (
         f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}"
-        f"_{_sanitize(judge_name)}_{_run_fingerprint(decompose_name)}.jsonl"
+        f"_{_sanitize(judge_name)}_{_run_fingerprint(decompose_name, decompose_fuse)}.jsonl"
     )
 
 
@@ -412,23 +422,51 @@ def _retrieved_dia_ids(store: GraphStore, results) -> List[str]:
     return ordered
 
 
-def _fuse_responses(resps: List, top_n: int):
-    """UNION sub-query recalls by node_id, keeping each node's best score,
-    sorted by score descending (stable: the original query's recall is first,
-    so ties favour it), truncated to top_n. Returns (results, diagnostics).
+def _fuse_responses(resps: List, top_n: int, mode: str = "rrf",
+                    k: float = RRF_K, original_weight: float = RRF_ORIGINAL_WEIGHT):
+    """Fuse sub-query recalls (resps[0] is the ORIGINAL question's recall).
+    Returns (results, diagnostics).
 
-    Diagnostics are merged for the miss taxonomy: per-node scores take the
-    max across recalls, filter reasons come from the first recall that saw the
-    node, anchor ids are unioned. Only the keys failure_analysis reads are
-    kept. Caveat: scores from different queries are pooled, so the taxonomy's
-    best_rank under decomposition is a pooled-score rank."""
-    best: Dict[str, object] = {}
-    for resp in resps:
-        for r in resp.results:
-            cur = best.get(r.node_id)
-            if cur is None or r.score > cur.score:
-                best[r.node_id] = r
-    results = sorted(best.values(), key=lambda r: r.score, reverse=True)[:top_n]
+    mode 'rrf' (default): weighted reciprocal-rank fusion. Raw scores from
+    different queries are not comparable, so only ranks are used:
+        fused(node) = sum over lists containing node of w_i / (k + rank_i)
+    rank_i is 1-based, w = original_weight for the original list and 1.0 for
+    each sub-question list. Result rows carry the fused score. Sorted by fused
+    score desc (ties: first seen, original list first), cut to top_n. The
+    engine's rrf_fuse is unweighted and returns ids only, so this is local.
+
+    mode 'max' (the earlier behaviour, kept for reproducibility): UNION by
+    node_id keeping each node's best RAW score, sorted desc, cut to top_n.
+
+    Diagnostics are merged for the miss taxonomy: filter reasons come from the
+    first recall that saw the node, anchor ids are unioned. Per-node scores take
+    the max across recalls ('max'), or the fused score ('rrf', so best_rank is
+    the rank in the fused list; frontier nodes absent from every result list
+    get 0.0, i.e. rank below all fused nodes)."""
+    if mode not in DECOMPOSE_FUSIONS:
+        raise ValueError(f"unknown decompose fusion {mode!r}; expected one of {DECOMPOSE_FUSIONS}")
+    fused_scores: Dict[str, float] = {}
+    if mode == "max":
+        best: Dict[str, object] = {}
+        for resp in resps:
+            for r in resp.results:
+                cur = best.get(r.node_id)
+                if cur is None or r.score > cur.score:
+                    best[r.node_id] = r
+        results = sorted(best.values(), key=lambda r: r.score, reverse=True)[:top_n]
+    else:
+        rows: Dict[str, object] = {}
+        for i, resp in enumerate(resps):
+            w = original_weight if i == 0 else 1.0
+            for rank, r in enumerate(resp.results, start=1):
+                rows.setdefault(r.node_id, r)
+                fused_scores[r.node_id] = fused_scores.get(r.node_id, 0.0) + w / (k + rank)
+        order = sorted(fused_scores, key=lambda n: -fused_scores[n])  # stable
+        results = []
+        for nid in order[:top_n]:
+            row = copy.copy(rows[nid])
+            row.score = fused_scores[nid]
+            results.append(row)
 
     diags = [r.diagnostics for r in resps if r.diagnostics]
     merged: Optional[Dict] = None
@@ -438,7 +476,9 @@ def _fuse_responses(resps: List, top_n: int):
         anchors: Dict[str, List[str]] = {}
         for d in diags:
             for nid, sc in (d.get("scores") or {}).items():
-                if nid not in scores or sc > scores[nid]:
+                if mode == "rrf":
+                    scores[nid] = fused_scores.get(nid, 0.0)
+                elif nid not in scores or sc > scores[nid]:
                     scores[nid] = sc
             for nid, why in (d.get("filtered") or {}).items():
                 filtered.setdefault(nid, why)
@@ -459,6 +499,7 @@ def _score_qa(
     dia_map: Optional[Dict[str, List[str]]] = None,
     judge=None,
     decomposer=None,
+    decompose_fuse: str = "rrf",
 ) -> Dict:
     """Run one QA through recall -> extractive answer -> score."""
     now_dt = parse_session_date(conv.last_session_date) or datetime.now(timezone.utc)
@@ -491,7 +532,7 @@ def _score_qa(
     if len(resps) == 1:
         resp = resps[0]
     else:
-        f_results, f_diag = _fuse_responses(resps, RECALL_TOP_N)
+        f_results, f_diag = _fuse_responses(resps, RECALL_TOP_N, mode=decompose_fuse)
         resp = SimpleNamespace(results=f_results, diagnostics=f_diag)
 
     ctx = A.RetrievedContext(
@@ -601,7 +642,10 @@ def run_benchmark(
     judge_name: str = "f1",
     allow_degraded: bool = False,
     decompose_name: str = "none",
+    decompose_fuse: str = "rrf",
 ) -> Dict:
+    if decompose_fuse not in DECOMPOSE_FUSIONS:
+        raise ValueError(f"unknown decompose fusion {decompose_fuse!r}")
     cfg = _load_config(config_name)
     want_semantic = _semantic_requested(cfg)
     layer_statuses: List[Dict] = []
@@ -628,7 +672,8 @@ def run_benchmark(
         # ── Checkpoint / resume setup ─────────────────────────────────────────
         dataset_sha = read_locked_hash()
         ckpt_path = _checkpoint_path(
-            out_dir, config_name, answerer_name, judge_name, decompose_name)
+            out_dir, config_name, answerer_name, judge_name, decompose_name,
+            decompose_fuse)
         if fresh:
             # --fresh: ignore + delete any prior checkpoint and start over.
             try:
@@ -828,6 +873,7 @@ def run_benchmark(
                         store, engine, qa, conv, answerer,
                         dia_map=dia_map, judge=judge_obj,
                         decomposer=decomposer,
+                        decompose_fuse=decompose_fuse,
                     )
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
@@ -995,6 +1041,9 @@ def run_benchmark(
                 ),
                 "n_questions": len(dec_rows),
                 "taxonomy_basis": "merged_subrecall_diagnostics",
+                "fusion": decompose_fuse,
+                "rrf_k": RRF_K,
+                "original_weight": RRF_ORIGINAL_WEIGHT,
             }
         report["reader_context"] = READER_CONTEXT
         report["dataset"] = {
@@ -1242,6 +1291,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "openai|openrouter|together|claude:<model> (cloud, egress "
                          "FAIL by design, labeled). Splits each question into "
                          "sub-questions, recalls each, unions before the reader.")
+    ap.add_argument("--decompose-fuse", default="rrf", choices=DECOMPOSE_FUSIONS,
+                    dest="decompose_fuse",
+                    help="how --decompose merges sub-recalls: rrf (default; "
+                         "reciprocal-rank fusion, original question weight 2.0, "
+                         "k=60) | max (earlier raw-score union, kept so the "
+                         "first decompose row is reproducible)")
     ap.add_argument("--out", default=str(_REPO_ROOT / "results"))
     ap.add_argument("--dataset", default=str(DATA_PATH))
     ap.add_argument("--limit", type=int, default=None,
@@ -1282,6 +1337,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         judge_name=args.judge,
         allow_degraded=args.allow_degraded,
         decompose_name=args.decompose,
+        decompose_fuse=args.decompose_fuse,
     )
     _print_summary(report)
     return 0

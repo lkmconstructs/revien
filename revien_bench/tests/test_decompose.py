@@ -164,9 +164,9 @@ def test_fuse_keeps_best_score_sorts_and_truncates():
     b = _resp([_res("n2", 0.9), _res("n3", 0.45)],
               scores={"n2": 0.9, "n3": 0.45}, filtered={"n9": "other", "n8": "dup"},
               anchors=["x", "y"])
-    results, diag = R._fuse_responses([a, b], top_n=3)
+    results, diag = R._fuse_responses([a, b], top_n=3, mode="max")
     assert [(r.node_id, r.score) for r in results] == [("n2", 0.9), ("n1", 0.5), ("n3", 0.45)]
-    results2, _ = R._fuse_responses([a, b], top_n=2)
+    results2, _ = R._fuse_responses([a, b], top_n=2, mode="max")
     assert [r.node_id for r in results2] == ["n2", "n1"]
     assert diag["scores"]["n2"] == 0.9
     assert diag["filtered"] == {"n9": "stale", "n8": "dup"}  # first recall wins
@@ -176,8 +176,69 @@ def test_fuse_keeps_best_score_sorts_and_truncates():
 def test_fuse_with_no_diagnostics():
     a = SimpleNamespace(results=[_res("n1", 0.5)], diagnostics=None)
     b = SimpleNamespace(results=[_res("n2", 0.6)], diagnostics=None)
-    results, diag = R._fuse_responses([a, b], top_n=10)
+    results, diag = R._fuse_responses([a, b], top_n=10, mode="max")
     assert [r.node_id for r in results] == ["n2", "n1"] and diag is None
+
+
+def _ids(*nids):
+    # Raw scores deliberately descend the WRONG way for rrf: only rank may count.
+    return _resp([_res(n, 1.0 - 0.1 * i) for i, n in enumerate(nids)])
+
+
+def test_rrf_original_only_beats_single_sub_list_rank_one():
+    orig, sub1, sub2 = _ids("X"), _ids("Y"), _ids("Z")
+    results, _ = R._fuse_responses([orig, sub1, sub2], top_n=10, mode="rrf")
+    got = {r.node_id: r.score for r in results}
+    assert got["X"] == pytest.approx(2.0 / 61)   # w=2.0, rank 1, k=60
+    assert got["Y"] == pytest.approx(1.0 / 61)
+    assert got["Z"] == pytest.approx(1.0 / 61)
+    assert [r.node_id for r in results][0] == "X"
+
+
+def test_rrf_consensus_rank_three_beats_single_rank_one():
+    orig = _ids("a", "b", "P")
+    sub1 = _ids("c", "d", "P")
+    sub2 = _ids("e", "f", "P")
+    results, _ = R._fuse_responses([orig, sub1, sub2], top_n=3, mode="rrf")
+    got = {r.node_id: r.score for r in results}
+    # P: 2/63 + 1/63 + 1/63 = 4/63 ~ 0.0635 ; a: 2/61 ~ 0.0328
+    assert got["P"] == pytest.approx(4.0 / 63)
+    assert got["a"] == pytest.approx(2.0 / 61)
+    assert [r.node_id for r in results][:2] == ["P", "a"]
+    assert len(results) == 3  # cut to top_n
+
+
+def test_rrf_diagnostics_use_fused_rank_and_original_is_not_mutated():
+    orig = _resp([_res("n1", 0.9)], scores={"n1": 0.9, "far": 0.8})
+    sub = _resp([_res("n2", 5.0)], scores={"n2": 5.0})
+    results, diag = R._fuse_responses([orig, sub], top_n=10, mode="rrf")
+    assert diag["scores"]["n1"] == pytest.approx(2.0 / 61)
+    assert diag["scores"]["n2"] == pytest.approx(1.0 / 61)
+    assert diag["scores"]["far"] == 0.0
+    assert orig.results[0].score == 0.9  # fused rows are copies
+
+
+def test_max_mode_reproduces_union_by_best_raw_score():
+    orig = _resp([_res("n1", 0.5)])
+    sub = _resp([_res("n2", 0.9), _res("n1", 0.7)])
+    results, _ = R._fuse_responses([orig, sub], top_n=10, mode="max")
+    assert [(r.node_id, r.score) for r in results] == [("n2", 0.9), ("n1", 0.7)]
+
+
+def test_default_fusion_is_rrf():
+    import inspect
+    assert inspect.signature(R._fuse_responses).parameters["mode"].default == "rrf"
+    assert inspect.signature(R.run_benchmark).parameters["decompose_fuse"].default == "rrf"
+    assert R.DECOMPOSE_FUSIONS == ("rrf", "max")
+    with pytest.raises(ValueError):
+        R._fuse_responses([_ids("a")], top_n=1, mode="bogus")
+
+
+def test_fingerprint_differs_between_fusion_modes():
+    assert (R._run_fingerprint("openai:x", "rrf")
+            != R._run_fingerprint("openai:x", "max"))
+    assert R._run_fingerprint("openai:x") == R._run_fingerprint("openai:x", "rrf")
+    assert R._run_fingerprint("none", "max") == R._run_fingerprint("none", "rrf")
 
 
 # ── fingerprint ──────────────────────────────────────────────────────────────
@@ -254,3 +315,9 @@ def test_runner_block_counts_and_egress(tmp_path, monkeypatch):
     # Persisted JSON carries the block.
     written = sorted((tmp_path / "blk").glob("*.json"))
     assert json.loads(written[-1].read_text(encoding="utf-8"))["decompose"]["network_calls"] == n
+
+
+def test_results_block_carries_fusion_fields(tmp_path, monkeypatch):
+    rep = _run(tmp_path, monkeypatch, "fus", _Stub(extra=["Where did Alice go?"]))
+    block = rep["decompose"]
+    assert (block["fusion"], block["rrf_k"], block["original_weight"]) == ("rrf", 60, 2.0)
