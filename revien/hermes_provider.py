@@ -82,6 +82,7 @@ import json
 import os
 import queue
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -101,6 +102,7 @@ except ImportError:  # pragma: no cover - exercised only without the SDK
 # Revien-side imports are core (no guard) — this module only imports cleanly-
 # importable engine pieces, so the mapping logic below is testable WITHOUT the
 # Hermes SDK by constructing the provider's in-process stack directly.
+from revien.dates import DATE_NOTE, said_date
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine
@@ -304,7 +306,7 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
         # the worker gets to this item (a new initialize() mid-flight must
         # not relabel an already-queued turn).
         session_key = session_id or self._session_id or None
-        self._sync_queue.put((text, session_key))
+        self._sync_queue.put((text, session_key, datetime.now(timezone.utc)))
 
     def on_session_end(self, messages: Any) -> None:
         """Session ended — flush deferred embeddings, else no-op.
@@ -469,6 +471,8 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                     "content": r.content,
                     "score": r.score,
                     "path": r.path,
+                    "recorded_at": r.recorded_at,
+                    "recorded_at_source": r.recorded_at_source,
                 }
                 for r in response.results
             ],
@@ -488,6 +492,8 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                 source_id=_HERMES_SOURCE_ID,
                 content=content,
                 content_type="note",
+                timestamp=datetime.now(timezone.utc),
+                timestamp_source="capture",
                 origin_runtime="hermes",
                 origin_source="live",
                 session_key=self._session_id or None,
@@ -585,7 +591,8 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
             try:
                 if item is None:
                     return
-                text, session_key = item
+                text, session_key, *rest = item
+                captured_at = rest[0] if rest else datetime.now(timezone.utc)
                 pipeline = self._pipeline
                 if pipeline is not None:
                     pipeline.ingest(
@@ -593,6 +600,8 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                             source_id=_HERMES_SOURCE_ID,
                             content=text,
                             content_type=_CONVERSATION,
+                            timestamp=captured_at,
+                            timestamp_source="capture",
                             defer_embed=True,  # persist now, embed on drain/sweep
                             origin_runtime="hermes",
                             origin_source="live",
@@ -640,17 +649,17 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
             return ""
         lines = ["## Relevant memory (Revien)"]
         body = []
+        dated = False
         for r in response.results:
-            said = getattr(r, "recorded_at", None)
-            prefix = f"[{said[:10]}] " if said else ""
+            day = said_date(getattr(r, "recorded_at", None),
+                            getattr(r, "recorded_at_source", None))
+            prefix = f"[{day}] " if day else ""
             body.append(f"- {prefix}{r.content}")
-        if any(getattr(r, "recorded_at", None) for r in response.results):
+            dated = dated or bool(day)
+        if dated:
             lines.append(DATE_NOTE)
         lines.extend(body)
         return "\n".join(lines)
-
-
-DATE_NOTE = "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)"
 
 
 def register(ctx: Any) -> None:

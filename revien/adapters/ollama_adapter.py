@@ -24,6 +24,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from revien.graph.schema import Node, NodeType
+from revien.dates import DATE_NOTE, said_date
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline, IngestionOutput
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
@@ -182,6 +183,7 @@ class OllamaAdapter:
             content=full_conversation,
             content_type="conversation",
             timestamp=datetime.now(timezone.utc),
+            timestamp_source="capture",
             metadata={"message_count": len(history)},
             origin_runtime="ollama",
             origin_source="live",
@@ -226,10 +228,9 @@ class OllamaAdapter:
             "The following context is retrieved from persistent memory based on relevance to the current query:\n",
         ]
 
-        if any(r.recorded_at for r in response.results):
-            lines.append(
-                "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)"
-            )
+        if any(said_date(r.recorded_at, getattr(r, "recorded_at_source", None))
+               for r in response.results):
+            lines.append(DATE_NOTE)
 
         for result in response.results:
             # Format score as percentage
@@ -243,7 +244,8 @@ class OllamaAdapter:
 
             # Age comes from when it was said (recorded_at), never from
             # ingest time (created_at); omitted when unknown.
-            said = f"[{result.recorded_at[:10]}] " if result.recorded_at else ""
+            day = said_date(result.recorded_at, getattr(result, "recorded_at_source", None))
+            said = f"[{day}] " if day else ""
             line = f"- {said}[Score: {score_pct}%] {label}: {content_preview}"
             lines.append(line)
 
@@ -342,6 +344,7 @@ class OllamaAdapter:
             content=exchange,
             content_type="conversation",
             timestamp=now,
+            timestamp_source="capture",
             metadata={
                 "role": "exchange",
                 "message_length": len(message),

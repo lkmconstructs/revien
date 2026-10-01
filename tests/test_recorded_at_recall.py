@@ -83,7 +83,10 @@ class TestSurfaces:
         out = _call(server, "revien_recall", {"query": QUERY})
         assert out["results"]
         assert all("recorded_at" in r for r in out["results"])
-        assert all(r["recorded_at"] is None for r in out["results"])
+        # revien_store has no timestamp parameter: the store call is the
+        # capture moment, so it is stamped and labelled capture.
+        assert all(r["recorded_at"] for r in out["results"])
+        assert {r["recorded_at_source"] for r in out["results"]} == {"capture"}
 
 
 def _payload(recorded_at):

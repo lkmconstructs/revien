@@ -106,7 +106,7 @@ class TestToolRoundTrip:
             "node_id", "node_type", "label", "content", "score",
             "score_breakdown", "path",
             "origin_runtime", "origin_source", "project_key",
-            "recorded_at",
+            "recorded_at", "recorded_at_source",
         }
         assert recalled["semantic_active"] is False  # conftest pins graph-only
 

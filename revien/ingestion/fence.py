@@ -30,6 +30,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Pattern, Tuple
 
+from revien.dates import DATE_NOTE
+
 
 @dataclass
 class FenceResult:
@@ -65,7 +67,8 @@ _MEMORY_CONTEXT_OPEN = re.compile(r"\[Revien Memory Context\]")
 # not), so the block would silently swallow one stray newline past every
 # real boundary line instead of stopping cleanly.
 _HERMES_HEADER_BLOCK = re.compile(
-    r"^## Relevant memory \(Revien\).*(?:\n(?:-[ ].*|\(dates in brackets .*|[ \t]*(?=\n|$)))*",
+    r"^## Relevant memory \(Revien\).*(?:\n(?:-[ ].*|" + re.escape(DATE_NOTE)
+    + r"[ \t\r]*(?=\n|$)|[ \t]*(?=\n|$)))*",
     re.MULTILINE,
 )
 

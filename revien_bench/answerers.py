@@ -41,6 +41,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
+
+from revien.dates import said_date
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple
 
 # Canonical refusal string. Contains BOTH official adversarial markers so the
@@ -80,6 +82,9 @@ class RetrievedContext:
     # RetrievalResult.recorded_at) or None. Only the LLM readers' prompt
     # rendering reads it; the extractive path uses plain contents.
     dates: List[Optional[str]] = field(default_factory=list)
+    # Parallel to dates: RetrievalResult.recorded_at_source. A date whose
+    # source is mtime is never shown to the reader.
+    date_sources: List[Optional[str]] = field(default_factory=list)
 
     def sentences(self) -> List[str]:
         """Flatten retrieved contents into candidate sentences, rank-preserving."""
@@ -354,7 +359,9 @@ def _format_context(ctx: RetrievedContext) -> str:
         if not text:
             continue
         label = ctx.labels[i] if i < len(ctx.labels) else ""
-        said = _reader_date(ctx.dates[i]) if i < len(ctx.dates) else None
+        src = ctx.date_sources[i] if i < len(ctx.date_sources) else None
+        said = (_reader_date(ctx.dates[i])
+                if i < len(ctx.dates) and said_date(ctx.dates[i], src) else None)
         if said:
             text = f"[{said}] {text}"
         prefix = f"[{i + 1}] " + (f"({label}) " if label else "")

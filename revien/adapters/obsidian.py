@@ -188,6 +188,7 @@ class ObsidianVaultAdapter(RevienAdapter):
                 "content": f"{label_line}\n{section}",
                 "content_type": "note",
                 "timestamp": ts.isoformat(),
+                "timestamp_source": "content" if fm.get("date") else "mtime",
                 "source_id": f"vault:{rel_path.as_posix()}#{_slug(heading)}",
                 "links": links,
                 "curated": True,

@@ -72,7 +72,8 @@ class GraphStore:
         self._ensure_db()
 
     def register_content_listener(
-        self, name: str, on_content_change=None, on_delete=None
+        self, name: str, on_content_change=None, on_delete=None,
+        on_successor_change=None,
     ) -> None:
         """Register callbacks fired after a node's label/content changes or a
         node is deleted. on_content_change(node_id, label, content);
@@ -82,8 +83,15 @@ class GraphStore:
         /v1/reindex before vector search saw the new content — now they queue
         a re-embed drained by the next search). Listeners fire while the
         store lock is held and MUST stay cheap: queue writes and small SQL,
-        never model inference."""
-        self._content_listeners[name] = (on_content_change, on_delete)
+        never model inference.
+
+        on_successor_change(node_id, label, content), optional: fired for the
+        NEXT CONTEXT node in the same session whenever a CONTEXT node's
+        content changes or the node is deleted. A layer that embeds a turn
+        together with its predecessor (REVIEN_EMBED_CONTEXT=prev) needs this:
+        the successor's stored vector still carries the old/deleted text."""
+        self._content_listeners[name] = (
+            on_content_change, on_delete, on_successor_change)
 
     def _fire_content_change(self, node: "Node") -> None:
         # Inside a transaction: defer until after the outer commit. Listeners
@@ -92,7 +100,7 @@ class GraphStore:
         if self._txn_depth > 0:
             self._deferred_fires.append(("change", node))
             return
-        for on_change, _ in list(self._content_listeners.values()):
+        for on_change, _d, _s in list(self._content_listeners.values()):
             if on_change is None:
                 continue
             try:
@@ -104,11 +112,23 @@ class GraphStore:
         if self._txn_depth > 0:
             self._deferred_fires.append(("delete", node_id))
             return
-        for _, on_delete in list(self._content_listeners.values()):
+        for _c, on_delete, _s in list(self._content_listeners.values()):
             if on_delete is None:
                 continue
             try:
                 on_delete(node_id)
+            except Exception:  # noqa: BLE001 - listeners must never break writes
+                pass
+
+    def _fire_successor_change(self, succ: "Node") -> None:
+        if self._txn_depth > 0:
+            self._deferred_fires.append(("successor", succ))
+            return
+        for _c, _d, on_succ in list(self._content_listeners.values()):
+            if on_succ is None:
+                continue
+            try:
+                on_succ(succ.node_id, succ.label, succ.content)
             except Exception:  # noqa: BLE001 - listeners must never break writes
                 pass
 
@@ -118,6 +138,8 @@ class GraphStore:
         for kind, payload in pending:
             if kind == "change":
                 self._fire_content_change(payload)
+            elif kind == "successor":
+                self._fire_successor_change(payload)
             else:
                 self._fire_delete(payload)
 
@@ -901,6 +923,35 @@ class GraphStore:
         return self._row_to_node(row) if row else None
 
     @_locked
+    def next_context_in_session(self, node: Node) -> Optional[Node]:
+        """Mirror of previous_context_in_session: the CONTEXT node
+        immediately AFTER ``node`` in its session (same ordering key,
+        reversed). None when the node has no session_key or is the last."""
+        if not node.session_key:
+            return None
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
+            "AND node_id != ? AND (COALESCE(recorded_at, ''), created_at, rowid) "
+            "> (?, ?, (SELECT rowid FROM nodes WHERE node_id = ?)) "
+            "ORDER BY COALESCE(recorded_at, '') ASC, created_at ASC, rowid ASC "
+            "LIMIT 1",
+            (node.session_key, NodeType.CONTEXT.value, node.node_id,
+             node.recorded_at.isoformat() if node.recorded_at else "",
+             node.created_at.isoformat(), node.node_id),
+        ).fetchone()
+        return self._row_to_node(row) if row else None
+
+    def _notify_successor(self, node: Node) -> None:
+        """Tell listeners the CONTEXT node after ``node`` has a stale
+        predecessor (node edited, or about to vanish)."""
+        if node.node_type != NodeType.CONTEXT:
+            return
+        succ = self.next_context_in_session(node)
+        if succ is not None:
+            self._fire_successor_change(succ)
+
+    @_locked
     def get_nodes_bulk(self, node_ids) -> dict:
         """Fetch many nodes in chunked IN() queries: {node_id: Node}. The
         recall path scores hundreds of walked nodes per query — one SELECT
@@ -1297,11 +1348,18 @@ class GraphStore:
             or ("content" in updates and updated.content != existing.content)
         ):
             self._fire_content_change(updated)
+            self._notify_successor(updated)
         return updated
 
     @_locked
     def delete_node(self, node_id: str) -> bool:
         """Delete a node and all its connected edges. Returns True if deleted."""
+        # The successor must be found while the row still exists; its stored
+        # vector (prev-context embeds) carries the text being forgotten.
+        doomed = self.get_node(node_id)
+        successor = (self.next_context_in_session(doomed)
+                     if doomed is not None and doomed.node_type == NodeType.CONTEXT
+                     else None)
         with self.transaction() as conn:
             # Edges cascade via FK, but be explicit for safety
             conn.execute(
@@ -1312,6 +1370,8 @@ class GraphStore:
             deleted = cursor.rowcount > 0
         if deleted:
             self._fire_delete(node_id)
+            if successor is not None:
+                self._fire_successor_change(successor)
         return deleted
 
     @_locked

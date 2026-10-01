@@ -38,6 +38,7 @@ except ImportError:
     Field = None  # type: ignore
 
 
+from revien.dates import DATE_NOTE, said_date
 from revien.graph.store import GraphStore
 from revien.graph.schema import EdgeType, NodeType
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
@@ -217,6 +218,7 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                 content=user_input,
                 content_type="conversation",
                 timestamp=datetime.now(timezone.utc),
+                timestamp_source="capture",
                 metadata={**metadata, "role": "user"},
                 origin_runtime="langchain",
                 origin_source="live",
@@ -232,6 +234,7 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                 content=ai_output,
                 content_type="conversation",
                 timestamp=datetime.now(timezone.utc),
+                timestamp_source="capture",
                 metadata={**metadata, "role": "assistant"},
                 origin_runtime="langchain",
                 origin_source="live",
@@ -347,10 +350,9 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
         lines = [
             f"## Relevant Context (from {len(response.results)} nodes)\n"
         ]
-        if any(r.recorded_at for r in response.results):
-            lines.append(
-                "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)"
-            )
+        if any(said_date(r.recorded_at, getattr(r, "recorded_at_source", None))
+               for r in response.results):
+            lines.append(DATE_NOTE)
 
         for i, result in enumerate(response.results, 1):
             lines.append(f"### Result {i}: {result.label}")
@@ -368,7 +370,8 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
             if result.path:
                 lines.append(f"Path: {' → '.join(result.path)}")
 
-            said = f"[{result.recorded_at[:10]}] " if result.recorded_at else ""
+            day = said_date(result.recorded_at, getattr(result, "recorded_at_source", None))
+            said = f"[{day}] " if day else ""
             lines.append(f"\n{said}{result.content}\n")
 
         lines.append(f"[Retrieved in {response.retrieval_time_ms:.2f}ms]")

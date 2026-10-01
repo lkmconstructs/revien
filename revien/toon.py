@@ -570,11 +570,12 @@ _RESULT_KEYS = ("node_id", "node_type", "label", "content", "score",
                 # so the reshape below can treat them as plain primitive
                 # columns like node_id/node_type/etc.
                 "origin_runtime", "origin_source", "project_key",
-                # When it was said (ISO-8601 UTC) or None; always present.
-                "recorded_at")
+                # When it was said (ISO-8601, speaker's own offset) or None,
+                # and where that time came from; always present.
+                "recorded_at", "recorded_at_source")
 _RESULT_PRIMITIVE_KEYS = ("node_id", "node_type", "label", "content", "score",
                           "origin_runtime", "origin_source", "project_key",
-                          "recorded_at")
+                          "recorded_at", "recorded_at_source")
 _SB_PREFIX = "score_breakdown."
 # Skills leg D2: skill_proposals rows are ALREADY flat (no nested fields to
 # reshape out, unlike a recall result's score_breakdown/path) — this fixed
@@ -640,6 +641,7 @@ def _flatten_recall(payload: Dict[str, Any]) -> Dict[str, Any]:
         row["origin_source"] = r["origin_source"]
         row["project_key"] = r["project_key"]
         row["recorded_at"] = r["recorded_at"]
+        row["recorded_at_source"] = r["recorded_at_source"]
         rows.append(row)
         paths.append(list(r["path"]))
     return {
@@ -682,7 +684,9 @@ def _unflatten_recall(obj: Dict[str, Any]) -> Dict[str, Any]:
                 "origin_runtime": row["origin_runtime"],
                 "origin_source": row["origin_source"],
                 "project_key": row["project_key"],
-                "recorded_at": row["recorded_at"],
+                # .get: TOON from an older daemon (no such column) still parses.
+                "recorded_at": row.get("recorded_at"),
+                "recorded_at_source": row.get("recorded_at_source"),
             })
         except KeyError as exc:
             raise ToonError("flattened recall row missing column: %s" % exc)

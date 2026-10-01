@@ -23,6 +23,7 @@ except ImportError:
 # Single version source (R4): revien.__version__ feeds the CLI banner, the
 # FastAPI app metadata, /v1/health, and the hermes plugin manifest alike.
 from revien import __version__
+from revien.dates import said_date
 
 
 def _default_db_path() -> str:
@@ -521,6 +522,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "origin_source": r.origin_source,
                         "project_key": r.project_key,
                         "recorded_at": r.recorded_at,
+                        "recorded_at_source": r.recorded_at_source,
                     }
                     for r in response.results
                 ],
@@ -546,6 +548,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "origin_source": r.origin_source,
                         "project_key": r.project_key,
                         "recorded_at": r.recorded_at,
+                        "recorded_at_source": r.recorded_at_source,
                     }
                     for r in response.results
                 ],
@@ -566,7 +569,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
 
             for i, r in enumerate(response.results, 1):
                 runtime = r.origin_runtime or "unknown"
-                said = r.recorded_at[:10] if r.recorded_at else "-"
+                said = said_date(r.recorded_at, r.recorded_at_source) or "-"
                 click.echo(f"  [{i}] {r.label}")
                 click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f} "
                            f"| Runtime: {runtime} | Date: {said}")

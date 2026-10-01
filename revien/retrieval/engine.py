@@ -86,12 +86,15 @@ def rrf_fuse(
 
 
 def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
-    """ISO-8601 UTC string for a node timestamp; naive is taken as UTC."""
+    """ISO-8601 string for a node timestamp. The speaker's own UTC offset is
+    PRESERVED (an aware non-UTC time stays in its offset), so the first ten
+    characters are the speaker's calendar day - converting to UTC would turn
+    a 9pm-EDT message into the next day. Naive is taken as UTC."""
     if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+    return dt.isoformat()
 
 
 @dataclass
@@ -115,11 +118,15 @@ class RetrievalResult:
     origin_runtime: Optional[str] = None
     origin_source: Optional[str] = None
     project_key: Optional[str] = None
-    # When the content was SAID (node.recorded_at), ISO-8601 UTC, or None
+    # When the content was SAID (node.recorded_at), ISO-8601 in the speaker's own offset, or None
     # when the node has none. Never falls back to created_at (ingest time):
     # a wrong date is worse than none. Key always present (None allowed) so
     # TOON's uniform-key tabular reshape stays uniform.
     recorded_at: Optional[str] = None
+    # Where recorded_at came from: content | capture | import | mtime, or None
+    # for rows ingested before the source was recorded. Renderers show the
+    # date (and the "when it was said" note) only for content/capture/import.
+    recorded_at_source: Optional[str] = None
 
 
 @dataclass
@@ -908,6 +915,7 @@ class RetrievalEngine:
                 origin_source=node.origin_source,
                 project_key=node.project_key,
                 recorded_at=_iso_utc(node.recorded_at),
+                recorded_at_source=(node.metadata or {}).get("recorded_at_source"),
             ))
 
         # 5. Rank by final score, then (opt-in) cross-encoder rerank of the
@@ -984,7 +992,10 @@ class RetrievalEngine:
             # time / M still pending) when there is any — None otherwise, so
             # the response shape is unchanged for the common case.
             semantic_note=(
-                self.semantic.inactive_reason() or self.semantic.pending_note()
+                self.semantic.inactive_reason()
+                or "; ".join(n for n in (
+                    getattr(self.semantic, "warnings_note", lambda: None)(),
+                    self.semantic.pending_note()) if n) or None
             ),
             diagnostics=diagnostics,
             # Skills leg D2: always computed, always present (possibly

@@ -17,7 +17,7 @@ langchain peer-dependency pattern in revien/adapters/__init__.py.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from revien.validation import validate_ingest, validate_recall
@@ -203,6 +203,7 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                     "origin_source": r.origin_source,
                     "project_key": r.project_key,
                     "recorded_at": r.recorded_at,
+                    "recorded_at_source": r.recorded_at_source,
                 }
                 for r in response.results
             ],
@@ -268,6 +269,10 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                 source_id=source_id,
                 content=content,
                 content_type=content_type,
+                # No timestamp parameter on this face: the store call IS the
+                # moment it was said, so stamp it (labelled capture).
+                timestamp=datetime.now(timezone.utc),
+                timestamp_source="capture",
                 defer_embed=defer_embed,
                 origin_runtime=origin_runtime,
                 # Hard-set, not a parameter: an LLM-facing tool must not be

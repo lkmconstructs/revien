@@ -6,8 +6,11 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
-- **Recall results carry `recorded_at`.** Every recall result now has `recorded_at` (when the memory was said, ISO-8601 UTC, or null when unknown) across the daemon, MCP, CLI and TOON; memory-context blocks show each memory's date as `[YYYY-MM-DD]` so a consuming model can resolve "yesterday" or "next month".
-- **Relative ages follow when a memory was said.** Any age shown to a reader or model is computed from `recorded_at`, never from ingest time (`created_at`), and is omitted when unknown; the Ollama memory-context line now shows the `[YYYY-MM-DD]` date instead of a misleading "N days ago".
+- **Recall results carry `recorded_at`.** Every recall result now has `recorded_at` (when the memory was said, ISO-8601 in the speaker's own UTC offset, or null when unknown) across the daemon, MCP, CLI and TOON; memory-context blocks show each memory's date as `[YYYY-MM-DD]` so a consuming model can resolve "yesterday" or "next month".
+- **No relative age is shown to a reader or model.** Memory blocks show the absolute `[YYYY-MM-DD]` date of when a memory was said (`recorded_at`), never an age computed from ingest time (`created_at`); the date is omitted when unknown, and the Ollama memory-context line now shows it instead of a misleading "N days ago".
+- **TOON recall gains `recorded_at` and `recorded_at_source` columns.** The tabular recall rows carry when each memory was said and where that time came from; `parse_recall` tolerates TOON from an older daemon that has neither column.
+- **`REVIEN_EMBED_CONTEXT=prev` (opt-in).** Embeds each conversation turn together with the turn before it in the same session; the recipe is recorded in the store and a mismatch at open warns in `status()` and the recall `semantic_note`, not only on stderr. Editing or deleting a turn re-queues the next turn for embedding so forgotten text cannot stay findable through its successor's vector. New index `idx_nodes_session` backs the previous/next-turn lookup (created automatically on open).
+- **The embedder is recorded in the store.** `semantic_meta` keeps `embed_model` and `embed_dim`. Opening with a different model warns (`revien reindex`); a dimension change degrades recall to graph-only with a clear note instead of failing silently, and `revien reindex` now recovers by rebuilding the vector table under the new dimension. `reindex` records the new recipe only when every batch succeeded (otherwise status `partial`, recipe unchanged, loud stderr line).
 - **Readers are told what the bracketed date means.** The benchmark answerer prompt gains one rule (the bracketed date is when a memory was said; resolve "yesterday"/"last week"/"next month" against it) and the Hermes, Ollama and LangChain memory blocks carry a one-line note to the same effect when any memory is dated; `READER_CONTEXT` is now `dated-resolved`.
 - **Importers — `revien import-chatgpt` / `import-claude` / `import-readwise`.**
   Batch-import a ChatGPT export, a Claude.ai export, or a Readwise
@@ -303,6 +306,12 @@ All notable changes to Revien are documented here. Format follows
   context nodes (stamps and refreshes it) instead of appending yet another copy. Known
   limitation: the older historical duplicates remain in the graph — retroactive merge
   is out of scope here; the consolidate (dream) pass is the future home for that cleanup.
+- **A date is shown as "when it was said" only when it is.** Session adapters (Claude Code, Codex) stamp the earliest message timestamp in the file instead of the file's mtime; mtime-derived times (file watcher, session files with no message timestamps) are labelled `recorded_at_source=mtime`, never rendered as a date, and never trigger the "dates in brackets" note. A keyed refresh from an mtime source keeps the earlier `recorded_at`. `IngestionInput.timestamp_source` (`content` | `capture` | `mtime` | `import`) is stamped on nodes and carried on recall results (`recorded_at_source`). Rows ingested before the source existed keep their old rendering.
+- **The speaker's calendar day is kept.** `recorded_at` is serialized in its own UTC offset (naive = UTC), so a 9:30pm-EDT message renders as that day everywhere.
+- **Hermes and MCP stores carry a capture time** (`capture` source) when the caller gives none.
+- **The context fence strips only the exact "dates in brackets" note Revien emits,** not any user line that starts the same way.
+- **Benchmark layer status is read live on db-cache hits** (a dead embedder at recall time now exits 3 / is labelled, instead of reporting the snapshot's status); the checkpoint fingerprint covers the benchmark's own source; the cache compares embedder dimension.
+
 
 ## [0.3.0] — 2026-07-11
 

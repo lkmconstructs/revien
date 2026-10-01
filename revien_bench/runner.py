@@ -568,6 +568,7 @@ def _score_qa(
         contents=[r.content for r in resp.results],
         labels=[r.label for r in resp.results],
         dates=[r.recorded_at for r in resp.results],
+        date_sources=[getattr(r, "recorded_at_source", None) for r in resp.results],
     )
     t1 = time.perf_counter()
     # A single hung/failing answerer call (socket timeout, HTTP error, malformed

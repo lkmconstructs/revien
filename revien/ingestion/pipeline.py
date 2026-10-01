@@ -14,6 +14,18 @@ from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
 from revien.graph.origin import derive_origin, validate_origin
+from revien.dates import TIMESTAMP_SOURCES
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Naive datetimes are taken as UTC (same rule as the recall engine)."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _stamp_ts_source(node: Node, timestamp: Optional[datetime], source: Optional[str]) -> None:
+    """Record where the node's recorded_at came from (only when it has one)."""
+    if timestamp is not None and source:
+        node.metadata = {**(node.metadata or {}), "recorded_at_source": source}
 
 
 def _ingest_deny_set() -> set:
@@ -141,6 +153,21 @@ class IngestionInput:
     origin_source: Optional[str] = None
     project_key: Optional[str] = None
     session_key: Optional[str] = None
+    # Where ``timestamp`` came from - stamped on every node as
+    # metadata["recorded_at_source"] and carried on recall results, because a
+    # consuming model is told "dates in brackets are when each memory was said"
+    # and that is only true for content/capture/import time:
+    #   content  the unit's own time (message timestamps, frontmatter, export)
+    #   capture  stamped when Revien captured it live
+    #   mtime    a file's modification time (NOT said-at; never rendered)
+    #   import   carried in from an import
+    timestamp_source: str = "content"
+
+    def __post_init__(self):
+        if self.timestamp_source not in TIMESTAMP_SOURCES:
+            raise ValueError(
+                f"timestamp_source must be one of {TIMESTAMP_SOURCES}, "
+                f"got {self.timestamp_source!r}")
 
 
 @dataclass
@@ -435,6 +462,7 @@ class IngestionPipeline:
             node.source_modality = input_data.source_modality
             node.vision_processed = input_data.vision_processed
             node.recorded_at = input_data.timestamp
+            _stamp_ts_source(node, input_data.timestamp, input_data.timestamp_source)
             node.origin_runtime, node.origin_source, node.project_key, node.session_key = _origin
             if _origin_declared:
                 # Declared vs derived must stay distinguishable after the
@@ -555,7 +583,11 @@ class IngestionPipeline:
                         source_type=SourceType.EXTRACTED,
                         confidence=1.0 if input_data.curated else 0.8,
                         recorded_at=input_data.timestamp,
-                        metadata={"curated": True} if input_data.curated else {},
+                        metadata={
+                            **({"curated": True} if input_data.curated else {}),
+                            **({"recorded_at_source": input_data.timestamp_source}
+                               if input_data.timestamp is not None else {}),
+                        },
                         origin_runtime=_origin[0],
                         origin_source=_origin[1],
                         project_key=_origin[2],
@@ -690,6 +722,17 @@ class IngestionPipeline:
         """
         ctx_id = existing_ctx.node_id
 
+        # Effective recorded_at for this refresh. A file-mtime timestamp moves
+        # forward on every sync and is never "when it was said": keep the
+        # EARLIER of (stored, new) so a refresh cannot make an old session
+        # look newer. Any other source behaves as before (new value wins).
+        ts, ts_source = input_data.timestamp, input_data.timestamp_source
+        if (ts is not None and ts_source == "mtime"
+                and existing_ctx.recorded_at is not None):
+            if _as_utc(existing_ctx.recorded_at) <= _as_utc(ts):
+                ts = existing_ctx.recorded_at
+                ts_source = (existing_ctx.metadata or {}).get("recorded_at_source")
+
         # Re-extract from the full new content.
         extraction = self.extractor.extract(
             content=input_data.content,
@@ -702,7 +745,7 @@ class IngestionPipeline:
         # Temporal re-resolution (best-effort, same contract as ingest()).
         event_updates: Dict = {}
         try:
-            res = resolve_event_time(input_data.content, input_data.timestamp)
+            res = resolve_event_time(input_data.content, ts)
         except Exception:  # noqa: BLE001 - temporal resolution is best-effort
             res = None
         if res is not None:
@@ -737,10 +780,13 @@ class IngestionPipeline:
                 },
                 **event_updates,
             }
-            if input_data.timestamp is not None:
+            if ts is not None:
                 # Keep the previous recorded_at when the caller has none —
                 # a refresh must never NULL a known content time.
-                ctx_updates["recorded_at"] = input_data.timestamp
+                ctx_updates["recorded_at"] = ts
+                if ts_source:
+                    ctx_updates["metadata"] = {
+                        **ctx_updates["metadata"], "recorded_at_source": ts_source}
             self.store.update_node(
                 ctx_id,
                 _audit_op="ingest_refresh",
@@ -761,7 +807,8 @@ class IngestionPipeline:
                     continue
                 candidate_node.source_modality = input_data.source_modality
                 candidate_node.vision_processed = input_data.vision_processed
-                candidate_node.recorded_at = input_data.timestamp
+                candidate_node.recorded_at = ts
+                _stamp_ts_source(candidate_node, ts, ts_source)
                 (
                     candidate_node.origin_runtime, candidate_node.origin_source,
                     candidate_node.project_key, candidate_node.session_key,
@@ -831,8 +878,12 @@ class IngestionPipeline:
                         source_id=input_data.source_id,
                         source_type=SourceType.EXTRACTED,
                         confidence=1.0 if input_data.curated else 0.8,
-                        recorded_at=input_data.timestamp,
-                        metadata={"curated": True} if input_data.curated else {},
+                        recorded_at=ts,
+                        metadata={
+                            **({"curated": True} if input_data.curated else {}),
+                            **({"recorded_at_source": ts_source}
+                               if ts is not None and ts_source else {}),
+                        },
                         origin_runtime=_origin[0],
                         origin_source=_origin[1],
                         project_key=_origin[2],
