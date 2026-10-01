@@ -2,7 +2,7 @@
 
 OWNS: revien/**, tests/**, CHANGELOG.md, README.md
 
-Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skills slice, the ChatGPT/Claude/Readwise importers, and the LoCoMo LLM-judge track, with governance intact and zero egress on the default path.
+Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skills slice, the ChatGPT/Claude/Readwise importers, the LoCoMo LLM-judge track, and the recall leg (recorded_at honesty, embedder recording, bench degraded-run guard), with governance intact and zero egress on the default path.
 
 - [ ] G1: full test suite passes with no failures
   CHECK: python -m pytest -q -p no:cacheprovider --basetemp=.gates-tmp -x
@@ -72,6 +72,21 @@ Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skil
 - [ ] G15: LoCoMo LLM judge is separate from F1, parses CORRECT/WRONG strictly, and a cloud judge fails the egress check even at zero measured calls
   CHECK: python scripts/gates/check_locomo_judge.py
   EXPECT: locomo judge verification passed
+  EVIDENCE: pending
+
+- [ ] G16: a consuming model is never shown a date for a memory unless the date is when it was said
+  CHECK: python scripts/gates/check_recorded_at_honesty.py
+  EXPECT: recorded_at honesty verification passed
+  EVIDENCE: pending
+
+- [ ] G17: the semantic index records its embedder and recipe, refuses to mix, and `revien reindex` recovers a dimension change
+  CHECK: python scripts/gates/check_embedder_record.py
+  EXPECT: embedder record verification passed
+  EVIDENCE: pending
+
+- [ ] G18: a benchmark run never produces a number from a degraded semantic layer, on cache miss or cache hit
+  CHECK: python scripts/gates/check_bench_degraded.py
+  EXPECT: bench degraded-run verification passed
   EVIDENCE: pending
 
 - [ ] G12: merge to main is the repository owner's call, never an agent's
