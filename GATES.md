@@ -2,7 +2,7 @@
 
 OWNS: revien/**, tests/**, CHANGELOG.md, README.md
 
-Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skills slice, the ChatGPT/Claude/Readwise importers, the LoCoMo LLM-judge track, and the recall leg (recorded_at honesty, embedder recording, bench degraded-run guard), with governance intact and zero egress on the default path.
+Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skills slice, the ChatGPT/Claude/Readwise importers, the LoCoMo LLM-judge track, and the recall leg (recorded_at honesty, embedder recording, bench degraded-run guard), truth maintenance that never corrupts memory (supersession safety and fact-update rate floors), with governance intact and zero egress on the default path.
 
 - [ ] G1: full test suite passes with no failures
   CHECK: python -m pytest -q -p no:cacheprovider --basetemp=.gates-tmp -x
@@ -87,6 +87,16 @@ Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skil
 - [ ] G18: a benchmark run never produces a number from a degraded semantic layer, on cache miss or cache hit
   CHECK: python scripts/gates/check_bench_degraded.py
   EXPECT: bench degraded-run verification passed
+  EVIDENCE: pending
+
+- [ ] G19: the supersession gate never auto-fires unsafely, never breaches a sensitive control, and never wrongfully erases
+  CHECK: python scripts/gates/check_truth_safety.py
+  EXPECT: truth safety verification passed
+  EVIDENCE: pending
+
+- [ ] G20: truth-maintenance rates on the rule path do not regress below the recorded floor
+  CHECK: python scripts/gates/check_truth_rates.py
+  EXPECT: truth rates verification passed
   EVIDENCE: pending
 
 - [ ] G12: merge to main is the repository owner's call, never an agent's
