@@ -63,14 +63,23 @@ _DISCLOSED: set = set()
 _VERDICT_RE = re.compile(r"\b(SENSITIVE|NEUTRAL|UNSURE)\b", re.I)
 
 
-def _disclose_cloud(provider: str) -> None:
-    if provider in _DISCLOSED:
+def _disclose_cloud(provider: str,
+                    purpose: str = "judge its sensitivity",
+                    backend_env: str = "REVIEN_SENSITIVITY_BACKEND") -> None:
+    """One loud line per (provider, purpose) before any claim text leaves the
+    machine. The tension recognizer subclasses this one with its own purpose
+    and env var; the call site always passed all three and this helper took
+    one, so every cloud call raised TypeError, was swallowed by recognize()'s
+    catch-all, and the recognizer silently abstained on everything (present
+    since 0.3.0, found Oct 2 2026)."""
+    key = (provider, purpose)
+    if key in _DISCLOSED:
         return
-    _DISCLOSED.add(provider)
+    _DISCLOSED.add(key)
     sys.stderr.write(
-        f"WARNING: Revien is sending CLAIM TEXT to {provider} to judge its "
-        f"sensitivity - this leaves your machine and may itself be a sensitive "
-        f"disclosure. Use REVIEN_SENSITIVITY_BACKEND=ollama (local) in production.\n")
+        f"WARNING: Revien is sending CLAIM TEXT to {provider} to {purpose} "
+        f"- this leaves your machine and may itself be a sensitive "
+        f"disclosure. Use {backend_env}=ollama (local) in production.\n")
     sys.stderr.flush()
 
 
@@ -92,7 +101,11 @@ class LLMSensitivityRecognizer:
         # recognizer) overrides these to reuse the transport unchanged.
         self.system_prompt = SYSTEM_PROMPT
         self.verdict_re = _VERDICT_RE
-        self.max_tokens = 4
+        # One-word verdict, but reasoning-capable models spend hidden tokens
+        # before the visible word; 4 returns an empty reply from them (the same
+        # trap the bench judge hit). 64 is the measured floor there; default
+        # 128, overridable for a model that reasons longer.
+        self.max_tokens = int(os.environ.get("REVIEN_RECOGNIZER_MAX_TOKENS", "128"))
         self.disclosure_purpose = "judge its sensitivity"
         self.backend_env = "REVIEN_SENSITIVITY_BACKEND"
         self._broken = False
