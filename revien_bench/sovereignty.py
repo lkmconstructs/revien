@@ -40,6 +40,7 @@ from revien.ingestion.extractor_llm import (
     CLOUD_BACKENDS as CLOUD_EXTRACTORS,
     DEFAULT_EXTRACTOR,
 )
+from revien.semantic._ort import ort_telemetry_state
 from revien.semantic.index import (
     CLOUD_EMBEDDERS,
     DEFAULT_EMBEDDER,
@@ -232,6 +233,8 @@ def network_egress_zero(
             "all_backends_local": all_local,
             "cloud_backends": cloud_backends,
             "cloud_calls": cloud_calls,
+            # True/False, or None when onnxruntime is not installed.
+            "ort_telemetry_disabled": ort_telemetry_state(),
         },
     )
 

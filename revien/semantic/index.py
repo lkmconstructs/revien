@@ -78,6 +78,8 @@ except ImportError:  # pragma: no cover - exercised only without the extra
 # inside FastEmbedProvider._ensure_model, under offline-first control.
 import importlib.util
 
+from ._ort import ort_telemetry_state
+
 _FASTEMBED_AVAILABLE = importlib.util.find_spec("fastembed") is not None
 
 # The vector STORAGE requires sqlite-vec. A cloud embedder can supply vectors
@@ -223,6 +225,8 @@ class FastEmbedProvider:
             raise RuntimeError(
                 "fastembed not installed (pip install revien[semantic])"
             )
+        from ._ort import disable_ort_telemetry
+        disable_ort_telemetry()  # before any ORT session exists
         from fastembed import TextEmbedding
         # OFFLINE-FIRST via the per-call `local_files_only` PARAMETER — NOT the
         # HF_HUB_OFFLINE env var. huggingface_hub reads HF_HUB_OFFLINE into a
@@ -464,6 +468,8 @@ class SemanticIndex:
             # Open-time warnings (mixed recipe / embedder swapped since the
             # vectors were built). Empty list = none.
             "warnings": list(self._open_warnings),
+            # True/False/None (None = onnxruntime not installed).
+            "ort_telemetry_disabled": ort_telemetry_state(),
         }
 
     def inactive_reason(self) -> Optional[str]:

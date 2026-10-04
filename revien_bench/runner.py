@@ -47,6 +47,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import revien
+from revien.semantic._ort import disable_ort_telemetry
+
+disable_ort_telemetry()  # before any import below can build an ORT session
+
 from revien.graph.clustering import CommunityDetector
 from revien.graph.store import GraphStore
 from revien.retrieval.engine import RetrievalEngine

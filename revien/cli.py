@@ -1034,6 +1034,11 @@ def status(db: Optional[str]):
                 click.echo(f"  {src}: {count}{note}")
 
         click.echo(f"Pairing token: {_pairing_token_status()}")
+        from revien.semantic._ort import ort_telemetry_state
+        click.echo(
+            "ONNX Runtime telemetry: "
+            + ("disabled" if ort_telemetry_state() else "not applicable")
+        )
     finally:
         store.close()
 

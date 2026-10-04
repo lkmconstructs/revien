@@ -132,6 +132,8 @@ class CrossEncoderReranker:
     def _ensure_model(self) -> None:
         if self._model is not None or self._scorer is not None:
             return
+        from ._ort import disable_ort_telemetry
+        disable_ort_telemetry()  # before any ORT session exists
         _register_builtin_variants()
         from fastembed.rerank.cross_encoder import TextCrossEncoder
         # OFFLINE-FIRST via the per-call parameter, NOT HF_HUB_OFFLINE (which
