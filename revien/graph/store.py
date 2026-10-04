@@ -866,6 +866,7 @@ class GraphStore:
 
     @_locked
     def add_node(self, node: Node) -> Node:
+        self._check_validity_window(node.valid_from, node.valid_until)
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.
         with self.transaction() as conn:
@@ -1649,6 +1650,19 @@ class GraphStore:
             q += " WHERE resolved_at IS NULL"
         return conn.execute(q).fetchone()[0]
 
+    @staticmethod
+    def _check_validity_window(valid_from, valid_until) -> None:
+        """Raise ValueError when valid_from is after valid_until. Equal bounds
+        are an empty window, not an inverted one. Naive datetimes read as UTC."""
+        if valid_from is None or valid_until is None:
+            return
+        vf = valid_from if valid_from.tzinfo else valid_from.replace(tzinfo=timezone.utc)
+        vu = valid_until if valid_until.tzinfo else valid_until.replace(tzinfo=timezone.utc)
+        if vf > vu:
+            raise ValueError(
+                f"inverted validity window: valid_from {vf.isoformat()} is "
+                f"after valid_until {vu.isoformat()}")
+
     @_locked
     def set_node_validity(
         self, node_id: str, valid_from=None, valid_until=None,
@@ -1662,6 +1676,10 @@ class GraphStore:
         node = self.get_node(node_id)
         if node is None:
             return False
+        # Never persist an inverted window. The bound that would stand after
+        # this call (an already-set bound wins) must not put from after until.
+        self._check_validity_window(
+            node.valid_from or valid_from, node.valid_until or valid_until)
         updates, params = [], []
         if valid_from is not None and node.valid_from is None:
             updates.append("valid_from = ?")

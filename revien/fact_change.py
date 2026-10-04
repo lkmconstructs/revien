@@ -27,7 +27,7 @@ _RETRACT = re.compile(
     r"laid off|got let go|let go|fired|ended|moved out|drop(?:ped)? out|dropped|ditched|"
     r"got rid of|left\b|passed away|died|switched off|went off|off it)\b", re.I)
 _CHANGE = re.compile(
-    r"\b(?:now|these days|instead|switched (?:to|schools|jobs|over)?|moved (?:to|in|into|over)|"
+    r"\b(?:now\b|these days|instead|switched (?:to|schools|jobs|over)?|moved (?:to|in|into|over)|"
     r"relocat\w+|got a new|new\b|upgraded|traded|replaced|finally|took (?:a|the|my)|"
     r"got (?:hired|promoted|my own|certified)|promoted|closed (?:on|my|the|out)?|opened|"
     r"signed (?:a|my|the|up)|taken over|has become|become my|started|again|"
@@ -114,6 +114,13 @@ def _fav_category(text: str) -> Optional[str]:
     return None
 
 
+def _fav_value(text: str) -> Optional[str]:
+    """The value in "my favourite <slot> is <value> [now]", if stated so."""
+    m = re.search(r"\bfavou?rite\s+(?:[a-z']+\s+){0,3}?(?:is|are|was)\s+(.+?)"
+                  r"(?:\s+now\b|\s+these days\b|[.,;!?]|$)", text, re.I)
+    return m.group(1).strip() if m else None
+
+
 def _same_value(a: str, b: str) -> bool:
     """Same entity if equal or one is contained in the other (Lincoln ⊂ Lincoln
     Elementary; Honda Civic ⊃ Civic) — a shorter restatement is NOT a change.
@@ -141,11 +148,21 @@ def detect_change(old: str, new: str) -> Tuple[Optional[str], bool]:
     # ── Favourite: single-valued per CATEGORY; a change needs a transition marker ──
     if do == "favourite":
         co, cn = _fav_category(old), _fav_category(new)
-        if co is not None and cn is not None and co != cn:
-            return ("favourite", False)               # different categories — independent
-        return ("favourite", has_marker)              # same/unknown category -> needs a marker
+        if co is not None and cn is not None:
+            if co != cn:
+                return ("favourite", False)           # different categories — independent
+            vo, vn = _fav_value(old), _fav_value(new)
+            if vo and vn and _same_value(vo, vn):
+                return ("favourite", False)           # same value restated
+            return ("favourite", has_marker)          # same known category -> needs a marker
+        # Category unknown on a side: still this favourite when the new
+        # claim is itself a favourite statement ("that's my go-to") or the two
+        # share a topic ("gone off blue"). A bare marker is no link — "I moved
+        # to Boston now" says nothing about food — so that falls through.
+        elif _FAV.search(new) or (_tokens(old) & _tokens(new)):
+            return ("favourite", has_marker)
 
-    if do is not None:
+    if do is not None and do != "favourite":
         dn = _dim(new)
         vo, vn = _value(old, do), _value(new, do)
         linked = (dn == do) or (vn is not None) or bool(_tokens(old) & _tokens(new))

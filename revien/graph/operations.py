@@ -63,6 +63,32 @@ class GraphOperations:
 
     # ── Confidence Layer: Scoring, Decay, Reinforcement ───────
 
+    # metadata key: UTC ISO timestamp up to which decay has ALREADY been
+    # charged against node.confidence. Metadata, not a column, so there is no
+    # migration; absent on nodes never decayed (their reference is then
+    # last_referenced/created_at, as before).
+    DECAYED_AT_KEY = "confidence_decayed_at"
+
+    def _decay_reference(self, node: Node) -> datetime:
+        """The instant decay is charged FROM: the later of the node's last
+        reference and the last APPLIED decay. Without the second term every
+        pass re-charged the whole age against an already-decayed confidence
+        (compounding on each consolidator run, and again on the read path)."""
+        reference_time = node.last_referenced or node.created_at
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=timezone.utc)
+        raw = (node.metadata or {}).get(self.DECAYED_AT_KEY)
+        if raw:
+            try:
+                applied = datetime.fromisoformat(raw)
+                if applied.tzinfo is None:
+                    applied = applied.replace(tzinfo=timezone.utc)
+                if applied > reference_time:
+                    reference_time = applied
+            except (TypeError, ValueError):
+                pass  # unreadable marker: fall back to the node's own times
+        return reference_time
+
     def _compute_decayed_confidence(self, node: Node) -> float:
         """PURE: effective (decayed) confidence for a node — NO writes, NO audit.
 
@@ -75,9 +101,7 @@ class GraphOperations:
         if node.pinned or node.source_type != SourceType.INFERRED:
             return node.confidence
         now = datetime.now(timezone.utc)
-        reference_time = node.last_referenced or node.created_at
-        if reference_time.tzinfo is None:
-            reference_time = reference_time.replace(tzinfo=timezone.utc)
+        reference_time = self._decay_reference(node)
         weeks_since = (now - reference_time).days / 7.0
         decay_amount = weeks_since * 0.01
         # Demote, don't delete: floor at DECAY_FLOOR; min() guard never raises a
@@ -96,10 +120,17 @@ class GraphOperations:
             return node
         new_confidence = self._compute_decayed_confidence(node)
         if node.confidence - new_confidence > 0.005:
+            # Advance the marker by the WHOLE days charged (the math counts
+            # whole days), so the remainder is not lost and a repeat pass at
+            # the same instant charges nothing.
+            charged_to = self._decay_reference(node) + timedelta(
+                days=(datetime.now(timezone.utc) - self._decay_reference(node)).days)
             return self.store.update_node(
                 node.node_id,
                 confidence=new_confidence,
                 confidence_set_at=datetime.now(timezone.utc),
+                metadata={**(node.metadata or {}),
+                          self.DECAYED_AT_KEY: charged_to.isoformat()},
                 source_context="lazy_decay",
                 _audit_op="decay",
             ) or node
