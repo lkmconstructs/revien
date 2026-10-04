@@ -101,6 +101,8 @@ def main_check(tmp):
         turn(store, f"Alice: postgres billing note {i}", i)
     res, _ = quiet(idx.reindex_all)
     check(res["status"] == "ok" and res["indexed"] == 3, f"initial build failed: {res['status']}")
+    # store.add_node queues every write; reindex_all embedded them inline.
+    store.clear_pending_embeds([n.node_id for n in store.list_nodes(limit=99)])
     store.close()
     meta = raw_meta(db)
     check(meta.get("embed_model") == "stub-a" and meta.get("embed_dim") == "4",
@@ -182,6 +184,7 @@ def main_check(tmp):
             n2 = turn(store, "Bob: my zebra passport number is 77341", 2)
             n3 = turn(store, "Alice: wow ok", 3)
             idx.index_nodes([(n.node_id, n.label, n.content) for n in (n1, n2, n3)])
+            store.clear_pending_embeds([n.node_id for n in (n1, n2, n3)])  # embedded inline
             check("zebra passport number is 77341" in idx._embedder.seen[-1],
                   "prev mode: turn 3 was not embedded with turn 2")
             idx._embedder.seen.clear()
@@ -208,6 +211,7 @@ def main_check(tmp):
         n2 = turn(store, "Bob: first", 2)
         n3 = turn(store, "Alice: wow ok", 3)
         idx.index_nodes([(n.node_id, n.label, n.content) for n in (n1, n2, n3)])
+        store.clear_pending_embeds([n.node_id for n in (n1, n2, n3)])  # embedded inline
         store.update_node(n2.node_id, content="Bob: second", label="Bob: second")
         check(idx.pending_count() == 1, "off mode re-queued the successor (control failed)")
         store.close()

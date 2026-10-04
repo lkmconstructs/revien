@@ -117,7 +117,9 @@ def test_prev_single_index_node_and_drain_paths(store, monkeypatch):
     n2 = _turn(store, "A: second", seq=2)
     idx.index_node(n2.node_id, n2.label, n2.content)
     assert emb.seen == ["A: first\nA: second"]
-    # deferred queue drain goes through index_nodes
+    # deferred queue drain goes through index_nodes. store.add_node queued
+    # both turns on write; retire those so only the explicit defer remains.
+    store.clear_pending_embeds([n1.node_id, n2.node_id])
     emb.seen.clear()
     idx.defer_nodes([(n2.node_id, n2.label, n2.content)])
     assert idx.drain_pending() == 1
@@ -130,6 +132,7 @@ def test_listener_requeue_uses_prev(store, monkeypatch):
     n1 = _turn(store, "A: first", seq=1)
     n2 = _turn(store, "A: second", seq=2)
     _index_all(idx, store, [n1, n2])
+    store.clear_pending_embeds([n1.node_id, n2.node_id])  # embedded inline above
     emb.seen.clear()
     store.update_node(n2.node_id, content="A: second, edited")
     assert idx.pending_count() == 1

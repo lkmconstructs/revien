@@ -401,6 +401,7 @@ class TestImportSemantic:
         sem = _QueueTestIndex(store)
         stale = store.add_node(_fact("bread", content="Bread starter notes."))
         sem.index_node(stale.node_id, stale.label, stale.content)
+        store.clear_pending_embeds([stale.node_id])  # embedded inline above
         assert stale.node_id in sem._vectors
 
         g, a, _b = self._searchable_graph()
@@ -420,6 +421,7 @@ class TestImportSemantic:
 
     def test_merge_queues_only_new_nodes(self, store):
         resident = store.add_node(_fact("revenue", content="Q3 revenue claim."))
+        store.clear_pending_embeds([resident.node_id])  # not part of this import
         sem = _QueueTestIndex(store)
         g, a, b = self._searchable_graph()
         result = store.import_graph(g, mode="merge", semantic=sem)

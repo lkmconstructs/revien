@@ -72,7 +72,12 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
         store: Underlying GraphStore instance.
         retrieval_engine: RetrievalEngine for querying the graph.
         ingestion_pipeline: IngestionPipeline for storing conversations.
-        session_scope: Optional session ID to isolate memory within a session.
+        session_scope: Optional session ID. Writes are stamped with it as
+            their session_key and clear() is scoped to it. LIMITATION:
+            recall (load_memory_variables) is NOT session-filtered — the
+            retrieval engine has no session filter yet, so a session can
+            still recall another session's memory from the same database.
+            Use a separate graph_path for hard isolation.
         top_n: Number of results to retrieve per query (default 5).
         min_score: Minimum relevance threshold (default 0.01).
     """
@@ -106,8 +111,10 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
 
         Args:
             graph_path: Path to the Revien SQLite database.
-            session_scope: Optional session identifier. If set, memory operations
-                are scoped to this session (stored in node metadata).
+            session_scope: Optional session identifier. If set, writes are
+                stamped with it (session_key) and clear() removes only that
+                session's nodes. Recall is not session-filtered (see class
+                docstring).
             top_n: Maximum number of relevant context nodes to retrieve (1-20).
             min_score: Minimum composite relevance score threshold (0.0-1.0).
             **kwargs: Additional arguments passed to BaseMemory (if available).
@@ -257,10 +264,13 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
 
     def clear(self) -> None:
         """
-        Clear all memory from the graph.
+        Clear memory from the graph.
 
-        WARNING: This deletes all nodes and edges. Use with caution.
-        Consider using session_scope to isolate conversations instead.
+        With ``session_scope`` set, removes ONLY the nodes stamped with that
+        session_key (and their edges) — another session's memory in the same
+        database is left alone. Without a scope, deletes every node and edge:
+        WARNING, use with caution. (Entities deduplicated into an earlier
+        session's nodes keep that session's key and survive this clear.)
         """
         if not self._store:
             return
@@ -269,11 +279,16 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
             # Batch deletion to avoid loading entire graph into memory
             batch_size = 100
             while True:
-                batch = self._store.list_nodes(limit=batch_size)
+                batch = self._store.list_nodes(
+                    limit=batch_size, session_key=self.session_scope or None)
                 if not batch:
                     break
+                deleted = 0
                 for node in batch:
-                    self._store.delete_node(node.node_id)
+                    if self._store.delete_node(node.node_id):
+                        deleted += 1
+                if not deleted:
+                    break  # nothing deletable left — never spin
         except Exception:
             pass
 

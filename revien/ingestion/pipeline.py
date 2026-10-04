@@ -4,6 +4,7 @@ The main entry point for feeding content into the graph.
 """
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,44 +39,50 @@ def _ingest_deny_set() -> set:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
+def _caller_metadata(input_data: "IngestionInput") -> Optional[Dict]:
+    """Caller-supplied IngestionInput.metadata, JSON-normalised, or None.
+
+    Stored on the CONTEXT node only, namespaced under metadata["caller"] so it
+    can never overwrite a reserved key (ingest_key, ingest_content_hash,
+    curated, recorded_at_source, origin_declared, dia_id). Derived claim
+    nodes (fact/entity/preference/...) do NOT inherit it: it describes the
+    verbatim turn the caller sent, not each claim extracted from it.
+    """
+    md = input_data.metadata
+    if not md or not isinstance(md, dict):
+        return None
+    return json.loads(json.dumps(md, default=str))
+
+
 def _resolve_origin(input_data: "IngestionInput"):
     """Resolve the (runtime, source, project, session) tuple for one input,
     once per ingest call — shared by the fresh-ingest and refresh paths.
 
-    An explicit origin_runtime is validated against the fixed vocabulary
-    (revien.graph.origin.validate_origin) and WINS outright; ValueError
-    propagates to the caller (daemon -> 400, CLI/MCP -> their own handling).
-    Omitted origin_runtime falls back to deriving runtime/source from
-    source_id — never validated, since derive_origin only ever returns
-    values from that same vocabulary or None. A caller-declared
-    project_key/session_key is kept even in the fallback case (only
-    runtime/source come from source_id there) — a caller that knows its
-    own project/session identity but not its runtime must not have that
-    identity silently discarded; derive_origin's own project/session only
-    fills in whichever of the two the caller left unset.
+    Each of runtime/source/project/session resolves independently: the
+    caller's declared value when given, else derived from source_id
+    (revien.graph.origin.derive_origin). Declared runtime/source are
+    validated against the fixed vocabulary; ValueError propagates to the
+    caller (daemon -> 400, CLI/MCP -> their own handling).
 
-    Returns (origin_tuple, declared) — `declared` is True only when the
-    caller supplied origin_runtime explicitly, which is what gates whether
-    produced nodes get metadata["origin_declared"] = True.
+    Returns (origin_tuple, declared) — `declared` is True when the caller
+    supplied origin_runtime or origin_source, which gates whether produced
+    nodes get metadata["origin_declared"] = True.
     """
-    if input_data.origin_runtime is None:
-        derived = derive_origin(input_data.source_id)
-        project_key = (
-            input_data.project_key if input_data.project_key is not None
-            else derived.project
-        )
-        session_key = (
-            input_data.session_key if input_data.session_key is not None
-            else derived.session
-        )
-        return (derived.runtime, derived.source, project_key, session_key), False
     validate_origin(input_data.origin_runtime, input_data.origin_source)
+    derived = derive_origin(input_data.source_id)
+
+    def _pick(declared, fallback):
+        return declared if declared is not None else fallback
+
     return (
         (
-            input_data.origin_runtime, input_data.origin_source,
-            input_data.project_key, input_data.session_key,
+            _pick(input_data.origin_runtime, derived.runtime),
+            _pick(input_data.origin_source, derived.source),
+            _pick(input_data.project_key, derived.project),
+            _pick(input_data.session_key, derived.session),
         ),
-        True,
+        input_data.origin_runtime is not None
+        or input_data.origin_source is not None,
     )
 
 
@@ -471,6 +478,9 @@ class IngestionPipeline:
                 node.metadata = {**(node.metadata or {}), "origin_declared": True}
             if node.node_id == ctx_id:
                 node.answerable_by_text = input_data.answerable_by_text
+                _caller_md = _caller_metadata(input_data)
+                if _caller_md is not None:
+                    node.metadata = {**(node.metadata or {}), "caller": _caller_md}
                 # Stamp the ingest key + content hash (R3) so the NEXT ingest
                 # of this same unit finds and refreshes this node.
                 if ingest_key:
@@ -635,6 +645,12 @@ class IngestionPipeline:
                 self.semantic.defer_nodes(newly_created)
             else:
                 self.semantic.index_nodes(newly_created)
+                if self.semantic.is_enabled:
+                    # Embedded inline: retire the queue rows store.add_node
+                    # left. A failed embed self-disables the layer, which
+                    # keeps them queued for a later process.
+                    self.store.clear_pending_embeds(
+                        [nid for nid, _l, _c in newly_created])
 
         # 4. Get context node ID from mapping
         context_id = id_map.get(
@@ -780,6 +796,9 @@ class IngestionPipeline:
                 },
                 **event_updates,
             }
+            _caller_md = _caller_metadata(input_data)
+            if _caller_md is not None:
+                ctx_updates["metadata"]["caller"] = _caller_md
             if ts is not None:
                 # Keep the previous recorded_at when the caller has none —
                 # a refresh must never NULL a known content time.
@@ -915,6 +934,12 @@ class IngestionPipeline:
                 self.semantic.defer_nodes(newly_created)
             else:
                 self.semantic.index_nodes(newly_created)
+                if self.semantic.is_enabled:
+                    # Embedded inline: retire the queue rows store.add_node
+                    # left. A failed embed self-disables the layer, which
+                    # keeps them queued for a later process.
+                    self.store.clear_pending_embeds(
+                        [nid for nid, _l, _c in newly_created])
 
         # Governance parity with ingest(): best-effort, never breaks ingest.
         governance: List = []

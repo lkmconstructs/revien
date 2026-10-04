@@ -96,6 +96,7 @@ def test_prev_mode_edit_requeues_successor(path, monkeypatch):
     n2 = _turn(store, "Bob: my zebra passport number is 77341", 2)
     n3 = _turn(store, "Alice: wow ok", 3)
     idx.index_nodes([(n.node_id, n.label, n.content) for n in (n1, n2, n3)])
+    store.clear_pending_embeds([n.node_id for n in (n1, n2, n3)])  # embedded inline
     assert "zebra passport number is 77341" in idx._embedder.seen[-1]  # n3 carries n2
     idx._embedder.seen.clear()
     store.update_node(n2.node_id, content="Bob: I like tea", label="Bob: I like tea")
@@ -113,6 +114,7 @@ def test_prev_mode_delete_requeues_successor_so_forgotten_text_is_gone(path, mon
     n2 = _turn(store, "Bob: my zebra passport number is 77341", 2)
     n3 = _turn(store, "Alice: wow ok", 3)
     idx.index_nodes([(n.node_id, n.label, n.content) for n in (n1, n2, n3)])
+    store.clear_pending_embeds([n.node_id for n in (n1, n2, n3)])  # embedded inline
     idx._embedder.seen.clear()
     store.delete_node(n2.node_id)
     assert idx.pending_count() == 1
@@ -130,10 +132,12 @@ def test_off_mode_does_not_requeue_successor(path):
     n2 = _turn(store, "Bob: first", 2)
     n3 = _turn(store, "Alice: wow ok", 3)
     idx.index_nodes([(n.node_id, n.label, n.content) for n in (n1, n2, n3)])
+    store.clear_pending_embeds([n.node_id for n in (n1, n2, n3)])  # embedded inline
     store.update_node(n2.node_id, content="Bob: second", label="Bob: second")
     assert idx.pending_count() == 1  # only n2
     store.delete_node(n2.node_id)
-    assert idx.pending_count() == 1
+    # n2's own queue row goes with the node; the successor is NOT requeued.
+    assert idx.pending_count() == 0
     store.close()
 
 
@@ -141,9 +145,10 @@ def test_off_mode_does_not_requeue_successor(path):
 
 def _seeded(path, **kw):
     store, idx = _open(path, **kw)
-    for i in range(3):
-        _turn(store, f"Alice: postgres billing note {i}", i)
+    ids = [_turn(store, f"Alice: postgres billing note {i}", i).node_id
+           for i in range(3)]
     assert idx.reindex_all()["status"] == "ok"
+    store.clear_pending_embeds(ids)  # reindex_all embedded them inline
     store.close()
 
 

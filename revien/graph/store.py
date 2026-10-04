@@ -580,8 +580,16 @@ class GraphStore:
             # created_at is always present: it's a NOT NULL column in this
             # store's CREATE TABLE nodes, so a nodes table missing it isn't
             # a state this store can produce.
-            conn.execute("DROP INDEX IF EXISTS idx_nodes_origin_runtime")
-            conn.execute("DROP INDEX IF EXISTS idx_nodes_project")
+            # Drop only when the stored definition is not the composite
+            # (an unconditional drop+create ran on every open). Both the old
+            # single-column form and the composite share the name, so look
+            # at the stored SQL.
+            for _name in ("idx_nodes_origin_runtime", "idx_nodes_project"):
+                _row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' "
+                    "AND name=?", (_name,)).fetchone()
+                if _row and "created_at" not in (_row[0] or ""):
+                    conn.execute(f"DROP INDEX {_name}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
                 "ON nodes(origin_runtime, created_at DESC)"
@@ -862,6 +870,7 @@ class GraphStore:
         # no crash window where a node exists the trail can't account for.
         with self.transaction() as conn:
             self._add_node_stmt(conn, node)
+            self._enqueue_embed_stmt(conn, node.node_id)
             # Provenance hook: record node creation. Inside the transaction an
             # audit failure rolls the insert back — provenance is required.
             self._record_node_audit(
@@ -870,6 +879,55 @@ class GraphStore:
                 before_node=None, after_node=node,
             )
         return node
+
+    # The deferred-embedding queue is owned by SemanticIndex.PENDING_TABLE
+    # (same name, same shape). The store enqueues into it in the SAME
+    # transaction as the node write, so every route that creates or edits a
+    # node — pipeline, skills, a bare CLI store, a second connection — leaves
+    # durable pending index work for whichever process runs the next drain,
+    # with or without a live SemanticIndex listener on this instance. Plain
+    # SQL, no extension, no embedder.
+    _PENDING_EMBED_TABLE = "pending_embeds"
+
+    @classmethod
+    def _enqueue_embed_stmt(cls, conn: sqlite3.Connection, node_id: str) -> None:
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {cls._PENDING_EMBED_TABLE} "
+            f"(node_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            f"INSERT OR REPLACE INTO {cls._PENDING_EMBED_TABLE} "
+            f"(node_id, queued_at) VALUES (?, ?)",
+            (node_id, datetime.now(timezone.utc).isoformat()),
+        )
+
+    @classmethod
+    def _discard_pending_stmt(cls, conn: sqlite3.Connection, node_id=None) -> None:
+        """Drop queue row(s) of a deleted node (all rows when node_id is None);
+        a table that was never created means nothing was ever queued."""
+        try:
+            if node_id is None:
+                conn.execute(f"DELETE FROM {cls._PENDING_EMBED_TABLE}")
+            else:
+                conn.execute(
+                    f"DELETE FROM {cls._PENDING_EMBED_TABLE} WHERE node_id = ?",
+                    (node_id,))
+        except sqlite3.OperationalError:
+            pass
+
+    @_locked
+    def clear_pending_embeds(self, node_ids) -> None:
+        """Drop queue rows for nodes a caller just embedded inline."""
+        ids = [(i,) for i in node_ids]
+        if not ids:
+            return
+        conn = self._get_conn()
+        try:
+            conn.executemany(
+                f"DELETE FROM {self._PENDING_EMBED_TABLE} WHERE node_id = ?", ids)
+            self._commit(conn)
+        except sqlite3.OperationalError:  # table never created: nothing queued
+            pass
 
     @staticmethod
     def _add_node_stmt(conn: sqlite3.Connection, node: Node) -> None:
@@ -1392,6 +1450,11 @@ class GraphStore:
                 values,
             )
             updated = self.get_node(node_id)
+            if updated is not None and (
+                updated.label != existing.label
+                or updated.content != existing.content
+            ):
+                self._enqueue_embed_stmt(conn, node_id)
             # Provenance hook: generic update entry unless a semantic caller
             # (reinforce/correct/decay/invalidate/access) suppresses it.
             if _audit_op:
@@ -1431,6 +1494,7 @@ class GraphStore:
             )
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
+            self._discard_pending_stmt(conn, node_id)
         if deleted:
             self._fire_delete(node_id)
             if successor is not None:
@@ -1446,6 +1510,7 @@ class GraphStore:
         offset: int = 0,
         origin_runtime: Optional[Union[str, List[str]]] = None,
         project_key: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> list[Node]:
         """List nodes, newest first. Origin Layer (WS0 Leg B): origin_runtime
         and project_key are SQL WHERE prefilters, not a post-fetch scan — a
@@ -1476,6 +1541,9 @@ class GraphStore:
         if project_key:
             query += " AND project_key = ?"
             params.append(project_key)
+        if session_key:
+            query += " AND session_key = ?"
+            params.append(session_key)
         # G7: created_at ties (same-millisecond ingest, common in bulk
         # backfills/tests) previously left paging order unstable across
         # calls — node_id is a deterministic tiebreaker so offset paging
@@ -2042,6 +2110,7 @@ class GraphStore:
                 # when the semantic index is rebuilt wholesale below.
                 conn.execute("DELETE FROM edges")
                 conn.execute("DELETE FROM nodes")
+                self._discard_pending_stmt(conn)
             for node in new_nodes:
                 self.add_node(node)  # rides this transaction; audit included
                 result["nodes_added"] += 1
