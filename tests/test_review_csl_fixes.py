@@ -68,6 +68,21 @@ def test_same_favourite_restated_is_not_a_change():
                          "My favorite food is pizza now.") == ("favourite", False)
 
 
+@pytest.mark.parametrize("old,new", [
+    ("The Office is hands down my favourite comfort show.",
+     "My comfort show used to be The Office but it's Parks and Rec now."),
+    ("Blue has always been my favourite colour.",
+     "I've completely gone off blue, it's forest green for me these days."),
+    ("My favourite coffee order is a flat white.",
+     "I'm an oat milk latte person now, that's my go-to."),
+])
+def test_favourite_change_with_category_named_on_one_side(old, new):
+    # The first cut of C sent these to the general path; the fact-update
+    # bench fell from 8/68 to 3/68. A shared topic or a favourite-shaped new
+    # claim is the link a bare "now" lacks.
+    assert detect_change(old, new) == ("favourite", True)
+
+
 # -- D: chronology before supersession ---------------------------------
 
 
