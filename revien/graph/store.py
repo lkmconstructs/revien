@@ -11,7 +11,7 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from .origin import derive_origin
 from .schema import (
@@ -248,6 +248,31 @@ class GraphStore:
                 PRIMARY KEY (note_stem, anchor_node_id)
             );
 
+            -- Usage ledger (N1, metacognition tier 1): one row per judgment of
+            -- whether an answer actually drew on a memory it was handed by
+            -- recall. episode_key = "{session source_id}#{tool_use_id}". The
+            -- UNIQUE pair makes a rescan of a grown session a no-op, and the
+            -- INSERT OR IGNORE claim is what decides who may apply, so two
+            -- processes can never both count one use. Abstentions are not
+            -- judgments and are never written here. applied = 1 only when
+            -- mark_used ran (mode "apply"). shared_terms holds the memory's own
+            -- words, so delete_node (and with it right-to-forget) removes a
+            -- node's rows.
+            CREATE TABLE IF NOT EXISTS use_judgments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_key TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                used INTEGER NOT NULL,
+                reason TEXT DEFAULT '',
+                shared_terms TEXT DEFAULT '[]',
+                similarity REAL,
+                query TEXT DEFAULT '',
+                mode TEXT NOT NULL,
+                applied INTEGER NOT NULL DEFAULT 0,
+                judged_at TEXT NOT NULL,
+                UNIQUE (episode_key, node_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
@@ -260,6 +285,8 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
             CREATE INDEX IF NOT EXISTS idx_candidates_unresolved
                 ON supersession_candidates(resolved_at);
+            CREATE INDEX IF NOT EXISTS idx_use_judgments_node
+                ON use_judgments(node_id);
         """)
         # idx_nodes_origin_* are NOT created here: on a legacy DB whose
         # "nodes" table predates the origin columns, CREATE TABLE IF NOT
@@ -1107,6 +1134,95 @@ class GraphStore:
         )
         self._commit(conn)
 
+    # ── Usage ledger (N1) ─────────────────────────────────
+
+    @_locked
+    def has_use_judgment(self, episode_key: str, node_id: str) -> bool:
+        """True when this (episode, node) pair has already been judged."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM use_judgments WHERE episode_key = ? AND node_id = ?",
+            (episode_key, node_id),
+        ).fetchone()
+        return row is not None
+
+    @_locked
+    def record_use_judgment(
+        self,
+        *,
+        episode_key: str,
+        node_id: str,
+        used: bool,
+        reason: str,
+        shared_terms: List[str],
+        similarity: Optional[float],
+        query: str,
+        mode: str,
+        applied: bool,
+    ) -> bool:
+        """Claim one judgment: INSERT OR IGNORE on the (episode_key, node_id)
+        pair. Returns True only for the caller whose insert landed — only that
+        caller may apply it, so a judgment is counted at most once even across
+        processes. Rows are never updated."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO use_judgments
+               (episode_key, node_id, used, reason, shared_terms, similarity,
+                query, mode, applied, judged_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (episode_key, node_id, int(bool(used)), reason,
+             json.dumps(list(shared_terms)), similarity, query, mode,
+             int(bool(applied)), datetime.now(timezone.utc).isoformat()),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
+    @_locked
+    def list_use_judgments(
+        self, limit: int = 50, used: Optional[bool] = None
+    ) -> List[Dict]:
+        """Most recent judgments first. ``used`` filters to used/unused rows."""
+        conn = self._get_conn()
+        sql = ("SELECT episode_key, node_id, used, reason, shared_terms, "
+               "similarity, query, mode, applied, judged_at FROM use_judgments")
+        params: list = []
+        if used is not None:
+            sql += " WHERE used = ?"
+            params.append(int(used))
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "episode_key": r[0],
+                "node_id": r[1],
+                "used": bool(r[2]),
+                "reason": r[3] or "",
+                "shared_terms": json.loads(r[4] or "[]"),
+                "similarity": r[5],
+                "query": r[6] or "",
+                "mode": r[7],
+                "applied": bool(r[8]),
+                "judged_at": r[9],
+            }
+            for r in rows
+        ]
+
+    @_locked
+    def use_judgment_counts(self) -> Dict[str, int]:
+        """Totals over the whole ledger: judged, used, unused, applied."""
+        conn = self._get_conn()
+        judged, used, applied = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied), 0) "
+            "FROM use_judgments"
+        ).fetchone()
+        return {
+            "judged": int(judged),
+            "used": int(used),
+            "unused": int(judged) - int(used),
+            "applied": int(applied),
+        }
+
     @_locked
     def find_context_node_by_ingest_key(
         self, ingest_key: str, node_type: NodeType = NodeType.CONTEXT
@@ -1280,6 +1396,10 @@ class GraphStore:
                 "DELETE FROM edges WHERE source_node_id = ? OR target_node_id = ?",
                 (node_id, node_id),
             )
+            # Usage judgments keep the memory's own words (shared_terms), so
+            # they go with it — right-to-forget runs through here, and its
+            # promise is that the content is actually gone.
+            conn.execute("DELETE FROM use_judgments WHERE node_id = ?", (node_id,))
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
         if deleted:

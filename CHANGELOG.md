@@ -252,6 +252,44 @@ All notable changes to Revien are documented here. Format follows
   pre-fence behavior byte-identically); stripped spans are logged with source_id,
   count, chars, and which marker families fired, and content that fences down to
   nothing is skipped rather than stored as an empty husk.
+- **Usage signal (N1) — did an answer actually draw on what recall handed it?**
+  `mark_used` existed (access count +1, an "access" audit row, +0.05 on the
+  node's edges) but its only caller was `POST /v1/mark_used`: the MCP server
+  exposes only `revien_recall` and `revien_store`, nothing produced the signal,
+  and the frequency term counted dedup hits instead of use. New
+  `revien/usage/` closes that loop for Claude Code. `episodes.py` reads each
+  session transcript for `revien_recall` calls (bare or
+  `mcp__<server>__revien_recall`), the memories each returned, and the
+  assistant's answer that followed. An episode is emitted only once its turn has
+  closed (`stop_reason: "end_turn"`, or a new human prompt), so an answer still
+  being written is never judged. Thinking blocks, tool inputs, `isMeta` and
+  sidechain entries are never part of the answer. `evidence.py` gathers two
+  independent signals per memory: shared distinctive terms, with the prompt's
+  and query's own words removed first so restating the question proves
+  nothing; and the best cosine between the memory and any answer paragraph,
+  from the configured embedder (local by default), or `None` when the
+  semantic layer is off. `judge.py:judge_use` is the rule: both signals must
+  agree, it abstains when one is missing, and it is precision-first because a
+  false "used" compounds. Judgments land in a new `use_judgments` ledger, one
+  row per (episode, memory), claimed by `INSERT OR IGNORE`. That makes rescans
+  of a grown session no-ops, and two processes can never count one use twice;
+  abstentions are not written. `shared_terms` holds the memory's own words, so
+  `delete_node`, and with it right-to-forget, removes that node's rows. The
+  observer also skips any recalled memory whose node no longer exists, so a
+  rescan can't copy forgotten words back in from the transcript.
+  `REVIEN_USAGE` picks the mode:
+  - `shadow` (default) records judgments only;
+  - `apply` also calls `mark_used`;
+  - `off` disables the pass.
+  Unrecognized values fall back to shadow, so a typo never writes to the graph.
+  `revien usage scan [--mode] [--full] [--path]` runs a pass with its own
+  cursor (`usage:claude-code` in `sync_cursors`), and `revien usage list
+  [--filter used|unused]` shows each judgment with its evidence. The daemon
+  schedules the pass only when `REVIEN_USAGE_INTERVAL_HOURS` is set (opt-in,
+  like dream mode). New `SemanticIndex.embed_texts()` embeds arbitrary text
+  without touching the vector table. Not covered yet: Hermes and Ollama (both
+  see the recall and the reply live and are the next callers), Codex sessions,
+  and the activation-level probe (tier 2, local open-weight models).
 
 ### Fixed
 - **The Claude Code adapter now reads real Claude Code sessions.** It read
