@@ -254,6 +254,22 @@ All notable changes to Revien are documented here. Format follows
   nothing is skipped rather than stored as an empty husk.
 
 ### Fixed
+- **The Claude Code adapter now reads real Claude Code sessions.** It read
+  only a top-level `content` field. Real transcripts nest the text under
+  `message.content`, so every real session parsed to nothing and the adapter
+  fetched 0 items. Verified against a live transcript: 0 items before, the full
+  conversation after. The test fixtures used a flat `{"type": "human",
+  "content": ...}` shape Claude Code never writes, so the suite stayed green.
+  The adapter now reads `message.content` (the flat shape still works) and
+  skips two kinds of entry that aren't the human's words: `isMeta` entries
+  (harness-injected skill bodies, command caveats, agent reports) and
+  `isSidechain` entries. Sidechain entries make up every subagent transcript
+  under `<session>/subagents/`, where the "user" is the parent agent, so those
+  files ingest as nothing. `session_files(since)` and `source_id_for(path)` are
+  now public, so anything else that reads sessions sees exactly the files
+  ingest reads. Known limitation: an existing install's `claude-code` sync cursor has already
+  moved past older sessions, so only sessions that change from now on are
+  captured until that cursor is reset.
 - **Auto-sync fires immediately at daemon startup**, then every interval — no more
   silent 6-hour wait before the first sync of connected adapters.
 - **Pre-existing duplicate session contexts stop growing.** The first keyed ingest of a
