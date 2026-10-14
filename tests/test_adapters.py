@@ -327,6 +327,73 @@ class TestClaudeCodeAdapter:
         ), "The real question outside the fenced block should still be stored"
 
 
+class TestClaudeCodeRealTranscript:
+    """Real Claude Code transcripts nest the text under ``message.content``.
+    The flat fixtures above never exercised that shape, so the adapter read
+    0 items from every real session until this was fixed."""
+
+    @staticmethod
+    def _write(path, entries):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n",
+                        encoding="utf-8")
+
+    @staticmethod
+    def _fetch(tmp_path):
+        adapter = ClaudeCodeAdapter(session_dir=str(tmp_path / "projects"))
+        since = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        return run_async(adapter.fetch_new_content(since))
+
+    def test_reads_real_shape_and_skips_everything_but_conversation(self, tmp_path):
+        self._write(tmp_path / "projects" / "billing" / "sess-1.jsonl", [
+            {"type": "user", "message": {"role": "user",
+                                         "content": "Which database does billing use?"}},
+            {"type": "assistant", "message": {
+                "id": "m1", "role": "assistant", "stop_reason": "tool_use",
+                "content": [
+                    {"type": "thinking", "thinking": "PRIVATE-REASONING",
+                     "signature": "sig"},
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "TOOL-INPUT"}},
+                ]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": "TOOL-OUTPUT"}]}},
+            {"type": "user", "isMeta": True,
+             "message": {"role": "user", "content": "HARNESS-INJECTED"}},
+            {"type": "assistant", "message": {
+                "id": "m2", "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Billing runs on PostgreSQL."}]}},
+            {"type": "attachment", "attachment": {"type": "file"}},
+        ])
+        results = self._fetch(tmp_path)
+        assert len(results) == 1
+        assert results[0]["source_id"] == "claude-code:billing:sess-1"
+        assert results[0]["content"] == (
+            "User: Which database does billing use?\n"
+            "Assistant: Billing runs on PostgreSQL."
+        )
+
+    def test_subagent_transcripts_are_not_ingested(self, tmp_path):
+        session_dir = tmp_path / "projects" / "billing"
+        self._write(session_dir / "sess-1.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "Audit billing."}},
+            {"type": "assistant", "message": {
+                "id": "m1", "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Audit done."}]}},
+        ])
+        # A subagent's "user" is the parent agent, not the human.
+        self._write(session_dir / "sess-1" / "subagents" / "agent-x.jsonl", [
+            {"type": "user", "isSidechain": True,
+             "message": {"role": "user", "content": "PARENT-AGENT-PROMPT"}},
+            {"type": "assistant", "isSidechain": True, "message": {
+                "id": "s1", "role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "SUBAGENT-REPORT"}]}},
+        ])
+        results = self._fetch(tmp_path)
+        assert [r["source_id"] for r in results] == ["claude-code:billing:sess-1"]
+
+
 # ── File Watcher Adapter Tests ────────────────────────────
 
 class TestFileWatcherAdapter:

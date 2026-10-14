@@ -23,13 +23,19 @@ class ClaudeCodeAdapter(RevienAdapter):
     """
     Reads Claude Code JSONL conversation logs and produces content for ingestion.
 
-    Claude Code stores sessions as JSONL files where each line is a message object:
+    Real Claude Code transcripts nest the API message under ``message``:
     {
-        "type": "human" | "assistant" | "tool_use" | "tool_result" | ...,
-        "content": "message text" | [...],
+        "type": "user" | "assistant" | "attachment" | "system" | ...,
+        "message": {"role": "user" | "assistant",
+                    "content": "message text" | [{"type": "text" | "tool_use"
+                                                  | "tool_result" | "thinking", ...}]},
+        "isMeta": true,          # harness-injected user entry, not the human
+        "isSidechain": true,     # subagent thread; its "user" is an agent
         "timestamp": "ISO-8601",
         ...
     }
+    The flat shape ({"type": "human", "content": ...}) is still read, for
+    older or simplified logs.
     """
 
     def __init__(self, session_dir: Optional[str] = None):
@@ -42,21 +48,9 @@ class ClaudeCodeAdapter(RevienAdapter):
 
     async def fetch_new_content(self, since: datetime) -> List[Dict]:
         """Fetch conversations from Claude Code sessions modified since `since`."""
-        if self.session_dir is None or not self.session_dir.exists():
-            return []
-
         results = []
-        since_ts = since.timestamp()
-
-        # Find all JSONL files in the session directory tree
-        for jsonl_file in self.session_dir.rglob("*.jsonl"):
-            if not jsonl_file.is_file():
-                continue
-
+        for jsonl_file in self.session_files(since):
             mtime = jsonl_file.stat().st_mtime
-            if mtime <= since_ts:
-                continue
-
             conversation, first_ts = self._parse_session_log_ts(jsonl_file)
             if conversation and conversation.strip():
                 # recorded_at = when the session's first message was SAID, not
@@ -69,7 +63,7 @@ class ClaudeCodeAdapter(RevienAdapter):
                     ts_source = "mtime"
                 # Derive project name from directory structure
                 project_name = self._extract_project_name(jsonl_file)
-                source_id = f"claude-code:{project_name}:{jsonl_file.stem}"
+                source_id = self.source_id_for(jsonl_file)
 
                 results.append({
                     "content": conversation,
@@ -97,6 +91,24 @@ class ClaudeCodeAdapter(RevienAdapter):
                 })
 
         return results
+
+    def session_files(self, since: datetime) -> List[Path]:
+        """Session JSONL files under the session directory modified after
+        ``since``. Shared by ingest and the usage observer, so both read the
+        same files."""
+        if self.session_dir is None or not self.session_dir.exists():
+            return []
+        since_ts = since.timestamp()
+        files = []
+        for jsonl_file in self.session_dir.rglob("*.jsonl"):
+            if jsonl_file.is_file() and jsonl_file.stat().st_mtime > since_ts:
+                files.append(jsonl_file)
+        return files
+
+    def source_id_for(self, jsonl_file: Path) -> str:
+        """The source_id a session file ingests under:
+        ``claude-code:{project}:{session}``."""
+        return f"claude-code:{self._extract_project_name(jsonl_file)}:{jsonl_file.stem}"
 
     async def health_check(self) -> bool:
         """Check if Claude Code session directory exists."""
@@ -126,6 +138,13 @@ class ClaudeCodeAdapter(RevienAdapter):
                         continue
 
                     if not isinstance(obj, dict):
+                        continue
+                    # Not the human's words: harness-injected user entries
+                    # (skill bodies, command caveats, agent reports) and
+                    # sidechain entries, whose "user" is the parent agent
+                    # (subagent transcripts under <session>/subagents/ are
+                    # all sidechain, so they ingest as nothing).
+                    if obj.get("isMeta") or obj.get("isSidechain"):
                         continue
 
                     msg_type = obj.get("type", "")
@@ -160,8 +179,13 @@ class ClaudeCodeAdapter(RevienAdapter):
             min(stamps) if stamps else None)
 
     def _extract_content(self, obj: Dict) -> Optional[str]:
-        """Extract text content from a message object."""
+        """Extract text content from a message object: top-level ``content``
+        (flat shape) or ``message.content`` (real transcripts). Only text
+        blocks count; tool_use, tool_result and thinking blocks are skipped."""
         content = obj.get("content", "")
+        message = obj.get("message")
+        if not content and isinstance(message, dict):
+            content = message.get("content", "")
 
         if isinstance(content, str):
             return content.strip() if content.strip() else None
