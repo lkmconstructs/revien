@@ -89,6 +89,21 @@ class RecallRequest(BaseModel):
     # origin_runtime values (e.g. "claude-code", or ["claude-code", "codex"]).
     # None (default): no filtering, response byte-identical.
     source: Optional[Union[str, List[str]]] = None
+    # Usage signal (N1): issue a receipt for this recall. The response gains
+    # recall_id + receipt_expires_at; hand recall_id back with the answer to
+    # POST /v1/usage/observe within 24h, or it is flagged. False (default):
+    # response byte-identical.
+    receipt: bool = False
+    # Who is recalling, recorded on the receipt (e.g. "langchain", "api").
+    runtime: Optional[str] = None
+
+
+class ObserveRequest(BaseModel):
+    recall_id: str
+    answer: str
+    # The prompt the recall served, if the client has it: its words are
+    # discounted as evidence, same as the query's.
+    prompt: str = ""
 
 
 class NodeUpdateRequest(BaseModel):
@@ -492,8 +507,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/recall ───────────────────────────────
 
     @app.post("/v1/recall")
-    async def recall(request: RecallRequest):
+    async def recall(request: RecallRequest, http_request: Request):
         """Query memory. Returns ranked nodes by three-factor score."""
+        if request.receipt:
+            # A receipt writes a row (and can become a flag), so it takes the
+            # same gate as other writes; plain recall stays ungated.
+            require_mutation_auth(
+                http_request.client.host if http_request.client else "",
+                http_request.headers.get("authorization", ""),
+            )
         if request.format not in ("json", "toon"):
             raise HTTPException(400, f"Invalid format (json|toon expected): {request.format}")
         # Shared validation core — blank query, out-of-range top_n (reject,
@@ -558,6 +580,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # this query. Always present, possibly [].
             "skill_proposals": response.skill_proposals,
         }
+        if request.receipt:
+            from revien.usage import UsageObserver
+
+            issued = UsageObserver(store, mode="shadow").issue_receipt(
+                query=response.query,
+                node_ids=[r.node_id for r in response.results],
+                runtime=(request.runtime or "api").strip() or "api",
+            )
+            payload["recall_id"] = issued.recall_id
+            payload["receipt_expires_at"] = issued.expires_at.isoformat()
         if request.format == "toon":
             # Same payload, TOON wire format (LEG P2). text/toon is the
             # spec's provisional media type. The json path above is
@@ -880,6 +912,33 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, f"Node not found: {request.node_id}")
         engine.mark_used(request.node_id, request.query)
         return {"status": "marked", "node_id": request.node_id}
+
+    # ── POST /v1/usage/observe ─────────────────────────
+
+    @app.post("/v1/usage/observe", dependencies=[_mutation_auth])
+    async def usage_observe(request: ObserveRequest):
+        """Hand back the answer a receipted recall served. Judges each memory
+        on the receipt (both signals must agree) and returns how each was
+        handled. Shadow records only; REVIEN_USAGE=apply counts uses."""
+        from revien.usage import ReceiptError, UsageObserver
+
+        try:
+            result = UsageObserver(
+                store, engine=engine, semantic=semantic,
+            ).observe_answer(request.recall_id, request.answer, request.prompt)
+        except ReceiptError as e:
+            status = {"unknown": 404, "expired": 410, "already_redeemed": 409,
+                      "empty_answer": 400}.get(e.code, 400)
+            raise HTTPException(status, {"code": e.code, "detail": str(e)})
+        return result.model_dump(mode="json")
+
+    # ── GET /v1/usage/flags ────────────────────────────
+
+    @app.get("/v1/usage/flags", dependencies=[_mutation_auth])
+    async def usage_flags(include_dismissed: bool = Query(False)):
+        """Recalls whose receipt expired unjudged. Kept until dismissed."""
+        store.expire_recall_receipts()
+        return {"flags": store.list_receipt_flags(include_dismissed)}
 
     # ── GET /v1/training/stats ─────────────────────────
 

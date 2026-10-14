@@ -1010,6 +1010,11 @@ def status(db: Optional[str]):
                 click.echo(f"  {runtime}: {count}")
 
         click.echo(f"Pairing token: {_pairing_token_status()}")
+        store.expire_recall_receipts()
+        flags = len(store.list_receipt_flags())
+        if flags:
+            click.echo(f"Usage flags: {flags} recall(s) expired unjudged "
+                       "(revien usage flags)")
     finally:
         store.close()
 
@@ -1552,6 +1557,62 @@ def usage_list(db: Optional[str], limit: int, which: str, json_output: bool):
         click.echo(f"         query : {row['query'][:70]}")
         if row["reason"]:
             click.echo(f"         reason: {row['reason'][:70]}")
+    click.echo()
+
+
+@usage.command(name="flags")
+@click.option("--db", default=None, help="Database path")
+@click.option("--dismiss", "dismiss_id", default=None,
+              help="Mark one flag (by recall_id) as seen. Kept, not deleted.")
+@click.option("--all", "include_dismissed", is_flag=True,
+              help="Also show flags already dismissed")
+@click.option("--json-output", is_flag=True, help="Output flags as JSON")
+def usage_flags(db: Optional[str], dismiss_id: Optional[str],
+                include_dismissed: bool, json_output: bool):
+    """Recalls whose receipt expired before their answer was judged."""
+    import json as _json
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        store.expire_recall_receipts()
+        if dismiss_id:
+            if store.dismiss_receipt_flag(dismiss_id):
+                click.echo(f"Dismissed {dismiss_id} (kept in the record).")
+            else:
+                click.echo(f"No open flag {dismiss_id}.")
+                sys.exit(1)
+            return
+        flags = store.list_receipt_flags(include_dismissed)
+        for flag in flags:
+            flag["labels"] = []
+            for node_id in flag["node_ids"]:
+                node = store.get_node(node_id)
+                flag["labels"].append(node.label if node is not None
+                                      else "(node no longer exists)")
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(_json.dumps({"flags": flags}, indent=2))
+        return
+    if not flags:
+        click.echo("No usage flags: every receipted recall was judged in time.")
+        return
+    click.echo(f"\n{len(flags)} recall(s) expired unjudged:\n")
+    for flag in flags:
+        status = " (dismissed)" if flag["status"] == "dismissed" else ""
+        click.echo(f"  {flag['recall_id']}{status}  runtime={flag['runtime']}  "
+                   f"expired {flag['expires_at'][:19]}")
+        click.echo(f"         query : {flag['query'][:70]}")
+        for label in flag["labels"][:8]:
+            click.echo(f"         memory: {label[:66]}")
     click.echo()
 
 

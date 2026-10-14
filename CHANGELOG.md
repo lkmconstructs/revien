@@ -287,9 +287,38 @@ All notable changes to Revien are documented here. Format follows
   [--filter used|unused]` shows each judgment with its evidence. The daemon
   schedules the pass only when `REVIEN_USAGE_INTERVAL_HOURS` is set (opt-in,
   like dream mode). New `SemanticIndex.embed_texts()` embeds arbitrary text
-  without touching the vector table. Not covered yet: Hermes and Ollama (both
-  see the recall and the reply live and are the next callers), Codex sessions,
-  and the activation-level probe (tier 2, local open-weight models).
+  without touching the vector table.
+- **Usage receipts: the same judgment for any runtime, not only Claude
+  Code.**
+  - `POST /v1/recall` with `"receipt": true` (and an optional `"runtime"`
+    name) returns a `recall_id` plus `receipt_expires_at`. The default
+    response is unchanged.
+  - The client hands the answer back to `POST /v1/usage/observe {recall_id,
+    answer, prompt?}`. That call returns, for every memory on the receipt,
+    its verdict (used / unused / abstain), shared terms, similarity, the
+    rule's reason, and whether it was applied. Errors: 404 unknown receipt,
+    409 already redeemed, 410 expired, 400 empty answer. Nothing is written
+    on an error.
+  - A receipt's row is in the new `recall_receipts` table. It holds ids, the
+    runtime and the query (so restated words can be discounted), never memory
+    content. Memories are judged as they are now, not as they were recalled.
+  - A receipt not redeemed within 24 hours becomes a flag. Flags are never
+    deleted: `revien status` shows a count, `revien usage flags` lists them
+    and `--dismiss` marks one as seen, and `GET /v1/usage/flags` returns
+    them. A judgment that fails leaves its receipt open, so it expires into a
+    flag rather than vanishing. Forgetting a node removes its id from
+    receipts and flags.
+  - Issuing a receipt and calling the usage endpoints take the pairing-token
+    gate; plain recall stays ungated.
+  - The Hermes provider issues a receipt at `prefetch` and redeems it with
+    the reply in `sync_turn`, on the existing worker, so turns stay
+    non-blocking. The Ollama adapter does the same inside `chat()`. Both run
+    only when `REVIEN_USAGE` is explicitly `shadow` or `apply`; unset, they
+    issue nothing.
+  - Not covered yet: Codex sessions (whose real format needs verifying against
+    a live session first), receipts on the MCP `revien_recall` tool (Claude
+    Code is covered by its transcripts), and the activation-level probe
+    (tier 2, local open-weight models).
 
 ### Fixed
 - **The Claude Code adapter now reads real Claude Code sessions.** It read
