@@ -88,7 +88,9 @@ All notable changes to Revien are documented here. Format follows
   original text unless it is forgotten too. Every forget/delete response
   (`suppression_notice`, `context_nodes_remaining`) and `revien suppressions`
   say this: "This forgets this node and suppresses all future imports from
-  <identity>. Sibling facts already captured from that source remain."
+  <identity>. Sibling facts already captured from that source remain." (A
+  whole-session cascade from the context node says "Removed:" and "Kept:"
+  instead, below.)
   Only source ids that name one unit are tombstoned (`claude-code:`, `codex:`,
   `openai:conversation:`, `file:`, `vault:`, `skill:`, `skill-proposal:`); shared channel ids
   ("mcp", "hermes", "ollama_*", "langchain", `api:<feed>`) are not, because
@@ -106,15 +108,35 @@ All notable changes to Revien are documented here. Format follows
   forgotten `openai:conversation:<id>` is skipped on single and bulk import
   (`suppressed` / `conversations_suppressed`), and a forgotten skill is skipped
   by `revien skills ingest` (counted, reported).
-- **The egress gate now covers the daemon probe.** `scripts/gates/check_egress.py`
-  recognises `http.client`, `urllib3`, `smtplib`, `ftplib`, `socket` and
-  similar clients (also as `from http import client`), takes an explicit
-  allowlist (today only the `revien sync reset` loopback probe in `cli.py`),
-  runs the probe's test, and fails if the allowlist entry no longer matches the
-  source. The test records every `http.client` connection, DNS lookup and
-  socket connect and fails if one names a non-loopback host, so removing the
-  loopback check from `_probe_daemon` (which previously still returned `None`
-  offline and passed) fails it.
+- **The egress gate now covers the daemon probe, and its allowlist pins the
+  function.** `scripts/gates/check_egress.py` parses each `revien/**/*.py`
+  file changed against `main` (and its `main` version) as Python and reports
+  every NEW network-client use: every name of a multi-name import (`import os,
+  socket`), `import http.client`, `from http import client`, `from urllib
+  import request`, a parent package used through an attribute (`import http`,
+  then `http.client...`, also through an alias), and the dynamic-import
+  facility (`__import__`, `importlib.import_module`, `from importlib import
+  import_module`): a literal argument names the module, a non-literal one is
+  reported as `<dynamic-import>`. The modules are `httpx`, `requests`,
+  `urllib.request`, `urllib3`, `socket`, `aiohttp`, `http.client`, `ftplib`,
+  `smtplib`, `poplib`, `imaplib`, `telnetlib`, `xmlrpc.client`, `websockets`,
+  `websocket`. The allowlist is keyed by file, ENCLOSING FUNCTION, module and
+  the exact statement: today only `import http.client` inside
+  `_probe_daemon` in `cli.py` (the `revien sync reset` loopback probe). The
+  same import in any other function or at module level of `cli.py`, or
+  another network module inside the probe, fails. (An earlier version keyed
+  the allowlist by file and module, so any `http.client` import anywhere in
+  `cli.py` passed, and `import os, socket`, `import http` + `http.client` and
+  `importlib.import_module("socket")` were not seen.) The gate runs its own
+  self-tests on every run (shapes E1-E5, aliases, negatives, and that the
+  allowlist rejects the other-function, module-level, attribute and
+  extra-module cases), runs the probe's test, and fails if the allowlist entry
+  no longer matches the source. The probe test records every `http.client`
+  connection, DNS lookup and socket connect and fails if one names a
+  non-loopback host. Limits, stated: it is a static scan of changed files. It
+  does not see `getattr(importlib, "import_module")(...)`, `exec`/`eval`,
+  a bare reference to `__import__` that is not called, `ctypes`, or a
+  subprocess such as `curl`; and it compares against the local `main`.
 - **Stdio MCP is no longer corrupted by ingest notices.** The suppression,
   deny-list and context-fence notices, and the migration note, go to stderr;
   stdout carries only JSON-RPC under `revien mcp`. Tested against the real
@@ -150,9 +172,18 @@ All notable changes to Revien are documented here. Format follows
   the neural `training.db`, every signal row of each logged recall that
   surfaced the node is deleted, not only the node's own row: a signal with its
   query blanked is no longer training data, and the other rows of that recall
-  carry the same query. `training.db` now sets `secure_delete` on every
-  connection and rewrites (`VACUUM`) a file that already has free pages, once
-  at open, so text deleted by an older build is zeroed. Bounded gap: a recall
+  carry the same query. In the usage ledger (`use_judgments`) the judgment
+  rows of the forgotten node are deleted AND the `query` of every other row
+  of the same episode or recall is blanked (the other nodes' own evidence
+  stays). `training.db` now sets `secure_delete` on every connection and, once
+  per file, rewrites it (`VACUUM`): the first open of a file without the
+  marker `secure_scrub_v1` in its `training_state` table, whatever its free
+  list holds, then records the marker. The free list is not the test: a
+  delete that leaves other rows on a page frees no page, so the page keeps the
+  deleted row's bytes and `freelist_count` is 0 (an earlier version vacuumed
+  only a file with free pages and left that residue). A file written by an
+  older build is cleaned on its first open by this version; after that,
+  deletes zero what they remove. Bounded gap: a recall
   whose query repeated the fact but did not return the node cannot be linked
   to it without reading the text, and is kept.
   Tests: one seeds a unique secret, forgets everything, then scans every
@@ -504,8 +535,20 @@ All notable changes to Revien are documented here. Format follows
   UUID (a sub-agent file, `agent-<id>.jsonl`) also records the `sessionId` its
   entries carry (a bare UUID, never text) as `parent_session_id`, and the
   forgotten parent session's tombstone matches it, so a sub-agent file that
-  did ingest cannot recapture a forgotten session. Tested with realistic
-  (sidechain) files, and with the flag removed. `session_files(since)` and `source_id_for(path)` are
+  did ingest cannot recapture a forgotten session. The id is read from the
+  first entry that has one, however far into the file (the file is streamed;
+  an earlier version stopped after 200 lines, so a later `sessionId` was
+  missed). A forget of the parent session with `cascade` also removes its
+  sub-agent context nodes already ingested (those that name it as
+  `parent_session_id`), and the forget response lists them
+  (`subagent_contexts_forgotten`). Tested with realistic (sidechain) files;
+  with the flag removed, ingesting a sub-agent file AFTER only the parent was
+  forgotten (the earlier test also forgot the sub-agent's own unit, so
+  removing the parent lookup did not fail it); a `sessionId` placed after 450
+  other lines; and cascade of already-ingested sub-agent units.
+  Limit: a sub-agent file ingested by a build before this one has no
+  `parent_session_id` and is not recognised as part of its parent.
+  `session_files(since)` and `source_id_for(path)` are
   now public, so anything else that reads sessions sees exactly the files
   ingest reads. Known limitation: an existing install's `claude-code` sync cursor has already
   moved past older sessions, so only sessions that change from now on are
@@ -545,29 +588,71 @@ All notable changes to Revien are documented here. Format follows
   the distill-manifest row but the note keeps the claim until the next
   `revien distill-vault`, which drops or rewrites it. The forget response now
   says so when a manifest referenced the node (`distilled_notes_remaining`, and
-  the notice: "the next `revien distill-vault` removes it"). Required
+  the notice: "the next `revien distill-vault` removes it"), on `forget` and on
+  `DELETE /v1/nodes/{id}` alike. Required
   follow-up: re-distill the configured vault as part of a forget.
 - Forgetting an extracted node does not remove the session's verbatim context
   node, nor near-duplicate sibling claims; the response names the context
   node(s). OPEN OWNER DECISION (A): whether a single-node forget should also
   remove the text from the context node.
-- **Forgetting a whole session in one call: cascade from its context node.**
+- **Forgetting a whole session in one call: cascade from its context node,
+  without touching any other unit.**
   The pipeline never writes `DERIVED_FROM`, so the old cascade (which follows
-  only `DERIVED_FROM`) removed just the context node. What links an extracted
-  node to its session is its `source_id`, which every node the pipeline, the
-  OpenAI importer and distill create carries, plus RELATED_TO / MENTIONED_BY /
-  DECIDED_IN edges to the context node. The edges are not a safe definition:
-  dedup reuses an existing entity or claim, and the later session's context
-  links to a node the earlier session created (tested), so following edges
-  would delete another session's data. `cascade=true` on a session's context
-  node (`POST /v1/nodes/{id}/forget`, `forget_node(..., cascade=True)`, with
-  `GET .../forget/preview` listing it first) therefore forgets every node
-  stamped with that source_id, with the same tombstones, in one call. It
-  applies only to per-unit sources (a shared channel such as `mcp` is never
-  swept), and cascade from an extracted node still follows `DERIVED_FROM`
-  only. A node first created by the forgotten session but later merged into
-  by another session goes with it; the other session's own context node keeps
-  its text and loses the link.
+  only `DERIVED_FROM`) removed just the context node. What ties an extracted
+  node to its session is an edge to that session's context node
+  (MENTIONED_BY / DECIDED_IN / RELATED_TO), plus the `source_id` the pipeline
+  and the OpenAI importer stamp on it (distill sets none). Neither is a safe
+  definition alone. Dedup reuses an existing node when a later session says
+  the same thing, so the later context links to nodes the first created;
+  `source_id` is also shared by DIFFERENT units (a file-watcher basename, a
+  vault relative path). An earlier version of this entry cascaded over every
+  node with the session's `source_id`; measured on 12 overlapping sessions
+  that deleted 59% of the nodes other sessions linked, and `projA/notes.md`
+  took `projB/notes.md`'s context node and verbatim text with it.
+  The rule now: the forgotten unit is gone, everything else remains.
+  `cascade=true` on a session's context node (`POST /v1/nodes/{id}/forget`,
+  `forget_node(..., cascade=True)`; `GET .../forget/preview` returns the same
+  lists first) forgets: that context node; the Claude Code sub-agent context
+  nodes that name the session as their parent; and every node DIRECTLY linked
+  to one of those context nodes, carrying its `source_id`, that no OTHER live
+  context node links. A node that another live context node also links is
+  SHARED and is kept (`kept_shared`, with the context ids that still link it
+  in `kept_shared_linked_from`), minus this session's links, and re-attributed
+  (`source_id` and origin columns) to a live unit that links it, so forgetting
+  that unit later removes it. Another unit's context node is never deleted,
+  even with the same `source_id`; those are listed
+  (`other_contexts_same_source`). It applies only to per-unit sources; a
+  context node of a shared channel (`mcp`, `api:<feed>`) is removed alone and
+  the response says the facts extracted from it were kept
+  (`extracted_facts_kept`), and cascade from an extracted node still follows
+  `DERIVED_FROM` only.
+  Why keeping a shared node keeps no forgotten content: it is kept only when
+  its stored wording (label, and for decisions, actions, facts and
+  preferences the content sentence) is found, ignoring case and punctuation,
+  in a live context's own text, so every word it holds is also in a unit that
+  was not forgotten. Dedup also merges on edit distance 2 (and, opt-in, on
+  semantic similarity), and then the node keeps the FIRST session's wording
+  ("service3 uses queue Q3x" for a session that said "service4 ..."); keeping
+  it would keep the forgotten text, so such a node is removed with the session
+  (`removed_unattested_shared`, named in the notice) and the other session's
+  verbatim text is untouched. Measured with the same 12 sessions: 0 other
+  contexts deleted and 0 attested links lost; links to nodes merged by
+  similarity are the only ones removed (44 of 1111 other-session links in the
+  probe, all to nodes worded by the forgotten session), and each is reported.
+  The tombstone covers only the forgotten unit's identity. For a file-watcher
+  file or vault note whose `source_id` is shared with another unit the
+  identity IS shared (`file:notes.md`): the forget still writes it, because
+  skipping it would let the forgotten file be silently recaptured, and the
+  notice names the other context nodes and says that future imports of every
+  item with that identity are skipped until `revien restore`. The
+  notice and response state what was removed ("Removed:") and what was kept
+  because it is shared ("Kept:"); the "Sibling facts already captured ...
+  remain" sentence is only used for a single-node forget now.
+- Forget notices, corrected: forgetting an extracted node of a shared channel
+  (`mcp`) no longer says that cascading from the context node "forgets the whole
+  session" (it removes only that node; a channel is not a session); a cascade
+  from a shared-channel or identity-less context node says the extracted facts
+  were kept; `DELETE /v1/nodes/{id}` carries the distilled-note notice.
 - LangChain `RevienMemory.clear()` writes no tombstone (decision: it is
   infrastructure bulk-clearing, i.e. cleanup; Revien does not infer intent from
   a method name). An application that exposes it as a user-facing "forget my
