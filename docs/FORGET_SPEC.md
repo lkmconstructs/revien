@@ -1,6 +1,6 @@
 # Forget, delete and cleanup: specification
 
-Status: **draft for owner approval.** No further code is built against these rules until this document is approved. Code is then built once against it, and verified against the invariants in §9.
+Status: **draft for owner approval.** §4 (vault), §8 and §10 are updated with the owner's 2026-10-16 confirmations; only §8's daemon-detection design still awaits approval. No further code is built against these rules until this document is approved. Code is then built once against it, and verified against the invariants in §9.
 
 Sources: owner rulings (Lissa, with Ash's reads, 2026-10-16), and the findings of seven independent verification rounds on branch `claude/project-mnemosyne-2eevt2`.
 
@@ -46,7 +46,7 @@ After a forget, the forgotten text must be absent from all of these:
 Allowed leftovers, each named in the response when it applies:
 - the user's own source files (the session `.jsonl` on disk);
 - exports written to disk before the forget;
-- distilled Obsidian notes until the next `revien distill-vault`. Re-distilling automatically on forget is a follow-up that needs its own owner approval, because it writes into the vault;
+- distilled Obsidian notes, until the user runs `revien distill-vault`. Revien never rewrites the vault on its own; automatic re-distill stays parked. A forget that leaves a distilled note behind must say so explicitly, naming the note and the manual command that removes the fact. Until that runs, the operation is reported as "forgotten from Revien", never "gone everywhere". The keyed fingerprint (§6) stops the unchanged note from being re-imported in the meantime;
 - the echo of a query the user types after the forget.
 
 ## 5. Shared nodes
@@ -75,7 +75,11 @@ Allowed leftovers, each named in the response when it applies:
 
 - `revien sync reset <adapter>` works only for adapters whose re-read is provably duplicate-free; others are refused. `--orphaned` is allowed only where a saved sync position exists. When explicit forgets exist, `--yes` is required.
 - **Generation fencing:** a reset cannot be undone by a sync that started before it (compare-and-set on the cursor generation).
-- **No daemon probe.** The CLI does not open network connections. It tells the user to restart the daemon after upgrading, because an old daemon ignores suppression and fencing. This removes the egress-gate exception entirely.
+- **Old daemons are detected and refused, not just documented.** A daemon running pre-upgrade code ignores suppression and fencing, so the upgraded CLI and API must refuse operations that depend on them, with a clear "restart required" error. Proposed design, for owner approval:
+  - A current daemon writes a heartbeat (code features, process id, time) into the database. Reading it needs no network.
+  - Pre-upgrade daemons write no heartbeat, so they are detected through one pinned, loopback-only health check (`/v1/health` on the local machine; an answer without the feature list means old code). Talking to Revien's own daemon on loopback is not egress. The egress gate pins that one module by hash and also forbids every other file from importing it or reaching into it, which closes the re-export evasion found in round 7.
+  - Either detection, a stale-code heartbeat or an old health answer, refuses the operation with the restart-required error. No daemon answering means proceed.
+  - The rejected alternative is process-table inspection. It is platform-specific (the CI runs on Windows too), and it needs subprocess calls that the egress gate flags.
 
 ## 9. Invariants the verifier checks
 
@@ -89,7 +93,7 @@ Allowed leftovers, each named in the response when it applies:
 
 ## 10. Out of scope here, tracked separately
 
-- The `list_nodes` crash on databases created by v0.3.0 and 7757085 (seen at 7420060 and 2f1dfb5; its status on `main` is unconfirmed). It is investigated on its own.
+- The `list_nodes` crash on databases created by v0.3.0 and 7757085 (seen at 7420060 and 2f1dfb5; its status on `main` is unconfirmed). It is investigated on its own and fixed in its own PR. **But if it breaks the supported upgrade path for this redesign, it is a release blocker for the forget work.**
 - Stable per-item identity for shared channels.
 - Automatic re-distill of the vault on forget.
-- Splitting the work: the usage signal, receipts and the Claude Code adapter fix ship as their own PR, ahead of forget.
+- **Confirmed split:** the usage signal, receipts and the Claude Code adapter fix ship first, as their own PR, with a smaller blast radius and independent review. Forget follows as a separate PR built against this spec.
