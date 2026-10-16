@@ -875,6 +875,14 @@ class TestResetSaysOnlyWhatItCanProve:
         r.output.encode("cp1252")  # stays ASCII
 
 
+    def test_probe_never_leaves_loopback(self, seeded, monkeypatch):
+        from revien.cli import _probe_daemon
+        assert _probe_daemon("http://example.com:7437") is None
+        assert _probe_daemon("https://127.0.0.1:7437") is None
+        r = self._reset(monkeypatch, seeded, "http://192.0.2.1:7437")
+        assert "nothing was checked" in r.output
+
+
 class TestEmbeddingIsRemoved:
     def test_forget_drops_the_vector_even_without_a_semantic_listener(
             self, db_path):
@@ -931,11 +939,3 @@ class TestImportReplaceScrubsAudit:
         store.import_graph(Graph(nodes=[], edges=[]), mode="replace")
         assert store.count_nodes() == 0
         assert "Zanzibar" not in json.dumps(store.get_all_audit())
-
-
-    def test_probe_never_leaves_loopback(self, seeded, monkeypatch):
-        from revien.cli import _probe_daemon
-        assert _probe_daemon("http://example.com:7437") is None
-        assert _probe_daemon("https://127.0.0.1:7437") is None
-        r = self._reset(monkeypatch, seeded, "http://192.0.2.1:7437")
-        assert "nothing was checked" in r.output
