@@ -1479,13 +1479,31 @@ def sync():
 
 # Columns a Revien database must have in the tables it always creates. A
 # table of the same name with other columns means a foreign database.
+# The complete column sets of the oldest real Revien database (commit
+# 7757085, 0.3.0) for nodes, edges and audit_log; later versions only add
+# columns and tables. sync_cursors appeared later, so it is checked only when
+# present. A file missing any of these is not a Revien database.
 _REVIEN_TABLE_COLUMNS = {
-    "nodes": {"node_id", "node_type", "label", "content"},
-    "edges": {"edge_id", "edge_type", "source_node_id", "target_node_id"},
-    "audit_log": {"node_id", "op", "after_json"},
+    "nodes": {
+        "node_id", "node_type", "label", "content", "source_id", "created_at",
+        "last_accessed", "access_count", "metadata", "source_type",
+        "confidence", "pinned", "confidence_set_at", "confidence_set_by",
+        "source_context", "last_referenced", "invalidated_at",
+        "source_modality", "answerable_by_text", "vision_processed",
+        "recorded_at", "event_time_start", "event_time_end",
+        "event_time_granularity", "event_time_confidence", "event_time_text",
+        "valid_from", "valid_until",
+    },
+    "edges": {
+        "edge_id", "edge_type", "source_node_id", "target_node_id", "weight",
+        "created_at", "metadata", "confidence", "confidence_set_at",
+        "confidence_set_by", "source_context",
+    },
+    "audit_log": {"id", "node_id", "op", "actor", "ts", "before_json",
+                  "after_json"},
     "sync_cursors": {"adapter_name", "cursor", "updated_at"},
 }
-_REVIEN_REQUIRED_TABLES = {"nodes", "edges"}
+_REVIEN_REQUIRED_TABLES = {"nodes", "edges", "audit_log"}
 
 
 def _readonly_uri(p: Path) -> str:
@@ -1540,7 +1558,7 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
             if not _REVIEN_REQUIRED_TABLES <= tables:
                 return (f"{db_path} is a SQLite database but not a Revien "
-                        "database (no nodes/edges tables). "
+                        "database (no nodes/edges/audit_log tables). "
                         "Not touching it.")
             for table, wanted in _REVIEN_TABLE_COLUMNS.items():
                 if table not in tables:

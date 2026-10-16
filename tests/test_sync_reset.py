@@ -374,6 +374,40 @@ class TestUsageCursorRefused:
 
 # -- bad --db paths ---------------------------------------------------------
 
+OLDEST_REVIEN_SCHEMA = """
+CREATE TABLE nodes (
+    node_id TEXT PRIMARY KEY, node_type TEXT NOT NULL, label TEXT NOT NULL,
+    content TEXT NOT NULL, source_id TEXT DEFAULT '', created_at TEXT NOT NULL,
+    last_accessed TEXT NOT NULL, access_count INTEGER DEFAULT 0,
+    metadata TEXT DEFAULT '{}', source_type TEXT DEFAULT 'inferred',
+    confidence REAL DEFAULT 0.5, pinned INTEGER DEFAULT 0,
+    confidence_set_at TEXT, confidence_set_by TEXT DEFAULT '',
+    source_context TEXT DEFAULT '', last_referenced TEXT, invalidated_at TEXT,
+    source_modality TEXT DEFAULT 'text', answerable_by_text INTEGER DEFAULT 1,
+    vision_processed INTEGER DEFAULT 0, recorded_at TEXT,
+    event_time_start TEXT, event_time_end TEXT, event_time_granularity TEXT,
+    event_time_confidence REAL, event_time_text TEXT DEFAULT '',
+    valid_from TEXT, valid_until TEXT
+);
+CREATE TABLE edges (
+    edge_id TEXT PRIMARY KEY, edge_type TEXT NOT NULL,
+    source_node_id TEXT NOT NULL, target_node_id TEXT NOT NULL,
+    weight REAL DEFAULT 0.5, created_at TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}', confidence REAL DEFAULT 0.5,
+    confidence_set_at TEXT, confidence_set_by TEXT DEFAULT '',
+    source_context TEXT DEFAULT '',
+    FOREIGN KEY (source_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE,
+    FOREIGN KEY (target_node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+);
+CREATE TABLE audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, node_id TEXT NOT NULL,
+    op TEXT NOT NULL, actor TEXT DEFAULT '', ts TEXT NOT NULL,
+    before_json TEXT, after_json TEXT
+);
+"""
+# (copied from `git show 7757085:revien/graph/store.py`, the first commit)
+
+
 class TestBadDbPaths:
     def _run(self, monkeypatch, path):
         monkeypatch.setattr("revien.cli._load_config", lambda: {
@@ -441,6 +475,8 @@ class TestBadDbPaths:
         c = sqlite3.connect(p)
         c.execute("CREATE TABLE nodes (id TEXT, x TEXT)")
         c.execute("CREATE TABLE edges (a TEXT, b TEXT)")
+        c.execute("CREATE TABLE audit_log (id INTEGER, node_id TEXT, op TEXT, "
+                  "actor TEXT, ts TEXT, before_json TEXT, after_json TEXT)")
         c.commit()
         c.close()
         r = self._bytes_and_run(monkeypatch, p)
@@ -460,10 +496,25 @@ class TestBadDbPaths:
 
     def test_old_revien_database_without_later_tables_is_accepted(
             self, tmp_path):
-        """Only nodes+edges are required; tables added by later versions may
-        be missing (GraphStore creates them on open)."""
+        """A database with the exact nodes/edges/audit_log schema the oldest
+        real Revien (commit 7757085, 0.3.0) created, and none of the later
+        tables, is accepted; GraphStore then upgrades it in place."""
         import sqlite3
         p = tmp_path / "old.db"
+        c = sqlite3.connect(p)
+        c.executescript(OLDEST_REVIEN_SCHEMA)
+        c.commit()
+        c.close()
+        from revien.cli import _sqlite_problem
+        assert _sqlite_problem(str(p)) is None
+        s = GraphStore(db_path=str(p))  # upgrades in place without error
+        s.close()
+
+    def test_minimal_nodes_edges_shape_is_not_revien(self, tmp_path):
+        """The 4-column nodes/edges shape no real Revien version produced
+        used to pass the check, and GraphStore then wrote into the file."""
+        import sqlite3
+        p = tmp_path / "shape.db"
         c = sqlite3.connect(p)
         c.execute("CREATE TABLE nodes (node_id TEXT PRIMARY KEY, node_type TEXT, "
                   "label TEXT, content TEXT)")
@@ -471,8 +522,85 @@ class TestBadDbPaths:
                   "source_node_id TEXT, target_node_id TEXT)")
         c.commit()
         c.close()
+        before = p.read_bytes()
         from revien.cli import _sqlite_problem
-        assert _sqlite_problem(str(p)) is None
+        assert _sqlite_problem(str(p))
+        assert p.read_bytes() == before
+
+    def test_foreign_wal_database_leaves_no_sidecars_and_no_changes(
+            self, tmp_path, monkeypatch):
+        """Read-only behaviour is observable: bytes and the directory listing
+        are identical afterwards (mode=rwc, or plain mode=ro on a WAL file,
+        would add -wal/-shm files)."""
+        import sqlite3
+        p = tmp_path / "foreign.db"
+        c = sqlite3.connect(p)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE people (id INTEGER, name TEXT)")
+        c.execute("INSERT INTO people VALUES (1, 'a')")
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        for side in ("-wal", "-shm"):  # closing may or may not remove them
+            (tmp_path / ("foreign.db" + side)).unlink(missing_ok=True)
+        listing = sorted(os.listdir(tmp_path))
+        before = p.read_bytes()
+        r = self._run(monkeypatch, p)
+        assert r.exit_code == 1
+        assert "not a Revien database" in r.output
+        assert sorted(os.listdir(tmp_path)) == listing
+        assert p.read_bytes() == before
+
+    def test_foreign_wal_database_with_revien_names_is_also_untouched(
+            self, tmp_path, monkeypatch):
+        import sqlite3
+        p = tmp_path / "shape-wal.db"
+        c = sqlite3.connect(p)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE nodes (node_id TEXT PRIMARY KEY, node_type TEXT, "
+                  "label TEXT, content TEXT)")
+        c.execute("CREATE TABLE edges (edge_id TEXT PRIMARY KEY, edge_type TEXT, "
+                  "source_node_id TEXT, target_node_id TEXT)")
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        for side in ("-wal", "-shm"):
+            (tmp_path / ("foreign.db" + side)).unlink(missing_ok=True)
+            (tmp_path / ("shape-wal.db" + side)).unlink(missing_ok=True)
+        listing = sorted(os.listdir(tmp_path))
+        before = p.read_bytes()
+        r = self._run(monkeypatch, p)
+        assert r.exit_code == 1 and "not a Revien database" in r.output
+        assert sorted(os.listdir(tmp_path)) == listing
+        assert p.read_bytes() == before
+
+    def test_mistyped_name_does_not_migrate_an_older_revien_db(
+            self, tmp_path, monkeypatch):
+        """Name/type are validated before a GraphStore is opened, so a typo
+        cannot write the newer schema into an older Revien database."""
+        import sqlite3
+        p = tmp_path / "old.db"
+        c = sqlite3.connect(p)
+        c.executescript(OLDEST_REVIEN_SCHEMA)
+        c.commit()
+        c.close()
+        before = p.read_bytes()
+        monkeypatch.setattr("revien.cli._load_config", lambda: {
+            "adapters": CC, "db_path": str(p)})
+        for argv in (["claude_code"],            # typo
+                     ["claude-code", "--orphaned"],  # connected + --orphaned
+                     ["nothing", "--orphaned"]):     # no recorded state
+            r = CliRunner().invoke(
+                main, ["sync", "reset", *argv, "--db", str(p)])
+            assert r.exit_code == 1, r.output
+            assert p.read_bytes() == before, argv
+        # unknown-type and unkeyed-type refusals also precede the open
+        for entry in ({"type": "bogus"}, {"type": "obsidian"}):
+            monkeypatch.setattr("revien.cli._load_config", lambda e=entry: {
+                "adapters": {"x": e}, "db_path": str(p)})
+            r = CliRunner().invoke(main, ["sync", "reset", "x", "--db", str(p)])
+            assert r.exit_code == 1
+            assert p.read_bytes() == before
 
     def test_locked_database_is_one_clean_line(self, store, db_path, monkeypatch):
         store.set_sync_cursor("claude-code", T)
@@ -631,6 +759,25 @@ class TestCapabilityDrift:
                 assert all(keyed), f"{atype} is flagged idempotent but emits unkeyed items"
             else:
                 assert not any(keyed), f"{atype} emits ingest_key but is not flagged"
+
+    def test_codex_without_a_known_project_is_still_keyed(self, tmp_path):
+        """The flag promises EVERY item is keyed, including a rollout whose
+        session_meta carries no cwd (project unknown)."""
+        from revien.adapters.codex import CodexAdapter
+        from tests.test_codex_adapter import MOCK_CODEX_ROLLOUT, _write_rollout
+
+        lines = [dict(l) for l in MOCK_CODEX_ROLLOUT]
+        for line in lines:
+            if line.get("type") == "session_meta":
+                line["payload"] = {k: v for k, v in line["payload"].items()
+                                   if k != "cwd"}
+        root = tmp_path / "codex-nocwd"
+        _write_rollout(root / "2026" / "07" / "01" / "rollout-z.jsonl", lines)
+        items = _fetch(CodexAdapter(session_dir=str(root)))
+        assert items, "nothing fetched: the test would prove nothing"
+        assert all(i["source_id"].startswith("codex:unknown:") for i in items)
+        assert all((i.get("ingest_key") or "").strip() for i in items)
+        assert CodexAdapter.IDEMPOTENT_REREAD
 
     def test_keys_are_stable_across_reads(self, tmp_path):
         adapters, _, _ = _make_adapters(tmp_path)
