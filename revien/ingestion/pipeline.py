@@ -5,6 +5,7 @@ The main entry point for feeding content into the graph.
 
 import hashlib
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -299,7 +300,8 @@ class IngestionPipeline:
                 f"[revien] ingest suppressed for {hit['kind']}="
                 f"{hit['identity']!r} (forgotten by the user on "
                 f"{hit['created_at'][:10]}) — nothing captured. "
-                f"`revien restore` lifts this."
+                f"`revien restore` lifts this.",
+                file=sys.stderr,
             )
             return IngestionOutput(
                 context_node_id="",
@@ -316,7 +318,8 @@ class IngestionPipeline:
         if input_data.source_id in deny:
             print(
                 f"[revien] ingest denied for source_id={input_data.source_id!r} "
-                f"(REVIEN_INGEST_DENY) — no content captured."
+                f"(REVIEN_INGEST_DENY) — no content captured.",
+                file=sys.stderr,
             )
             return IngestionOutput(
                 context_node_id="",
@@ -348,7 +351,8 @@ class IngestionPipeline:
                 print(
                     f"[revien] context-fenced source_id={input_data.source_id!r} "
                     f"spans={fenced.stripped_spans} chars={fenced.stripped_chars} "
-                    f"markers={fenced.markers}"
+                    f"markers={fenced.markers}",
+                    file=sys.stderr,
                 )
             input_data.content = fenced.content
             # Only short-circuit when FENCING is what emptied the content —
@@ -359,7 +363,8 @@ class IngestionPipeline:
                 print(
                     f"[revien] ingest skipped for source_id={input_data.source_id!r} "
                     f"— content was entirely recall re-entry (fenced to empty), "
-                    f"nothing left to capture."
+                    f"nothing left to capture.",
+                    file=sys.stderr,
                 )
                 return IngestionOutput(
                     context_node_id="",

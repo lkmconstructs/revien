@@ -183,12 +183,19 @@ def _link_matching_entities(store: GraphStore, skill_node: Node) -> int:
     return created
 
 
-def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, project_key: Optional[str], origin_runtime: Optional[str]) -> Tuple[Node, bool, int]:
+def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, project_key: Optional[str], origin_runtime: Optional[str]) -> Tuple[Optional[Node], bool, int]:
     """Ingest one SKILL.md. Returns (node, created, edges_created). Idempotent
     by ingest_key: an unchanged path refreshes label/content/metadata on the
     existing node in place rather than duplicating it."""
     fresh = build_skill_node(skill_md_path, scope, project_key, origin_runtime)
     ikey = fresh.metadata["ingest_key"]
+    # Suppression tombstone: the user forgot this skill. Skill ingest writes
+    # through the store (not the pipeline), so it applies the gate itself.
+    # Returns (None, False, 0); the caller counts it.
+    hit = store.find_ingest_suppression(fresh.source_id, ikey)
+    if hit is not None:
+        store.note_suppressed_skip(hit["identity"], hit["kind"])
+        return None, False, 0
     existing = store.find_context_node_by_ingest_key(ikey, node_type=NodeType.SKILL)
 
     if existing is None:
@@ -214,14 +221,18 @@ def ingest_roots(
     cwd: Optional[Path] = None,
 ) -> Dict:
     """Scan every resolved root and ingest each SKILL.md found. Returns a
-    summary dict: {"scanned", "created", "refreshed", "edges", "skills": [...]}"""
+    summary dict: {"scanned", "created", "refreshed", "edges", "suppressed", "skills": [...]}"""
     roots = resolve_roots(paths=paths, include_global=include_global, cwd=cwd)
-    summary = {"scanned": 0, "created": 0, "refreshed": 0, "edges": 0, "skills": []}
+    summary = {"scanned": 0, "created": 0, "refreshed": 0, "edges": 0,
+               "suppressed": 0, "skills": []}
     for root, scope, project_key in roots:
         origin_runtime = _origin_runtime_for_root(root)
         for skill_md in discover_skill_files(root):
             node, created, edges = ingest_skill_file(store, skill_md, scope, project_key, origin_runtime)
             summary["scanned"] += 1
+            if node is None:  # forgotten by the user: skipped, counted
+                summary["suppressed"] += 1
+                continue
             summary["edges"] += edges
             if created:
                 summary["created"] += 1

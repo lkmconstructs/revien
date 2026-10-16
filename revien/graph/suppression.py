@@ -16,17 +16,67 @@ Identity kinds:
                 caller is told so.
     ingest_key  the stable key a keyed adapter stamps on its context node
                 (equal to source_id for claude-code/codex).
+    session_id  claude-code / codex only: the session UUID the runtime itself
+                assigned, independent of the project folder. Survives a moved
+                project or a moved/renamed session file. Only bound when a
+                real UUID is present.
+
+Gaps (no stable content-free identity exists): a file-watcher file renamed
+(identity is its basename), a vault note renamed or moved (its relative
+path), a skill moved (its resolved path), a Claude Code / Codex session that
+the runtime copies into a NEW session id (resume/fork), and any shared channel.
 
 A tombstone holds no content. Lifting it is an explicit act (restore or a
 graph import with the override flag) and is audited.
 """
 
+import re
 from typing import Dict, List, Optional, Tuple
 
+from revien.graph.origin import derive_origin
 from revien.graph.schema import NodeType
 
 KIND_SOURCE_ID = "source_id"
 KIND_INGEST_KEY = "ingest_key"
+KIND_SESSION_ID = "session_id"
+
+_UUID = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_CLAUDE_STEM = re.compile(rf"^({_UUID})$")
+# Codex rollout stems: rollout-<local timestamp>-<thread uuid>
+_CODEX_STEM = re.compile(rf"^rollout-.*?({_UUID})$")
+
+
+def session_identity_for(source_id: str) -> Optional[str]:
+    """The project-independent identity of a Claude Code / Codex session, or
+    None. Both runtimes name a session file with an id THEY assign at session
+    creation (a UUID; for Codex the UUID is the tail of ``rollout-<ts>-<uuid>``).
+    The id does not depend on the project directory or on which dated folder
+    the file sits in, so it survives a moved project, a moved file, or a
+    renamed project folder. It is only used when a real UUID is present: a
+    free-form stem ("main", "notes") is not globally unique, and binding it
+    across projects would block unrelated sessions. Content-free."""
+    sid = (source_id or "").strip()
+    if not sid.startswith(("claude-code:", "codex:")):
+        return None
+    origin = derive_origin(sid)
+    if not origin.session:
+        return None
+    if origin.runtime == "claude-code":
+        m = _CLAUDE_STEM.match(origin.session)
+    elif origin.runtime == "codex":
+        m = _CODEX_STEM.match(origin.session)
+    else:
+        return None
+    if not m:
+        return None
+    return f"{origin.runtime}-session:{m.group(1).lower()}"
+
+
+def unit_key(identity: str) -> str:
+    """Rows that name the same unit share a key (a source_id row and the
+    session_id row derived from it), so restore lifts them together."""
+    return session_identity_for(identity) or identity
 
 # source_id prefixes whose conventions are per-unit (verified against the
 # adapters that produce them, see revien/graph/origin.py).
@@ -34,7 +84,8 @@ UNIT_SOURCE_PREFIXES = (
     "claude-code:",          # claude-code:{project}:{session_stem}
     "codex:",                # codex:{project}:{session_stem}
     "openai:conversation:",  # openai:conversation:{conv_id}
-    "file:",                 # file:{name}        (file watcher)
+    "file:",                 # file:{name}        (file watcher; the BASENAME only)
+    "skill:",                # skill:{resolved SKILL.md path}
     "vault:",                # vault:{relpath}#{heading slug}  (obsidian)
 )
 
@@ -62,15 +113,62 @@ def identities_for(
         key = key.strip()
     else:
         key = ""
-    # Only context nodes are gated by ingest_key at ingest time (skills use
-    # their own store-level path, which is not gated), so only they bind it.
-    if key and node_type == NodeType.CONTEXT:
+    # Context nodes (pipeline) and skill nodes (skill ingest) are gated by
+    # ingest_key at ingest time, so only they bind it.
+    if key and node_type in (NodeType.CONTEXT, NodeType.SKILL):
         found.append((key, KIND_INGEST_KEY))
+    session = session_identity_for(sid)
+    if session:
+        found.append((session, KIND_SESSION_ID))
     if found:
         return found, None
     if not sid:
         return [], "node has no source_id"
-    if node_type != NodeType.CONTEXT and (metadata or {}).get("ingest_key"):
-        return [], "skill/keyed non-context nodes are not gated at ingest"
     return [], (f"source_id {sid!r} is a shared channel, not one unit; "
                 "tombstoning it would block everything it sends")
+
+
+# Identity prefixes whose identity is a NAME or PATH the user can change.
+_RENAMEABLE = {
+    "file:": "file name",
+    "vault:": "note path",
+    "skill:": "skill path",
+}
+
+
+def notices_for(
+    identities: List[Tuple[str, str]], gap: Optional[str], count: int = 1,
+) -> List[str]:
+    """Plain-language blast radius of a forget/delete, for CLI, REST and MCP
+    responses. States only what the tombstone provably does."""
+    if not identities:
+        return [
+            "Deleted now, but eligible for recapture because the source "
+            f"supplied no stable item identity ({gap or 'no source identity'})."
+        ]
+    units = sorted({i for i, k in identities if k == KIND_SESSION_ID}
+                   or {i for i, k in identities if k == KIND_SOURCE_ID}
+                   or {i for i, _ in identities})
+    what = "this node" if count == 1 else f"{count} nodes"
+    out = [
+        f"This forgets {what} and suppresses all future imports from "
+        f"{', '.join(units)}. Sibling facts already captured from that "
+        "source remain in the graph; forget them too if you want them gone. "
+        "'revien restore' lifts the suppression."
+    ]
+    kinds = {k for _, k in identities}
+    if KIND_SESSION_ID not in kinds:
+        for ident, kind in identities:
+            for prefix, noun in _RENAMEABLE.items():
+                if kind == KIND_SOURCE_ID and ident.startswith(prefix):
+                    out.append(
+                        f"The suppression is bound to the {noun}; if it is "
+                        "renamed or moved it is a different identity and may "
+                        "be captured again.")
+            if kind == KIND_SOURCE_ID and ident.startswith(
+                    ("claude-code:", "codex:")):
+                out.append(
+                    "This session id is not a UUID, so the suppression is "
+                    "bound to its project folder as well; moving the "
+                    "session to another project may capture it again.")
+    return out

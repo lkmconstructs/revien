@@ -118,6 +118,19 @@ class TrainingLoop:
         # Check if we should train
         self._maybe_train()
 
+    def forget_node(self, node_id: str) -> None:
+        """Right-to-forget: drop every logged signal for a deleted node (the
+        log holds its label). Wired as a store delete listener by the
+        retrieval engine, so it covers deletes in processes that run the
+        engine with neural logging on."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("DELETE FROM retrieval_signals WHERE node_id = ?",
+                         (node_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
     def mark_used(self, node_id: str, query: Optional[str] = None) -> None:
         """Mark a node as actually used after retrieval (positive signal)."""
         conn = sqlite3.connect(self.db_path)

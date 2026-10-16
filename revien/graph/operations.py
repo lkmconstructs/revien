@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
-from .suppression import REASON_RETENTION, identities_for
+from .suppression import REASON_RETENTION, identities_for, notices_for
 
 
 # ── Governance Layer (leg 6b): retention config ──────────────────────────────
@@ -395,14 +395,17 @@ class GraphOperations:
         identities, gap = identities_for(
             node.source_id, node.metadata, node.node_type)
         if not identities:
-            return {"status": "unavailable", "identities": [], "gap": gap}
+            return {"status": "unavailable", "identities": [], "gap": gap,
+                    "notice": notices_for([], gap)}
         created = False
         for identity, kind in identities:
             if self.store.add_ingest_suppression(
                     identity, kind, reason=reason, actor=actor):
                 created = True
         return {"status": "created" if created else "exists",
-                "identities": [i for i, _ in identities], "gap": None}
+                "identities": [i for i, _ in identities], "gap": None,
+                "pairs": list(identities),
+                "notice": notices_for(identities, None)}
 
     def _forget_one(
         self, node_id: str, reason: str, construct_id: str,
@@ -456,7 +459,18 @@ class GraphOperations:
                     if suppress else
                     {"status": "not_applicable", "identities": [], "gap": None})
             if outcome is not None:
-                outcome[node_id] = supp
+                outcome[node_id] = dict(
+                    supp, source_id=node.source_id,
+                    node_type=node.node_type.value)
+                # A verbatim transcript (CONTEXT) node of the same source is
+                # a different node: forgetting an extracted claim does not
+                # remove the text from it.
+                if node.node_type != NodeType.CONTEXT and node.source_id:
+                    outcome[node_id]["context_siblings"] = [
+                        n.node_id for n in self.store.list_nodes(
+                            node_type=NodeType.CONTEXT,
+                            source_id=node.source_id, limit=5)
+                        if n.node_id != node_id]
             self.store.record_audit(
                 node_id, "forget", actor=construct_id,
                 before=None,  # NO content snapshot — it is being forgotten
@@ -468,6 +482,9 @@ class GraphOperations:
                     # Status only, never the identity: lets the sync-reset
                     # warning count forgets that are NOT covered by a tombstone.
                     "suppression": supp["status"],
+                    # Set only by the internal automatic-cleanup channel
+                    # (suppress=False); a user's reason text cannot set it.
+                    "automatic": not suppress,
                 },
                 ts=now,
             )
@@ -497,11 +514,15 @@ class GraphOperations:
         identity, so ordinary sync/ingest can never silently capture that
         session again (the WHOLE source session, not just this node: the
         node's content cannot be matched without storing it). Automatic
-        cleanup never suppresses: reason "retention_expire" defaults to
-        False. Only ``revien restore`` / a graph import override lifts it.
+        cleanup (apply_retention) passes suppress=False and never
+        suppresses; a user-supplied reason of "retention_expire" does not. Only ``revien restore`` / a graph import override lifts it.
         """
         if suppress is None:
-            suppress = reason != REASON_RETENTION
+            # The reason string is free text a user controls (POST /forget
+            # takes any reason), so it never decides this. Only the internal
+            # ``suppress=False`` argument, which no REST/CLI/MCP surface
+            # exposes (apply_retention passes it), marks automatic cleanup.
+            suppress = True
         if node_id.startswith(self.TOMBSTONE_PREFIX):
             # Refuse to forget a gravestone — that would orphan lineage.
             return {"status": "skipped", "node_id": node_id,
@@ -532,12 +553,47 @@ class GraphOperations:
         unavailable = [{"node_id": t, "reason": outcome[t]["gap"]}
                        for t in forgotten
                        if outcome.get(t, {}).get("status") == "unavailable"]
+        # What the forget does beyond deleting: per-source notices, deduplicated
+        # (a cascade over one session says it once, with the node count).
+        notice: List[str] = []
+        if suppress and forgotten:
+            pairs: List[Tuple[str, str]] = []
+            bound = 0
+            for t in forgotten:
+                got = outcome.get(t, {}).get("pairs", [])
+                if got:
+                    bound += 1
+                for pair in got:
+                    if pair not in pairs:
+                        pairs.append(pair)
+            if pairs:
+                notice.extend(notices_for(pairs, None, count=bound))
+            if unavailable:
+                notice.extend(notices_for([], unavailable[0]["reason"]))
+        residue = sorted({c for t in forgotten
+                          for c in outcome.get(t, {}).get("context_siblings", [])
+                          if c not in forgotten})
+        if residue:
+            notice.append(
+                "The source's verbatim context node(s) "
+                f"({', '.join(residue)}) are separate nodes and still hold "
+                "the original text this was extracted from; forget them too "
+                "(cascade) to remove that text.")
+        # Deduplicate, keep order.
+        notice = list(dict.fromkeys(notice))
+        if forgotten:
+            # Page images of the deleted rows can sit in the WAL file until a
+            # checkpoint; fold them out now (best effort).
+            self.store.truncate_wal()
         return {
             "status": "forgotten",
             "node_id": node_id,
             "cascade": cascade,
             "forgotten": forgotten,
             "count": len(forgotten),
+            "suppression_notice": notice,
+            "context_nodes_remaining": residue,
+            "recapture_eligible": [u["node_id"] for u in unavailable],
             # Identities now suppressed from ordinary ingestion, and nodes
             # whose source has no stable identity (nothing could be bound).
             "suppressed_identities": suppressed,

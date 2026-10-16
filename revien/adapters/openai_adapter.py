@@ -138,8 +138,16 @@ class OpenAIAdapter:
 
         conversation_nodes: List[Node] = []
 
+        conversations_suppressed = 0
+
         for i, conv_data in enumerate(data):
             conv_id = self._extract_conversation_id(conv_data)
+
+            # Suppression: a conversation the user forgot is never re-imported
+            # (only `revien restore` / an import override lifts it).
+            if self._suppressed_hit(conv_id) is not None:
+                conversations_suppressed += 1
+                continue
 
             # Deduplication: skip if already ingested
             if self._is_conversation_ingested(conv_id):
@@ -168,6 +176,7 @@ class OpenAIAdapter:
             "total_conversations": len(data),
             "conversations_ingested": conversations_ingested,
             "conversations_skipped": conversations_skipped,
+            "conversations_suppressed": conversations_suppressed,
             "total_nodes": total_nodes,
             "total_edges": total_edges,
             "total_messages": total_messages,
@@ -295,6 +304,21 @@ class OpenAIAdapter:
         """
         conv_id = self._extract_conversation_id(conv_data)
         source_id = f"openai:conversation:{conv_id}"
+
+        # Suppression tombstone: the user forgot this conversation. This
+        # adapter writes through the store (not the ingestion pipeline), so
+        # it applies the same gate itself. Checked BEFORE the dedup check.
+        hit = self._suppressed_hit(conv_id)
+        if hit is not None:
+            return {
+                "node_count": 0,
+                "edge_count": 0,
+                "conversation_id": conv_id,
+                "message_count": 0,
+                "system_messages": 0,
+                "skipped_messages": 0,
+                "suppressed": 1,
+            }
 
         # Check for dedup before processing
         if self._is_conversation_ingested(conv_id):
@@ -623,6 +647,19 @@ class OpenAIAdapter:
         t2 = text2.lower()[:500]
         matcher = SequenceMatcher(None, t1, t2)
         return matcher.ratio()
+
+    def _suppressed_hit(self, conversation_id: str) -> Optional[dict]:
+        """The suppression tombstone for this conversation, if the user
+        forgot it. Counted against the tombstone and logged, never silent."""
+        source_id = f"openai:conversation:{conversation_id}"
+        hit = self.store.find_ingest_suppression(source_id, "")
+        if hit is not None:
+            self.store.note_suppressed_skip(hit["identity"], hit["kind"])
+            logger.warning(
+                "OpenAI conversation %s not imported: you forgot it on %s "
+                "('revien restore' lifts this)",
+                conversation_id, hit["created_at"][:10])
+        return hit
 
     def _is_conversation_ingested(self, conversation_id: str) -> bool:
         """

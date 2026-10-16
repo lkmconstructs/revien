@@ -258,6 +258,16 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
 
         WARNING: This deletes all nodes and edges. Use with caution.
         Consider using session_scope to isolate conversations instead.
+
+        This is infrastructure bulk-clearing, i.e. cleanup: it writes NO
+        suppression tombstone, so a source that is read again can capture
+        the same content again. Revien does not infer intent from a method
+        name. If your application exposes clear() as a user-facing "forget
+        my memories" control, the wrapper must call Revien's explicit
+        forget semantics instead (GraphOperations.forget_node / POST
+        /v1/nodes/{id}/forget), which tombstone the source where it has a
+        stable identity. Audit snapshots of the deleted nodes are still
+        scrubbed (delete_node does that).
         """
         if not self._store:
             return

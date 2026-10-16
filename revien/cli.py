@@ -1293,6 +1293,10 @@ def skills_ingest(paths: Tuple[str, ...], include_global: bool, db: Optional[str
         f"{summary['refreshed']} refreshed, {summary['edges']} entity/topic "
         f"edge(s) linked."
     )
+    if summary.get("suppressed"):
+        click.echo(
+            f"{summary['suppressed']} skill(s) skipped: you forgot them "
+            "('revien suppressions' lists them; 'revien restore' lifts).")
 
 
 @skills.command(name="list")
@@ -1587,7 +1591,12 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
 @click.option("--orphaned", is_flag=True,
               help="Reset a saved sync position whose adapter is no longer in "
                    "your config (only works when a saved position exists)")
-def sync_reset(adapter_name: str, db: Optional[str], yes: bool, orphaned: bool):
+@click.option("--daemon-url", default="http://127.0.0.1:7437",
+              help="Where to look for a running daemon (to check it is "
+                   "current); loopback addresses only; default "
+                   "http://127.0.0.1:7437")
+def sync_reset(adapter_name: str, db: Optional[str], yes: bool, orphaned: bool,
+               daemon_url: str):
     """Forget a connected adapter's sync position so its next sync re-reads
     its full history (for example 'revien sync reset claude-code').
 
@@ -1595,9 +1604,12 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool, orphaned: bool):
     can be reset: their sessions are refreshed in place, not duplicated, so
     the reset is safe to repeat. Other adapters would ingest everything again
     as new nodes, so they are refused. Nothing is deleted from the graph.
-    A sync already running when you reset cannot undo the reset: its newer
-    position is discarded. The new position is used at the next sync
-    (default every 6 hours).
+    A sync already running in a CURRENT daemon when you reset cannot undo the
+    reset: its newer position is discarded. The command asks the daemon at
+    --daemon-url whether it is current and says what it found; a daemon
+    started before you upgraded does not have that protection and must be
+    restarted. The new position is used at the next sync (default every 6
+    hours).
 
     --orphaned resets a saved position whose adapter was removed from your
     config. Its type cannot be checked, so the reset is allowed only because
@@ -1713,17 +1725,87 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool, orphaned: bool):
     click.echo("It takes effect at the next sync (default every 6 hours), "
                "which re-reads the full history. Already captured sessions "
                "are refreshed in place, not duplicated. Nothing was deleted.")
-    click.echo("A sync that is running right now cannot undo this reset: when "
-               "it finishes, its position is discarded. If the daemon is not "
-               "running, start it with 'revien start'.")
+    for line in _daemon_report(daemon_url, db_path):
+        click.echo(line)
     if protected:
         click.echo(f"{protected} suppressed source(s) (forgotten by you) are "
                    "skipped by the re-read, not recaptured. See "
                    "'revien suppressions'.")
     click.echo("Not covered: forgotten content from a source with no stable "
                "identity, anything forgotten or deleted before suppressions "
-               "existed, and LangChain clear() leave no suppression and can "
-               "be captured again if its source still exists.")
+               "existed, a file-watcher file or vault note that was renamed "
+               "or moved since you forgot it, and LangChain clear() leave no "
+               "suppression and can be captured again if the source still "
+               "exists.")
+
+
+def _probe_daemon(url: str):
+    """Ask a LOOPBACK daemon for /v1/health. Returns None when nothing
+    answers, the address is not loopback, or the answer is not Revien's;
+    else the decoded JSON object. Loopback only, by construction: this
+    command must never reach off the machine, whatever --daemon-url says."""
+    import http.client
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if parts.scheme != "http" or host not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        conn = http.client.HTTPConnection(host, parts.port or 80, timeout=1.5)
+        try:
+            conn.request("GET", (parts.path.rstrip("/") or "") + "/v1/health")
+            resp = conn.getresponse()
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - unreachable, refused, not JSON: all "none"
+        return None
+    if not isinstance(data, dict) or "node_count" not in data \
+            or "uptime_seconds" not in data:
+        return None
+    return data
+
+
+def _daemon_report(url: str, db_path: str):
+    """What can truthfully be said about daemons after a reset. Only claims
+    what the health endpoint of the daemon at ``url`` proved."""
+    from revien.daemon.server import DAEMON_FEATURES, db_identity
+
+    health = _probe_daemon(url)
+    restart = ("Restart it ('Ctrl+C' in its terminal, then 'revien start'), "
+               "then run this reset again.")
+    if health is None:
+        return [
+            f"No Revien daemon answered at {url}, so nothing was checked. A "
+            "daemon that was started BEFORE you upgraded Revien ignores "
+            "suppressions and this reset's protection: until it is restarted "
+            "it can recapture forgotten sources and undo this reset. Restart "
+            "any daemon you started before upgrading ('Ctrl+C', then "
+            "'revien start'); use --daemon-url if yours listens elsewhere.",
+        ]
+    feats = health.get("features")
+    if not isinstance(feats, list) or not set(DAEMON_FEATURES) <= set(feats):
+        return [
+            f"WARNING: the daemon answering at {url} (version "
+            f"{health.get('version', 'unknown')}) does not report "
+            "suppression or reset protection, so it was started before this "
+            "version. If it uses this database it ignores suppressions and "
+            "can recapture forgotten sources and undo this reset. " + restart,
+        ]
+    if health.get("db_id") and health.get("db_id") != db_identity(db_path):
+        return [
+            f"The current daemon at {url} serves a different database, so it "
+            "is unaffected by this reset. A daemon on this database that was "
+            "started before you upgraded would not be protected; none was "
+            "found at that address.",
+        ]
+    return [
+        f"The daemon at {url} is current and serves this database: a sync "
+        "already running in it cannot undo this reset (its newer position is "
+        "discarded). Other daemons you started before upgrading were not "
+        "checked.",
+    ]
 
 
 def _has_sync_row(db_path: str, name: str) -> bool:
@@ -1768,7 +1850,10 @@ def suppressions_cmd(db: Optional[str]):
         click.echo(f"  {r['identity']}  [{r['kind']}]  since {r['created_at'][:10]}"
                    f"  skipped {r['skipped_count']}x  by {r['actor'] or '-'}"
                    + (f"  reason: {r['reason']}" if r['reason'] else ""))
-    click.echo("Lift one with: revien restore <identity>")
+    click.echo("Each row blocks the WHOLE source (a session, conversation, file "
+               "or skill), not just the node you forgot. Sibling facts "
+               "captured from it before remain in the graph. Lift one with: "
+               "revien restore <identity>")
 
 
 @main.command(name="restore")

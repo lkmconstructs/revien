@@ -332,6 +332,12 @@ class RetrievalEngine:
         )
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
+        if self.neural_enabled:
+            # The signal log keeps node labels: a forgotten node's rows go
+            # with it (only in processes that run this engine; the log is a
+            # separate file the store itself does not know about).
+            store.register_content_listener(
+                "neural_training", on_delete=self.training_loop.forget_node)
 
         # Semantic/vector layer (SPINE — core deps as of the promote-to-spine
         # change). Constructs cleanly even when the deps are absent (source

@@ -6,6 +6,7 @@ Every node, every edge, every relationship — stored, never compacted.
 import functools
 import json
 import sqlite3
+import sys
 import threading
 import warnings
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from .origin import derive_origin
+from .suppression import session_identity_for, unit_key
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -356,6 +358,103 @@ class GraphStore:
         self._migrate_add_origin_columns(conn)
         # Reset/sync fencing: add sync_cursors.generation to older DBs.
         self._migrate_add_sync_cursor_generation(conn)
+        self._backfill_session_suppressions(conn)
+        self._migrate_scrub_legacy_audit(conn)
+
+    def _backfill_session_suppressions(self, conn: sqlite3.Connection) -> None:
+        """Tombstones written before session ids were bound get their
+        project-independent session_id row derived from the identity they
+        already hold (content-free; idempotent)."""
+        try:
+            rows = conn.execute(
+                "SELECT identity, kind, created_at, reason, actor "
+                "FROM ingest_suppressions WHERE kind != 'session_id'").fetchall()
+            for identity, _kind, created_at, reason, actor in rows:
+                session = session_identity_for(identity)
+                if session:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO ingest_suppressions "
+                        "(identity, kind, created_at, reason, actor) "
+                        "VALUES (?, 'session_id', ?, ?, ?)",
+                        (session, created_at, reason, actor))
+            self._commit(conn)
+        except sqlite3.Error as e:
+            print(f"Migration note: session suppression backfill: {e}",
+                  file=sys.stderr)
+
+    _LEGACY_SCRUB_MARK = "legacy_audit_scrub_done"
+
+    def _migrate_scrub_legacy_audit(self, conn: sqlite3.Connection) -> None:
+        """One-time: blank audit snapshots that still hold the content of
+        nodes deleted BEFORE delete_node scrubbed its own audit rows.
+
+        Deliberately narrow, because the audit trail is otherwise
+        append-only history. A row is scrubbed only when it is shaped like a
+        node snapshot (has node_type + content) and its node_id no longer
+        exists, or shaped like an edge snapshot (has both endpoints) and an
+        endpoint no longer exists. That is the same thing delete_node does
+        today for every deletion path (forget, DELETE /v1/nodes,
+        LangChain clear()). Rows that are not snapshots (forget, suppress,
+        suppression_lift, tombstone markers) and rows of live nodes/edges are
+        never touched. A store_meta row records that it ran, so it runs once.
+        """
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS store_meta "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            done = conn.execute(
+                "SELECT 1 FROM store_meta WHERE key = ?",
+                (self._LEGACY_SCRUB_MARK,)).fetchone()
+            if done:
+                return
+            live_nodes = {r[0] for r in conn.execute("SELECT node_id FROM nodes")}
+            live_edges = {r[0] for r in conn.execute("SELECT edge_id FROM edges")}
+            doomed = []
+            for rid, nid, op, before, after in conn.execute(
+                    "SELECT id, node_id, op, before_json, after_json "
+                    "FROM audit_log WHERE (before_json IS NOT NULL "
+                    "OR after_json IS NOT NULL) "
+                    "AND op NOT IN ('forget', 'suppress', 'suppression_lift')"
+            ).fetchall():
+                for raw in (before, after):
+                    if not raw or raw == self._SCRUBBED:
+                        continue
+                    try:
+                        snap = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(snap, dict) or snap.get("_tombstone"):
+                        continue
+                    node_like = "node_type" in snap and "content" in snap
+                    edge_like = ("source_node_id" in snap
+                                 and "target_node_id" in snap)
+                    if node_like and nid not in live_nodes:
+                        doomed.append(rid)
+                        break
+                    if edge_like and (
+                            snap["source_node_id"] not in live_nodes
+                            or snap["target_node_id"] not in live_nodes):
+                        doomed.append(rid)
+                        break
+            for i in range(0, len(doomed), 400):
+                chunk = doomed[i:i + 400]
+                conn.execute(
+                    "UPDATE audit_log SET "
+                    "before_json = CASE WHEN before_json IS NULL THEN NULL "
+                    f"ELSE '{self._SCRUBBED}' END, "
+                    "after_json = CASE WHEN after_json IS NULL THEN NULL "
+                    f"ELSE '{self._SCRUBBED}' END "
+                    f"WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES (?, ?)",
+                (self._LEGACY_SCRUB_MARK,
+                 json.dumps({"at": datetime.now(timezone.utc).isoformat(),
+                             "scrubbed_rows": len(doomed)})))
+            self._commit(conn)
+            if doomed:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as e:
+            print(f"Migration note: legacy audit scrub: {e}", file=sys.stderr)
 
     def _migrate_add_sync_cursor_generation(self, conn: sqlite3.Connection) -> None:
         """Add sync_cursors.generation to databases created before reset
@@ -370,7 +469,7 @@ class GraphStore:
             self._commit(conn)
         except sqlite3.OperationalError as e:
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -445,7 +544,7 @@ class GraphStore:
             # there). Anything else — locked db, disk, corruption — must be
             # loud at startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -488,7 +587,7 @@ class GraphStore:
             # there). Anything else — locked db, disk, corruption — must be
             # loud at startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -524,7 +623,7 @@ class GraphStore:
             # there). Anything else — locked db, disk, corruption — must be
             # loud at startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -550,7 +649,7 @@ class GraphStore:
             # there). Anything else — locked db, disk, corruption — must be
             # loud at startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -572,7 +671,7 @@ class GraphStore:
             # Anything else — locked db, disk, corruption — must be loud at
             # startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -668,7 +767,7 @@ class GraphStore:
             # Anything else — locked db, disk, corruption — must be loud at
             # startup, not a "Migration note" that hides it.
             if "duplicate column name" in str(e) or "already exists" in str(e):
-                print(f"Migration note: {e}")
+                print(f"Migration note: {e}", file=sys.stderr)
             else:
                 raise
 
@@ -690,6 +789,9 @@ class GraphStore:
             )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
+            # Deleted rows are zeroed in the file, not just unlinked, so
+            # right-to-forget does not leave the content in free pages.
+            self._conn.execute("PRAGMA secure_delete = ON")
         return self._conn
 
     @_locked
@@ -1319,7 +1421,12 @@ class GraphStore:
     ) -> Optional[dict]:
         """The suppression row matching this ingest, else None."""
         conn = self._get_conn()
-        for identity, kind in ((source_id, "source_id"), (ingest_key, "ingest_key")):
+        candidates = [(source_id, "source_id"), (ingest_key, "ingest_key")]
+        for raw in (source_id, ingest_key):
+            session = session_identity_for(raw or "")
+            if session:
+                candidates.append((session, "session_id"))
+        for identity, kind in candidates:
             if not identity:
                 continue
             row = conn.execute(
@@ -1369,13 +1476,19 @@ class GraphStore:
         """Explicit override: remove every suppression row for this identity
         (either kind). Audited. Returns rows lifted (0 = none existed)."""
         conn = self._get_conn()
-        kinds = [r[0] for r in conn.execute(
-            "SELECT kind FROM ingest_suppressions WHERE identity = ?",
-            (identity,)).fetchall()]
-        if not kinds:
+        # Rows that name the same unit (a source_id row and the session_id row
+        # derived from it) are lifted together, or the restore would not work.
+        target = unit_key(identity)
+        rows = [(r[0], r[1]) for r in conn.execute(
+            "SELECT identity, kind FROM ingest_suppressions").fetchall()
+            if r[0] == identity or unit_key(r[0]) == target]
+        if not rows:
             return 0
-        conn.execute(
-            "DELETE FROM ingest_suppressions WHERE identity = ?", (identity,))
+        kinds = [k for _, k in rows]
+        for ident, kind in rows:
+            conn.execute(
+                "DELETE FROM ingest_suppressions WHERE identity = ? AND kind = ?",
+                (ident, kind))
         self.record_audit(
             f"suppression:{identity}", "suppression_lift", actor=actor,
             after={"_tombstone": True, "identity": identity, "kinds": kinds,
@@ -1393,21 +1506,36 @@ class GraphStore:
         ).fetchone()
         return int(row[0])
 
+    @staticmethod
+    def _forget_is_automatic(after_json: Optional[str]) -> bool:
+        """True for a forget written by automatic cleanup (retention expiry).
+        Decided by the internal ``automatic`` flag, never by the reason text,
+        which a user controls. Rows written before the flag existed carry
+        ``suppression: "not_applicable"`` exactly when cleanup wrote them."""
+        try:
+            data = json.loads(after_json) if after_json else {}
+        except ValueError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        if "automatic" in data:
+            return bool(data["automatic"])
+        if "suppression" in data:
+            return data["suppression"] == "not_applicable"
+        # Before suppressions existed the reason string was all there was;
+        # those rows cannot be told apart, so the old rule stays for them only.
+        return data.get("reason") == "retention_expire"
+
     @_locked
     def count_user_forgets(self) -> int:
         """Right-to-forget operations in the audit trail, EXCLUDING retention
-        expiry (which also writes op='forget' but with the tombstone reason
-        'retention_expire'). Hard deletes that bypass the audit trail
+        expiry (which also writes op='forget', flagged automatic). Hard deletes that bypass the audit trail
         (DELETE /v1/nodes, LangChain clear()) are not, and cannot be, counted."""
         conn = self._get_conn()
         count = 0
         for (after,) in conn.execute(
                 "SELECT after_json FROM audit_log WHERE op = 'forget'"):
-            try:
-                reason = (json.loads(after) or {}).get("reason") if after else None
-            except (ValueError, AttributeError):
-                reason = None
-            if reason != "retention_expire":
+            if not self._forget_is_automatic(after):
                 count += 1
         return count
 
@@ -1429,7 +1557,7 @@ class GraphStore:
                 data = data if isinstance(data, dict) else {}
             except ValueError:
                 data = {}
-            if data.get("reason") == "retention_expire":
+            if self._forget_is_automatic(after):
                 continue
             if data.get("suppression") not in ("created", "exists"):
                 count += 1
@@ -1775,10 +1903,35 @@ class GraphStore:
             self._fire_content_change(updated)
         return updated
 
+    _SCRUBBED = '{"_scrubbed": true}'
+
+    def _scrub_audit_rows(self, conn: sqlite3.Connection, ids: list) -> None:
+        """Blank before/after snapshots of audit rows keyed by these ids
+        (node ids or edge ids). Keeps op/actor/ts: the history that the thing
+        existed. Content-free 'forget'/'suppress' rows are left as written."""
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            marks = ",".join("?" * len(chunk))
+            conn.execute(
+                "UPDATE audit_log SET "
+                "before_json = CASE WHEN before_json IS NULL THEN NULL "
+                f"ELSE '{self._SCRUBBED}' END, "
+                "after_json = CASE WHEN after_json IS NULL THEN NULL "
+                f"ELSE '{self._SCRUBBED}' END "
+                f"WHERE node_id IN ({marks}) "
+                "AND op NOT IN ('forget', 'suppress', 'suppression_lift')",
+                chunk)
+
     @_locked
     def delete_node(self, node_id: str) -> bool:
         """Delete a node and all its connected edges. Returns True if deleted."""
         with self.transaction() as conn:
+            # Edge audit rows are keyed by edge_id and their snapshots carry
+            # the endpoints' labels in source_context (ALIAS_OF name forms),
+            # so they are scrubbed with the node, before the edges go.
+            edge_ids = [r[0] for r in conn.execute(
+                "SELECT edge_id FROM edges WHERE source_node_id = ? "
+                "OR target_node_id = ?", (node_id, node_id)).fetchall()]
             # Edges cascade via FK, but be explicit for safety
             conn.execute(
                 "DELETE FROM edges WHERE source_node_id = ? OR target_node_id = ?",
@@ -1799,22 +1952,80 @@ class GraphStore:
                     "UPDATE recall_receipts SET node_ids = ? WHERE recall_id = ?",
                     (json.dumps(remaining), recall_id),
                 )
+            # Supersession candidates carry a reason/trace written from the
+            # claims' own text; a pair with a deleted member is moot.
+            conn.execute(
+                "DELETE FROM supersession_candidates "
+                "WHERE existing_node_id = ? OR new_node_id = ?",
+                (node_id, node_id))
+            # Distill manifest rows hold a hash of the rendered claim; the
+            # vault note itself is a file outside the database (see
+            # VaultDistiller / CHANGELOG known gaps).
+            conn.execute(
+                "DELETE FROM distill_manifest "
+                "WHERE current_node_id = ? OR anchor_node_id = ?",
+                (node_id, node_id))
+            # Embedding queue (ids only) -- drop it; the vector row itself is
+            # removed by the semantic listener when that layer is active.
+            try:
+                conn.execute("DELETE FROM pending_embeds WHERE node_id = ?",
+                             (node_id,))
+            except sqlite3.OperationalError:
+                pass  # queue table never created
+            self._delete_vector_row(conn, node_id)
             # The audit trail keeps full node snapshots (add/update ops).
             # A deleted node's content must not survive there: blank the
             # snapshots, keep op/actor/ts (the history that it existed). The
             # content-free 'forget' tombstone row is left as written.
-            conn.execute(
-                "UPDATE audit_log SET "
-                "before_json = CASE WHEN before_json IS NULL THEN NULL "
-                "ELSE '{\"_scrubbed\": true}' END, "
-                "after_json = CASE WHEN after_json IS NULL THEN NULL "
-                "ELSE '{\"_scrubbed\": true}' END "
-                "WHERE node_id = ? AND op != 'forget'", (node_id,))
+            self._scrub_audit_rows(conn, [node_id] + edge_ids)
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
         if deleted:
             self._fire_delete(node_id)
+            if self._txn_depth == 0:
+                self.truncate_wal()
         return deleted
+
+    def _delete_vector_row(self, conn: sqlite3.Connection, node_id: str) -> None:
+        """Drop the node's embedding from the vector table, whether or not the
+        semantic layer is active in THIS process: a forget run by the CLI or a
+        plain store must not leave an embedding of the forgotten text behind.
+        No-op when there is no vector table; if the table exists but the
+        sqlite-vec extension cannot be loaded here, the residue is reported
+        on stderr instead of silently kept."""
+        try:
+            has = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_nodes'"
+            ).fetchone()
+        except sqlite3.Error:
+            return
+        if not has:
+            return
+        try:
+            conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+            return
+        except sqlite3.Error:
+            pass  # module not loaded on this connection: try to load it
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            conn.execute("DELETE FROM vec_nodes WHERE node_id = ?", (node_id,))
+        except Exception as e:  # noqa: BLE001
+            print(f"[revien] embedding for deleted node {node_id} could not "
+                  f"be removed ({e}); run 'revien reindex' with the semantic "
+                  "extra installed to rebuild the vector index.",
+                  file=sys.stderr)
+
+    def truncate_wal(self) -> None:
+        """Fold the WAL into the main file and truncate it, so page images of
+        just-deleted content do not linger in the -wal file. Best effort: it
+        cannot complete while another connection is mid-read."""
+        try:
+            self._get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
 
     @_locked
     def list_nodes(
@@ -2427,7 +2638,9 @@ class GraphStore:
                     kept.append(n)
                     continue
                 hit_identities.update(
-                    x for x in (sid, key) if x in known_identities)
+                    x for x in (sid, key, session_identity_for(sid),
+                                session_identity_for(key))
+                    if x and x in known_identities)
                 if suppressions == "override":
                     kept.append(n)
                 else:
@@ -2461,6 +2674,11 @@ class GraphStore:
                 # Direct SQL, not delete_node: the wipe and the inserts must
                 # be one atomic unit, and per-node listener churn is pointless
                 # when the semantic index is rebuilt wholesale below.
+                # The replaced graph's content must not linger in the audit
+                # trail either (same rule as delete_node).
+                removed_edge_ids = [r[0] for r in conn.execute(
+                    "SELECT edge_id FROM edges").fetchall()]
+                self._scrub_audit_rows(conn, removed_node_ids + removed_edge_ids)
                 conn.execute("DELETE FROM edges")
                 conn.execute("DELETE FROM nodes")
             for node in new_nodes:

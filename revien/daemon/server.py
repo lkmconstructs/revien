@@ -5,6 +5,7 @@ Runs as local daemon on port 7437 or as hosted service.
 
 import time
 import os
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
@@ -160,12 +161,32 @@ class NodeResponse(BaseModel):
     session_key: Optional[str] = None
 
 
+DAEMON_FEATURES = ("suppression_tombstones", "sync_reset_fence")
+
+
+def db_identity(db_path: str) -> str:
+    """Stable short id of a database file path, for health checks."""
+    import hashlib
+    try:
+        resolved = str(Path(db_path).resolve())
+    except OSError:
+        resolved = str(db_path)
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+
+
 class HealthResponse(BaseModel):
     status: str
     node_count: int
     edge_count: int
     uptime_seconds: float
     version: str
+    # Capabilities that decide whether this daemon honors the forget
+    # guarantees. A daemon from before they existed omits both fields, which
+    # is how `revien sync reset` recognises one it cannot trust.
+    features: List[str] = []
+    # Short hash of the database path (never the path itself), so a client can
+    # tell whether this daemon is serving the database it is about to change.
+    db_id: str = ""
 
 
 class SyncResponse(BaseModel):
@@ -719,17 +740,39 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             deleted = store.delete_node(node_id)
         if not deleted:
             raise HTTPException(404, f"Node not found: {node_id}")
+        store.truncate_wal()
+        notice = list(supp.get("notice", []))
+        residue = []
+        if node.node_type != NodeType.CONTEXT and node.source_id:
+            residue = [n.node_id for n in store.list_nodes(
+                node_type=NodeType.CONTEXT, source_id=node.source_id, limit=5)]
+            if residue:
+                notice.append(
+                    "The source's verbatim context node(s) "
+                    f"({', '.join(residue)}) are separate nodes and still hold "
+                    "the original text this was extracted from; delete them "
+                    "too to remove that text.")
         return {"status": "deleted", "node_id": node_id,
+                "context_nodes_remaining": residue,
                 "suppression": supp["status"],
                 "suppressed_identities": supp["identities"],
-                "suppression_gap": supp["gap"]}
+                "suppression_gap": supp["gap"],
+                "suppression_notice": notice}
 
     # ── Ingestion suppressions (content-free tombstones) ──
 
     @app.get("/v1/suppressions")
     async def list_suppressions():
         """Identities the user forgot/deleted that ordinary ingestion skips.
-        Identity, timestamp, reason, actor and skip counts only."""
+        Identity, timestamp, reason, actor and skip counts only.
+
+        Deliberately NOT behind the pairing token, like every other read
+        (recall, /v1/graph, /v1/nodes, /v1/export): reads are open to
+        whoever can reach the daemon, mutations need the token. This
+        endpoint exposes strictly less than /v1/export, which already
+        returns the same identities in its audit rows, so gating only this
+        route would protect nothing. The protection is the same as for all
+        reads: keep the daemon on loopback."""
         return {"suppressions": store.list_ingest_suppressions()}
 
     class RestoreRequest(BaseModel):
@@ -916,6 +959,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             edge_count=store.count_edges(),
             uptime_seconds=round(time.time() - start_time, 2),
             version=__version__,
+            features=list(DAEMON_FEATURES),
+            db_id=db_identity(store.db_path),
         )
 
     # ── POST /v1/sync ─────────────────────────────────
