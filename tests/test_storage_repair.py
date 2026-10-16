@@ -255,7 +255,7 @@ class TestLoudMigrations:
         store._migrate_add_validity_columns(
             _FailingConn("duplicate column name: valid_from")
         )
-        assert "Migration note" in capsys.readouterr().out
+        assert "Migration note" in capsys.readouterr().err
 
     def test_real_errors_raise(self, store):
         # Locked db / disk / corruption must be loud at startup.

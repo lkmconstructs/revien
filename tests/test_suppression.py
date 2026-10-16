@@ -149,8 +149,10 @@ class TestForgetSuppresses:
         assert store.list_ingest_suppressions() == []
         n2 = Node(node_type=NodeType.FACT, label="o2", content="o2", source_id=SID)
         store.add_node(n2)
+        # The reason string is user-controlled and decides nothing: a user
+        # forget that says "retention_expire" is still an explicit forget.
         ops.forget_node(n2.node_id, reason="retention_expire")
-        assert store.list_ingest_suppressions() == []
+        assert [r["identity"] for r in store.list_ingest_suppressions()] == [SID]
 
     def test_shared_channel_source_cannot_be_tombstoned_and_says_so(self, store):
         n = Node(node_type=NodeType.FACT, label="m", content="c", source_id="mcp")
@@ -164,17 +166,21 @@ class TestForgetSuppresses:
         r = pipe.ingest(IngestionInput(source_id="mcp", content="We use Redis."))
         assert not r.suppressed
 
-    def test_keyed_identity_survives_a_source_id_change(self, store):
-        """ingest_key is bound too, so a renamed source_id with the same key
-        is still suppressed."""
+    def test_session_identity_survives_a_project_change(self, store):
+        """Real adapters set ingest_key == source_id, so a changed project
+        folder changes both; what survives is the runtime-assigned session
+        UUID (see tests/test_forget_followups.py for the adapter-level proofs)."""
+        uuid = "3f2b8c1e-5d4a-4e7b-9a10-0c6d2e8f1a42"
         pipe = IngestionPipeline(store)
-        pipe.ingest(IngestionInput(source_id="claude-code:p:s", content="We use Redis.",
-                                   ingest_key="key-1"))
-        ctx = store.find_context_node_by_ingest_key("key-1")
+        sid = f"claude-code:p:{uuid}"
+        pipe.ingest(IngestionInput(source_id=sid, content="We use Redis.",
+                                   ingest_key=sid))
+        ctx = store.find_context_node_by_ingest_key(sid)
         GraphOperations(store).forget_node(ctx.node_id, reason="x")
-        r = pipe.ingest(IngestionInput(source_id="claude-code:other:s",
+        other = f"claude-code:other:{uuid}"
+        r = pipe.ingest(IngestionInput(source_id=other,
                                        content="We use Redis. More.",
-                                       ingest_key="key-1"))
+                                       ingest_key=other))
         assert r.suppressed and r.nodes_created == 0
 
     def test_file_watcher_style_identity_is_stable_across_changes(self, store):

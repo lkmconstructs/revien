@@ -110,7 +110,10 @@ class TestCLI:
         assert "Cleared the sync position for 'claude-code'" in r.output
         assert "next sync" in r.output
         assert "6 hours" in r.output
-        assert "cannot undo this reset" in r.output
+        # No daemon is listening in the test environment: the text must say
+        # nothing was checked, and must not claim a running sync is fenced.
+        assert "No Revien daemon answered" in r.output
+        assert "cannot undo this reset" not in r.output
         assert "run this again" not in r.output
         s = GraphStore(db_path=db_path)
         try:
@@ -269,7 +272,9 @@ class TestForgetWarning:
                  created_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
         store.add_node(n)
         ops = GraphOperations(store)
-        ops.forget_node(n.node_id, reason="retention_expire")
+        # Automatic cleanup is the internal suppress=False channel, not a
+        # reason string.
+        ops.forget_node(n.node_id, reason="retention_expire", suppress=False)
         assert [r for r in store.get_all_audit() if r["op"] == "forget"]
         assert store.count_forget_tombstones() == 1
         assert store.count_user_forgets() == 0
@@ -285,8 +290,13 @@ class TestForgetWarning:
         for reason in ("retention_expire", "user asked", ""):
             n = Node(node_type=NodeType.FACT, label=reason or "x", content="c " + reason)
             store.add_node(n)
+            # A user who types "retention_expire" is still a user forget.
             ops.forget_node(n.node_id, reason=reason)
-        assert store.count_user_forgets() == 2
+        assert store.count_user_forgets() == 3
+        n = Node(node_type=NodeType.FACT, label="auto", content="c auto")
+        store.add_node(n)
+        ops.forget_node(n.node_id, reason="retention_expire", suppress=False)
+        assert store.count_user_forgets() == 3
 
     def test_warning_states_what_is_not_covered(
             self, store, db_path, monkeypatch):
