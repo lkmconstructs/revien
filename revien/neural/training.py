@@ -27,6 +27,7 @@ class TrainingLoop:
 
     INITIAL_THRESHOLD = 100
     RETRAIN_INTERVAL = 500
+    _SCRUB_KEY = "secure_scrub_v1"
 
     def __init__(self, db_path: Optional[str] = None, model_dir: Optional[str] = None):
         self.db_path = db_path or str(Path.home() / ".revien" / "training.db")
@@ -72,10 +73,22 @@ class TrainingLoop:
             CREATE INDEX IF NOT EXISTS idx_signals_node ON retrieval_signals(node_id)
         """)
         conn.commit()
-        # A file written before secure_delete was set can hold deleted query
-        # text in free pages; rewrite it once (a no-op when nothing is free).
-        if conn.execute("PRAGMA freelist_count").fetchone()[0]:
+        # A file written before secure_delete was set can hold text a delete
+        # left behind. A delete frees a whole page only when every row on it
+        # is gone; otherwise the page stays in use with the deleted row's bytes
+        # still inside it, and freelist_count is 0. So the free list says
+        # nothing about residue, and the rewrite is keyed by a marker instead:
+        # one VACUUM, ever, per file, whatever the free list holds. Deletes
+        # after that run under secure_delete and leave nothing behind.
+        done = conn.execute(
+            "SELECT 1 FROM training_state WHERE key = ?",
+            (self._SCRUB_KEY,)).fetchone()
+        if not done:
             conn.execute("VACUUM")
+            conn.execute(
+                "INSERT OR REPLACE INTO training_state (key, value) "
+                "VALUES (?, ?)", (self._SCRUB_KEY, "1"))
+            conn.commit()
         conn.close()
 
     def _load_train_state(self) -> None:

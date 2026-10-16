@@ -1260,6 +1260,49 @@ class GraphStore:
         self._commit(conn)
 
     @_locked
+    def list_subagent_contexts(self, session_uuid: str) -> List[Node]:
+        """CONTEXT nodes whose ``parent_session_id`` metadata names this
+        session UUID (Claude Code sub-agent transcripts, see
+        ``parent_session_identity``). The LIKE only narrows; the caller (and
+        this method) confirm the exact field."""
+        conn = self._get_conn()
+        out = []
+        for row in conn.execute(
+                "SELECT * FROM nodes WHERE node_type = ? AND metadata LIKE ? "
+                "ORDER BY created_at, node_id",
+                (NodeType.CONTEXT.value, f"%{session_uuid.lower()}%")).fetchall():
+            n = self._row_to_node(row)
+            ident = parent_session_identity(n.metadata)
+            if ident and ident.split(":", 1)[1] == session_uuid.lower():
+                out.append(n)
+        return out
+
+    @_locked
+    def reattribute_node(
+        self, node_id: str, source_id: str, origin_runtime: Optional[str],
+        origin_source: Optional[str], project_key: Optional[str],
+        session_key: Optional[str], actor: str = "",
+    ) -> bool:
+        """Move a node's attribution (source_id and the origin columns) to
+        another unit. Used when the unit that first created a node is
+        forgotten but a live unit still links it: the node must stop naming the
+        forgotten unit and must be owned by a live one, so that forgetting that
+        unit later removes it. Content-free audit row (new source_id only)."""
+        conn = self._get_conn()
+        with self.transaction():
+            cur = conn.execute(
+                "UPDATE nodes SET source_id = ?, origin_runtime = ?, "
+                "origin_source = ?, project_key = ?, session_key = ? "
+                "WHERE node_id = ?",
+                (source_id, origin_runtime, origin_source, project_key,
+                 session_key, node_id))
+            if cur.rowcount:
+                self.record_audit(
+                    node_id, "reattribute", actor=actor, before=None,
+                    after={"source_id": source_id})
+        return cur.rowcount > 0
+
+    @_locked
     def distill_notes_for_nodes(self, node_ids: List[str]) -> List[str]:
         """Stems of distilled vault notes whose manifest names any of these
         nodes (as the claim, its anchor, or the entity the note is about).
@@ -1991,6 +2034,15 @@ class GraphStore:
             # Usage judgments keep the memory's own words (shared_terms), so
             # they go with it — right-to-forget runs through here, and its
             # promise is that the content is actually gone.
+            # Every judgment of the same episode/recall carries that recall's
+            # query text (the user's words, which can repeat the forgotten
+            # fact), including the rows of OTHER nodes judged in it. Blank the
+            # query on all of them; those rows are other nodes' own evidence
+            # and stay.
+            conn.execute(
+                "UPDATE use_judgments SET query = '' WHERE episode_key IN "
+                "(SELECT episode_key FROM use_judgments WHERE node_id = ?)",
+                (node_id,))
             conn.execute("DELETE FROM use_judgments WHERE node_id = ?", (node_id,))
             # Receipts hold only ids, but a forgotten node's id should not
             # linger in an open receipt or a flag either.

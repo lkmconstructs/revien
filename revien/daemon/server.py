@@ -727,6 +727,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         node = store.get_node(node_id)
         if node is None:
             raise HTTPException(404, f"Node not found: {node_id}")
+        # Distilled vault notes are files outside the database; the delete
+        # drops the manifest rows that name this node, so read them first.
+        distilled_notes = store.distill_notes_for_nodes([node_id])
         with store.transaction():
             supp = ops.suppress_node_source(node, "rest_delete", "rest:delete")
             deleted = store.delete_node(node_id)
@@ -734,6 +737,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, f"Node not found: {node_id}")
         store.truncate_wal()
         notice = list(supp.get("notice", []))
+        if distilled_notes:
+            notice.append(ops.distilled_notice(distilled_notes))
         residue = []
         if node.node_type != NodeType.CONTEXT and node.source_id:
             residue = [n.node_id for n in store.list_nodes(
@@ -746,6 +751,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "too to remove that text.")
         return {"status": "deleted", "node_id": node_id,
                 "context_nodes_remaining": residue,
+                "distilled_notes_remaining": distilled_notes,
                 "suppression": supp["status"],
                 "suppressed_identities": supp["identities"],
                 "suppression_gap": supp["gap"],
@@ -1196,9 +1202,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         Distinct from invalidate (which retains). Writes a content-free tombstone
         audit entry and re-points children's lineage to a tombstone marker.
         cascade=True forgets the whole DERIVED_FROM subtree; on a session's
-        verbatim context node it forgets every node of that session (the
-        pipeline never writes DERIVED_FROM; nodes are tied to a session by
-        source_id). GET .../forget/preview lists what it would remove.
+        verbatim context node it forgets that context node, its sub-agent
+        context nodes and every node linked ONLY to them (the pipeline never
+        writes DERIVED_FROM). A node another live context node also links is
+        kept, with this session's links removed; the response lists what was
+        kept (`kept_shared`) and which other context nodes carry the same
+        source id (`other_contexts_same_source`). GET .../forget/preview
+        returns the same lists before anything is deleted.
         """
         req = request or ForgetRequest()
         result = ops.forget_node(

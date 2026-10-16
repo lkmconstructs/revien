@@ -113,17 +113,22 @@ class ClaudeCodeAdapter(RevienAdapter):
         """For a file whose own stem is not a session UUID (a sub-agent
         transcript, ``<session>/subagents/agent-<id>.jsonl``), the ``sessionId``
         its entries carry: the PARENT session's id. Read from the first entry
-        that has one; nothing else in the file is kept, so the result is
-        content-free. None for a normal session file (its stem is the id) or
-        when no entry names a UUID. Lets the parent's forget tombstone cover
-        its sub-agent files."""
+        that has one, however far into the file it is: the file is streamed a
+        line at a time (a line without the key is skipped by a substring test
+        before any JSON parsing), so there is no line limit to place the id
+        beyond. Real files carry it on line 1, so this reads one line; a file
+        that never names one is read once, which the adapter does anyway to
+        build the conversation. Nothing else in the file is kept, so the
+        result is content-free. None for a normal session file (its stem is
+        the id) or when no entry names a UUID. Lets the parent's forget
+        tombstone cover its sub-agent files."""
         if session_identity_for(source_id):
             return None
         try:
             with open(jsonl_file, "r", encoding="utf-8", errors="replace") as f:
-                for n, line in enumerate(f):
-                    if n >= 200:
-                        break
+                for line in f:
+                    if '"sessionId"' not in line:
+                        continue
                     try:
                         obj = json.loads(line)
                     except ValueError:

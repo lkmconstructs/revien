@@ -4,6 +4,7 @@ a network client on the default path.
 CHECK: python scripts/gates/check_egress.py
 EXPECT: egress verification passed
 """
+import ast
 import os
 import re
 import subprocess
@@ -28,20 +29,158 @@ NETWORK_MODULES = (
     "http.client", "ftplib", "smtplib", "poplib", "imaplib", "telnetlib",
     "xmlrpc.client", "websockets", "websocket",
 )
-_ALT = "|".join(re.escape(m) for m in NETWORK_MODULES)
-_IMPORT_RE = re.compile(
-    r"^\+\s*(?:import\s+(" + _ALT + r")\b"
-    r"|from\s+(" + _ALT + r")\b"
-    # `from http import client` / `from urllib import request`
-    r"|from\s+(http)\s+import\s+client\b"
-    r"|from\s+(urllib)\s+import\s+request\b)"
-)
+# A parent package whose network submodule is reached as an attribute:
+# `import http` then `http.client.HTTPConnection(...)`.
+_PARENTS = {m.split(".")[0] for m in NETWORK_MODULES if "." in m}
+DYNAMIC = "<dynamic-import>"
 
-# Network-client imports that are known and reviewed, keyed by file and module.
-# Anything else added to revien/ fails the gate. The reason is the review:
-# a new entry needs a test that pins the behaviour it justifies.
+
+def _matches(name: str):
+    """The NETWORK_MODULES entry that `name` is or lies under, else None."""
+    for m in NETWORK_MODULES:
+        if name == m or name.startswith(m + "."):
+            return m
+    return None
+
+
+class _Scan(ast.NodeVisitor):
+    """Every network-client use in one module's source, as
+    (function qualname or '<module>', module, statement text).
+
+    Covers: `import a, b` (every name), `import http.client`, `from x import
+    y` (including `from http import client`, `from urllib import request`,
+    `import *`), a parent package used through an attribute (`import http` then
+    `http.client...`), and the dynamic-import facility (`__import__`,
+    `importlib.import_module`, `from importlib import import_module`, aliases
+    of it): a literal argument names the module, anything else is
+    `<dynamic-import>`. The position is the ENCLOSING FUNCTION, so an
+    allowlist entry pins the one function that may do it."""
+
+    def __init__(self, src: str):
+        self.src = src
+        self.scope = ["<module>"]
+        self.alias = [{}]          # local name -> dotted module
+        self.found = []
+
+    def _line(self, node) -> str:
+        seg = ast.get_source_segment(self.src, node) or ""
+        return " ".join(seg.split())[:120]
+
+    def _where(self) -> str:
+        return ".".join(x for x in self.scope[1:]) or "<module>"
+
+    def _add(self, module, node, stmt=None):
+        self.found.append((self._where(), module, stmt or self._line(node)))
+
+    def _func(self, node):
+        self.scope.append(node.name)
+        self.alias.append({})
+        self.generic_visit(node)
+        self.alias.pop()
+        self.scope.pop()
+
+    visit_FunctionDef = visit_AsyncFunctionDef = _func
+
+    def visit_ClassDef(self, node):
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    def visit_Import(self, node):
+        stmt = self._line(node)
+        for a in node.names:
+            if a.asname:
+                self.alias[-1][a.asname] = a.name
+            else:
+                self.alias[-1][a.name.split(".")[0]] = a.name.split(".")[0]
+            m = _matches(a.name)
+            if m:
+                self._add(m, node, stmt)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        stmt = self._line(node)
+        base = node.module or ""
+        for a in node.names:
+            full = f"{base}.{a.name}" if a.name != "*" else base
+            self.alias[-1][a.asname or a.name] = full
+            m = _matches(full) or _matches(base)
+            if m:
+                self._add(m, node, stmt)
+            if full in ("importlib.import_module", "importlib.__import__"):
+                self._add(DYNAMIC, node, stmt)
+        self.generic_visit(node)
+
+    def _resolve(self, node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        root = node.id
+        for scope in reversed(self.alias):
+            if root in scope:
+                root = scope[root]
+                break
+        return ".".join([root] + list(reversed(parts)))
+
+    def visit_Attribute(self, node):
+        dotted = self._resolve(node)
+        if dotted:
+            m = _matches(dotted)
+            # only the parent-package route: a bare `socket.socket` is already
+            # reported by its import statement
+            if m and "." in m and dotted.split(".")[0] in _PARENTS:
+                self._add(m, node)
+                return
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        f = node.func
+        name = (f.id if isinstance(f, ast.Name)
+                else f.attr if isinstance(f, ast.Attribute) else "")
+        resolved = self._resolve(f) if isinstance(f, ast.Attribute) else (
+            next((sc[f.id] for sc in reversed(self.alias) if f.id in sc), f.id)
+            if isinstance(f, ast.Name) else "")
+        if (name in ("import_module", "__import__")
+                or resolved in ("importlib.import_module", "__import__")):
+            arg = node.args[0] if node.args else None
+            lit = (arg.value if isinstance(arg, ast.Constant)
+                   and isinstance(arg.value, str) else None)
+            if lit is None:
+                self._add(DYNAMIC, node)
+            elif _matches(lit):
+                self._add(_matches(lit), node)
+        self.generic_visit(node)
+
+
+def network_uses(src: str):
+    """[(function, module, statement)] for every network-client use in `src`."""
+    scan = _Scan(src)
+    scan.visit(ast.parse(src))
+    return scan.found
+
+
+def new_network_uses(head_src: str, base_src: str):
+    """Uses present in `head_src` and not already (same function, module and
+    statement) in `base_src`."""
+    base = list(network_uses(base_src)) if base_src else []
+    out = []
+    for use in network_uses(head_src):
+        if use in base:
+            base.remove(use)
+        else:
+            out.append(use)
+    return out
+
+
+# Network-client uses that are known and reviewed. Each entry pins the FILE,
+# the one FUNCTION, the module and the exact statement; anything else, in the
+# same file or elsewhere, fails the gate. The reason is the review: a new
+# entry needs a test that pins the behaviour it justifies.
 ALLOWED = {
-    ("revien/cli.py", "http.client"):
+    ("revien/cli.py", "_probe_daemon", "http.client", "import http.client"):
         "`revien sync reset` asks a LOOPBACK daemon for /v1/health; "
         "_probe_daemon refuses any non-loopback host before connecting "
         "(pinned by tests/test_forget_followups.py::"
@@ -51,40 +190,85 @@ PROBE_TEST = ("tests/test_forget_followups.py::TestResetSaysOnlyWhatItCanProve"
               "::test_probe_egress_is_loopback_only")
 
 
-def added_network_import(diff_line: str):
-    """Return the module name if this unified-diff ADDED line ('+...',
-    never a '+++' file header) introduces a new import of a network client
-    module; else None."""
-    if diff_line.startswith("+++"):
-        return None
-    if not diff_line.startswith("+"):
-        return None
-    m = _IMPORT_RE.match(diff_line)
-    if not m:
-        return None
-    return m.group(1) or m.group(2) or m.group(3) or m.group(4)
+def violations_in(rel_path: str, head_src: str, base_src: str):
+    """New network uses in this file that no ALLOWED entry pins."""
+    hits = []
+    for func, module, stmt in new_network_uses(head_src, base_src):
+        # `http.client.HTTPConnection(...)` inside the pinned function is the
+        # use of the pinned import, not a second import
+        if (rel_path, func, module, stmt) in ALLOWED:
+            continue
+        if any(k[0] == rel_path and k[1] == func and k[2] == module
+               and stmt.startswith(module) for k in ALLOWED):
+            continue
+        hits.append((rel_path, func, module, stmt))
+    return hits
+
+
+# Gate self-tests: each snippet must (not) be reported. E1..E5 are the
+# shapes a one-line allowlist keyed by (file, module) used to miss.
+CONTROLS = (
+    ("E1 import http.client", "import http.client\n", {"http.client"}),
+    ("E2 multi-name import",
+     "import os, socket\n", {"socket"}),
+    ("E3 parent package then attribute",
+     "import http\ndef f():\n    return http.client.HTTPConnection('x')\n",
+     {"http.client"}),
+    ("E3b aliased parent package",
+     "import http as h\ndef f():\n    return h.client.HTTPConnection('x')\n",
+     {"http.client"}),
+    ("E4 http.client in another function",
+     "def probe():\n    import http.client\n\ndef other():\n"
+     "    import http.client\n", {"http.client"}),
+    ("E5 importlib literal",
+     "import importlib\nm = importlib.import_module('socket')\n", {"socket"}),
+    ("E5b __import__ literal", "m = __import__('socket')\n", {"socket"}),
+    ("E5c importlib non-literal",
+     "import importlib\ndef f(n):\n    return importlib.import_module(n)\n",
+     {DYNAMIC}),
+    ("E5d from importlib import import_module",
+     "from importlib import import_module as im\nim('x' + 'y')\n", {DYNAMIC}),
+    ("from x import y", "from http import client\n", {"http.client"}),
+    ("from urllib import request", "from urllib import request\n",
+     {"urllib.request"}),
+    ("plain httpx", "import httpx\n", {"httpx"}),
+    ("negative: os/json", "import os, json\nfrom pathlib import Path\n", set()),
+    ("negative: urllib.parse", "import urllib.parse\n", set()),
+    ("negative: importlib.util", "import importlib.util\n", set()),
+    ("negative: literal safe dynamic import",
+     "import importlib\nimportlib.import_module('json')\n", set()),
+)
+
+
+def _controls():
+    for name, src, want in CONTROLS:
+        got = {m for _f, m, _s in network_uses(src)}
+        if got != want:
+            fail(f"positive control {name!r}: got {sorted(got)}, want {sorted(want)}")
+    # the allowlist pins the FUNCTION: the same import in another function of
+    # the same file, or at module level, is a violation
+    probe = ("revien/cli.py", "_probe_daemon", "http.client", "import http.client")
+    ok = "def _probe_daemon():\n    import http.client\n    http.client.HTTPConnection('h')\n"
+    if violations_in("revien/cli.py", ok, ""):
+        fail("control: the pinned probe import was flagged")
+    for name, src in (
+            ("E4 other function", ok + "def other():\n    import http.client\n"),
+            ("module level", "import http.client\n" + ok),
+            ("E3 attribute elsewhere",
+             ok + "import http\ndef other():\n    return http.client.HTTPConnection('x')\n"),
+            ("socket inside the probe",
+             "def _probe_daemon():\n    import http.client\n    import os, socket\n"),
+            ("another file", ok)):
+        path = "revien/other.py" if name == "another file" else "revien/cli.py"
+        if not violations_in(path, src, ""):
+            fail(f"control {name!r}: not reported as a violation (probe key {probe})")
 
 
 def main():
-    # ── positive control FIRST, always runs regardless of whether there's
-    # a diff from main -- proves the detector itself isn't a no-op.
-    control_hit = added_network_import("+import httpx")
-    if control_hit != "httpx":
-        fail(f"positive control failed: detector did not flag '+import httpx' (got {control_hit!r})")
-    control_miss = added_network_import("+import os")
-    if control_miss is not None:
-        fail(f"positive control false-positive: '+import os' was flagged as {control_miss!r}")
-    control_context_line = added_network_import("+++ b/revien/foo.py")
-    if control_context_line is not None:
-        fail("positive control false-positive: a '+++' file-header line was flagged")
-
-    for line, want in (("+import http.client", "http.client"),
-                       ("+    import http.client", "http.client"),
-                       ("+from http import client", "http"),
-                       ("+import socket", "socket")):
-        got = added_network_import(line)
-        if got != want:
-            fail(f"positive control failed: {line!r} gave {got!r}, want {want!r}")
+    # ── self-tests FIRST, always run regardless of whether there is a diff
+    # from main -- they prove the detector itself is not a no-op and that
+    # the allowlist pins a function, not a file.
+    _controls()
 
     # ── the allowlisted probe is covered by a test that must pass: it fails
     # if the loopback-only guard is removed from _probe_daemon ──
@@ -121,7 +305,7 @@ def main():
     if not m or int(m.group(1)) <= 0:
         fail(f"pytest summary shows 0 (or unparseable) passed: {summary_line!r}")
 
-    # ── scan added lines of every changed revien/**/*.py vs main ──
+    # ── scan every changed revien/**/*.py vs main, by AST ──
     diff_names = subprocess.run(
         ["git", "diff", "--name-only", "main", "--", "revien/"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
@@ -133,32 +317,31 @@ def main():
     ]
 
     violations = []
-    if not changed_files:
-        # No diff from main -- handled gracefully; the positive control
-        # above already proved the scan logic works.
-        pass
-    else:
-        for rel_path in changed_files:
-            diff_proc = subprocess.run(
-                ["git", "diff", "main", "--", rel_path],
-                cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
-            )
-            if diff_proc.returncode != 0:
-                fail(f"git diff main -- {rel_path} failed: {diff_proc.stderr}")
-            for line in diff_proc.stdout.splitlines():
-                hit = added_network_import(line)
-                if hit and (rel_path, hit) not in ALLOWED:
-                    violations.append((rel_path, hit, line))
+    for rel_path in changed_files:
+        head_path = REPO_ROOT / rel_path
+        if not head_path.exists():
+            continue  # deleted in this branch
+        head_src = head_path.read_text(encoding="utf-8")
+        base = subprocess.run(
+            ["git", "show", f"main:{rel_path}"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
+        )
+        base_src = base.stdout if base.returncode == 0 else ""  # new file
+        try:
+            violations.extend(violations_in(rel_path, head_src, base_src))
+        except SyntaxError as e:
+            fail(f"{rel_path} does not parse: {e}")
 
-    # Full-tree check as well: an allowlisted import must still exist where
-    # the allowlist says (a stale entry would silently stop covering it).
-    for (rel_path, module), _why in ALLOWED.items():
+    # An allowlist entry must still match the source it pins (a stale entry
+    # would silently stop covering anything).
+    for (rel_path, func, module, stmt), _why in ALLOWED.items():
         src = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-        if not re.search(rf"^\s*import\s+{re.escape(module)}\b", src, re.M):
-            fail(f"allowlist entry {rel_path}:{module} no longer matches the source")
+        if (func, module, stmt) not in network_uses(src):
+            fail(f"allowlist entry {rel_path}:{func}:{stmt} no longer matches the source")
 
     if violations:
-        fail(f"changed files add a new network-client import on the default path: {violations}")
+        fail("changed files add a network-client use on the default path "
+             f"that no allowlist entry pins (file, function, module, statement): {violations}")
 
     print("egress verification passed")
 

@@ -165,6 +165,7 @@ _RENAMEABLE = {
 
 def notices_for(
     identities: List[Tuple[str, str]], gap: Optional[str], count: int = 1,
+    whole_unit: bool = False,
 ) -> List[str]:
     """Plain-language blast radius of a forget/delete, for CLI, REST and MCP
     responses. States only what the tombstone provably does."""
@@ -177,12 +178,21 @@ def notices_for(
                    or {i for i, k in identities if k == KIND_SOURCE_ID}
                    or {i for i, _ in identities})
     what = "this node" if count == 1 else f"{count} nodes"
-    out = [
-        f"This forgets {what} and suppresses all future imports from "
-        f"{', '.join(units)}. Sibling facts already captured from that "
-        "source remain in the graph; forget them too if you want them gone. "
-        "'revien restore' lifts the suppression."
-    ]
+    if whole_unit:
+        # A whole-session cascade: the exclusive nodes went with it, so the
+        # "siblings remain" sentence would be false. What was kept is stated
+        # separately by the forget response.
+        out = [
+            f"This forgets {what} and suppresses all future imports from "
+            f"{', '.join(units)}. 'revien restore' lifts the suppression."
+        ]
+    else:
+        out = [
+            f"This forgets {what} and suppresses all future imports from "
+            f"{', '.join(units)}. Sibling facts already captured from that "
+            "source remain in the graph; forget them too if you want them gone. "
+            "'revien restore' lifts the suppression."
+        ]
     kinds = {k for _, k in identities}
     if any(k == KIND_SOURCE_ID and i.startswith("skill-proposal:")
            for i, k in identities):

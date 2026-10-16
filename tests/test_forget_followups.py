@@ -1094,18 +1094,25 @@ class TestSessionCascade:
                if n.node_type == NodeType.CONTEXT][0]
         ops = GraphOperations(store)
         prev = ops.forget_preview(ctx.node_id)
-        assert set(prev["node_ids"]) == mine and prev["count"] == len(mine)
+        # session 2 says "We decided to use Postgres for billing" too: the
+        # dedup'd node is linked from BOTH contexts, so it is kept
+        shared = set(prev["kept_shared"])
+        assert shared and shared <= mine
+        assert set(prev["node_ids"]) == mine - shared
+        assert prev["count"] == len(mine) - len(shared)
         out = ops.forget_node(ctx.node_id, cascade=True, reason="private",
                               construct_id="me")
-        assert set(out["forgotten"]) == mine
-        assert not _session_nodes(store, sid)
-        assert keep <= {n.node_id for n in store.list_nodes(limit=99999)}
+        assert set(out["forgotten"]) == mine - shared
+        assert set(out["kept_shared"]) == shared
+        assert not _session_nodes(store, sid), \
+            "a kept node must stop naming the forgotten session"
+        assert keep | shared <= {n.node_id for n in store.list_nodes(limit=99999)}
         assert out["suppressed_identities"] == sorted(
             [f"claude-code-session:{UUID1}", sid])
         assert out["context_nodes_remaining"] == []
         # each forgotten node has its content-free tombstone row
         forgets = [r for r in store.get_all_audit() if r["op"] == "forget"]
-        assert {r["node_id"] for r in forgets} >= mine
+        assert {r["node_id"] for r in forgets} >= mine - shared
         assert SECRET not in json.dumps(store.get_all_audit())
         # and the session is not recaptured
         r = _ingest_session(store, sid, self.TEXT + "\nUser: more")
@@ -1121,8 +1128,9 @@ class TestSessionCascade:
             claim.node_id, cascade=True, reason="private")
         assert out["forgotten"] == [claim.node_id]
         assert out["context_nodes_remaining"]
-        assert any("cascade from the context node forgets the whole session" in n
+        assert any("forget the context node with cascade" in n
                    for n in out["suppression_notice"])
+        assert not any("whole session" in n for n in out["suppression_notice"])
         assert any(n.node_type == NodeType.CONTEXT for n in _session_nodes(store, sid))
 
     def test_shared_channel_context_cascade_stays_one_node(self, store):
@@ -1144,7 +1152,7 @@ class TestSessionCascade:
         ctx = [n for n in _session_nodes(s, sid)
                if n.node_type == NodeType.CONTEXT][0]
         total = len(_session_nodes(s, sid))
-        s.close()
+        s.close()  # one session only: nothing is shared
         with TestClient(create_app(db_path=db_path)) as c:
             p = c.get(f"/v1/nodes/{ctx.node_id}/forget/preview").json()
             assert p["count"] == total
@@ -1463,21 +1471,69 @@ class TestEgressGateCoversTheProbe:
         spec.loader.exec_module(mod)
         return mod
 
-    def test_http_client_and_socket_imports_are_detected(self):
+    @pytest.mark.parametrize("name,src,want", [
+        ("E1", "import http.client\n", {"http.client"}),
+        ("E2 multi-name import", "import os, socket\n", {"socket"}),
+        ("E3 parent package + attribute",
+         "import http\ndef f():\n    return http.client.HTTPConnection('x')\n",
+         {"http.client"}),
+        ("E3 aliased parent",
+         "import http as h\nx = h.client.HTTPSConnection('x')\n", {"http.client"}),
+        ("E5 importlib literal",
+         "import importlib\nimportlib.import_module('socket')\n", {"socket"}),
+        ("E5 __import__ literal", "__import__('socket')\n", {"socket"}),
+        ("E5 importlib dotted literal",
+         "import importlib\nimportlib.import_module('http.client')\n",
+         {"http.client"}),
+        ("E5 non-literal", "import importlib\nimportlib.import_module(name)\n",
+         {"<dynamic-import>"}),
+        ("E5 imported name",
+         "from importlib import import_module\nimport_module('socket')\n",
+         {"socket", "<dynamic-import>"}),
+        ("from-import", "from http import client\n", {"http.client"}),
+        ("from xmlrpc", "from xmlrpc import client\n", {"xmlrpc.client"}),
+        ("urllib3", "    import urllib3\n".lstrip(), {"urllib3"}),
+        ("smtplib", "import smtplib\n", {"smtplib"}),
+        ("not network", "import json, os\nimport urllib.parse\n"
+                        "import importlib.util\n", set()),
+    ])
+    def test_gate_self_test_network_shapes(self, name, src, want):
         g = self._gate()
-        for line, want in (("+import http.client", "http.client"),
-                           ("+    import http.client", "http.client"),
-                           ("+from http.client import HTTPConnection", "http.client"),
-                           ("+from http import client", "http"),
-                           ("+import socket", "socket"),
-                           ("+    import urllib3", "urllib3"),
-                           ("+import smtplib", "smtplib")):
-            assert g.added_network_import(line) == want, line
-        assert g.added_network_import("+import json") is None
+        assert {m for _f, m, _s in g.network_uses(src)} == want, name
+
+    def test_allowlist_pins_the_function_not_the_file(self):
+        g = self._gate()
+        ok = ("def _probe_daemon():\n    import http.client\n"
+              "    return http.client.HTTPConnection('h')\n")
+        assert g.violations_in("revien/cli.py", ok, "") == []
+        # E4: the same import anywhere else in cli.py used to pass
+        for src in (ok + "def other():\n    import http.client\n",
+                    "import http.client\n" + ok,
+                    ok + "import http\ndef g():\n"
+                         "    return http.client.HTTPConnection('x')\n",
+                    "def _probe_daemon():\n    import http.client\n"
+                    "    import os, socket\n",
+                    "def _probe_daemon():\n    import http.client\n"
+                    "    import importlib\n"
+                    "    importlib.import_module('socket')\n"):
+            assert g.violations_in("revien/cli.py", src, ""), src
+        assert g.violations_in("revien/other.py", ok, "")
+        # an unchanged use already on the base is not new
+        assert g.violations_in("revien/other.py", ok, ok) == []
+
+    def test_gate_main_runs_its_own_controls(self):
+        self._gate()._controls()
+
+    def test_real_cli_has_exactly_the_pinned_probe(self):
+        g = self._gate()
+        uses = g.network_uses((REPO / "revien" / "cli.py").read_text())
+        assert uses, "the probe must be visible to the scanner"
+        assert {(f, m) for f, m, _s in uses} == {("_probe_daemon", "http.client")}
 
     def test_probe_is_allowlisted_with_its_test(self):
         g = self._gate()
-        assert ("revien/cli.py", "http.client") in g.ALLOWED
+        assert ("revien/cli.py", "_probe_daemon", "http.client",
+                "import http.client") in g.ALLOWED
         assert "test_probe_egress_is_loopback_only" in g.PROBE_TEST
         assert g.PROBE_TEST.split("::")[-1] in (REPO / "tests" /
             "test_forget_followups.py").read_text()
