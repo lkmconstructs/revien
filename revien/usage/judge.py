@@ -23,6 +23,11 @@ from pydantic import BaseModel
 
 from .evidence import UseEvidence
 
+# Starting bars, deliberately strict. Tune them from shadow-mode data
+# (`revien usage list`): false "used" -> raise; obvious uses missed -> lower.
+MIN_SHARED_TERMS = 2
+MIN_SIMILARITY = 0.75
+
 
 class UseVerdict(BaseModel):
     """The rule's answer for one (answer, memory) pair."""
@@ -49,13 +54,19 @@ def judge_use(evidence: UseEvidence) -> UseVerdict:
         against real sessions with ``revien usage list`` before turning on
         apply.
     """
-    # TODO(Lissa): write the rule, 5-10 lines. It has to:
-    #   - abstain when a signal is missing (similarity is None),
-    #   - return used=True only when the shared terms AND the similarity
-    #     both clear your bars,
-    #   - put the deciding numbers in `reason` (it is what `revien usage
-    #     list` shows when you audit a judgment later).
-    # tests/test_usage_judge.py is the contract; it passes once this does.
-    raise NotImplementedError(
-        "judge_use() is not written yet: see the TODO in revien/usage/judge.py"
+    if evidence.similarity is None:
+        return UseVerdict(used=False, abstain=True,
+                          reason="semantic layer off: no similarity signal")
+    if evidence.memory_terms == 0:
+        return UseVerdict(used=False, abstain=True,
+                          reason="memory has no distinctive words to check")
+    shared = len(evidence.shared_terms)
+    # Two shared words, or every word a one- or two-word memory has.
+    word_bar = min(MIN_SHARED_TERMS, evidence.memory_terms)
+    words_ok = shared >= word_bar
+    meaning_ok = evidence.similarity >= MIN_SIMILARITY
+    return UseVerdict(
+        used=words_ok and meaning_ok,
+        reason=(f"{shared} shared term(s), similarity {evidence.similarity:.2f} "
+                f"(bars: {word_bar}, {MIN_SIMILARITY:.2f})"),
     )
