@@ -38,6 +38,8 @@ class ClaudeCodeAdapter(RevienAdapter):
     older or simplified logs.
     """
 
+    IDEMPOTENT_REREAD = True  # every item carries ingest_key
+
     def __init__(self, session_dir: Optional[str] = None):
         """
         Args:

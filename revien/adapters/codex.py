@@ -66,6 +66,8 @@ class CodexAdapter(RevienAdapter):
     Reasoning, function calls, and event_msg lines are noise and skipped.
     """
 
+    IDEMPOTENT_REREAD = True  # every item carries ingest_key
+
     def __init__(self, session_dir: Optional[str] = None):
         """
         Args:
