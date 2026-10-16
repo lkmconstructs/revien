@@ -1,10 +1,27 @@
 """G8: sovereignty and egress tests pass, and no changed source file imports
 a network client on the default path.
 
+How it holds:
+* The one place Revien opens a connection by itself is revien/loopback_probe.py
+  (`revien sync reset` asks a daemon on this machine for /v1/health). The gate
+  pins the SHA-256 of that WHOLE FILE. Any edit to it, a decorator, a default
+  argument, a nested function, a second definition, a lambda, fails the gate
+  until the hash in PINNED is changed on purpose, in a reviewed commit that
+  also keeps tests/test_forget_followups.py::...::test_probe_egress_is_loopback_only
+  passing.
+* Every other changed revien/**/*.py is scanned by AST against `main`; any
+  network-client use that is new there fails.
+
+The scanner cannot see everything. EVASIONS lists the shapes it provably does
+not report (each has a snippet the self-test runs and requires to stay
+unreported, so the list cannot go stale) and OUT_OF_SCOPE lists what it does
+not look at. Both are printed on success.
+
 CHECK: python scripts/gates/check_egress.py
 EXPECT: egress verification passed
 """
 import ast
+import hashlib
 import os
 import re
 import subprocess
@@ -25,10 +42,23 @@ def fail(msg):
 
 
 NETWORK_MODULES = (
-    "httpx", "requests", "urllib.request", "urllib3", "socket", "aiohttp",
-    "http.client", "ftplib", "smtplib", "poplib", "imaplib", "telnetlib",
-    "xmlrpc.client", "websockets", "websocket",
+    "httpx", "requests", "urllib.request", "urllib3", "socket", "_socket",
+    "ssl", "socketserver", "aiohttp", "http.client", "ftplib", "smtplib",
+    "poplib", "imaplib", "telnetlib", "xmlrpc.client", "websockets",
+    "websocket", "pycurl", "grpc", "paramiko", "boto3", "botocore",
+    "anthropic", "openai", "subprocess", "ctypes",
 )
+# Functions of an otherwise harmless module that open a connection.
+NETWORK_CALLS = (
+    "asyncio.open_connection", "asyncio.open_unix_connection",
+    "asyncio.start_server", "asyncio.start_unix_server",
+    "os.system", "os.popen", "os.execv", "os.execvp", "os.execl",
+    "os.spawnv", "os.spawnl", "os.posix_spawn",
+)
+# Names that run or fetch code from a string or an attribute name.
+DYNAMIC_NAMES = ("__import__", "exec", "eval", "__builtins__")
+# Modules whose getattr()/vars() reach the dynamic-import facility.
+DYNAMIC_ROOTS = ("importlib", "builtins", "sys")
 # A parent package whose network submodule is reached as an attribute:
 # `import http` then `http.client.HTTPConnection(...)`.
 _PARENTS = {m.split(".")[0] for m in NETWORK_MODULES if "." in m}
@@ -61,6 +91,7 @@ class _Scan(ast.NodeVisitor):
         self.scope = ["<module>"]
         self.alias = [{}]          # local name -> dotted module
         self.found = []
+        self._call_funcs = set()   # Attribute nodes that are being called
 
     def _line(self, node) -> str:
         seg = ast.get_source_segment(self.src, node) or ""
@@ -107,8 +138,41 @@ class _Scan(ast.NodeVisitor):
             m = _matches(full) or _matches(base)
             if m:
                 self._add(m, node, stmt)
+            if full in NETWORK_CALLS:
+                self._add(full.split(".")[0], node, stmt)
             if full in ("importlib.import_module", "importlib.__import__"):
                 self._add(DYNAMIC, node, stmt)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        """`h = http`, `h = http.client`, `f = importlib.import_module`: the
+        new name resolves to what it was assigned (simple names only)."""
+        self.generic_visit(node)
+        dotted = self._resolve(node.value)
+        if dotted:
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    self.alias[-1][t.id] = dotted
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in DYNAMIC_NAMES \
+                and not any(node.id in sc for sc in self.alias):
+            # `__import__('x')` is judged by its argument in visit_Call;
+            # exec/eval/__builtins__ and a bare reference never are
+            if node.id == "__import__" and id(node) in self._call_funcs:
+                return
+            self._add(DYNAMIC, node)
+
+    def visit_Subscript(self, node):
+        """`sys.modules['http.client']` and `sys.modules[name]`."""
+        if self._resolve(node.value) == "sys.modules":
+            key = node.slice
+            lit = key.value if (isinstance(key, ast.Constant)
+                                and isinstance(key.value, str)) else None
+            if lit is None:
+                self._add(DYNAMIC, node)
+            elif _matches(lit):
+                self._add(_matches(lit), node)
         self.generic_visit(node)
 
     def _resolve(self, node):
@@ -128,6 +192,17 @@ class _Scan(ast.NodeVisitor):
     def visit_Attribute(self, node):
         dotted = self._resolve(node)
         if dotted:
+            if dotted in NETWORK_CALLS:
+                self._add(dotted.split(".")[0], node)
+                return
+            if (dotted in ("importlib.import_module", "importlib.__import__",
+                           "builtins.__import__")
+                    and id(node) not in self._call_funcs):
+                # a bare reference (`f = importlib.import_module`): the call
+                # that follows is invisible; a direct call is judged in
+                # visit_Call by its argument
+                self._add(DYNAMIC, node)
+                return
             m = _matches(dotted)
             # only the parent-package route: a bare `socket.socket` is already
             # reported by its import statement
@@ -138,8 +213,22 @@ class _Scan(ast.NodeVisitor):
 
     def visit_Call(self, node):
         f = node.func
+        self._call_funcs.add(id(f))
         name = (f.id if isinstance(f, ast.Name)
                 else f.attr if isinstance(f, ast.Attribute) else "")
+        if name in ("getattr", "vars", "setattr", "delattr") and node.args:
+            root = self._resolve(node.args[0])
+            if root and root.split(".")[0] in DYNAMIC_ROOTS:
+                self._add(DYNAMIC, node)
+        if name in ("get", "setdefault", "pop") and isinstance(f, ast.Attribute) \
+                and self._resolve(f.value) == "sys.modules":
+            arg = node.args[0] if node.args else None
+            lit = (arg.value if isinstance(arg, ast.Constant)
+                   and isinstance(arg.value, str) else None)
+            if lit is None:
+                self._add(DYNAMIC, node)
+            elif _matches(lit):
+                self._add(_matches(lit), node)
         resolved = self._resolve(f) if isinstance(f, ast.Attribute) else (
             next((sc[f.id] for sc in reversed(self.alias) if f.id in sc), f.id)
             if isinstance(f, ast.Name) else "")
@@ -175,38 +264,45 @@ def new_network_uses(head_src: str, base_src: str):
     return out
 
 
-# Network-client uses that are known and reviewed. Each entry pins the FILE,
-# the one FUNCTION, the module and the exact statement; anything else, in the
-# same file or elsewhere, fails the gate. The reason is the review: a new
-# entry needs a test that pins the behaviour it justifies.
-ALLOWED = {
-    ("revien/cli.py", "_probe_daemon", "http.client", "import http.client"):
-        "`revien sync reset` asks a LOOPBACK daemon for /v1/health; "
-        "_probe_daemon refuses any non-loopback host before connecting "
-        "(pinned by tests/test_forget_followups.py::"
-        "TestResetSaysOnlyWhatItCanProve::test_probe_egress_is_loopback_only)",
+# The reviewed place that may open a connection, pinned by the SHA-256 of the
+# WHOLE FILE (CRLF normalized). A change to anything in it, however small or
+# wherever in the file, fails the gate until this hash is changed on purpose.
+PINNED = {
+    "revien/loopback_probe.py":
+        "e9fcaea4673b6af851739a6d6bddbf255bf55f9d63c91b0a984fc6e2ae7fa60c",
 }
 PROBE_TEST = ("tests/test_forget_followups.py::TestResetSaysOnlyWhatItCanProve"
               "::test_probe_egress_is_loopback_only")
 
 
+def file_digest(data: bytes) -> str:
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def pin_problem(rel_path: str, data: bytes):
+    """None when `rel_path` is the pinned file with the pinned content, else
+    why not."""
+    want = PINNED.get(rel_path)
+    if want is None:
+        return f"{rel_path} is not a pinned file"
+    got = file_digest(data)
+    if got != want:
+        return (f"{rel_path} changed (sha256 {got}, pinned {want}); review the "
+                "whole file, keep test_probe_egress_is_loopback_only passing, "
+                "then update PINNED in scripts/gates/check_egress.py")
+    return None
+
+
 def violations_in(rel_path: str, head_src: str, base_src: str):
-    """New network uses in this file that no ALLOWED entry pins."""
-    hits = []
-    for func, module, stmt in new_network_uses(head_src, base_src):
-        # `http.client.HTTPConnection(...)` inside the pinned function is the
-        # use of the pinned import, not a second import
-        if (rel_path, func, module, stmt) in ALLOWED:
-            continue
-        if any(k[0] == rel_path and k[1] == func and k[2] == module
-               and stmt.startswith(module) for k in ALLOWED):
-            continue
-        hits.append((rel_path, func, module, stmt))
-    return hits
+    """New network uses in this file. A pinned file is checked by its hash
+    (`pin_problem`), not by the scanner: its whole content is the review."""
+    if rel_path in PINNED:
+        return []
+    return [(rel_path, func, module, stmt)
+            for func, module, stmt in new_network_uses(head_src, base_src)]
 
 
-# Gate self-tests: each snippet must (not) be reported. E1..E5 are the
-# shapes a one-line allowlist keyed by (file, module) used to miss.
+# Gate self-tests: each snippet must (not) be reported.
 CONTROLS = (
     ("E1 import http.client", "import http.client\n", {"http.client"}),
     ("E2 multi-name import",
@@ -216,6 +312,12 @@ CONTROLS = (
      {"http.client"}),
     ("E3b aliased parent package",
      "import http as h\ndef f():\n    return h.client.HTTPConnection('x')\n",
+     {"http.client"}),
+    ("E3c alias made by assignment",
+     "import http\nh = http\ndef f():\n    return h.client.HTTPConnection('x')\n",
+     {"http.client"}),
+    ("E3d alias chain by assignment",
+     "import http\na = http\nb = a\nb.client.HTTPConnection('x')\n",
      {"http.client"}),
     ("E4 http.client in another function",
      "def probe():\n    import http.client\n\ndef other():\n"
@@ -228,6 +330,41 @@ CONTROLS = (
      {DYNAMIC}),
     ("E5d from importlib import import_module",
      "from importlib import import_module as im\nim('x' + 'y')\n", {DYNAMIC}),
+    ("E5e getattr on importlib",
+     "import importlib\ndef f():\n    return getattr(importlib, 'import_module')('socket')\n",
+     {DYNAMIC}),
+    ("E5f getattr on builtins",
+     "import builtins\ndef f():\n    return getattr(builtins, '__imp' + 'ort__')('socket')\n",
+     {DYNAMIC}),
+    ("E5g exec", "def f():\n    exec('import socket')\n", {DYNAMIC}),
+    ("E5h eval", "def f():\n    return eval('__import__(\"socket\")')\n",
+     {DYNAMIC}),
+    ("E5i reference to __import__ without a call",
+     "imp = __import__\nimp('socket')\n", {DYNAMIC, "socket"}),
+    ("E5j attribute reference to import_module",
+     "import importlib\nf = importlib.import_module\nf('socket')\n",
+     {DYNAMIC, "socket"}),
+    ("E6 sys.modules literal",
+     "import sys\ndef f():\n    return sys.modules['http.client'].HTTPConnection('x')\n",
+     {"http.client"}),
+    ("E6b sys.modules non-literal",
+     "import sys\ndef f(n):\n    return sys.modules[n]\n", {DYNAMIC}),
+    ("E6c sys.modules.get", "import sys\nsys.modules.get('socket')\n",
+     {"socket"}),
+    ("E7 _socket", "import _socket\n", {"_socket"}),
+    ("E7b ssl", "import ssl\ndef f():\n    return ssl.create_connection(('x', 443))\n",
+     {"ssl"}),
+    ("E7c asyncio.open_connection",
+     "import asyncio\nasync def f():\n    return await asyncio.open_connection('x', 80)\n",
+     {"asyncio"}),
+    ("E7d from asyncio import open_connection",
+     "from asyncio import open_connection\n", {"asyncio"}),
+    ("E7e lambda at module level",
+     "import http\nf = lambda: http.client.HTTPSConnection('x')\n",
+     {"http.client"}),
+    ("E7f subprocess", "import subprocess\nsubprocess.run(['curl', 'x'])\n",
+     {"subprocess"}),
+    ("E7g os.system", "import os\nos.system('curl x')\n", {"os"}),
     ("from x import y", "from http import client\n", {"http.client"}),
     ("from urllib import request", "from urllib import request\n",
      {"urllib.request"}),
@@ -237,6 +374,35 @@ CONTROLS = (
     ("negative: importlib.util", "import importlib.util\n", set()),
     ("negative: literal safe dynamic import",
      "import importlib\nimportlib.import_module('json')\n", set()),
+    ("negative: sys.modules of a safe module",
+     "import sys\nsys.modules['json']\n", set()),
+    ("negative: asyncio.sleep",
+     "import asyncio\nasync def f():\n    await asyncio.sleep(1)\n", set()),
+)
+
+# What the scanner provably does NOT report. Each snippet is run by the
+# self-test and must stay unreported: if the scanner ever learns one, the
+# self-test fails until the entry is removed, so this list cannot go stale.
+EVASIONS = (
+    ("alias through a container, a call or a parameter",
+     "import http\nm = [http][0]\ndef f():\n    return m.client.HTTPConnection('x')\n"),
+    ("a method of an object whose type the scanner cannot see",
+     "async def f(loop):\n    return await loop.create_connection(None, 'x', 80)\n"),
+    ("a network client the NETWORK_MODULES list does not name",
+     "import pymysql\n"),
+    ("a module that is not imported where it is used, reached through a "
+     "variable set elsewhere",
+     "def f(client):\n    return client.get('https://x.example')\n"),
+)
+# What the gate does not look at at all.
+OUT_OF_SCOPE = (
+    "non-Python files (a .pth file, a shell script, a build hook) and compiled "
+    "extension modules",
+    "code inside third-party packages the listed clients pull in",
+    "any file unchanged against `main` (the scan covers the diff, not the tree), "
+    "and a repository with no `main` to diff against",
+    "a runtime effect of data (a URL a config file supplies to an already "
+    "allowed client): the gate looks for clients, not for destinations",
 )
 
 
@@ -245,33 +411,41 @@ def _controls():
         got = {m for _f, m, _s in network_uses(src)}
         if got != want:
             fail(f"positive control {name!r}: got {sorted(got)}, want {sorted(want)}")
-    # the allowlist pins the FUNCTION: the same import in another function of
-    # the same file, or at module level, is a violation
-    probe = ("revien/cli.py", "_probe_daemon", "http.client", "import http.client")
-    ok = "def _probe_daemon():\n    import http.client\n    http.client.HTTPConnection('h')\n"
-    if violations_in("revien/cli.py", ok, ""):
-        fail("control: the pinned probe import was flagged")
-    for name, src in (
-            ("E4 other function", ok + "def other():\n    import http.client\n"),
-            ("module level", "import http.client\n" + ok),
-            ("E3 attribute elsewhere",
-             ok + "import http\ndef other():\n    return http.client.HTTPConnection('x')\n"),
-            ("socket inside the probe",
-             "def _probe_daemon():\n    import http.client\n    import os, socket\n"),
-            ("another file", ok)):
-        path = "revien/other.py" if name == "another file" else "revien/cli.py"
-        if not violations_in(path, src, ""):
-            fail(f"control {name!r}: not reported as a violation (probe key {probe})")
+    for name, src in EVASIONS:
+        if network_uses(src):
+            fail(f"EVASIONS entry {name!r} is now reported: remove it from "
+                 "EVASIONS (and from the documented limits)")
+    # a pinned file is checked by hash: any byte of difference is reported
+    real = (REPO_ROOT / "revien" / "loopback_probe.py").read_bytes()
+    if pin_problem("revien/loopback_probe.py", real):
+        fail(pin_problem("revien/loopback_probe.py", real))
+    for name, data in (
+            ("added decorator", real.replace(b"def probe_daemon(", b"@(lambda f: f)\ndef probe_daemon(")),
+            ("default argument", real.replace(b"probe_daemon(url)", b"probe_daemon(url, c=http.client.HTTPSConnection('x'))")),
+            ("second def", real + b"\ndef probe_daemon(url):\n    return None\n"),
+            ("lambda", real + b"\nleak = lambda: http.client.HTTPSConnection('x')\n"),
+            ("extra import", real.replace(b"import json", b"import json, socket"))):
+        if data == real:
+            fail(f"pin control {name!r} did not change the file")
+        if not pin_problem("revien/loopback_probe.py", data):
+            fail(f"pin control {name!r}: a modified probe was accepted")
+    if pin_problem("revien/cli.py", b"x") is None:
+        fail("an unpinned file was treated as pinned")
+    # a network use anywhere else is a violation, wherever it is
+    for name, src in (("cli.py", "import http.client\n"),
+                      ("other function", "def _probe_daemon():\n    import http.client\n")):
+        if not violations_in("revien/cli.py", src, ""):
+            fail(f"control {name!r}: not reported as a violation")
 
 
 def main():
     # ── self-tests FIRST, always run regardless of whether there is a diff
     # from main -- they prove the detector itself is not a no-op and that
-    # the allowlist pins a function, not a file.
+    # a change to the pinned probe file is reported.
     _controls()
 
-    # ── the allowlisted probe is covered by a test that must pass: it fails
-    # if the loopback-only guard is removed from _probe_daemon ──
+    # ── the pinned probe is covered by a test that must pass: it fails
+    # if the loopback-only guard is removed from it ──
     probe = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          f"--basetemp={tempfile.mkdtemp(prefix='revien-gate8p-')}", PROBE_TEST],
@@ -332,18 +506,26 @@ def main():
         except SyntaxError as e:
             fail(f"{rel_path} does not parse: {e}")
 
-    # An allowlist entry must still match the source it pins (a stale entry
-    # would silently stop covering anything).
-    for (rel_path, func, module, stmt), _why in ALLOWED.items():
-        src = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-        if (func, module, stmt) not in network_uses(src):
-            fail(f"allowlist entry {rel_path}:{func}:{stmt} no longer matches the source")
+    # Every pinned file is checked by hash on every run, diff or no diff.
+    for rel_path in PINNED:
+        path = REPO_ROOT / rel_path
+        if not path.exists():
+            fail(f"pinned file {rel_path} is missing")
+        problem = pin_problem(rel_path, path.read_bytes())
+        if problem:
+            fail(problem)
 
     if violations:
         fail("changed files add a network-client use on the default path "
-             f"that no allowlist entry pins (file, function, module, statement): {violations}")
+             f"(file, function, module, statement): {violations}")
 
     print("egress verification passed")
+    print("limits, shapes the scanner does not report:")
+    for name, _src in EVASIONS:
+        print(f"  - {name}")
+    print("limits, not examined by the gate:")
+    for name in OUT_OF_SCOPE:
+        print(f"  - {name}")
 
 
 if __name__ == "__main__":

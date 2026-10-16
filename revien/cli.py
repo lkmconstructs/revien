@@ -1740,31 +1740,13 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool, orphaned: bool,
 
 
 def _probe_daemon(url: str):
-    """Ask a LOOPBACK daemon for /v1/health. Returns None when nothing
-    answers, the address is not loopback, or the answer is not Revien's;
-    else the decoded JSON object. Loopback only, by construction: this
-    command must never reach off the machine, whatever --daemon-url says."""
-    import http.client
-    from urllib.parse import urlsplit
+    """Ask a LOOPBACK daemon for /v1/health (see revien/loopback_probe.py, the
+    one reviewed and hash-pinned module that may open a connection). None when
+    nothing answers, the address is not loopback, or the answer is not Revien's;
+    else the decoded JSON object."""
+    from revien.loopback_probe import probe_daemon
 
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname or ""
-        if parts.scheme != "http" or host not in ("127.0.0.1", "localhost", "::1"):
-            return None
-        conn = http.client.HTTPConnection(host, parts.port or 80, timeout=1.5)
-        try:
-            conn.request("GET", (parts.path.rstrip("/") or "") + "/v1/health")
-            resp = conn.getresponse()
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        finally:
-            conn.close()
-    except Exception:  # noqa: BLE001 - unreachable, refused, not JSON: all "none"
-        return None
-    if not isinstance(data, dict) or "node_count" not in data \
-            or "uptime_seconds" not in data:
-        return None
-    return data
+    return probe_daemon(url)
 
 
 def _read_database_id(db_path: str) -> Optional[str]:

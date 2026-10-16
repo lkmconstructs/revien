@@ -1517,39 +1517,99 @@ class TestEgressGateCoversTheProbe:
         g = self._gate()
         assert {m for _f, m, _s in g.network_uses(src)} == want, name
 
-    def test_allowlist_pins_the_function_not_the_file(self):
+    PROBE = "revien/loopback_probe.py"
+
+    def _probe_bytes(self):
+        return (REPO / self.PROBE).read_bytes()
+
+    def test_probe_file_matches_its_pin(self):
         g = self._gate()
-        ok = ("def _probe_daemon():\n    import http.client\n"
-              "    return http.client.HTTPConnection('h')\n")
-        assert g.violations_in("revien/cli.py", ok, "") == []
-        # E4: the same import anywhere else in cli.py used to pass
-        for src in (ok + "def other():\n    import http.client\n",
-                    "import http.client\n" + ok,
-                    ok + "import http\ndef g():\n"
-                         "    return http.client.HTTPConnection('x')\n",
-                    "def _probe_daemon():\n    import http.client\n"
-                    "    import os, socket\n",
-                    "def _probe_daemon():\n    import http.client\n"
-                    "    import importlib\n"
-                    "    importlib.import_module('socket')\n"):
-            assert g.violations_in("revien/cli.py", src, ""), src
-        assert g.violations_in("revien/other.py", ok, "")
+        assert g.pin_problem(self.PROBE, self._probe_bytes()) is None
+
+    @pytest.mark.parametrize("name,edit", [
+        ("decorator", lambda b: b.replace(
+            b"def probe_daemon(", b"@(lambda f: f)\ndef probe_daemon(")),
+        ("default argument", lambda b: b.replace(
+            b"probe_daemon(url)",
+            b"probe_daemon(url, c=http.client.HTTPSConnection('x'))")),
+        ("second definition", lambda b: b + b"\ndef probe_daemon(u):\n    return 1\n"),
+        ("lambda", lambda b: b + b"\nf = lambda: http.client.HTTPSConnection('x')\n"),
+        ("nested function", lambda b: b.replace(
+            b"    try:\n        parts", b"    def inner():\n        pass\n    try:\n        parts")),
+        ("a comment", lambda b: b + b"# harmless\n"),
+        ("loopback list", lambda b: b.replace(b'"::1")', b'"::1", "x")')),
+    ])
+    def test_any_edit_to_the_probe_file_fails_the_pin(self, name, edit):
+        g = self._gate()
+        real = self._probe_bytes()
+        changed = edit(real)
+        assert changed != real, name
+        assert g.pin_problem(self.PROBE, changed), name
+
+    def test_a_network_use_outside_the_pinned_file_is_a_violation(self):
+        g = self._gate()
+        src = ("def _probe_daemon():\n    import http.client\n"
+               "    return http.client.HTTPConnection('h')\n")
+        assert g.violations_in("revien/cli.py", src, "")
+        assert g.violations_in("revien/other.py", src, "")
         # an unchanged use already on the base is not new
-        assert g.violations_in("revien/other.py", ok, ok) == []
+        assert g.violations_in("revien/other.py", src, src) == []
+        assert g.violations_in(self.PROBE, src, "") == []   # judged by its pin
+
+    def test_cli_has_no_network_client_of_its_own(self):
+        g = self._gate()
+        assert g.network_uses((REPO / "revien" / "cli.py").read_text()) == []
+        uses = g.network_uses(self._probe_bytes().decode())
+        assert {m for _f, m, _s in uses} == {"http.client"}
+
+    def test_the_only_pinned_file_is_the_probe_and_it_has_its_test(self):
+        g = self._gate()
+        assert set(g.PINNED) == {self.PROBE}
+        assert g.PROBE_TEST.split("::")[-1] in (
+            REPO / "tests" / "test_forget_followups.py").read_text()
 
     def test_gate_main_runs_its_own_controls(self):
         self._gate()._controls()
 
-    def test_real_cli_has_exactly_the_pinned_probe(self):
+    # The shapes the verifier used against the previous gate.
+    @pytest.mark.parametrize("name,src", [
+        ("getattr importlib",
+         "import importlib\ndef f():\n    return getattr(importlib, 'import_module')('socket')\n"),
+        ("getattr builtins",
+         "import builtins\ndef f():\n    return getattr(builtins, '__imp' + 'ort__')('socket')\n"),
+        ("exec", "def f():\n    exec('import socket')\n"),
+        ("sys.modules",
+         "import sys\ndef f():\n    return sys.modules['http.client'].HTTPConnection('e')\n"),
+        ("alias by assignment",
+         "import http\nh = http\ndef f():\n    return h.client.HTTPConnection('e')\n"),
+        ("_socket", "import _socket\n"),
+        ("ssl.create_connection",
+         "import ssl\ndef f():\n    return ssl.create_connection(('e', 443))\n"),
+        ("asyncio.open_connection",
+         "import asyncio\nasync def f():\n    return await asyncio.open_connection('e', 80)\n"),
+        ("subprocess", "import subprocess\nsubprocess.run(['curl', 'e'])\n"),
+        ("lambda", "import http\nf = lambda: http.client.HTTPSConnection('e')\n"),
+        ("second probe def",
+         "def _probe_daemon():\n    import http.client\n"
+         "def _probe_daemon():\n    import http.client\n"),
+        ("decorator",
+         "import http\n@(lambda fn: (http.client.HTTPSConnection('e'), fn)[1])\n"
+         "def _probe_daemon(url):\n    pass\n"),
+        ("default argument",
+         "import http\ndef _probe_daemon(url, _c=http.client.HTTPSConnection('e')):\n    pass\n"),
+    ])
+    def test_verifier_shapes_are_reported(self, name, src):
         g = self._gate()
-        uses = g.network_uses((REPO / "revien" / "cli.py").read_text())
-        assert uses, "the probe must be visible to the scanner"
-        assert {(f, m) for f, m, _s in uses} == {("_probe_daemon", "http.client")}
+        assert g.violations_in("revien/cli.py", src, ""), name
 
-    def test_probe_is_allowlisted_with_its_test(self):
+    def test_every_documented_limit_really_evades_and_nothing_else_is_claimed(self):
         g = self._gate()
-        assert ("revien/cli.py", "_probe_daemon", "http.client",
-                "import http.client") in g.ALLOWED
-        assert "test_probe_egress_is_loopback_only" in g.PROBE_TEST
-        assert g.PROBE_TEST.split("::")[-1] in (REPO / "tests" /
-            "test_forget_followups.py").read_text()
+        assert g.EVASIONS and g.OUT_OF_SCOPE
+        for name, src in g.EVASIONS:
+            assert g.network_uses(src) == [], name
+        # the limits are published where the user reads them
+        changelog = (REPO / "CHANGELOG.md").read_text()
+        for name, _src in g.EVASIONS:
+            assert name in changelog, f"limit not in CHANGELOG: {name}"
+        for name in g.OUT_OF_SCOPE:
+            assert name in changelog, f"limit not in CHANGELOG: {name}"
