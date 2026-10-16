@@ -11,7 +11,7 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
@@ -306,6 +306,8 @@ class GraphStore:
         self._migrate_add_origin_columns(conn)
         # recorded_at_source backfill (user_version 4); needs origin columns.
         self._migrate_backfill_recorded_at_source(conn)
+        # Usage layer (user_version 5): ALL of its DDL lives in one guard.
+        self._migrate_add_usage_layer(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -536,6 +538,102 @@ class GraphStore:
                          (json.dumps(meta), node_id))
         conn.execute("PRAGMA user_version = 4")
         self._commit(conn)
+
+    # Migration 005 — usage layer. This is the ONLY place the usage layer's
+    # DDL lives; _ensure_db does not create these objects inline. Fresh and
+    # existing databases take the same path.
+    _USAGE_LAYER_DDL = """
+        -- Usage ledger (N1, metacognition tier 1): one row per judgment of
+        -- whether an answer actually drew on a memory it was handed by
+        -- recall. episode_key = "{session source_id}#{tool_use_id}". The
+        -- UNIQUE pair makes a rescan of a grown session a no-op, and the
+        -- INSERT OR IGNORE claim is what decides who may apply, so two
+        -- processes can never both count one use. Abstentions are not
+        -- judgments and are never written here. applied = 1 only when
+        -- mark_used ran (mode "apply"). shared_terms holds the memory's own
+        -- words, so delete_node removes a node's rows.
+        CREATE TABLE IF NOT EXISTS use_judgments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_key TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            used INTEGER NOT NULL,
+            reason TEXT DEFAULT '',
+            shared_terms TEXT DEFAULT '[]',
+            similarity REAL,
+            query TEXT DEFAULT '',
+            mode TEXT NOT NULL,
+            applied INTEGER NOT NULL DEFAULT 0,
+            judged_at TEXT NOT NULL,
+            UNIQUE (episode_key, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_use_judgments_node
+            ON use_judgments(node_id);
+
+        -- Recall receipts (N1, any runtime): a recall made with a receipt
+        -- gets a random recall_id the client hands back with its answer
+        -- (POST /v1/usage/observe). Ids only: node_ids is a JSON list, no
+        -- memory content; query is kept so words the client merely repeated
+        -- can be discounted. status: open -> redeemed, or open -> expired
+        -- after 24h unjudged. An expired row IS the flag: it stays until a
+        -- person dismisses it, so no recall vanishes unseen.
+        CREATE TABLE IF NOT EXISTS recall_receipts (
+            recall_id TEXT PRIMARY KEY,
+            runtime TEXT NOT NULL DEFAULT '',
+            query TEXT NOT NULL DEFAULT '',
+            node_ids TEXT NOT NULL DEFAULT '[]',
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_recall_receipts_status
+            ON recall_receipts(status, expires_at);
+
+        -- Per-database key/value facts: a random database id and the running
+        -- daemon's heartbeat (features, pid, time). Not derived from the
+        -- path or the contents.
+        CREATE TABLE IF NOT EXISTS store_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """
+
+    def _migrate_add_usage_layer(self, conn: sqlite3.Connection) -> None:
+        """Migration 005: usage ledger, recall receipts, store_meta and the
+        ``sync_cursors.generation`` fence column.
+
+        Idempotent and cheap on every connect: once ``PRAGMA user_version``
+        is >= 5 AND the schema in front of us really has every object, it
+        returns after a handful of catalogue reads. A marker never overrides
+        the schema (a table dropped out-of-band is recreated). Existing rows
+        are untouched: ``generation`` backfills 0 on every cursor row.
+        """
+        try:
+            have = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name IN "
+                "('use_judgments','recall_receipts','store_meta',"
+                "'idx_use_judgments_node','idx_recall_receipts_status')")}
+            cursor_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(sync_cursors)")}
+            complete = len(have) == 5 and "generation" in cursor_cols
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= 5 and complete:
+                return
+            conn.executescript(self._USAGE_LAYER_DDL)
+            if "generation" not in cursor_cols:
+                conn.execute(
+                    "ALTER TABLE sync_cursors ADD COLUMN generation "
+                    "INTEGER NOT NULL DEFAULT 0")
+            if version < 5:
+                conn.execute("PRAGMA user_version = 5")
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            # Swallow ONLY the idempotency race (another opener got there
+            # first). Anything else must be loud at startup.
+            if "duplicate column name" in str(e) or "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
 
     def _migrate_add_origin_columns(self, conn: sqlite3.Connection) -> None:
         """Add Origin Layer (WS0) columns to existing DBs, then backfill.
@@ -1304,6 +1402,95 @@ class GraphStore:
         )
         self._commit(conn)
 
+    # ── Usage ledger (N1) ─────────────────────────────────
+
+    @_locked
+    def has_use_judgment(self, episode_key: str, node_id: str) -> bool:
+        """True when this (episode, node) pair has already been judged."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM use_judgments WHERE episode_key = ? AND node_id = ?",
+            (episode_key, node_id),
+        ).fetchone()
+        return row is not None
+
+    @_locked
+    def record_use_judgment(
+        self,
+        *,
+        episode_key: str,
+        node_id: str,
+        used: bool,
+        reason: str,
+        shared_terms: List[str],
+        similarity: Optional[float],
+        query: str,
+        mode: str,
+        applied: bool,
+    ) -> bool:
+        """Claim one judgment: INSERT OR IGNORE on the (episode_key, node_id)
+        pair. Returns True only for the caller whose insert landed — only that
+        caller may apply it, so a judgment is counted at most once even across
+        processes. Rows are never updated."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO use_judgments
+               (episode_key, node_id, used, reason, shared_terms, similarity,
+                query, mode, applied, judged_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (episode_key, node_id, int(bool(used)), reason,
+             json.dumps(list(shared_terms)), similarity, query, mode,
+             int(bool(applied)), datetime.now(timezone.utc).isoformat()),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
+    @_locked
+    def list_use_judgments(
+        self, limit: int = 50, used: Optional[bool] = None
+    ) -> List[Dict]:
+        """Most recent judgments first. ``used`` filters to used/unused rows."""
+        conn = self._get_conn()
+        sql = ("SELECT episode_key, node_id, used, reason, shared_terms, "
+               "similarity, query, mode, applied, judged_at FROM use_judgments")
+        params: list = []
+        if used is not None:
+            sql += " WHERE used = ?"
+            params.append(int(used))
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "episode_key": r[0],
+                "node_id": r[1],
+                "used": bool(r[2]),
+                "reason": r[3] or "",
+                "shared_terms": json.loads(r[4] or "[]"),
+                "similarity": r[5],
+                "query": r[6] or "",
+                "mode": r[7],
+                "applied": bool(r[8]),
+                "judged_at": r[9],
+            }
+            for r in rows
+        ]
+
+    @_locked
+    def use_judgment_counts(self) -> Dict[str, int]:
+        """Totals over the whole ledger: judged, used, unused, applied."""
+        conn = self._get_conn()
+        judged, used, applied = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied), 0) "
+            "FROM use_judgments"
+        ).fetchone()
+        return {
+            "judged": int(judged),
+            "used": int(used),
+            "unused": int(judged) - int(used),
+            "applied": int(applied),
+        }
+
     @_locked
     def find_context_node_by_ingest_key(
         self, ingest_key: str, node_type: NodeType = NodeType.CONTEXT
@@ -1493,6 +1680,10 @@ class GraphStore:
                 "DELETE FROM edges WHERE source_node_id = ? OR target_node_id = ?",
                 (node_id, node_id),
             )
+            # Usage judgments keep the memory's own words (shared_terms), so
+            # they go with it — right-to-forget runs through here, and its
+            # promise is that the content is actually gone.
+            conn.execute("DELETE FROM use_judgments WHERE node_id = ?", (node_id,))
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
             self._discard_pending_stmt(conn, node_id)

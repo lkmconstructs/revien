@@ -1580,5 +1580,121 @@ def skills_decline(node_id: str, db: Optional[str]):
         click.echo(f"Declined ({declines}x): {node.label}")
 
 
+@main.group()
+def usage():
+    """Did recalled memory actually get used? Judges each revien_recall in
+    your Claude Code sessions against the answer that followed it. Records
+    only (shadow) unless REVIEN_USAGE=apply."""
+    pass
+
+
+@usage.command(name="scan")
+@click.option("--db", default=None, help="Database path")
+@click.option("--path", "session_dir", default=None, type=click.Path(),
+              help="Claude Code projects directory (default: the connected "
+                   "adapter's, else auto-detect)")
+@click.option("--mode", type=click.Choice(["shadow", "apply"]), default=None,
+              help="Override REVIEN_USAGE for this run")
+@click.option("--full", is_flag=True,
+              help="Rescan every session, not only those changed since the "
+                   "last scan (safe: judged pairs are skipped)")
+@click.option("--json-output", is_flag=True, help="Output the report as JSON")
+def usage_scan(db: Optional[str], session_dir: Optional[str], mode: Optional[str],
+               full: bool, json_output: bool):
+    """Judge recall episodes in Claude Code sessions."""
+    import json as _json
+    from revien.adapters.claude_code import ClaudeCodeAdapter
+    from revien.graph.store import GraphStore
+    from revien.retrieval.engine import RetrievalEngine
+    from revien.semantic.index import SemanticIndex
+    from revien.usage import UsageObserver
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+    if session_dir is None:
+        connected = (config.get("adapters") or {}).get("claude-code") or {}
+        session_dir = connected.get("session_dir")
+    adapter = ClaudeCodeAdapter(session_dir=session_dir)
+
+    store = GraphStore(db_path=db_path)
+    try:
+        semantic = SemanticIndex(store)
+        engine = RetrievalEngine(store, semantic=semantic)
+        report = UsageObserver(
+            store, engine=engine, semantic=semantic, mode=mode,
+        ).run_claude_code(adapter, full=full)
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(_json.dumps(report.model_dump(), indent=2))
+        return
+    click.echo(f"\nUsage scan ({report.mode}): {report.files_scanned} session "
+               f"file(s), {report.episodes} recall episode(s)\n")
+    click.echo(f"  judged    : {report.judged} new ({report.used} used, "
+               f"{report.unused} not used)")
+    click.echo(f"  abstained : {report.abstained}")
+    click.echo(f"  skipped   : {report.already_judged} already judged, "
+               f"{report.missing} no longer in the graph")
+    if report.mode == "apply":
+        click.echo(f"  applied   : {report.applied} use(s) counted")
+    else:
+        click.echo("  applied   : 0 (shadow records only; REVIEN_USAGE=apply "
+                   "or --mode apply to count uses)")
+    click.echo("  semantic  : " + ("active" if report.semantic_active else
+               "OFF - no similarity signal, so the rule abstains"))
+    click.echo()
+
+
+@usage.command(name="list")
+@click.option("--db", default=None, help="Database path")
+@click.option("--limit", default=20, show_default=True, help="Rows to show")
+@click.option("--filter", "which", type=click.Choice(["all", "used", "unused"]),
+              default="all", show_default=True, help="Which judgments to show")
+@click.option("--json-output", is_flag=True, help="Output rows as JSON")
+def usage_list(db: Optional[str], limit: int, which: str, json_output: bool):
+    """Show recent usage judgments with the evidence behind each."""
+    import json as _json
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        used = {"all": None, "used": True, "unused": False}[which]
+        rows = store.list_use_judgments(limit=limit, used=used)
+        counts = store.use_judgment_counts()
+        for row in rows:
+            node = store.get_node(row["node_id"])
+            row["label"] = node.label if node is not None else "(node no longer exists)"
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(_json.dumps({"counts": counts, "judgments": rows}, indent=2))
+        return
+    click.echo(f"\n{counts['judged']} judgment(s): {counts['used']} used, "
+               f"{counts['unused']} not used, {counts['applied']} applied\n")
+    for row in rows:
+        similarity = ("-" if row["similarity"] is None
+                      else f"{row['similarity']:.2f}")
+        verdict = "USED  " if row["used"] else "unused"
+        click.echo(f"  {verdict} sim={similarity} terms={len(row['shared_terms'])} "
+                   f"[{row['mode']}] {row['label'][:60]}")
+        if row["shared_terms"]:
+            click.echo(f"         shared: {', '.join(row['shared_terms'][:8])}")
+        click.echo(f"         query : {row['query'][:70]}")
+        if row["reason"]:
+            click.echo(f"         reason: {row['reason'][:70]}")
+    click.echo()
+
+
 if __name__ == "__main__":
     main()
