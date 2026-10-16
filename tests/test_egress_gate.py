@@ -161,6 +161,11 @@ class TestDynamicImportEvasions:
         "import importlib.util\nspec = importlib.util.find_spec('http.client')\n"
         "mod = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(mod)\n",
         "import runpy\nrunpy.run_module('http.client')\n",
+        "import importlib.machinery\nm = importlib.machinery.SourceFileLoader("
+        "'c', '/usr/lib/python3/http/client.py').load_module()\n",
+        "import json\nm = json.__loader__.load_module('http.client')\n",
+        "import importlib, operator\n"
+        "operator.attrgetter('import_module')(importlib)('socket')\n",
     ])
     def test_still_uncaught_and_listed(self, gate, src):
         assert gate.network_uses(src) == []

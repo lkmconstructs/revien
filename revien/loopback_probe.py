@@ -43,7 +43,12 @@ def probe_daemon(url):
         host = parts.hostname
         if parts.scheme != "http" or not host or parts.username or parts.password:
             return {"rejected": "not a plain http URL with a host"}
-        port = parts.port or 80
+        try:
+            port = 80 if parts.port is None else parts.port
+        except ValueError:
+            return {"rejected": "port is not a number from 1 to 65535"}
+        if not 1 <= port <= 65535:
+            return {"rejected": "port is not a number from 1 to 65535"}
         if host.lower() == "localhost":
             ip = ipaddress.ip_address("127.0.0.1")
         else:

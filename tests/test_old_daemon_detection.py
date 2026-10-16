@@ -207,6 +207,16 @@ class TestNonLoopback:
         monkeypatch.undo()
         assert cursor_state(seeded) == (T, 0)
 
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1:99999", "http://127.0.0.1:abc", "http://127.0.0.1:-1",
+        "http://127.0.0.1:0"])
+    def test_a_bad_port_refuses_the_reset(self, monkeypatch, seeded, url):
+        r = reset(monkeypatch, seeded, "--daemon-url", url)
+        assert r.exit_code == 1, r.output
+        assert "Use a loopback --daemon-url" in r.output
+        assert "Nothing was changed." in r.output
+        assert cursor_state(seeded) == (T, 0)
+
     def test_localhost_and_loopback_literals_are_accepted(
             self, monkeypatch, seeded):
         for url in ("http://localhost:%d" % free_port(),

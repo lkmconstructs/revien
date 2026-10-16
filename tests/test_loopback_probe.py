@@ -151,7 +151,8 @@ class TestAnswers:
             self, monkeypatch, url):
         _forbid_sockets(monkeypatch)
         _NoResolver.install(monkeypatch)
-        assert probe_daemon(url) in (None, {"rejected": "not a plain http URL with a host"})
+        got = probe_daemon(url)
+        assert got is None or set(got) == {"rejected"}
         assert _NoSockets.made == 0 and _NoResolver.calls == []
 
 
@@ -239,6 +240,23 @@ class TestLoopbackOnly:
 
         monkeypatch.setattr(socket, "socket", Lying)
         assert probe_daemon(s.url) is None
+
+
+class TestPort:
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1:99999", "http://127.0.0.1:abc", "http://127.0.0.1:-1",
+        "http://127.0.0.1:0", "http://localhost:0", "http://[::1]:65536"])
+    def test_a_bad_port_is_rejected_without_a_connection(self, monkeypatch, url):
+        _forbid_sockets(monkeypatch)
+        _NoResolver.install(monkeypatch)
+        got = probe_daemon(url)
+        assert set(got or {}) == {"rejected"}, url
+        assert _NoSockets.made == 0 and _NoResolver.calls == []
+
+    def test_no_port_still_means_80_and_65535_is_valid(self, monkeypatch):
+        _NoResolver.install(monkeypatch)
+        assert "rejected" not in (probe_daemon("http://127.0.0.1") or {})
+        assert "rejected" not in (probe_daemon("http://127.0.0.1:65535") or {})
 
 
 class TestNoRedirectsNoProxies:

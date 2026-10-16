@@ -419,7 +419,7 @@ All notable changes to Revien are documented here. Format follows
     the reset proceeds. Only an IP literal in 127.0.0.0/8, `[::1]`, or the
     literal `localhost` (mapped to 127.0.0.1 by the probe itself) is
     accepted; any other `--daemon-url` (another IP, any other host name, a
-    non-http scheme) refuses the reset with "Use a loopback --daemon-url" and
+    non-http scheme, a port that is not 1-65535) refuses the reset with "Use a loopback --daemon-url" and
     nothing is resolved or contacted, so no name leaves the machine. The probe
     never follows a redirect, never reads proxy settings, and returns only the
     features list and version. Limit: an old daemon on another port is found only if
@@ -433,8 +433,10 @@ All notable changes to Revien are documented here. Format follows
     re-exporting its network module or patching it through the shapes it
     knows (it is a heuristic: for example a module name assembled at run time
     is not seen). It also flags `pkgutil.resolve_name` and `builtins.__dict__`
-    use as dynamic imports; importing by file location (`importlib.util`) and
-    `runpy` are known not to be caught and are listed as limits. The gate's self-tests cover both; its limits are listed
+    use as dynamic imports; importing by file location or loader (`importlib.util`,
+    `importlib.machinery` loaders, a module's `__loader__`), `runpy`, and
+    reaching `import_module` through `operator.attrgetter` are known not to
+    be caught and are listed as limits. The gate's self-tests cover both; its limits are listed
     when it runs.
 - **Schema: migration 005 (`PRAGMA user_version` 5).** All of the above
   creates its tables in one numbered migration,

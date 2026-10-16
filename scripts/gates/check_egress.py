@@ -287,7 +287,7 @@ def new_network_uses(head_src: str, base_src: str):
 # WHOLE FILE (CRLF normalized). A change to anything in it, however small or
 # wherever in the file, fails the gate until this hash is changed on purpose.
 PINNED = {
-    "revien/loopback_probe.py": "8c01980582e631713a209b3183a023002aa6477e5f605b21199399b8ce29947d",
+    "revien/loopback_probe.py": "c083718c91df27ab3beb0647d251db07b95938f0160822d3e5b83f96ecfdbfdf",
 }
 PROBE_TEST = "tests/test_loopback_probe.py"
 PROBE_MODULE = "revien.loopback_probe"
@@ -527,6 +527,14 @@ EVASIONS = (
     ("importing by file location, not by name (importlib.util)",
      "import importlib.util\nspec = importlib.util.find_spec('http.client')\n"
      "mod = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(mod)\n"),
+    ("an importlib.machinery loader (SourceFileLoader(...).load_module())",
+     "import importlib.machinery\nm = importlib.machinery.SourceFileLoader("
+     "'c', '/usr/lib/python3/http/client.py').load_module()\n"),
+    ("a module's __loader__ used to load another",
+     "import json\nm = json.__loader__.load_module('http.client')\n"),
+    ("operator.attrgetter to reach import_module",
+     "import importlib, operator\n"
+     "operator.attrgetter('import_module')(importlib)('socket')\n"),
     ("running a module through runpy",
      "import runpy\nrunpy.run_module('http.client')\n"),
     ("a network client the NETWORK_MODULES list does not name",
