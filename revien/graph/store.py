@@ -1154,6 +1154,28 @@ class GraphStore:
         )
         self._commit(conn)
 
+    @_locked
+    def list_sync_cursor_names(self) -> List[str]:
+        """Names of all adapters with a persisted sync position."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT adapter_name FROM sync_cursors ORDER BY adapter_name"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    @_locked
+    def delete_sync_cursor(self, adapter_name: str) -> bool:
+        """Remove one adapter's sync position so its next sync starts at EPOCH
+        (full history). Returns True if a row existed. Deletes nothing else."""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM sync_cursors WHERE adapter_name = ?",
+            (adapter_name,),
+        )
+        deleted = cur.rowcount > 0
+        self._commit(conn)
+        return deleted
+
     # ── Usage ledger (N1) ─────────────────────────────────
 
     @_locked

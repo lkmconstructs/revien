@@ -6,6 +6,16 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **`revien sync reset <adapter>` — re-read an adapter's full history.**
+  Clears that adapter's persisted sync cursor (new
+  `GraphStore.delete_sync_cursor`), so the next daemon sync starts at EPOCH.
+  It deletes nothing from the graph and is safe to repeat: keyed sessions
+  (claude-code, codex) refresh their one context node instead of duplicating
+  (`tests/test_sync_reset.py`). The name must be a connected adapter or have a
+  saved cursor, otherwise it exits 1 and lists the known names. No
+  confirmation prompt, since nothing is lost. The usage observer's separate
+  `usage:claude-code` cursor needs no reset (it never used the adapter's
+  session parser); `revien usage scan --full` rescans if wanted.
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/
@@ -338,7 +348,8 @@ All notable changes to Revien are documented here. Format follows
   now public, so anything else that reads sessions sees exactly the files
   ingest reads. Known limitation: an existing install's `claude-code` sync cursor has already
   moved past older sessions, so only sessions that change from now on are
-  captured until that cursor is reset.
+  captured until that cursor is reset; run `revien sync reset claude-code`
+  to have the next daemon sync re-read the full history.
 - **Auto-sync fires immediately at daemon startup**, then every interval — no more
   silent 6-hour wait before the first sync of connected adapters.
 - **Pre-existing duplicate session contexts stop growing.** The first keyed ingest of a
