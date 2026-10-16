@@ -97,6 +97,15 @@ def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat()
 
 
+def recalled_content(node: Node) -> str:
+    """The text a recall result carries for ``node`` -- the one projection
+    every surface shows (and the usage signal judges against). D1 leftover: a
+    SKILL result's `content` is the index-row text ("<description> --
+    triggers: a, b"), never the full body (`revien skills show` returns the
+    body). Every other node type is unchanged."""
+    return skill_index_row(node) if node.node_type == NodeType.SKILL else node.content
+
+
 @dataclass
 class RetrievalResult:
     """A single node result with its score and path."""
@@ -900,11 +909,7 @@ class RetrievalEngine:
                 # text ("<description> — triggers: a, b"), never the full
                 # body — `skills show`/`revien skills show` is what returns
                 # the body. Every other node type is unchanged.
-                content=(
-                    skill_index_row(node)
-                    if node.node_type == NodeType.SKILL
-                    else node.content
-                ),
+                content=recalled_content(node),
                 score=final_score,
                 score_breakdown=score_breakdown,
                 path=path_labels,

@@ -340,7 +340,11 @@ All notable changes to Revien are documented here. Format follows
   recalled memory whose node no longer exists, so a rescan can't copy
   forgotten words back in from the transcript. `REVIEN_USAGE` picks the mode:
   - `shadow` (default) records judgments only;
-  - `apply` also calls `mark_used`;
+  - `apply` also calls `mark_used`: a judgment is recorded unapplied and
+    marked applied only after `mark_used` succeeds. If it fails, the next
+    pass or retry applies that used-but-unapplied judgment exactly once
+    (concurrent retries cannot both apply it; a process that dies mid-apply
+    leaves it unretried rather than risk applying twice);
   - `off` disables the pass.
   Unrecognized values fall back to shadow, so a typo never writes to the graph.
   `revien usage scan [--mode] [--full] [--path]` runs a pass with its own
@@ -361,9 +365,18 @@ All notable changes to Revien are documented here. Format follows
     409 already redeemed, 410 expired, 400 empty answer. No judgment is
     written on an error (the expiry pass runs first, so such a call can still
     flag other overdue receipts).
+  - A recall that returns no results gets no receipt (nothing could have been
+    used): `recall_id` and `receipt_expires_at` are `null` and `receipt_note`
+    says so.
+  - With `REVIEN_USAGE=off`, `POST /v1/usage/observe` judges and records
+    nothing; it closes the receipt (status `closed_off`, so it does not
+    expire into a flag) and answers `status: "signal_off"` with a note. A
+    second call gets 409 (`already_closed`).
   - A receipt's row is in the new `recall_receipts` table. It holds ids, the
     runtime and the query (so restated words can be discounted), never memory
-    content. Memories are judged as they are now, not as they were recalled.
+    content. Memories are judged as they are now, not as they were recalled, and
+    against exactly the text recall returned (a SKILL's index row, never its
+    hidden body).
   - A receipt not redeemed within 24 hours becomes a flag. Flags are never
     deleted: `revien status` shows a count, `revien usage flags` lists them
     and `--dismiss` marks one as seen, and `GET /v1/usage/flags` returns

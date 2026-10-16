@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from revien.daemon.scheduler import EPOCH
+from revien.retrieval.engine import recalled_content
 
 from .episodes import RecallEpisode, RecalledMemory, extract_recall_episodes
 from .evidence import EmbedFn, UseEvidence, gather_evidence
@@ -89,6 +90,10 @@ class ObserveResult(BaseModel):
     recall_id: str
     runtime: str
     mode: str
+    # "judged", or "signal_off": REVIEN_USAGE=off, nothing was judged, the
+    # receipt was closed (so it does not expire into a flag).
+    status: str = "judged"
+    note: str = ""
     semantic_active: bool
     judgments: List[JudgmentDetail] = Field(default_factory=list)
     skipped: Dict[str, int] = Field(default_factory=dict)
@@ -145,9 +150,24 @@ class UsageObserver:
         """Judge every not-yet-judged memory of one episode. Returns the
         verdict for each memory it judged or abstained on."""
         details: List[JudgmentDetail] = []
+        if self.mode == "off":
+            return details  # off means off, on every path
         fresh = []
         for memory in episode.memories:
-            if self.store.has_use_judgment(episode.episode_key, memory.node_id):
+            row = self.store.get_use_judgment(episode.episode_key, memory.node_id)
+            if row is not None:
+                if (self.mode == "apply" and row["mode"] == "apply"
+                        and row["used"] and row["applied"] == 0):
+                    # Claimed earlier but never applied (mark_used failed):
+                    # apply it now, exactly once.
+                    if self._apply(episode, memory.node_id):
+                        report.applied += 1
+                        details.append(JudgmentDetail(
+                            node_id=memory.node_id, label=memory.label,
+                            verdict="used", shared_terms=row["shared_terms"],
+                            similarity=row["similarity"], reason=row["reason"],
+                            applied=True))
+                        continue
                 report.already_judged += 1
             elif self.store.get_node(memory.node_id) is None:
                 # Forgotten or deleted since the recall. The transcript still
@@ -175,6 +195,7 @@ class UsageObserver:
                 details.append(detail)
                 continue
             apply = self.mode == "apply" and verdict.used
+            # Claimed UNAPPLIED: "applied" is set only after mark_used succeeds.
             claimed = self.store.record_use_judgment(
                 episode_key=episode.episode_key,
                 node_id=memory.node_id,
@@ -184,7 +205,7 @@ class UsageObserver:
                 similarity=evidence.similarity,
                 query=episode.query,
                 mode=self.mode,
-                applied=apply,
+                applied=False,
             )
             if not claimed:  # another pass got there first
                 report.already_judged += 1
@@ -194,12 +215,28 @@ class UsageObserver:
                 report.used += 1
             else:
                 report.unused += 1
-            if apply:
-                self.engine.mark_used(memory.node_id, episode.query)
+            if apply and self._apply(episode, memory.node_id):
                 report.applied += 1
-            detail.applied = apply
+                detail.applied = True
             details.append(detail)
         return details
+
+    def _apply(self, episode: RecallEpisode, node_id: str) -> bool:
+        """mark_used for one claimed judgment. The claim (applied 0 -> 2) is
+        one atomic UPDATE, so concurrent callers cannot both apply; success
+        records applied = 1, a failure releases the claim (back to 0) and
+        re-raises so the caller's cursor/receipt stays open for a retry. A
+        process that dies between the claim and the end leaves it at 2:
+        never applied twice, at the price of not being retried."""
+        if not self.store.claim_use_application(episode.episode_key, node_id):
+            return False
+        try:
+            self.engine.mark_used(node_id, episode.query)
+        except BaseException:
+            self.store.finish_use_application(episode.episode_key, node_id, False)
+            raise
+        self.store.finish_use_application(episode.episode_key, node_id, True)
+        return True
 
     # ── Receipts: any runtime ─────────────────────────────
 
@@ -239,9 +276,25 @@ class UsageObserver:
         if receipt["status"] == "redeemed":
             raise ReceiptError("already_redeemed",
                                f"receipt {recall_id!r} was already redeemed")
+        if receipt["status"] == "closed_off":
+            raise ReceiptError("already_closed",
+                               f"receipt {recall_id!r} was closed while the "
+                               "usage signal was off")
         if receipt["status"] != "open":
             raise ReceiptError("expired", f"receipt {recall_id!r} expired "
                                f"unjudged at {receipt['expires_at']} (flagged)")
+
+        runtime = receipt["runtime"] or "api"
+        if self.mode == "off":
+            # REVIEN_USAGE=off: judge nothing, but do not leave the receipt to
+            # expire into a flag -- close it with a status that says why.
+            self.store.close_recall_receipt(recall_id, "closed_off")
+            return ObserveResult(
+                recall_id=recall_id, runtime=runtime, mode="off",
+                status="signal_off",
+                note="the usage signal is off (REVIEN_USAGE=off): nothing was "
+                     "judged or recorded; the receipt was closed",
+                semantic_active=False)
 
         memories = []
         for node_id in receipt["node_ids"]:
@@ -249,9 +302,9 @@ class UsageObserver:
             memories.append(RecalledMemory(
                 node_id=node_id,
                 label=node.label if node is not None else "",
-                content=node.content if node is not None else "",
+                # exactly what the recall returned, not the stored body
+                content=recalled_content(node) if node is not None else "",
             ))
-        runtime = receipt["runtime"] or "api"
         episode = RecallEpisode(
             session_source_id=f"receipt:{runtime}", tool_use_id=recall_id,
             query=receipt["query"], prompt=prompt, memories=memories,

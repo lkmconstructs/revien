@@ -619,7 +619,14 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # this query. Always present, possibly [].
             "skill_proposals": response.skill_proposals,
         }
-        if request.receipt:
+        if request.receipt and not response.results:
+            # Nothing was recalled, so nothing could be used: a receipt would
+            # only expire into a meaningless flag.
+            payload["recall_id"] = None
+            payload["receipt_expires_at"] = None
+            payload["receipt_note"] = ("no receipt issued: the recall "
+                                       "returned no results")
+        elif request.receipt:
             from revien.usage import UsageObserver
 
             issued = UsageObserver(store, mode="shadow").issue_receipt(
@@ -968,7 +975,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             ).observe_answer(request.recall_id, request.answer, request.prompt)
         except ReceiptError as e:
             status = {"unknown": 404, "expired": 410, "already_redeemed": 409,
-                      "empty_answer": 400}.get(e.code, 400)
+                      "already_closed": 409, "empty_answer": 400}.get(e.code, 400)
             raise HTTPException(status, {"code": e.code, "detail": str(e)})
         return result.model_dump(mode="json")
 

@@ -1570,6 +1570,46 @@ class GraphStore:
         return cursor.rowcount == 1
 
     @_locked
+    def get_use_judgment(self, episode_key: str, node_id: str) -> Optional[Dict]:
+        """The ledger row for one (episode, memory) pair, or None. ``applied``
+        is 0 (not applied), 2 (an apply is in progress) or 1 (applied)."""
+        conn = self._get_conn()
+        r = conn.execute(
+            "SELECT used, mode, applied, reason, shared_terms, similarity "
+            "FROM use_judgments WHERE episode_key = ? AND node_id = ?",
+            (episode_key, node_id)).fetchone()
+        if r is None:
+            return None
+        return {"used": bool(r[0]), "mode": r[1], "applied": int(r[2]),
+                "reason": r[3] or "", "shared_terms": json.loads(r[4] or "[]"),
+                "similarity": r[5]}
+
+    @_locked
+    def claim_use_application(self, episode_key: str, node_id: str) -> bool:
+        """Take the right to apply one used judgment: applied 0 -> 2 in a
+        single UPDATE, so of any number of concurrent callers exactly one
+        gets True."""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "UPDATE use_judgments SET applied = 2 WHERE episode_key = ? "
+            "AND node_id = ? AND used = 1 AND applied = 0",
+            (episode_key, node_id))
+        self._commit(conn)
+        return cur.rowcount == 1
+
+    @_locked
+    def finish_use_application(self, episode_key: str, node_id: str,
+                               ok: bool) -> None:
+        """After mark_used: 2 -> 1 on success, 2 -> 0 (claimable again) on
+        failure."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE use_judgments SET applied = ? WHERE episode_key = ? "
+            "AND node_id = ? AND applied = 2",
+            (1 if ok else 0, episode_key, node_id))
+        self._commit(conn)
+
+    @_locked
     def list_use_judgments(
         self, limit: int = 50, used: Optional[bool] = None
     ) -> List[Dict]:
@@ -1594,7 +1634,7 @@ class GraphStore:
                 "similarity": r[5],
                 "query": r[6] or "",
                 "mode": r[7],
-                "applied": bool(r[8]),
+                "applied": r[8] == 1,
                 "judged_at": r[9],
             }
             for r in rows
@@ -1692,7 +1732,7 @@ class GraphStore:
         """Totals over the whole ledger: judged, used, unused, applied."""
         conn = self._get_conn()
         judged, used, applied = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied), 0) "
+            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied = 1), 0) "
             "FROM use_judgments"
         ).fetchone()
         return {
