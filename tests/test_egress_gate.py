@@ -133,3 +133,35 @@ class TestSelfTests:
     def test_listed_evasions_really_evade(self, gate):
         for name, src in gate.PROBE_EVASIONS:
             assert gate.probe_reaches(src) == [], name
+
+
+class TestDynamicImportEvasions:
+    """Shapes a verifier used to get past the gate, and the ones that still
+    get past it (pinned, so the documented limits list stays true)."""
+
+    @pytest.mark.parametrize("src,want", [
+        ("import pkgutil\npkgutil.resolve_name('http.client:HTTPSConnection')\n",
+         "http.client"),
+        ("from pkgutil import resolve_name\nresolve_name('socket')\n", "socket"),
+        ("import builtins\nbuiltins.__dict__['__imp' + 'ort__']('socket')\n",
+         "<dynamic-import>"),
+        ("import builtins\nbuiltins.__import__('socket')\n", "socket"),
+        ("import pkgutil\ndef f(n):\n    return pkgutil.resolve_name(n)\n",
+         "<dynamic-import>"),
+    ])
+    def test_caught(self, gate, src, want):
+        assert want in {m for _f, m, _s in gate.network_uses(src)}
+
+    def test_a_new_use_in_an_existing_file_fails_the_gate(self, gate):
+        base = "import os\n"
+        head = base + "import pkgutil\nx = pkgutil.resolve_name('http.client:HTTPSConnection')\n"
+        assert gate.violations_in("revien/cli.py", head, base)
+
+    @pytest.mark.parametrize("src", [
+        "import importlib.util\nspec = importlib.util.find_spec('http.client')\n"
+        "mod = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(mod)\n",
+        "import runpy\nrunpy.run_module('http.client')\n",
+    ])
+    def test_still_uncaught_and_listed(self, gate, src):
+        assert gate.network_uses(src) == []
+        assert any(src == s for _n, s in gate.EVASIONS)

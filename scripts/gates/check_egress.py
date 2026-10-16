@@ -150,7 +150,8 @@ class _Scan(ast.NodeVisitor):
                 self._add(m, node, stmt)
             if full in NETWORK_CALLS:
                 self._add(full.split(".")[0], node, stmt)
-            if full in ("importlib.import_module", "importlib.__import__"):
+            if full in ("importlib.import_module", "importlib.__import__",
+                        "pkgutil.resolve_name"):
                 self._add(DYNAMIC, node, stmt)
         self.generic_visit(node)
 
@@ -205,8 +206,13 @@ class _Scan(ast.NodeVisitor):
             if dotted in NETWORK_CALLS:
                 self._add(dotted.split(".")[0], node)
                 return
+            if dotted in ("builtins.__dict__", "builtins.__import__") \
+                    and id(node) not in self._call_funcs:
+                # the import machinery by attribute: builtins.__dict__[...]
+                self._add(DYNAMIC, node)
+                return
             if (dotted in ("importlib.import_module", "importlib.__import__",
-                           "builtins.__import__")
+                           "pkgutil.resolve_name")
                     and id(node) not in self._call_funcs):
                 # a bare reference (`f = importlib.import_module`): the call
                 # that follows is invisible; a direct call is judged in
@@ -242,11 +248,14 @@ class _Scan(ast.NodeVisitor):
         resolved = self._resolve(f) if isinstance(f, ast.Attribute) else (
             next((sc[f.id] for sc in reversed(self.alias) if f.id in sc), f.id)
             if isinstance(f, ast.Name) else "")
-        if (name in ("import_module", "__import__")
-                or resolved in ("importlib.import_module", "__import__")):
+        if (name in ("import_module", "__import__", "resolve_name")
+                or resolved in ("importlib.import_module", "__import__",
+                                "pkgutil.resolve_name")):
             arg = node.args[0] if node.args else None
             lit = (arg.value if isinstance(arg, ast.Constant)
                    and isinstance(arg.value, str) else None)
+            if lit is not None:
+                lit = lit.replace(":", ".")  # pkgutil "pkg.mod:attr"
             if lit is None:
                 self._add(DYNAMIC, node)
             elif _matches(lit):
@@ -278,7 +287,7 @@ def new_network_uses(head_src: str, base_src: str):
 # WHOLE FILE (CRLF normalized). A change to anything in it, however small or
 # wherever in the file, fails the gate until this hash is changed on purpose.
 PINNED = {
-    "revien/loopback_probe.py": "0e78c745bf526d5ad75e3e7a20e935a3115f705e2129dbe715ad72ba29a52928",
+    "revien/loopback_probe.py": "8c01980582e631713a209b3183a023002aa6477e5f605b21199399b8ce29947d",
 }
 PROBE_TEST = "tests/test_loopback_probe.py"
 PROBE_MODULE = "revien.loopback_probe"
@@ -458,6 +467,19 @@ CONTROLS = (
     ("E5j attribute reference to import_module",
      "import importlib\nf = importlib.import_module\nf('socket')\n",
      {DYNAMIC, "socket"}),
+    ("E5k pkgutil.resolve_name literal",
+     "import pkgutil\npkgutil.resolve_name('http.client:HTTPSConnection')\n",
+     {"http.client"}),
+    ("E5l pkgutil.resolve_name non-literal",
+     "import pkgutil\ndef f(n):\n    return pkgutil.resolve_name(n)\n", {DYNAMIC}),
+    ("E5m from pkgutil import resolve_name",
+     "from pkgutil import resolve_name\nresolve_name('socket')\n",
+     {DYNAMIC, "socket"}),
+    ("E5n builtins.__dict__ subscript",
+     "import builtins\nbuiltins.__dict__['__imp' + 'ort__']('socket')\n",
+     {DYNAMIC}),
+    ("E5o builtins.__import__ attribute",
+     "import builtins\nbuiltins.__import__('socket')\n", {"socket"}),
     ("E6 sys.modules literal",
      "import sys\ndef f():\n    return sys.modules['http.client'].HTTPConnection('x')\n",
      {"http.client"}),
@@ -502,6 +524,11 @@ EVASIONS = (
      "import http\nm = [http][0]\ndef f():\n    return m.client.HTTPConnection('x')\n"),
     ("a method of an object whose type the scanner cannot see",
      "async def f(loop):\n    return await loop.create_connection(None, 'x', 80)\n"),
+    ("importing by file location, not by name (importlib.util)",
+     "import importlib.util\nspec = importlib.util.find_spec('http.client')\n"
+     "mod = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(mod)\n"),
+    ("running a module through runpy",
+     "import runpy\nrunpy.run_module('http.client')\n"),
     ("a network client the NETWORK_MODULES list does not name",
      "import pymysql\n"),
     ("a module that is not imported where it is used, reached through a "

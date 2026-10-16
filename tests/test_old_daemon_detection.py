@@ -179,23 +179,43 @@ class TestOldDaemon:
 
 class TestNonLoopback:
     @pytest.mark.parametrize("url", [
-        "http://192.0.2.1:7437", "http://203.0.113.9", "http://[2001:db8::1]:80",
-        "https://127.0.0.1:7437"])
-    def test_a_non_loopback_url_is_never_contacted(
+        "http://192.0.2.1:7437", "http://10.0.0.5", "http://192.168.1.2",
+        "http://[::ffff:10.0.0.5]:80", "http://0.0.0.0:7437",
+        "http://[2001:db8::1]:80", "https://127.0.0.1:7437",
+        "http://example.com", "http://my-box.test:7437"])
+    def test_a_non_loopback_url_refuses_the_reset_and_is_never_contacted(
             self, monkeypatch, seeded, url):
-        made = []
+        made, resolved = [], []
 
         class NoSocket:
             def __init__(self, *a, **k):
                 made.append(1)
                 raise AssertionError("a socket was created")
 
+        def no_resolve(*a, **k):
+            resolved.append(a)
+            raise AssertionError("the resolver was called")
+
         monkeypatch.setattr(socket, "socket", NoSocket)
         monkeypatch.setattr(socket, "create_connection", NoSocket)
+        monkeypatch.setattr(socket, "getaddrinfo", no_resolve)
         r = reset(monkeypatch, seeded, "--daemon-url", url)
-        assert made == []
-        # nothing was asked, so nothing blocks: same as no daemon
-        assert r.exit_code == 0, r.output
+        assert (made, resolved) == ([], [])
+        assert r.exit_code == 1, r.output
+        assert "Use a loopback --daemon-url" in r.output
+        assert "Nothing was changed." in r.output
+        monkeypatch.undo()
+        assert cursor_state(seeded) == (T, 0)
+
+    def test_localhost_and_loopback_literals_are_accepted(
+            self, monkeypatch, seeded):
+        for url in ("http://localhost:%d" % free_port(),
+                    "http://127.0.0.1:%d" % free_port()):
+            r = reset(monkeypatch, seeded, "--daemon-url", url)
+            assert r.exit_code == 0, r.output
+            seeded_again = GraphStore(db_path=seeded)
+            seeded_again.set_sync_cursor("claude-code", T)
+            seeded_again.close()
 
 
 class _CurrentDaemon:

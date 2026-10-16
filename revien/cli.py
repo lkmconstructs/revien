@@ -1858,6 +1858,12 @@ def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
     health = probe_daemon(daemon_url)
     if health is None:
         return None
+    if "rejected" in health:
+        return (f"--daemon-url {daemon_url!r} was not used ({health['rejected']}). "
+                "Only http://127.0.0.1:PORT (any 127.x.x.x), http://[::1]:PORT "
+                "or http://localhost:PORT can be checked, so the reset cannot "
+                "tell whether a daemon from before sync-reset protection is "
+                "running. Use a loopback --daemon-url.")
     ver = health.get("version") or "unknown"
     if health["features"] is None:
         return (f"A Revien daemon answering at {daemon_url} (version {ver}) was "

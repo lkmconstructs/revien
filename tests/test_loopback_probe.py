@@ -147,51 +147,64 @@ class TestAnswers:
         "https://127.0.0.1:7437", "ftp://127.0.0.1", "127.0.0.1:7437", "",
         "http://", "http://user:pw@127.0.0.1:7437", "http://127.0.0.1:notaport",
     ])
-    def test_bad_urls_are_none_without_a_connection(self, monkeypatch, url):
+    def test_bad_urls_are_rejected_or_none_without_a_connection(
+            self, monkeypatch, url):
         _forbid_sockets(monkeypatch)
-        assert probe_daemon(url) is None
-        assert _NoSockets.made == 0
+        _NoResolver.install(monkeypatch)
+        assert probe_daemon(url) in (None, {"rejected": "not a plain http URL with a host"})
+        assert _NoSockets.made == 0 and _NoResolver.calls == []
+
+
+class _NoResolver:
+    calls = []
+
+    @classmethod
+    def install(cls, monkeypatch):
+        cls.calls = []
+
+        def boom(*a, **k):
+            cls.calls.append(a)
+            raise AssertionError("the resolver was called")
+
+        monkeypatch.setattr(socket, "getaddrinfo", boom)
+        monkeypatch.setattr(socket, "gethostbyname", boom)
+        monkeypatch.setattr(socket, "gethostbyname_ex", boom)
 
 
 class TestLoopbackOnly:
     @pytest.mark.parametrize("url", [
-        "http://192.0.2.1:7437", "http://10.0.0.5", "http://203.0.113.9:80",
-        "http://[2001:db8::1]:80", "http://0.0.0.0:7437",
-        "http://169.254.169.254", "http://[::]:80",
+        "http://192.0.2.1:7437", "http://10.0.0.5", "http://192.168.1.2:80",
+        "http://203.0.113.9:80", "http://[2001:db8::1]:80", "http://0.0.0.0:7437",
+        "http://169.254.169.254", "http://[::]:80", "http://[::ffff:10.0.0.5]:80",
+        "http://[::ffff:203.0.113.9]:80", "http://[::ffff:127.0.0.1]:80",
+        "http://128.0.0.1", "http://126.255.255.255",
     ])
-    def test_non_loopback_address_never_connects(self, monkeypatch, url):
+    def test_non_loopback_literal_is_rejected_without_a_connection(
+            self, monkeypatch, url):
         _forbid_sockets(monkeypatch)
-        assert probe_daemon(url) is None
-        assert _NoSockets.made == 0
+        _NoResolver.install(monkeypatch)
+        got = probe_daemon(url)
+        assert set(got) == {"rejected"}
+        assert _NoSockets.made == 0 and _NoResolver.calls == []
 
-    def test_a_name_that_resolves_off_the_machine_never_connects(
-            self, monkeypatch):
-        _resolve_to(monkeypatch, {"looks-local.test": ["203.0.113.9"]})
+    @pytest.mark.parametrize("url", [
+        "http://example.com", "http://example.com:7437", "http://looks-local.test",
+        "http://localhost.example.com", "http://127.0.0.1.example.com",
+        "http://my-box.test:7437", "http://LOCALHOST.evil.test", "http://local",
+        "http://2130706433", "http://0x7f.1",
+    ])
+    def test_a_host_name_is_rejected_before_any_resolver_call(
+            self, monkeypatch, url):
         _forbid_sockets(monkeypatch)
-        assert probe_daemon("http://looks-local.test:7437") is None
-        assert _NoSockets.made == 0
+        _NoResolver.install(monkeypatch)
+        got = probe_daemon(url)
+        assert set(got) == {"rejected"}
+        assert _NoResolver.calls == [] and _NoSockets.made == 0
 
-    def test_localhost_that_is_resolved_to_a_public_address_never_connects(
-            self, monkeypatch):
-        """The check is on the resolved address, not on the spelling."""
-        _resolve_to(monkeypatch, {"localhost": ["203.0.113.9"]})
-        _forbid_sockets(monkeypatch)
-        assert probe_daemon("http://localhost:7437") is None
-        assert _NoSockets.made == 0
-
-    def test_one_non_loopback_answer_among_loopback_ones_refuses(
-            self, monkeypatch):
-        _resolve_to(monkeypatch, {"split.test": ["127.0.0.1", "203.0.113.9"]})
-        _forbid_sockets(monkeypatch)
-        assert probe_daemon("http://split.test:7437") is None
-        assert _NoSockets.made == 0
-
-    def test_any_name_that_resolves_to_loopback_is_allowed(
+    def test_localhost_is_mapped_to_127_0_0_1_without_a_resolver(
             self, monkeypatch, serve):
-        """Validated by resolved address, and connected by it: the socket goes
-        to the resolved IP, not to the name a second time."""
         s = serve()
-        _resolve_to(monkeypatch, {"my-box.test": ["127.0.0.1"]})
+        _NoResolver.install(monkeypatch)
         seen = []
         real = socket.socket
 
@@ -201,18 +214,20 @@ class TestLoopbackOnly:
                 return super().connect(addr)
 
         monkeypatch.setattr(socket, "socket", Spy)
-        assert probe_daemon(f"http://my-box.test:{s.port}") is not None
-        assert seen == [("127.0.0.1", s.port)]
-
-    def test_localhost_and_other_loopback_forms_work(self, serve):
-        s = serve()
         assert probe_daemon(f"http://localhost:{s.port}") is not None
-        assert probe_daemon(f"http://127.0.0.1:{s.port}") is not None
+        assert probe_daemon(f"http://LocalHost:{s.port}") is not None
+        assert seen == [("127.0.0.1", s.port)] * 2
+        assert _NoResolver.calls == []
 
-    def test_ipv4_mapped_ipv6_of_a_public_address_is_refused(self, monkeypatch):
-        _forbid_sockets(monkeypatch)
-        assert probe_daemon("http://[::ffff:203.0.113.9]:80") is None
-        assert _NoSockets.made == 0
+    def test_any_address_in_127_8_works(self, serve):
+        s = serve()
+        assert probe_daemon(f"http://127.0.0.1:{s.port}") is not None
+        assert "rejected" not in (probe_daemon(f"http://127.5.6.7:{s.port}") or {})
+
+    def test_ipv6_loopback_literal_is_accepted_by_the_check(self, monkeypatch):
+        _NoResolver.install(monkeypatch)
+        got = probe_daemon(f"http://[::1]:{_free_port()}")
+        assert got is None  # accepted, nothing listening (or no IPv6)
 
     def test_a_peer_that_is_not_loopback_is_dropped(self, monkeypatch, serve):
         s = serve()

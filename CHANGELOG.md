@@ -358,8 +358,9 @@ All notable changes to Revien are documented here. Format follows
     answer, prompt?}`. That call returns, for every memory on the receipt,
     its verdict (used / unused / abstain), shared terms, similarity, the
     rule's reason, and whether it was applied. Errors: 404 unknown receipt,
-    409 already redeemed, 410 expired, 400 empty answer. Nothing is written
-    on an error.
+    409 already redeemed, 410 expired, 400 empty answer. No judgment is
+    written on an error (the expiry pass runs first, so such a call can still
+    flag other overdue receipts).
   - A receipt's row is in the new `recall_receipts` table. It holds ids, the
     runtime and the query (so restated words can be discounted), never memory
     content. Memories are judged as they are now, not as they were recalled.
@@ -411,22 +412,29 @@ All notable changes to Revien are documented here. Format follows
     database's new `store_meta` table, refreshed every 10 s and removed on a
     clean exit (a row older than 60 s is ignored), and `GET /v1/health` now
     lists `features`; it adds no path and no id derived from one. A daemon
-    from before reports no features: the command makes ONE health request on
-    loopback (`--daemon-url`, default `http://127.0.0.1:7437`) in
-    `revien/loopback_probe.py`, and an answer without the features list
-    refuses. Nothing answering means no daemon, and the reset proceeds. The
-    probe judges the address the host name resolves to (every resolved address
-    must be loopback, and the connection goes to that address), never follows
-    a redirect, never reads proxy settings, and returns only the features
-    list and version. Limit: an old daemon on another port is found only if
+    from before reports no features: the command makes at most ONE health
+    request, to a loopback address (`--daemon-url`, default
+    `http://127.0.0.1:7437`), in `revien/loopback_probe.py`, and an answer
+    without the features list refuses. Nothing answering means no daemon, and
+    the reset proceeds. Only an IP literal in 127.0.0.0/8, `[::1]`, or the
+    literal `localhost` (mapped to 127.0.0.1 by the probe itself) is
+    accepted; any other `--daemon-url` (another IP, any other host name, a
+    non-http scheme) refuses the reset with "Use a loopback --daemon-url" and
+    nothing is resolved or contacted, so no name leaves the machine. The probe
+    never follows a redirect, never reads proxy settings, and returns only the
+    features list and version. Limit: an old daemon on another port is found only if
     you point `--daemon-url` at it; an old daemon whose answer cannot say
     which database it serves refuses either way.
   - The egress gate (`scripts/gates/check_egress.py`) pins the SHA-256 of
     `revien/loopback_probe.py` and fails if any other file imports it other
     than as `from revien.loopback_probe import probe_daemon` used as a call,
     or reaches into it (alias, attribute, `__globals__`, `setattr`, a string
-    naming it). That rules out re-exporting its network module or patching it
-    from another file. The gate's self-tests cover both; its limits are listed
+    naming it). The gate parses every file and flags those forms, which catches
+    re-exporting its network module or patching it through the shapes it
+    knows (it is a heuristic: for example a module name assembled at run time
+    is not seen). It also flags `pkgutil.resolve_name` and `builtins.__dict__`
+    use as dynamic imports; importing by file location (`importlib.util`) and
+    `runpy` are known not to be caught and are listed as limits. The gate's self-tests cover both; its limits are listed
     when it runs.
 - **Schema: migration 005 (`PRAGMA user_version` 5).** All of the above
   creates its tables in one numbered migration,
