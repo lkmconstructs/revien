@@ -7,36 +7,82 @@ All notable changes to Revien are documented here. Format follows
 
 ### Added
 - **`revien sync reset <adapter>` — re-read a connected adapter's full history.**
-  Clears that adapter's persisted sync cursor (new
-  `GraphStore.delete_sync_cursor`), so the next sync starts at EPOCH;
-  the change is picked up at the daemon's next sync (default every 6 hours).
-  A sync already running when you reset saves the time that sync started
-  when it finishes, which undoes the reset; run it again once that sync ends.
-  It deletes nothing from the graph. Only adapters whose items all carry a
-  stable `ingest_key` (claude-code, codex; declared by `IDEMPOTENT_REREAD` on
-  the adapter class, and checked against what each adapter actually emits in
-  `tests/test_sync_reset.py`) can be reset: re-reading a session refreshes
-  its one context node instead of duplicating it. Other adapters (file
-  watcher, Obsidian, generic API) are refused with exit 1, because a full
-  re-read would add everything again as new nodes; a config entry with a
+  Resets that adapter's persisted sync cursor (`GraphStore.reset_sync_cursor`),
+  so the next sync starts at EPOCH; the change is picked up at the daemon's
+  next sync (default every 6 hours). It deletes nothing from the graph. Only
+  adapters whose items all carry a stable `ingest_key` (claude-code, codex;
+  declared by `IDEMPOTENT_REREAD` on the adapter class, and checked against
+  what each adapter actually emits in `tests/test_sync_reset.py`, including a
+  codex rollout with no known project) can be reset: re-reading a session
+  refreshes its one context node instead of duplicating it. Other adapters
+  (file watcher, Obsidian, generic API) are refused with exit 1, because a
+  full re-read would add everything again as new nodes; a config entry with a
   missing or unknown `type` is refused as a config error instead. The name
-  must be a connected adapter; a name that only has a saved position is
-  refused and the connected names are listed; `usage:*` positions are refused
-  with a pointer to `revien usage scan --full`.
-  If the audit trail records explicit forgets (retention expiry, which also
-  writes `forget` rows, is excluded by its `retention_expire` reason), a full
-  re-read would capture those sessions again when their files still exist,
-  so the command prints a warning and needs `--yes`. Limits, stated plainly:
-  content removed by retention expiry is not counted, and `DELETE
-  /v1/nodes` and LangChain `clear()` leave no audit record at all, so the
-  command cannot warn about any of those and a re-read may capture that
-  content again. Known and unchanged: keying is per project +
-  file stem, so same-stem files in one project collide; and nodes extracted
-  from an edited session are not refreshed (only its context node is).
+  must be a connected adapter, unless `--orphaned` is given (below); `usage:*`
+  positions are refused with a pointer to `revien usage scan --full`. All of
+  these refusals happen before the database is opened, so a mistyped name
+  does not write the current schema into an older Revien database.
+  `--orphaned` resets a saved position whose adapter is no longer in the
+  config. It works only when a `sync_cursors` row exists for that name (and is
+  refused for a connected adapter); the adapter's type cannot be checked, and
+  the command says so.
+  Known and unchanged: keying is per project + file stem, so same-stem files
+  in one project collide; and nodes extracted from an edited session are not
+  refreshed (only its context node is).
   A missing, empty, directory, non-SQLite, locked or non-Revien `--db` gives
-  a one-line error and exit 1. A foreign file is recognised read-only (a
-  `mode=ro` connection reading its table list: it must have Revien's `nodes`
-  and `edges` tables with Revien's columns) and is left byte-identical.
+  a one-line error and exit 1. A foreign file is recognised read-only: it
+  must have Revien's `nodes`, `edges` and `audit_log` tables with every
+  column the oldest real Revien database (commit 7757085) has (`sync_cursors`,
+  added later, is checked when present). The file is opened read-only and
+  creates no `-wal`/`-shm` sidecar (immutable when there is no `-wal` file,
+  read-only when one exists, since recent data lives there); tests assert
+  the bytes and directory listing are unchanged for foreign WAL-mode files.
+- **Reset/sync generation fencing.** `sync_cursors` gains a `generation`
+  column (added in place to existing databases). A reset keeps the row, blanks
+  the cursor and bumps the generation. The scheduler reads the generation
+  before it fetches and saves its cursor only if it is unchanged
+  (`set_sync_cursor_if_generation`, a single SQL compare-and-set, so it also
+  fences a reset made from another process). A sync that was running when you
+  reset finishes with status `reset_during_sync` and its newer position is
+  discarded; the reset stands. Tested by interleaving sync start, reset and
+  sync finish. Limit: a sync that was already running may still have ingested
+  items (harmless, ingestion refreshes in place).
+- **Suppression tombstones: forgetting a session stops sync recapturing it.**
+  A new content-free table `ingest_suppressions` holds one row per stable
+  source identity (`identity`, `kind`, `created_at`, `reason`, `actor`, plus a
+  skip counter). It is written, in the same transaction as the delete, by an
+  explicit user forget (`forget_node` / `POST /v1/nodes/{id}/forget`, any
+  reason except `retention_expire`) and by `DELETE /v1/nodes/{id}`. Retention
+  expiry never writes one. Ordinary ingestion of a suppressed identity
+  (adapter sync, MCP store, REST ingest, `revien ingest`) is skipped, printed,
+  counted (`ingest_suppressions.skipped_count`, the sync result's
+  `items_suppressed`, `suppressed` in the REST/MCP ingest response) and never
+  silent. `revien suppressions` lists them; `revien restore <identity>` (and
+  `POST /v1/suppressions/restore`) lifts one, audited. `revien import` and
+  `POST /v1/graph/import` skip nodes of suppressed sources and count them
+  unless `--override-suppressions` / `override_suppressions=true`, the
+  explicit reimport, which lifts them (audited). A restored session is read
+  again when its file next changes or after `revien sync reset`.
+  Decisions (owner to confirm): the identity is the node's `source_id` plus
+  its context node's `ingest_key`, so it survives the file changing.
+  Forgetting ONE extracted node suppresses that node's whole source session
+  (the node's content cannot be matched without storing it): the session's
+  other nodes stay, but its future turns are no longer captured until
+  restored. Only source ids that name one unit are tombstoned
+  (`claude-code:`, `codex:`, `openai:conversation:`, `file:`, `vault:`);
+  shared channel ids ("mcp", "hermes", "ollama_*", "langchain", `api:<feed>`)
+  are not, because that would block everything the channel sends, and the
+  forget/delete response says so (`suppression_unavailable` /
+  `suppression: "unavailable"`). The identity string itself (a project or file
+  name) remains in the table; the content does not.
+  The `sync reset` forget warning now counts only what is provably not
+  covered (`count_unprotected_forgets`: forgets recorded before this change,
+  or of a source with no stable identity) and needs `--yes` for those.
+- **Fixed: forget and delete left node content in the audit trail.** Earlier
+  `add`/`update` audit rows keep full node snapshots, so a forgotten or
+  deleted node's content survived there. `GraphStore.delete_node` now blanks
+  the snapshots of that node's audit rows (op, actor and time are kept).
+
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/
@@ -378,6 +424,23 @@ All notable changes to Revien are documented here. Format follows
   context nodes (stamps and refreshes it) instead of appending yet another copy. Known
   limitation: the older historical duplicates remain in the graph — retroactive merge
   is out of scope here; the consolidate (dream) pass is the future home for that cleanup.
+
+### Known gaps / required follow-up
+- LangChain `RevienMemory.clear()` writes no tombstone (decision: it wipes the
+  whole store from application code and its source ids are caller-chosen, so
+  it is not treated as a user forget). Follow-up: owner to confirm.
+- Forgetting or deleting content whose source has no stable identity (REST/MCP
+  default ids, hermes, ollama, langchain, `api:<feed>`) cannot be suppressed;
+  a later sync or ingest can capture it again. Follow-up: a content-free
+  identity for these, or caller-supplied keys.
+- Skill nodes are not gated by suppression (skill ingest bypasses the
+  pipeline). An Obsidian section's identity includes its heading slug, so
+  renaming the heading or moving the file creates a new identity.
+- Forgets and `DELETE`s made before this change have no tombstone and are not
+  retroactively protected; `DELETE` of an unsuppressible source leaves no
+  audit row, so the warning cannot count it.
+- Suppressions apply to ingestion through the pipeline and to graph import; no
+  other writer is gated.
 
 ## [0.3.0] — 2026-07-11
 
