@@ -312,6 +312,11 @@ def _write_session(root, entries, project="billing", session="sess-1"):
     path = root / "projects" / project / f"{session}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(_lines(entries)) + "\n", encoding="utf-8")
+    # A file modified in the same clock tick as the cursor stamp is re-read on
+    # purpose; Windows' coarse clock makes that tick wide. Age the fixture so
+    # cursor tests test the cursor (tests that need "newer" set it explicitly).
+    old = time.time() - 60
+    os.utime(path, (old, old))
     return path
 
 
