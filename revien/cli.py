@@ -1593,12 +1593,47 @@ def sync():
 
 # Columns a Revien database must have in the tables it always creates. A
 # table of the same name with other columns means a foreign database.
+# The complete column sets of the oldest real Revien database (commit
+# 7757085, 0.3.0) for nodes, edges and audit_log; later versions only add
+# columns and tables. sync_cursors appeared later, so it is checked only when
+# present. A file missing any of these is not a Revien database.
 _REVIEN_TABLE_COLUMNS = {
-    "nodes": {"node_id", "node_type", "label", "content"},
-    "edges": {"edge_id", "edge_type", "source_node_id", "target_node_id"},
-    "audit_log": {"node_id", "op", "after_json"},
+    "nodes": {
+        "node_id", "node_type", "label", "content", "source_id", "created_at",
+        "last_accessed", "access_count", "metadata", "source_type",
+        "confidence", "pinned", "confidence_set_at", "confidence_set_by",
+        "source_context", "last_referenced", "invalidated_at",
+        "source_modality", "answerable_by_text", "vision_processed",
+        "recorded_at", "event_time_start", "event_time_end",
+        "event_time_granularity", "event_time_confidence", "event_time_text",
+        "valid_from", "valid_until",
+    },
+    "edges": {
+        "edge_id", "edge_type", "source_node_id", "target_node_id", "weight",
+        "created_at", "metadata", "confidence", "confidence_set_at",
+        "confidence_set_by", "source_context",
+    },
+    "audit_log": {"id", "node_id", "op", "actor", "ts", "before_json",
+                  "after_json"},
     "sync_cursors": {"adapter_name", "cursor", "updated_at"},
 }
+_REVIEN_REQUIRED_TABLES = {"nodes", "edges", "audit_log"}
+
+
+def _readonly_uri(p: Path) -> str:
+    """SQLite URI for a read that changes nothing on disk. A WAL-mode file
+    opened plain read-only still CREATES -wal/-shm sidecars, so when no -wal
+    file exists the file is opened immutable (no locks, no sidecars; with no
+    -wal file the main file holds everything). When a -wal file exists (an
+    open or crashed WAL database) it is opened read-only instead, because
+    recent data lives in the WAL and immutable would not see it."""
+    import urllib.parse
+    resolved = p.resolve()
+    quoted = urllib.parse.quote(str(resolved))
+    wal = Path(str(resolved) + "-wal")
+    if wal.exists():
+        return "file:" + quoted + "?mode=ro"
+    return "file:" + quoted + "?mode=ro&immutable=1"
 
 
 def _sqlite_problem(db_path: str) -> Optional[str]:
@@ -1607,14 +1642,13 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
     an empty or foreign file.
 
     A SQLite header alone is not enough (any app's database has one), so the
-    file is opened READ-ONLY (``mode=ro`` URI: it cannot be written, not even
-    a journal) and its own catalog is read: it must hold the ``nodes`` and
-    ``edges`` tables every Revien database has, and any of ``nodes``,
-    ``edges``, ``audit_log`` and ``sync_cursors`` that exist must have
-    Revien's columns. Tables a Revien database may lack (older versions) are
-    not required, so older Revien files are still accepted."""
+    file is opened READ-ONLY (see ``_readonly_uri``: it cannot be written and
+    creates no journal, -wal or -shm file, even for a WAL-mode database) and
+    its own catalog is read: it must hold the
+    ``nodes``, ``edges`` and ``audit_log`` tables every Revien version has,
+    each with every column the oldest real version has. ``sync_cursors``,
+    added later, is checked only when present."""
     import sqlite3
-    import urllib.parse
 
     p = Path(db_path)
     if not p.exists():
@@ -1630,15 +1664,16 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
         return f"{db_path} is empty, not a Revien database."
     if head != b"SQLite format 3\x00":
         return f"{db_path} is not a SQLite database."
-    uri = "file:" + urllib.parse.quote(str(p.resolve())) + "?mode=ro"
+    uri = _readonly_uri(p)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=1.0)
         try:
             tables = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
-            if not {"nodes", "edges"} <= tables:
+            if not _REVIEN_REQUIRED_TABLES <= tables:
                 return (f"{db_path} is a SQLite database but not a Revien "
-                        "database (no nodes/edges tables). Not touching it.")
+                        "database (no nodes/edges/audit_log tables). "
+                        "Not touching it.")
             for table, wanted in _REVIEN_TABLE_COLUMNS.items():
                 if table not in tables:
                     continue
@@ -1660,7 +1695,10 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
 @sync.command(name="reset")
 @click.argument("adapter_name")
 @click.option("--db", default=None, help="Database path")
-def sync_reset(adapter_name: str, db: Optional[str]):
+@click.option("--orphaned", is_flag=True,
+              help="Reset a saved sync position whose adapter is no longer in "
+                   "your config (only works when a saved position exists)")
+def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool):
     """Clear a connected adapter's sync position so its next sync re-reads
     its full history (for example 'revien sync reset claude-code').
 
@@ -1668,7 +1706,13 @@ def sync_reset(adapter_name: str, db: Optional[str]):
     can be reset: their sessions are refreshed in place, not duplicated, so
     the reset is safe to repeat. Other adapters would ingest everything again
     as new nodes, so they are refused. Nothing is deleted from the graph.
-    The new position is used at the next sync (default every 6 hours)."""
+    A sync already running when you reset cannot undo the reset: its newer
+    position is discarded. The new position is used at the next sync
+    (default every 6 hours).
+
+    --orphaned resets a saved position whose adapter was removed from your
+    config. Its type cannot be checked, so the reset is allowed only because
+    a saved position exists."""
     import sqlite3
 
     from revien.adapters import (
@@ -1690,26 +1734,34 @@ def sync_reset(adapter_name: str, db: Optional[str]):
     adapters = config.get("adapters") or {}
     connected = list(adapters.keys())
     entry = adapters.get(adapter_name)
+    connected_txt = ", ".join(sorted(connected)) or "none"
 
-    try:
-        store = GraphStore(db_path=db_path)
-    except (sqlite3.Error, OSError) as e:
-        click.echo(f"Cannot open {db_path}: {e}")
-        raise SystemExit(1)
-    try:
-        if entry is None:
-            has_cursor = adapter_name in store.list_sync_cursor_names()
-            connected_txt = ", ".join(sorted(connected)) or "none"
-            if has_cursor:
+    # Everything that can be decided from the config and a read-only look at
+    # the database is decided BEFORE a GraphStore is opened: opening one
+    # migrates (writes to) the database, and a mistyped name must not do that.
+    if entry is None:
+        if not orphaned:
+            if _has_sync_row(db_path, adapter_name):
                 click.echo(
                     f"'{adapter_name}' has a saved sync position but is not a "
                     "connected adapter in your config, so its type cannot be "
                     "checked and it is not reset. Connected adapters: "
-                    f"{connected_txt}. Connect it again ('revien connect') "
-                    "or use one of those names.")
+                    f"{connected_txt}. Connect it again ('revien connect'), "
+                    "use one of those names, or re-run with --orphaned to "
+                    "reset the saved position anyway.")
             else:
                 click.echo(f"No connected adapter named '{adapter_name}'. "
                            f"Connected adapters: {connected_txt}.")
+            raise SystemExit(1)
+        if not _has_sync_row(db_path, adapter_name):
+            click.echo(f"No saved sync position for '{adapter_name}', so "
+                       "--orphaned has nothing to reset. Connected adapters: "
+                       f"{connected_txt}. Nothing was changed.")
+            raise SystemExit(1)
+    else:
+        if orphaned:
+            click.echo(f"'{adapter_name}' is a connected adapter, so "
+                       "--orphaned does not apply. Run the command without it.")
             raise SystemExit(1)
         atype = entry.get("type", "") if isinstance(entry, dict) else None
         if not isinstance(atype, str) or atype not in _ADAPTER_CLASSES:
@@ -1727,25 +1779,57 @@ def sync_reset(adapter_name: str, db: Optional[str]):
                 "nodes instead of refreshing them. Only claude-code and codex "
                 "adapters can be reset.")
             raise SystemExit(1)
-        existed = store.delete_sync_cursor(adapter_name)
+
+    try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        had_position = store.reset_sync_cursor(adapter_name)
     except sqlite3.Error as e:
         click.echo(f"Database error: {e}")
         raise SystemExit(1)
     finally:
         store.close()
 
-    if not existed:
+    if had_position is None:
         click.echo(f"'{adapter_name}' has no saved sync position, so its next "
                    "sync already reads its full history. Nothing to reset.")
         return
-    click.echo(f"Cleared the sync position for '{adapter_name}'.")
+    if not had_position:
+        click.echo(f"'{adapter_name}' was already reset; its next sync reads "
+                   "its full history. The reset was recorded again.")
+    else:
+        click.echo(f"Cleared the sync position for '{adapter_name}'.")
+    if orphaned:
+        click.echo("Its adapter type is unknown (it is not in your config). If "
+                   "you connect it again as anything other than claude-code or "
+                   "codex, its first sync adds everything as new nodes.")
     click.echo("It takes effect at the next sync (default every 6 hours), "
                "which re-reads the full history. Already captured sessions "
                "are refreshed in place, not duplicated. Nothing was deleted.")
-    click.echo("If the daemon is in the middle of a sync right now, it will "
-               "save the time that sync started when it finishes, which "
-               "undoes this reset; run this again after it ends. If the daemon is not running, start it with "
-               "'revien start'.")
+    click.echo("A sync that is running right now cannot undo this reset: when "
+               "it finishes, its position is discarded. If the daemon is not "
+               "running, start it with 'revien start'.")
+
+
+def _has_sync_row(db_path: str, name: str) -> bool:
+    """True if sync_cursors holds a row for ``name``. Read-only (see
+    _readonly_uri): creates no files."""
+    import sqlite3
+
+    uri = _readonly_uri(Path(db_path))
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sync_cursors WHERE adapter_name = ?",
+                (name,)).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
 
 
 @main.group()

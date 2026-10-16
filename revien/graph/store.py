@@ -1376,21 +1376,34 @@ class GraphStore:
     # ── Adapter-sync cursors (repair leg R3) ───────────────────────────
     @_locked
     def get_sync_cursor(self, adapter_name: str) -> Optional[datetime]:
-        """Persisted sync position for one adapter. None = never synced —
-        the scheduler treats that as EPOCH (full history on first sync)."""
+        """Persisted sync position for one adapter. None = never synced (or
+        reset) — the scheduler treats that as EPOCH (full history)."""
+        return self.get_sync_state(adapter_name)[0]
+
+    @_locked
+    def get_sync_state(self, adapter_name: str) -> tuple:
+        """(cursor or None, generation). No row = (None, 0). A reset row
+        (blank cursor) = (None, generation). Read this BEFORE fetching and
+        pass the generation to ``set_sync_cursor_if_generation``."""
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            "SELECT cursor, generation FROM sync_cursors WHERE adapter_name = ?",
             (adapter_name,),
         ).fetchone()
         if row is None:
-            return None
-        return datetime.fromisoformat(row[0])
+            return (None, 0)
+        cursor = datetime.fromisoformat(row[0]) if row[0] else None
+        return (cursor, int(row[1] or 0))
+
+    @_locked
+    def get_sync_generation(self, adapter_name: str) -> int:
+        return self.get_sync_state(adapter_name)[1]
 
     @_locked
     def set_sync_cursor(self, adapter_name: str, cursor: datetime) -> None:
-        """Persist an adapter's sync position (upsert). Called only after a
-        fully successful sync — a failed/unhealthy sync never advances it."""
+        """Persist an adapter's sync position (upsert, unfenced; keeps the
+        row's generation). For callers that cannot be reset (usage observer).
+        The adapter scheduler uses ``set_sync_cursor_if_generation``."""
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
@@ -1403,8 +1416,38 @@ class GraphStore:
         self._commit(conn)
 
     @_locked
+    def set_sync_cursor_if_generation(
+        self, adapter_name: str, cursor: datetime, expected_generation: int,
+    ) -> bool:
+        """Compare-and-set: persist the cursor only if the row's generation
+        still equals ``expected_generation`` (the one read before the fetch).
+        Returns False, writing nothing, when a reset happened in between.
+        Atomic in SQL, so it also fences a reset from another process.
+        Absent row is generation 0."""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
+            "WHERE adapter_name = ? AND generation = ?",
+            (cursor.isoformat(), now, adapter_name, expected_generation),
+        )
+        ok = cur.rowcount > 0
+        if not ok and expected_generation == 0:
+            # No row yet? INSERT OR IGNORE loses to any row that exists.
+            ins = conn.execute(
+                "INSERT OR IGNORE INTO sync_cursors "
+                "(adapter_name, cursor, updated_at, generation) "
+                "VALUES (?, ?, ?, 0)",
+                (adapter_name, cursor.isoformat(), now),
+            )
+            ok = ins.rowcount > 0
+        self._commit(conn)
+        return ok
+
+    @_locked
     def list_sync_cursor_names(self) -> List[str]:
-        """Names of all adapters with a persisted sync position."""
+        """Names of all adapters with a sync_cursors row (recorded state),
+        including rows left blank by a reset."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT adapter_name FROM sync_cursors ORDER BY adapter_name"
@@ -1412,9 +1455,33 @@ class GraphStore:
         return [r[0] for r in rows]
 
     @_locked
+    def reset_sync_cursor(self, adapter_name: str) -> Optional[bool]:
+        """Acknowledged reset: blank the cursor (next sync starts at EPOCH)
+        and BUMP the generation, so any sync already in flight fails its
+        compare-and-set and cannot write its older position back. Returns
+        None if the adapter has no row (nothing recorded, nothing changed),
+        else True if it held a real position, False if already blank."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            (adapter_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        had_position = bool(row[0])
+        conn.execute(
+            "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
+            "updated_at = ? WHERE adapter_name = ?",
+            (datetime.now(timezone.utc).isoformat(), adapter_name),
+        )
+        self._commit(conn)
+        return had_position
+
+    @_locked
     def delete_sync_cursor(self, adapter_name: str) -> bool:
-        """Remove one adapter's sync position so its next sync starts at EPOCH
-        (full history). Returns True if a row existed. Deletes nothing else."""
+        """Remove one adapter's sync row outright. Not fenced: a stale writer
+        can re-create the row. ``reset_sync_cursor`` is the fenced reset;
+        this remains for housekeeping. Returns True if a row existed."""
         conn = self._get_conn()
         cur = conn.execute(
             "DELETE FROM sync_cursors WHERE adapter_name = ?",
