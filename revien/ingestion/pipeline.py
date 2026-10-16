@@ -15,6 +15,7 @@ from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
 from revien.graph.origin import derive_origin, validate_origin
+from revien.graph.suppression import parent_session_identity
 
 
 def _ingest_deny_set() -> set:
@@ -293,7 +294,8 @@ class IngestionPipeline:
         #     restore` or a graph-import override lifts it. Checked before
         #     anything is extracted or stored.
         hit = self.store.find_ingest_suppression(
-            input_data.source_id or "", (input_data.ingest_key or "").strip())
+            input_data.source_id or "", (input_data.ingest_key or "").strip(),
+            input_data.metadata)
         if hit is not None:
             self.store.note_suppressed_skip(hit["identity"], hit["kind"])
             print(
@@ -479,6 +481,15 @@ class IngestionPipeline:
                         **(node.metadata or {}),
                         "ingest_key": ingest_key,
                         "ingest_content_hash": content_hash,
+                    }
+                # A sub-agent file's parent session (a bare UUID, no text):
+                # kept so a graph import is gated by the parent's tombstone
+                # too, like live ingestion.
+                if parent_session_identity(input_data.metadata):
+                    node.metadata = {
+                        **(node.metadata or {}),
+                        "parent_session_id":
+                            input_data.metadata["parent_session_id"].strip().lower(),
                     }
             # Curated provenance: human-curated content is ground truth —
             # full confidence, and the `curated` metadata flag is what the

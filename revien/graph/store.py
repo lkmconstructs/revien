@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from .origin import derive_origin
-from .suppression import session_identity_for, unit_key
+from .suppression import parent_session_identity, session_identity_for, unit_key
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -1260,6 +1260,27 @@ class GraphStore:
         self._commit(conn)
 
     @_locked
+    def distill_notes_for_nodes(self, node_ids: List[str]) -> List[str]:
+        """Stems of distilled vault notes whose manifest names any of these
+        nodes (as the claim, its anchor, or the entity the note is about).
+        Read BEFORE a delete: the delete drops the manifest rows, and the note
+        file outside the database keeps the claim until the next
+        `revien distill-vault`."""
+        if not node_ids:
+            return []
+        conn = self._get_conn()
+        stems: set = set()
+        for i in range(0, len(node_ids), 300):
+            chunk = list(node_ids[i:i + 300])
+            marks = ", ".join("?" for _ in chunk)
+            for (stem,) in conn.execute(
+                    "SELECT DISTINCT note_stem FROM distill_manifest WHERE "
+                    f"current_node_id IN ({marks}) OR anchor_node_id IN ({marks}) "
+                    f"OR entity_id IN ({marks})", chunk * 3).fetchall():
+                stems.add(stem)
+        return sorted(stems)
+
+    @_locked
     def manifest_refs_elsewhere(self, node_id: str, exclude_stem: str) -> bool:
         """True if this node is rendered into a DIFFERENT note's manifest — so
         deleting its line from one note must not soft-invalidate it globally."""
@@ -1389,6 +1410,31 @@ class GraphStore:
         self._commit(conn)
         return deleted
 
+    # ── Database id ───────────────────────────────────────
+
+    _DB_ID_KEY = "database_id"
+
+    @_locked
+    def database_id(self) -> str:
+        """A random id for THIS database, created once and kept in
+        ``store_meta``. It is not derived from the path or the contents, so
+        publishing it (``GET /v1/health``) reveals nothing about either; a
+        client uses it only to tell whether a daemon serves the database it
+        is about to change. A copy of the file carries the same id."""
+        import secrets
+        conn = self._get_conn()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS store_meta "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT OR IGNORE INTO store_meta (key, value) VALUES (?, ?)",
+            (self._DB_ID_KEY, secrets.token_hex(8)))
+        row = conn.execute(
+            "SELECT value FROM store_meta WHERE key = ?",
+            (self._DB_ID_KEY,)).fetchone()
+        self._commit(conn)
+        return str(row[0])
+
     # ── Ingestion suppression tombstones ──────────────────
 
     @_locked
@@ -1418,10 +1464,15 @@ class GraphStore:
     @_locked
     def find_ingest_suppression(
         self, source_id: str = "", ingest_key: str = "",
+        metadata: Optional[dict] = None,
     ) -> Optional[dict]:
-        """The suppression row matching this ingest, else None."""
+        """The suppression row matching this ingest, else None. ``metadata``
+        may carry ``parent_session_id`` (a sub-agent file's parent session)."""
         conn = self._get_conn()
         candidates = [(source_id, "source_id"), (ingest_key, "ingest_key")]
+        parent = parent_session_identity(metadata)
+        if parent:
+            candidates.append((parent, "session_id"))
         for raw in (source_id, ingest_key):
             session = session_identity_for(raw or "")
             if session:
@@ -1948,8 +1999,13 @@ class GraphStore:
                 "WHERE node_ids LIKE ?", (f'%"{node_id}"%',),
             ).fetchall():
                 remaining = [n for n in json.loads(raw or "[]") if n != node_id]
+                # The receipt also keeps the query text (the user's words,
+                # which can repeat the forgotten fact). A receipt that
+                # surfaced this node loses its query; the row stays so an
+                # expired flag is not silently lost.
                 conn.execute(
-                    "UPDATE recall_receipts SET node_ids = ? WHERE recall_id = ?",
+                    "UPDATE recall_receipts SET node_ids = ?, query = '' "
+                    "WHERE recall_id = ?",
                     (json.dumps(remaining), recall_id),
                 )
             # Supersession candidates carry a reason/trace written from the
@@ -2633,7 +2689,7 @@ class GraphStore:
                 sid = n.source_id or ""
                 key = (n.metadata or {}).get("ingest_key") or ""
                 key = key if isinstance(key, str) else ""
-                hit = self.find_ingest_suppression(sid, key)
+                hit = self.find_ingest_suppression(sid, key, n.metadata)
                 if hit is None:
                     kept.append(n)
                     continue

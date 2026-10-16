@@ -164,16 +164,6 @@ class NodeResponse(BaseModel):
 DAEMON_FEATURES = ("suppression_tombstones", "sync_reset_fence")
 
 
-def db_identity(db_path: str) -> str:
-    """Stable short id of a database file path, for health checks."""
-    import hashlib
-    try:
-        resolved = str(Path(db_path).resolve())
-    except OSError:
-        resolved = str(db_path)
-    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
-
-
 class HealthResponse(BaseModel):
     status: str
     node_count: int
@@ -184,8 +174,9 @@ class HealthResponse(BaseModel):
     # guarantees. A daemon from before they existed omits both fields, which
     # is how `revien sync reset` recognises one it cannot trust.
     features: List[str] = []
-    # Short hash of the database path (never the path itself), so a client can
-    # tell whether this daemon is serving the database it is about to change.
+    # Random id stored in the database (not derived from its path or content),
+    # so a client can tell whether this daemon serves the database it is about
+    # to change without learning anything about it.
     db_id: str = ""
 
 
@@ -381,6 +372,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     clustering = CommunityDetector(db_path=db_path)
     engine = RetrievalEngine(store, clustering=clustering, semantic=semantic)
     start_time = time.time()
+    db_id = store.database_id()
 
     # Load existing community assignments (or run initial clustering)
     if not clustering.load_from_db():
@@ -960,7 +952,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             uptime_seconds=round(time.time() - start_time, 2),
             version=__version__,
             features=list(DAEMON_FEATURES),
-            db_id=db_identity(store.db_path),
+            db_id=db_id,
         )
 
     # ── POST /v1/sync ─────────────────────────────────
@@ -1203,7 +1195,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
         Distinct from invalidate (which retains). Writes a content-free tombstone
         audit entry and re-points children's lineage to a tombstone marker.
-        cascade=True forgets the whole DERIVED_FROM subtree.
+        cascade=True forgets the whole DERIVED_FROM subtree; on a session's
+        verbatim context node it forgets every node of that session (the
+        pipeline never writes DERIVED_FROM; nodes are tied to a session by
+        source_id). GET .../forget/preview lists what it would remove.
         """
         req = request or ForgetRequest()
         result = ops.forget_node(

@@ -11,7 +11,9 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
-from .suppression import REASON_RETENTION, identities_for, notices_for
+from .suppression import (
+    REASON_RETENTION, identities_for, is_unit_source_id, notices_for,
+)
 
 
 # ── Governance Layer (leg 6b): retention config ──────────────────────────────
@@ -354,19 +356,57 @@ class GraphOperations:
                 children.append(edge.source_node_id)
         return children
 
+    def _session_unit(self, node_id: str) -> List[str]:
+        """Every node the pipeline wrote for the same session as ``node_id``,
+        when ``node_id`` is a verbatim CONTEXT node of a per-unit source.
+
+        What actually links an extracted node to its context node: nothing
+        that records derivation. The pipeline never writes DERIVED_FROM. It
+        stamps every node it creates with the unit's ``source_id`` and links
+        it to the context node by RELATED_TO / MENTIONED_BY / DECIDED_IN. Edges
+        are NOT a reliable definition of "derived from this session": the same
+        edge types also run from this context node to entities and claims that
+        ANOTHER session created (dedup reuses the existing node; declared links
+        and the known-entity gazetteer link by name), so following them would
+        delete other sessions' data. ``source_id`` is exact: it is set on every
+        node the pipeline, the OpenAI importer and distill create for the unit.
+        A node first created by this session but merged into by a later
+        session goes with it (it was created here); the later session's own
+        context node keeps its text and only loses the link.
+
+        Only per-unit sources qualify. A shared channel's source_id ("mcp",
+        "api:<feed>") names everything a channel ever sent, so it is never a
+        session and the unit is empty for it.
+        """
+        node = self.store.get_node(node_id)
+        if (node is None or node.node_type != NodeType.CONTEXT
+                or node_id.startswith(self.TOMBSTONE_PREFIX)
+                or not node.source_id
+                or not is_unit_source_id(node.source_id)):
+            return []
+        return [
+            n.node_id for n in self.store.list_nodes(
+                source_id=node.source_id, limit=999999)
+            if n.node_id != node_id
+            and not n.node_id.startswith(self.TOMBSTONE_PREFIX)
+        ]
+
     def forget_preview(self, node_id: str) -> Dict:
         """Report what a cascade forget WOULD remove — so cascade is never blind.
 
         Returns the node itself plus every descendant reachable via DERIVED_FROM
-        (the nodes that would be forgotten under ``cascade=True``). Cycle-safe.
+        and, when the node is a session's verbatim CONTEXT node, every node
+        stamped with that session's source_id (see ``_session_unit``). These
+        are the nodes ``cascade=True`` forgets. Cycle-safe.
         """
         root = self.store.get_node(node_id)
         if root is None or node_id.startswith(self.TOMBSTONE_PREFIX):
             return {"node_id": node_id, "exists": False, "count": 0, "node_ids": []}
 
+        unit = self._session_unit(node_id)
         to_delete: List[str] = []
         seen = set()
-        frontier = [node_id]
+        frontier = [node_id] + unit
         while frontier:
             current = frontier.pop(0)
             if current in seen:
@@ -382,6 +422,7 @@ class GraphOperations:
             "exists": True,
             "count": len(to_delete),
             "node_ids": to_delete,
+            "session_source_id": root.source_id if unit else None,
         }
 
     def suppress_node_source(
@@ -507,7 +548,12 @@ class GraphOperations:
         cascade=False (default): forget only this node. Children survive and now
         trace to the tombstone marker.
         cascade=True: also forget every node DERIVED_FROM this one, recursively
-        (each tombstoned). Use ``forget_preview`` first to see the blast radius.
+        (each tombstoned). Called on a session's verbatim CONTEXT node it
+        forgets the whole session: every node carrying that session's
+        source_id (the pipeline never writes DERIVED_FROM, so this is what
+        "derived from the session" means; see ``_session_unit``), in one call,
+        with the same tombstones. Use ``forget_preview`` first to see the
+        blast radius. Cascade from an extracted node follows DERIVED_FROM only.
 
         suppress: an explicit user forget (the default) also writes a
         content-free ingestion suppression keyed on the node's stable source
@@ -520,8 +566,12 @@ class GraphOperations:
         if suppress is None:
             # The reason string is free text a user controls (POST /forget
             # takes any reason), so it never decides this. Only the internal
-            # ``suppress=False`` argument, which no REST/CLI/MCP surface
-            # exposes (apply_retention passes it), marks automatic cleanup.
+            # ``suppress=False`` argument marks automatic cleanup. No surface
+            # passes that argument itself, but apply_retention does, and
+            # ``POST /v1/retention/sweep`` (caller-chosen mode and window)
+            # reaches apply_retention: an expiry the caller asks for there
+            # writes no tombstone. Whether it should is an open owner
+            # decision.
             suppress = True
         if node_id.startswith(self.TOMBSTONE_PREFIX):
             # Refuse to forget a gravestone — that would orphan lineage.
@@ -540,6 +590,10 @@ class GraphOperations:
             targets = list(reversed(order))
         else:
             targets = [node_id]
+
+        # Distilled vault notes are files outside the database; the delete
+        # drops the manifest rows that name these nodes, so read them first.
+        distilled_notes = self.store.distill_notes_for_nodes(targets)
 
         forgotten: List[str] = []
         outcome: Dict[str, Dict] = {}
@@ -578,7 +632,14 @@ class GraphOperations:
                 "The source's verbatim context node(s) "
                 f"({', '.join(residue)}) are separate nodes and still hold "
                 "the original text this was extracted from; forget them too "
-                "(cascade) to remove that text.")
+                "(cascade from the context node forgets the whole session) "
+                "to remove that text.")
+        if forgotten and distilled_notes:
+            notice.append(
+                f"{len(distilled_notes)} distilled vault note(s) "
+                f"({', '.join(distilled_notes)}) were rendered from this and "
+                "may still hold the claim as text in the vault; the next "
+                "`revien distill-vault` removes it.")
         # Deduplicate, keep order.
         notice = list(dict.fromkeys(notice))
         if forgotten:
@@ -593,6 +654,7 @@ class GraphOperations:
             "count": len(forgotten),
             "suppression_notice": notice,
             "context_nodes_remaining": residue,
+            "distilled_notes_remaining": distilled_notes if forgotten else [],
             "recapture_eligible": [u["node_id"] for u in unavailable],
             # Identities now suppressed from ordinary ingestion, and nodes
             # whose source has no stable identity (nothing could be bound).

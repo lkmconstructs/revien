@@ -35,10 +35,18 @@ class TrainingLoop:
         self._ensure_db()
         self._load_train_state()
 
+    def _connect(self) -> sqlite3.Connection:
+        """Every connection overwrites deleted content with zeros
+        (``secure_delete``), like the graph database: a forgotten recall's
+        query text must not stay in free pages or index cells of this file."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA secure_delete = ON")
+        return conn
+
     def _ensure_db(self) -> None:
         """Create the training signal table."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS retrieval_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,11 +72,15 @@ class TrainingLoop:
             CREATE INDEX IF NOT EXISTS idx_signals_node ON retrieval_signals(node_id)
         """)
         conn.commit()
+        # A file written before secure_delete was set can hold deleted query
+        # text in free pages; rewrite it once (a no-op when nothing is free).
+        if conn.execute("PRAGMA freelist_count").fetchone()[0]:
+            conn.execute("VACUUM")
         conn.close()
 
     def _load_train_state(self) -> None:
         """Load last training count from DB."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         row = conn.execute(
             "SELECT value FROM training_state WHERE key = 'last_train_count'"
         ).fetchone()
@@ -78,7 +90,7 @@ class TrainingLoop:
 
     def _save_train_state(self) -> None:
         """Persist training state."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.execute(
             "INSERT OR REPLACE INTO training_state (key, value) VALUES (?, ?)",
             ("last_train_count", str(self._last_train_count)),
@@ -96,7 +108,7 @@ class TrainingLoop:
         Initially logged as was_used=0; call mark_used() when the user
         actually uses a retrieved node.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         now = datetime.now(timezone.utc).isoformat()
         for result in results:
             conn.execute(
@@ -119,12 +131,22 @@ class TrainingLoop:
         self._maybe_train()
 
     def forget_node(self, node_id: str) -> None:
-        """Right-to-forget: drop every logged signal for a deleted node (the
-        log holds its label). Wired as a store delete listener by the
+        """Right-to-forget: drop every logged recall that surfaced a deleted
+        node. The log holds the node's label AND the query text of the recall
+        that returned it (the user's own words, which may repeat the forgotten
+        fact). A recall is logged as one batch of rows sharing a timestamp, so
+        all rows of each batch that included the node go, not just the node's
+        row: a signal whose query text is blanked is no longer training data.
+        A recall that never returned the node cannot be linked to it without
+        reading the text, and is kept. Wired as a store delete listener by the
         retrieval engine, so it covers deletes in processes that run the
         engine with neural logging on."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         try:
+            conn.execute(
+                "DELETE FROM retrieval_signals WHERE (query, timestamp) IN "
+                "(SELECT query, timestamp FROM retrieval_signals "
+                "WHERE node_id = ?)", (node_id,))
             conn.execute("DELETE FROM retrieval_signals WHERE node_id = ?",
                          (node_id,))
             conn.commit()
@@ -133,7 +155,7 @@ class TrainingLoop:
 
     def mark_used(self, node_id: str, query: Optional[str] = None) -> None:
         """Mark a node as actually used after retrieval (positive signal)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         if query:
             conn.execute(
                 "UPDATE retrieval_signals SET was_used = 1 WHERE node_id = ? AND query = ?",
@@ -149,7 +171,7 @@ class TrainingLoop:
 
     def get_signal_count(self) -> int:
         """Get total number of logged signals."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         count = conn.execute("SELECT COUNT(*) FROM retrieval_signals").fetchone()[0]
         conn.close()
         return count
@@ -170,7 +192,7 @@ class TrainingLoop:
 
     def get_training_data(self) -> List[Dict]:
         """Export all signals as training data."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         rows = conn.execute(
             """SELECT query, node_id, node_label, node_type, score, was_used, timestamp 
                FROM retrieval_signals"""
@@ -264,7 +286,7 @@ class TrainingLoop:
     def get_stats(self) -> Dict:
         """Return training loop statistics."""
         count = self.get_signal_count()
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         used_count = conn.execute(
             "SELECT COUNT(*) FROM retrieval_signals WHERE was_used = 1"
         ).fetchone()[0]

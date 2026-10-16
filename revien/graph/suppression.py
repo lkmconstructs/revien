@@ -21,6 +21,16 @@ Identity kinds:
                 project or a moved/renamed session file. Only bound when a
                 real UUID is present.
 
+A file-watcher file's identity is its BASENAME (``file:<name>``), which is
+also the source_id its nodes carry. Consequences, both stated to the user: a
+moved file keeps its identity (stays suppressed), and an unrelated file with
+the same basename in another folder is suppressed too. Decision: kept as is.
+A watched-dir-relative path would stop the false match but make a moved file
+a new identity (recapturable) and strand every existing tombstone for a nested
+file; a false match is loud (printed, counted, listed by ``revien
+suppressions``, lifted by ``revien restore``) while a recapture is silent.
+Both identities stay content-free.
+
 Gaps (no stable content-free identity exists): a file-watcher file renamed
 (identity is its basename), a vault note renamed or moved (its relative
 path), a skill moved (its resolved path), a Claude Code / Codex session that
@@ -73,6 +83,22 @@ def session_identity_for(source_id: str) -> Optional[str]:
     return f"{origin.runtime}-session:{m.group(1).lower()}"
 
 
+def parent_session_identity(metadata: Optional[Dict]) -> Optional[str]:
+    """The session identity named by a ``parent_session_id`` metadata field,
+    or None. A Claude Code sub-agent transcript
+    (``<session uuid>/subagents/agent-<id>.jsonl``) has its own file stem but
+    every entry carries the PARENT's ``sessionId``; the adapter copies that
+    one id (never any text) into metadata so a forgotten session's sub-agent
+    files are covered by the session tombstone. Only a real UUID counts."""
+    raw = (metadata or {}).get("parent_session_id")
+    if not isinstance(raw, str):
+        return None
+    m = _CLAUDE_STEM.match(raw.strip())
+    if not m:
+        return None
+    return f"claude-code-session:{m.group(1).lower()}"
+
+
 def unit_key(identity: str) -> str:
     """Rows that name the same unit share a key (a source_id row and the
     session_id row derived from it), so restore lifts them together."""
@@ -87,6 +113,7 @@ UNIT_SOURCE_PREFIXES = (
     "file:",                 # file:{name}        (file watcher; the BASENAME only)
     "skill:",                # skill:{resolved SKILL.md path}
     "vault:",                # vault:{relpath}#{heading slug}  (obsidian)
+    "skill-proposal:",       # skill-proposal:{pattern hash}  (engine proposals)
 )
 
 REASON_RETENTION = "retention_expire"
@@ -157,6 +184,14 @@ def notices_for(
         "'revien restore' lifts the suppression."
     ]
     kinds = {k for _, k in identities}
+    if any(k == KIND_SOURCE_ID and i.startswith("skill-proposal:")
+           for i, k in identities):
+        out.append(
+            "This is an engine skill proposal: it is not proposed again "
+            "while the suppression stands. Its identity is a hash of the "
+            "pattern's step labels, so a pattern with different steps is a "
+            "different proposal. The actions it was drawn from stay in the "
+            "graph; forget them to stop the pattern being detected.")
     if KIND_SESSION_ID not in kinds:
         for ident, kind in identities:
             for prefix, noun in _RENAMEABLE.items():
@@ -165,6 +200,13 @@ def notices_for(
                         f"The suppression is bound to the {noun}; if it is "
                         "renamed or moved it is a different identity and may "
                         "be captured again.")
+                    if ident.startswith("file:"):
+                        out.append(
+                            "The name is the file's base name only: a file "
+                            "with the same name anywhere in a watched folder "
+                            "is skipped too, and the same file moved to "
+                            "another folder stays skipped. "
+                            "'revien suppressions' lists what was skipped.")
             if kind == KIND_SOURCE_ID and ident.startswith(
                     ("claude-code:", "codex:")):
                 out.append(

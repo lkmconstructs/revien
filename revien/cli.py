@@ -1767,10 +1767,29 @@ def _probe_daemon(url: str):
     return data
 
 
+def _read_database_id(db_path: str) -> Optional[str]:
+    """The random id stored in the database (see GraphStore.database_id), read
+    without writing anything; None when the database has none (a daemon that
+    serves it would have created one)."""
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(_readonly_uri(Path(db_path)), uri=True,
+                               timeout=1.0)
+        try:
+            row = conn.execute("SELECT value FROM store_meta WHERE key = ?",
+                               ("database_id",)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row else None
+
+
 def _daemon_report(url: str, db_path: str):
     """What can truthfully be said about daemons after a reset. Only claims
     what the health endpoint of the daemon at ``url`` proved."""
-    from revien.daemon.server import DAEMON_FEATURES, db_identity
+    from revien.daemon.server import DAEMON_FEATURES
 
     health = _probe_daemon(url)
     restart = ("Restart it ('Ctrl+C' in its terminal, then 'revien start'), "
@@ -1793,7 +1812,7 @@ def _daemon_report(url: str, db_path: str):
             "version. If it uses this database it ignores suppressions and "
             "can recapture forgotten sources and undo this reset. " + restart,
         ]
-    if health.get("db_id") and health.get("db_id") != db_identity(db_path):
+    if health.get("db_id") and health.get("db_id") != _read_database_id(db_path):
         return [
             f"The current daemon at {url} serves a different database, so it "
             "is unaffected by this reset. A daemon on this database that was "

@@ -389,11 +389,21 @@ def propose_skills(
                 # human-authored (D1) skills; an engine proposal never sets it.
             }
             if existing is None:
+                # A forgotten proposal is not re-proposed: this writer
+                # bypasses the ingestion pipeline, so it applies the
+                # suppression gate itself, keyed on the proposal's stable
+                # identity (the pattern hash in its source_id).
+                proposal_source = f"skill-proposal:{pattern['pattern_hash']}"
+                hit = store.find_ingest_suppression(proposal_source, "")
+                if hit is not None:
+                    store.note_suppressed_skip(hit["identity"], hit["kind"])
+                    summary["suppressed"] = summary.get("suppressed", 0) + 1
+                    continue
                 node = Node(
                     node_type=NodeType.SKILL,
                     label=label,
                     content=body,
-                    source_id=f"skill-proposal:{pattern['pattern_hash']}",
+                    source_id=proposal_source,
                     metadata=metadata,
                     source_type=SourceType.INFERRED,
                     confidence=0.5,

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from revien.graph.suppression import parent_session_identity, session_identity_for
+
 from .base import RevienAdapter
 
 
@@ -58,17 +60,21 @@ class ClaudeCodeAdapter(RevienAdapter):
                 # Derive project name from directory structure
                 project_name = self._extract_project_name(jsonl_file)
                 source_id = self.source_id_for(jsonl_file)
+                meta = {
+                    "adapter": "claude_code",
+                    "project": project_name,
+                    "session_file": jsonl_file.name,
+                    "path": str(jsonl_file),
+                }
+                parent = self._parent_session_id(jsonl_file, source_id)
+                if parent:
+                    meta["parent_session_id"] = parent
 
                 results.append({
                     "content": conversation,
                     "content_type": "conversation",
                     "timestamp": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
-                    "metadata": {
-                        "adapter": "claude_code",
-                        "project": project_name,
-                        "session_file": jsonl_file.name,
-                        "path": str(jsonl_file),
-                    },
+                    "metadata": meta,
                     "source_id": source_id,
                     # Stable re-ingest identity (R3): the whole session file is
                     # re-fetched on every mtime bump (correct change detector);
@@ -102,6 +108,33 @@ class ClaudeCodeAdapter(RevienAdapter):
         """The source_id a session file ingests under:
         ``claude-code:{project}:{session}``."""
         return f"claude-code:{self._extract_project_name(jsonl_file)}:{jsonl_file.stem}"
+
+    def _parent_session_id(self, jsonl_file: Path, source_id: str) -> Optional[str]:
+        """For a file whose own stem is not a session UUID (a sub-agent
+        transcript, ``<session>/subagents/agent-<id>.jsonl``), the ``sessionId``
+        its entries carry: the PARENT session's id. Read from the first entry
+        that has one; nothing else in the file is kept, so the result is
+        content-free. None for a normal session file (its stem is the id) or
+        when no entry names a UUID. Lets the parent's forget tombstone cover
+        its sub-agent files."""
+        if session_identity_for(source_id):
+            return None
+        try:
+            with open(jsonl_file, "r", encoding="utf-8", errors="replace") as f:
+                for n, line in enumerate(f):
+                    if n >= 200:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    sid = obj.get("sessionId") if isinstance(obj, dict) else None
+                    if isinstance(sid, str) and parent_session_identity(
+                            {"parent_session_id": sid}):
+                        return sid.strip().lower()
+        except OSError:
+            return None
+        return None
 
     async def health_check(self) -> bool:
         """Check if Claude Code session directory exists."""
