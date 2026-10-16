@@ -1476,6 +1476,93 @@ class GraphStore:
             for r in rows
         ]
 
+    # ── Recall receipts (N1, any runtime) ─────────────────
+
+    @staticmethod
+    def _receipt_row(r) -> Dict:
+        return {
+            "recall_id": r[0], "runtime": r[1] or "", "query": r[2] or "",
+            "node_ids": json.loads(r[3] or "[]"), "issued_at": r[4],
+            "expires_at": r[5], "status": r[6], "closed_at": r[7],
+        }
+
+    _RECEIPT_COLUMNS = ("recall_id, runtime, query, node_ids, issued_at, "
+                        "expires_at, status, closed_at")
+
+    @_locked
+    def add_recall_receipt(
+        self, *, recall_id: str, runtime: str, query: str,
+        node_ids: List[str], issued_at: datetime, expires_at: datetime,
+    ) -> None:
+        """Record one issued receipt (status open)."""
+        conn = self._get_conn()
+        conn.execute(
+            f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
+            (recall_id, runtime, query, json.dumps(list(node_ids)),
+             issued_at.isoformat(), expires_at.isoformat()),
+        )
+        self._commit(conn)
+
+    @_locked
+    def get_recall_receipt(self, recall_id: str) -> Optional[Dict]:
+        conn = self._get_conn()
+        row = conn.execute(
+            f"SELECT {self._RECEIPT_COLUMNS} FROM recall_receipts "
+            "WHERE recall_id = ?", (recall_id,),
+        ).fetchone()
+        return self._receipt_row(row) if row else None
+
+    @_locked
+    def close_recall_receipt(self, recall_id: str, status: str) -> bool:
+        """Move an OPEN receipt to ``status`` (redeemed). True only for the
+        caller whose update landed."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE recall_receipts SET status = ?, closed_at = ? "
+            "WHERE recall_id = ? AND status = 'open'",
+            (status, datetime.now(timezone.utc).isoformat(), recall_id),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
+    @_locked
+    def expire_recall_receipts(self, now: Optional[datetime] = None) -> int:
+        """Open receipts past their expiry become flags (status expired).
+        Never deleted. Returns how many were flagged now."""
+        now = now or datetime.now(timezone.utc)
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE recall_receipts SET status = 'expired', closed_at = ? "
+            "WHERE status = 'open' AND expires_at < ?",
+            (now.isoformat(), now.isoformat()),
+        )
+        self._commit(conn)
+        return cursor.rowcount
+
+    @_locked
+    def list_receipt_flags(self, include_dismissed: bool = False) -> List[Dict]:
+        """Receipts that expired unjudged, newest first."""
+        conn = self._get_conn()
+        statuses = ("expired", "dismissed") if include_dismissed else ("expired",)
+        marks = ", ".join("?" for _ in statuses)
+        rows = conn.execute(
+            f"SELECT {self._RECEIPT_COLUMNS} FROM recall_receipts "
+            f"WHERE status IN ({marks}) ORDER BY expires_at DESC", statuses,
+        ).fetchall()
+        return [self._receipt_row(r) for r in rows]
+
+    @_locked
+    def dismiss_receipt_flag(self, recall_id: str) -> bool:
+        """A person has seen an expired-unjudged flag. Kept, marked dismissed."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE recall_receipts SET status = 'dismissed' "
+            "WHERE recall_id = ? AND status = 'expired'", (recall_id,),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
     @_locked
     def use_judgment_counts(self) -> Dict[str, int]:
         """Totals over the whole ledger: judged, used, unused, applied."""
@@ -1684,6 +1771,17 @@ class GraphStore:
             # they go with it — right-to-forget runs through here, and its
             # promise is that the content is actually gone.
             conn.execute("DELETE FROM use_judgments WHERE node_id = ?", (node_id,))
+            # Receipts hold only ids, but a forgotten node's id should not
+            # linger in an open receipt or a flag either.
+            for recall_id, raw in conn.execute(
+                "SELECT recall_id, node_ids FROM recall_receipts "
+                "WHERE node_ids LIKE ?", (f'%"{node_id}"%',),
+            ).fetchall():
+                remaining = [n for n in json.loads(raw or "[]") if n != node_id]
+                conn.execute(
+                    "UPDATE recall_receipts SET node_ids = ? WHERE recall_id = ?",
+                    (json.dumps(remaining), recall_id),
+                )
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
             self._discard_pending_stmt(conn, node_id)

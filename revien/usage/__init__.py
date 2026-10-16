@@ -13,9 +13,26 @@ from .episodes import (
 )
 from .evidence import UseEvidence, distinctive_terms, gather_evidence
 from .judge import UseVerdict, judge_use
-from .observer import USAGE_CURSOR, UsageObserver, UsageReport, usage_mode
+from .observer import (
+    RECEIPT_TTL,
+    USAGE_CURSOR,
+    JudgmentDetail,
+    ObserveResult,
+    Receipt,
+    ReceiptError,
+    UsageObserver,
+    UsageReport,
+    live_observation_enabled,
+    usage_mode,
+)
 
 __all__ = [
+    "JudgmentDetail",
+    "ObserveResult",
+    "RECEIPT_TTL",
+    "Receipt",
+    "ReceiptError",
+    "live_observation_enabled",
     "RecallEpisode",
     "RecalledMemory",
     "USAGE_CURSOR",

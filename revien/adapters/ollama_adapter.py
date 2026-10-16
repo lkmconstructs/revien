@@ -111,9 +111,9 @@ class OllamaAdapter:
             httpx.HTTPError: For other network errors.
         """
         # Retrieve context from graph
-        context_str = self.get_context_for_prompt(
-            message, max_nodes=max_context_nodes
-        )
+        recalled = self.retrieval.recall(message, top_n=max_context_nodes)
+        context_str = self._format_context(recalled)
+        recall_id = self._issue_receipt(message, recalled)
 
         # Build system prompt with injected context
         if system_prompt is None:
@@ -132,8 +132,38 @@ class OllamaAdapter:
 
         # Ingest message and response into graph
         self._ingest_exchange(message, response_text)
+        if recall_id:
+            self._observe(recall_id, response_text, message)
 
         return response_text
+
+    def _issue_receipt(self, message: str, recalled: RetrievalResponse) -> Optional[str]:
+        """Usage signal (N1): receipt the recall injected into this prompt.
+        Off unless REVIEN_USAGE is shadow or apply; never breaks a chat."""
+        from revien.usage import UsageObserver, live_observation_enabled
+
+        if not recalled.results or not live_observation_enabled():
+            return None
+        try:
+            return UsageObserver(self.store, mode="shadow").issue_receipt(
+                query=message, node_ids=[r.node_id for r in recalled.results],
+                runtime="ollama",
+            ).recall_id
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _observe(self, recall_id: str, answer: str, message: str) -> None:
+        """Judge the model's reply against the recall it was given. A failure
+        leaves the receipt open, so it expires into a flag."""
+        from revien.usage import UsageObserver
+
+        try:
+            UsageObserver(
+                self.store, engine=self.retrieval,
+                semantic=self.retrieval.semantic,
+            ).observe_answer(recall_id, answer, prompt=message)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Usage observation failed for {recall_id}: {e}")
 
     def ingest_ollama_history(self, history: List[Dict[str, str]]) -> Dict[str, Any]:
         """
@@ -219,7 +249,10 @@ class OllamaAdapter:
         response: RetrievalResponse = self.retrieval.recall(
             query, top_n=max_nodes
         )
+        return self._format_context(response)
 
+    def _format_context(self, response: RetrievalResponse) -> str:
+        """Format recall results as the injected context block."""
         if not response.results:
             return ""
 

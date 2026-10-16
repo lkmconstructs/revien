@@ -191,9 +191,13 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
         # self._session_id), not read off self at drain time, so a second
         # initialize() landing mid-flight can never relabel an already-queued
         # turn under the wrong session. None is the stop sentinel.
-        self._sync_queue: "queue.Queue[Optional[Tuple[str, Optional[str]]]]" = queue.Queue()
+        self._sync_queue: "queue.Queue[Optional[Tuple[Any, ...]]]" = queue.Queue()
         self._sync_worker: Optional[threading.Thread] = None
         self._worker_lock = threading.Lock()
+        # Usage signal (N1): the receipt of each session's latest prefetch,
+        # redeemed with the reply in sync_turn. Only populated when
+        # REVIEN_USAGE is explicitly shadow or apply.
+        self._pending_receipts: Dict[str, str] = {}
 
     # ── stack wiring (mirrors build_mcp_server's own-stack branch) ──────────
 
@@ -264,7 +268,32 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
             response = self._engine.recall(query=query, top_n=_PREFETCH_TOP_N)
         except Exception:  # noqa: BLE001 - a recall miss must never break a turn
             return ""
+        self._issue_receipt(query, response, session_id or self._session_id)
         return self._format_context(response)
+
+    def _issue_receipt(self, query: str, response: Any, session_key: str) -> None:
+        """Usage signal (N1): receipt this prefetch so sync_turn can hand the
+        reply back for judging. Off unless REVIEN_USAGE is shadow or apply;
+        never breaks a turn."""
+        from revien.usage import UsageObserver, live_observation_enabled
+
+        results = getattr(response, "results", None)
+        if not results or not live_observation_enabled():
+            return
+        try:
+            receipt = UsageObserver(self._store, mode="shadow").issue_receipt(
+                query=query, node_ids=[r.node_id for r in results],
+                runtime="hermes",
+            )
+        except Exception:  # noqa: BLE001
+            return
+        self._receipts()[session_key or ""] = receipt.recall_id
+
+    def _receipts(self) -> Dict[str, str]:
+        """Pending prefetch receipts by session (created on first use)."""
+        if not hasattr(self, "_pending_receipts"):
+            self._pending_receipts = {}
+        return self._pending_receipts
 
     def sync_turn(
         self,
@@ -306,7 +335,12 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
         # the worker gets to this item (a new initialize() mid-flight must
         # not relabel an already-queued turn).
         session_key = session_id or self._session_id or None
-        self._sync_queue.put((text, session_key, datetime.now(timezone.utc)))
+        # The receipt of the prefetch this reply answered, if any: judged on
+        # the worker after the turn is stored, never on the turn thread.
+        recall_id = self._receipts().pop(session_key or "", None)
+        observe = (recall_id, assistant_content, user_content) if recall_id else None
+        self._sync_queue.put(
+            (text, session_key, datetime.now(timezone.utc), observe))
 
     def on_session_end(self, messages: Any) -> None:
         """Session ended — flush deferred embeddings, else no-op.
@@ -593,6 +627,7 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                     return
                 text, session_key, *rest = item
                 captured_at = rest[0] if rest else datetime.now(timezone.utc)
+                observe = rest[1] if len(rest) > 1 else None
                 pipeline = self._pipeline
                 if pipeline is not None:
                     pipeline.ingest(
@@ -615,10 +650,25 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                             session_key=session_key,
                         )
                     )
+                if observe is not None:
+                    self._observe(*observe)
             except Exception:  # noqa: BLE001 - a sync failure never breaks Hermes
                 pass
             finally:
                 self._sync_queue.task_done()
+
+    def _observe(self, recall_id: str, answer: str, prompt: str) -> None:
+        """Judge a reply against its prefetch receipt (worker thread). Any
+        failure leaves the receipt open, so it expires into a flag rather
+        than vanishing."""
+        from revien.usage import UsageObserver
+
+        if self._store is None or not answer or not answer.strip():
+            return
+        UsageObserver(
+            self._store, engine=self._engine,
+            semantic=getattr(self._pipeline, "semantic", None),
+        ).observe_answer(recall_id, answer, prompt=prompt or "")
 
     def _flush_sync(self) -> None:
         """Block until every enqueued turn has been ingested — ALL in-flight
