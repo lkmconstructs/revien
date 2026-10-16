@@ -12,8 +12,8 @@ How it holds:
 * Every other changed revien/**/*.py is scanned by AST against `main`; any
   network-client use that is new there fails.
 
-The scanner cannot see everything. EVASIONS lists the shapes it provably does
-not report (each has a snippet the self-test runs and requires to stay
+The scanner is a heuristic and cannot see everything. EVASIONS lists the shapes
+shown to evade it (each has a snippet the self-test runs and requires to stay
 unreported, so the list cannot go stale) and OUT_OF_SCOPE lists what it does
 not look at. Both are printed on success.
 

@@ -135,9 +135,11 @@ All notable changes to Revien are documented here. Format follows
   `pycurl`, `grpc`, `paramiko`, `boto3`, `botocore`, `anthropic`, `openai`.
   The gate runs its own self-tests on every run (positive and negative
   snippets, that each edit shape above to the pinned file is rejected, and
-  that every documented limit still evades). Limits, exactly what still
-  evades the scan, each with a snippet the self-test runs and requires to
-  stay unreported:
+  that every documented limit still evades). Limits: the shapes known to
+  evade the scan, each with a snippet the self-test runs and requires to
+  stay unreported (so an entry cannot go stale). The scan is a heuristic, not
+  a proof: this list is what has been shown to evade it, not a claim that
+  nothing else can:
   - alias through a container, a call or a parameter
   - a method of an object whose type the scanner cannot see
   - a network client the NETWORK_MODULES list does not name
