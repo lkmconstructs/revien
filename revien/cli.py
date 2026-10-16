@@ -1586,6 +1586,58 @@ def skills_decline(node_id: str, db: Optional[str]):
 
 
 @main.group()
+def sync():
+    """Control adapter sync positions."""
+    pass
+
+
+@sync.command(name="reset")
+@click.argument("adapter_name")
+@click.option("--db", default=None, help="Database path")
+def sync_reset(adapter_name: str, db: Optional[str]):
+    """Forget an adapter's sync position so its next sync re-reads its full
+    history (for example 'revien sync reset claude-code').
+
+    Safe to repeat: sessions are re-ingested by a stable key, so already
+    captured ones are refreshed in place, not duplicated. Nothing is deleted
+    from the graph."""
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        raise SystemExit(1)
+
+    connected = list((config.get("adapters") or {}).keys())
+    store = GraphStore(db_path=db_path)
+    try:
+        existed = store.delete_sync_cursor(adapter_name)
+        known = [] if existed else store.list_sync_cursor_names()
+    finally:
+        store.close()
+
+    if existed:
+        click.echo(f"Cleared the sync position for '{adapter_name}'.")
+        click.echo("The next daemon sync will re-read its full history. "
+                   "Already captured items are refreshed in place, not "
+                   "duplicated. Nothing was deleted.")
+        click.echo("If the daemon is not running, start it with 'revien start'. "
+                   "A sync already in progress may re-save its position once "
+                   "more; if so, run this again.")
+        return
+    if adapter_name in connected:
+        click.echo(f"'{adapter_name}' has no saved sync position, so its next "
+                   "sync already reads its full history. Nothing to reset.")
+        return
+    click.echo(f"No adapter or sync position named '{adapter_name}'.")
+    names = sorted(set(connected) | set(known))
+    if names:
+        click.echo(f"Known: {', '.join(names)}")
+    raise SystemExit(1)
+
+
+@main.group()
 def usage():
     """Did recalled memory actually get used? Judges each revien_recall in
     your Claude Code sessions against the answer that followed it. Records
