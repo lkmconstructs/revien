@@ -120,12 +120,12 @@ def main():
     if summary1b["backfilled"] != 0:
         fail(f"second migrate() run backfilled {summary1b['backfilled']}, expected 0")
 
-    # user_version == 3 after.
+    # user_version == 4 after (chain ends at the recorded_at_source backfill).
     conn = sqlite3.connect(standalone_path)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
-    if version != 3:
-        fail(f"PRAGMA user_version after migrate() == {version}, expected 3")
+    if version != 4:
+        fail(f"PRAGMA user_version after migrate() == {version}, expected 4")
 
     # ── GraphStore auto-migrate path (_ensure_db) ───────────────────────
     store2 = GraphStore(db_path=autopath)
@@ -143,8 +143,8 @@ def main():
     conn = sqlite3.connect(autopath)
     auto_version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
-    if auto_version != 3:
-        fail(f"GraphStore auto-migrate PRAGMA user_version == {auto_version}, expected 3")
+    if auto_version != 4:
+        fail(f"GraphStore auto-migrate PRAGMA user_version == {auto_version}, expected 4")
 
     try:
         shutil.rmtree(tmpdir, ignore_errors=True)

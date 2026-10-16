@@ -106,3 +106,25 @@ def derive_origin(source_id: str) -> Origin:
         return Origin("langchain", "live", None, None)
 
     return _UNKNOWN
+
+
+_MTIME_RUNTIMES = frozenset({"claude-code", "codex", "file", "obsidian"})
+_CAPTURE_RUNTIMES = frozenset({"hermes", "ollama", "langchain", "api"})
+_CONTENT_RUNTIMES = frozenset({"chatgpt", "claude", "readwise"})
+
+
+def derive_recorded_at_source(origin_runtime: Optional[str],
+                              origin_source: Optional[str]) -> Optional[str]:
+    """Backfill rule for rows ingested before recorded_at_source existed.
+
+    Pure. mtime for runtimes whose stored date is a file modification time
+    (never rendered as "when said"), capture for live-captured runtimes,
+    content for imports. Anything else is None: unknown, left unlabeled and
+    therefore undated at render time."""
+    if origin_runtime in _MTIME_RUNTIMES:
+        return "mtime"
+    if origin_runtime in _CAPTURE_RUNTIMES:
+        return "capture"
+    if origin_runtime in _CONTENT_RUNTIMES or origin_source == "import":
+        return "content"
+    return None

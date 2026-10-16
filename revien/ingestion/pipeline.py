@@ -4,6 +4,7 @@ The main entry point for feeding content into the graph.
 """
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,18 @@ from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
 from revien.graph.origin import derive_origin, validate_origin
+from revien.dates import TIMESTAMP_SOURCES
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Naive datetimes are taken as UTC (same rule as the recall engine)."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _stamp_ts_source(node: Node, timestamp: Optional[datetime], source: Optional[str]) -> None:
+    """Record where the node's recorded_at came from (only when it has one)."""
+    if timestamp is not None and source:
+        node.metadata = {**(node.metadata or {}), "recorded_at_source": source}
 
 
 def _ingest_deny_set() -> set:
@@ -26,44 +39,50 @@ def _ingest_deny_set() -> set:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
+def _caller_metadata(input_data: "IngestionInput") -> Optional[Dict]:
+    """Caller-supplied IngestionInput.metadata, JSON-normalised, or None.
+
+    Stored on the CONTEXT node only, namespaced under metadata["caller"] so it
+    can never overwrite a reserved key (ingest_key, ingest_content_hash,
+    curated, recorded_at_source, origin_declared, dia_id). Derived claim
+    nodes (fact/entity/preference/...) do NOT inherit it: it describes the
+    verbatim turn the caller sent, not each claim extracted from it.
+    """
+    md = input_data.metadata
+    if not md or not isinstance(md, dict):
+        return None
+    return json.loads(json.dumps(md, default=str))
+
+
 def _resolve_origin(input_data: "IngestionInput"):
     """Resolve the (runtime, source, project, session) tuple for one input,
     once per ingest call — shared by the fresh-ingest and refresh paths.
 
-    An explicit origin_runtime is validated against the fixed vocabulary
-    (revien.graph.origin.validate_origin) and WINS outright; ValueError
-    propagates to the caller (daemon -> 400, CLI/MCP -> their own handling).
-    Omitted origin_runtime falls back to deriving runtime/source from
-    source_id — never validated, since derive_origin only ever returns
-    values from that same vocabulary or None. A caller-declared
-    project_key/session_key is kept even in the fallback case (only
-    runtime/source come from source_id there) — a caller that knows its
-    own project/session identity but not its runtime must not have that
-    identity silently discarded; derive_origin's own project/session only
-    fills in whichever of the two the caller left unset.
+    Each of runtime/source/project/session resolves independently: the
+    caller's declared value when given, else derived from source_id
+    (revien.graph.origin.derive_origin). Declared runtime/source are
+    validated against the fixed vocabulary; ValueError propagates to the
+    caller (daemon -> 400, CLI/MCP -> their own handling).
 
-    Returns (origin_tuple, declared) — `declared` is True only when the
-    caller supplied origin_runtime explicitly, which is what gates whether
-    produced nodes get metadata["origin_declared"] = True.
+    Returns (origin_tuple, declared) — `declared` is True when the caller
+    supplied origin_runtime or origin_source, which gates whether produced
+    nodes get metadata["origin_declared"] = True.
     """
-    if input_data.origin_runtime is None:
-        derived = derive_origin(input_data.source_id)
-        project_key = (
-            input_data.project_key if input_data.project_key is not None
-            else derived.project
-        )
-        session_key = (
-            input_data.session_key if input_data.session_key is not None
-            else derived.session
-        )
-        return (derived.runtime, derived.source, project_key, session_key), False
     validate_origin(input_data.origin_runtime, input_data.origin_source)
+    derived = derive_origin(input_data.source_id)
+
+    def _pick(declared, fallback):
+        return declared if declared is not None else fallback
+
     return (
         (
-            input_data.origin_runtime, input_data.origin_source,
-            input_data.project_key, input_data.session_key,
+            _pick(input_data.origin_runtime, derived.runtime),
+            _pick(input_data.origin_source, derived.source),
+            _pick(input_data.project_key, derived.project),
+            _pick(input_data.session_key, derived.session),
         ),
-        True,
+        input_data.origin_runtime is not None
+        or input_data.origin_source is not None,
     )
 
 
@@ -141,6 +160,21 @@ class IngestionInput:
     origin_source: Optional[str] = None
     project_key: Optional[str] = None
     session_key: Optional[str] = None
+    # Where ``timestamp`` came from - stamped on every node as
+    # metadata["recorded_at_source"] and carried on recall results, because a
+    # consuming model is told "dates in brackets are when each memory was said"
+    # and that is only true for content/capture/import time:
+    #   content  the unit's own time (message timestamps, frontmatter, export)
+    #   capture  stamped when Revien captured it live
+    #   mtime    a file's modification time (NOT said-at; never rendered)
+    #   import   carried in from an import
+    timestamp_source: str = "content"
+
+    def __post_init__(self):
+        if self.timestamp_source not in TIMESTAMP_SOURCES:
+            raise ValueError(
+                f"timestamp_source must be one of {TIMESTAMP_SOURCES}, "
+                f"got {self.timestamp_source!r}")
 
 
 @dataclass
@@ -162,6 +196,13 @@ class IngestionOutput:
     # consumers construct their own response dicts field-by-field, so a new
     # dataclass field with a default is additive, not breaking.
     fenced_spans: int = 0
+    # True only when this ingest took the keyed REFRESH path (existing_ctx
+    # found, content hash changed) — i.e. run_import's importer classification
+    # (F2): a refresh is units_ingested ("nodes created or refreshed"), never
+    # units_unchanged, even when the refresh happened to add 0 new nodes/edges
+    # (e.g. re-extraction of edited text produced no NEW claims). The keyed
+    # true no-op path (unchanged content hash) leaves this False.
+    refreshed: bool = False
 
 
 class IngestionPipeline:
@@ -428,6 +469,7 @@ class IngestionPipeline:
             node.source_modality = input_data.source_modality
             node.vision_processed = input_data.vision_processed
             node.recorded_at = input_data.timestamp
+            _stamp_ts_source(node, input_data.timestamp, input_data.timestamp_source)
             node.origin_runtime, node.origin_source, node.project_key, node.session_key = _origin
             if _origin_declared:
                 # Declared vs derived must stay distinguishable after the
@@ -436,6 +478,9 @@ class IngestionPipeline:
                 node.metadata = {**(node.metadata or {}), "origin_declared": True}
             if node.node_id == ctx_id:
                 node.answerable_by_text = input_data.answerable_by_text
+                _caller_md = _caller_metadata(input_data)
+                if _caller_md is not None:
+                    node.metadata = {**(node.metadata or {}), "caller": _caller_md}
                 # Stamp the ingest key + content hash (R3) so the NEXT ingest
                 # of this same unit finds and refreshes this node.
                 if ingest_key:
@@ -548,7 +593,11 @@ class IngestionPipeline:
                         source_type=SourceType.EXTRACTED,
                         confidence=1.0 if input_data.curated else 0.8,
                         recorded_at=input_data.timestamp,
-                        metadata={"curated": True} if input_data.curated else {},
+                        metadata={
+                            **({"curated": True} if input_data.curated else {}),
+                            **({"recorded_at_source": input_data.timestamp_source}
+                               if input_data.timestamp is not None else {}),
+                        },
                         origin_runtime=_origin[0],
                         origin_source=_origin[1],
                         project_key=_origin[2],
@@ -596,6 +645,12 @@ class IngestionPipeline:
                 self.semantic.defer_nodes(newly_created)
             else:
                 self.semantic.index_nodes(newly_created)
+                if self.semantic.is_enabled:
+                    # Embedded inline: retire the queue rows store.add_node
+                    # left. A failed embed self-disables the layer, which
+                    # keeps them queued for a later process.
+                    self.store.clear_pending_embeds(
+                        [nid for nid, _l, _c in newly_created])
 
         # 4. Get context node ID from mapping
         context_id = id_map.get(
@@ -626,6 +681,7 @@ class IngestionPipeline:
             total_edges_in_graph=self.store.count_edges(),
             governance=governance,
             fenced_spans=fenced_spans,
+            refreshed=False,
         )
 
     def _find_adoptable_context(self, source_id: str) -> Optional[Node]:
@@ -682,6 +738,17 @@ class IngestionPipeline:
         """
         ctx_id = existing_ctx.node_id
 
+        # Effective recorded_at for this refresh. A file-mtime timestamp moves
+        # forward on every sync and is never "when it was said": keep the
+        # EARLIER of (stored, new) so a refresh cannot make an old session
+        # look newer. Any other source behaves as before (new value wins).
+        ts, ts_source = input_data.timestamp, input_data.timestamp_source
+        if (ts is not None and ts_source == "mtime"
+                and existing_ctx.recorded_at is not None):
+            if _as_utc(existing_ctx.recorded_at) <= _as_utc(ts):
+                ts = existing_ctx.recorded_at
+                ts_source = (existing_ctx.metadata or {}).get("recorded_at_source")
+
         # Re-extract from the full new content.
         extraction = self.extractor.extract(
             content=input_data.content,
@@ -694,7 +761,7 @@ class IngestionPipeline:
         # Temporal re-resolution (best-effort, same contract as ingest()).
         event_updates: Dict = {}
         try:
-            res = resolve_event_time(input_data.content, input_data.timestamp)
+            res = resolve_event_time(input_data.content, ts)
         except Exception:  # noqa: BLE001 - temporal resolution is best-effort
             res = None
         if res is not None:
@@ -729,10 +796,16 @@ class IngestionPipeline:
                 },
                 **event_updates,
             }
-            if input_data.timestamp is not None:
+            _caller_md = _caller_metadata(input_data)
+            if _caller_md is not None:
+                ctx_updates["metadata"]["caller"] = _caller_md
+            if ts is not None:
                 # Keep the previous recorded_at when the caller has none —
                 # a refresh must never NULL a known content time.
-                ctx_updates["recorded_at"] = input_data.timestamp
+                ctx_updates["recorded_at"] = ts
+                if ts_source:
+                    ctx_updates["metadata"] = {
+                        **ctx_updates["metadata"], "recorded_at_source": ts_source}
             self.store.update_node(
                 ctx_id,
                 _audit_op="ingest_refresh",
@@ -753,7 +826,8 @@ class IngestionPipeline:
                     continue
                 candidate_node.source_modality = input_data.source_modality
                 candidate_node.vision_processed = input_data.vision_processed
-                candidate_node.recorded_at = input_data.timestamp
+                candidate_node.recorded_at = ts
+                _stamp_ts_source(candidate_node, ts, ts_source)
                 (
                     candidate_node.origin_runtime, candidate_node.origin_source,
                     candidate_node.project_key, candidate_node.session_key,
@@ -823,8 +897,12 @@ class IngestionPipeline:
                         source_id=input_data.source_id,
                         source_type=SourceType.EXTRACTED,
                         confidence=1.0 if input_data.curated else 0.8,
-                        recorded_at=input_data.timestamp,
-                        metadata={"curated": True} if input_data.curated else {},
+                        recorded_at=ts,
+                        metadata={
+                            **({"curated": True} if input_data.curated else {}),
+                            **({"recorded_at_source": ts_source}
+                               if ts is not None and ts_source else {}),
+                        },
                         origin_runtime=_origin[0],
                         origin_source=_origin[1],
                         project_key=_origin[2],
@@ -856,6 +934,12 @@ class IngestionPipeline:
                 self.semantic.defer_nodes(newly_created)
             else:
                 self.semantic.index_nodes(newly_created)
+                if self.semantic.is_enabled:
+                    # Embedded inline: retire the queue rows store.add_node
+                    # left. A failed embed self-disables the layer, which
+                    # keeps them queued for a later process.
+                    self.store.clear_pending_embeds(
+                        [nid for nid, _l, _c in newly_created])
 
         # Governance parity with ingest(): best-effort, never breaks ingest.
         governance: List = []
@@ -876,6 +960,7 @@ class IngestionPipeline:
             total_edges_in_graph=self.store.count_edges(),
             governance=governance,
             fenced_spans=fenced_spans,
+            refreshed=True,
         )
 
     def _edge_exists(

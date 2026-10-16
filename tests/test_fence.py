@@ -162,6 +162,19 @@ class TestHermesHeader:
         assert "You prefer PostgreSQL" in result.content
         assert result.markers == ["hermes_header"]
 
+    def test_strips_date_note_with_block(self):
+        text = (
+            "User: hi\n"
+            "## Relevant memory (Revien)\n"
+            "(dates in brackets are when each memory was said; resolve 'yesterday' etc. against them)\n"
+            "- [2023-05-07] Bought the figurines yesterday\n"
+            "Assistant: ok"
+        )
+        out = fence_content(text).content
+        assert "dates in brackets" not in out
+        assert "figurines" not in out
+        assert "User: hi" in out and "Assistant: ok" in out
+
     def test_stops_at_first_non_list_line(self):
         text = (
             "## Relevant memory (Revien)\n"

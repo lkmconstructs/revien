@@ -20,7 +20,7 @@ from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
 from revien.graph.clustering import CommunityDetector
-from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline
+from revien.ingestion.pipeline import IngestionInput, IngestionOutput, IngestionPipeline, TIMESTAMP_SOURCES
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
 from revien.semantic.index import SemanticIndex
 from revien.skills.ingest import sort_user_before_engine
@@ -35,6 +35,9 @@ class IngestRequest(BaseModel):
     content: str
     content_type: str = "conversation"
     timestamp: Optional[str] = None
+    # Where `timestamp` came from (content/capture/mtime/import). Omitted:
+    # "content" when the caller supplied a timestamp, else "capture".
+    timestamp_source: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     # Capture path: persist now, embed later — the response returns before any
     # embedding-model load. Queued nodes become recallable at the next semantic
@@ -457,11 +460,17 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         except ValidationError as e:
             raise HTTPException(400, str(e))
 
+        if request.timestamp_source is not None and request.timestamp_source not in TIMESTAMP_SOURCES:
+            raise HTTPException(
+                400, f"Unknown timestamp_source {request.timestamp_source!r}; "
+                     f"expected one of {sorted(TIMESTAMP_SOURCES)}")
         input_data = IngestionInput(
             source_id=request.source_id,
             content=request.content,
             content_type=request.content_type,
             timestamp=ts,
+            timestamp_source=request.timestamp_source
+            or ("content" if ts is not None else "capture"),
             metadata=request.metadata,
             defer_embed=request.defer_embed,
             origin_runtime=request.origin_runtime,
@@ -541,6 +550,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "origin_runtime": r.origin_runtime,
                     "origin_source": r.origin_source,
                     "project_key": r.project_key,
+                    # When it was said (ISO-8601, speaker offset) or None; always present.
+                    "recorded_at": r.recorded_at,
+                    "recorded_at_source": r.recorded_at_source,
                     # Only present when asked for — the flag-off response
                     # shape is byte-identical to pre-B1.
                     **({"tensions": r.tensions} if request.include_tensions else {}),

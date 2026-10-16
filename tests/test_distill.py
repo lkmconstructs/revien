@@ -44,6 +44,9 @@ def vault():
 def _node(store, node_type, label, content=None, curated=False, recorded=None,
           invalidated=False, confidence=0.9):
     now = datetime.now(timezone.utc)
+    meta = {"curated": True} if curated else {"adapter": "claude_code"}
+    if recorded is not None:
+        meta["recorded_at_source"] = "content"
     n = Node(
         node_type=node_type,
         label=label,
@@ -53,7 +56,7 @@ def _node(store, node_type, label, content=None, curated=False, recorded=None,
         created_at=now,
         last_accessed=now,
         recorded_at=recorded,
-        metadata={"curated": True} if curated else {"adapter": "claude_code"},
+        metadata=meta,
     )
     if invalidated:
         n.invalidated_at = now

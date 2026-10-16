@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .base import RevienAdapter
+from .base import RevienAdapter, parse_message_timestamp
 
 
 _PATH_SEP_RE = re.compile(r"[\\/]+")
@@ -91,8 +91,16 @@ class CodexAdapter(RevienAdapter):
             if mtime <= since_ts:
                 continue
 
-            conversation, project_name = self._parse_rollout(jsonl_file)
+            conversation, project_name, first_ts = self._parse_rollout_ts(jsonl_file)
             if conversation and conversation.strip():
+                # recorded_at = when the first message was SAID, not the
+                # rollout file's mtime (moves on every append). No message
+                # timestamp -> mtime, labelled as such.
+                if first_ts is not None:
+                    ts_iso, ts_source = first_ts.isoformat(), "content"
+                else:
+                    ts_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+                    ts_source = "mtime"
                 # Per-session source_id, matching the claude_code adapter's
                 # granularity (adapter:project:session-stem) — sessions in one
                 # project must not share provenance.
@@ -102,7 +110,8 @@ class CodexAdapter(RevienAdapter):
                 results.append({
                     "content": conversation,
                     "content_type": "conversation",
-                    "timestamp": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                    "timestamp": ts_iso,
+                    "timestamp_source": ts_source,
                     "metadata": {
                         "adapter": "codex",
                         "project": project_name or "",
@@ -134,7 +143,14 @@ class CodexAdapter(RevienAdapter):
         Parse a Codex rollout JSONL log into (conversation text, project name).
         Extracts user and assistant messages, skips tool/reasoning/event noise.
         """
+        text, project, _ts = self._parse_rollout_ts(filepath)
+        return text, project
+
+    def _parse_rollout_ts(self, filepath: Path) -> tuple:
+        """(conversation text | None, project name, earliest message
+        timestamp | None)."""
         messages = []
+        stamps = []
         project_name = None
 
         try:
@@ -179,6 +195,7 @@ class CodexAdapter(RevienAdapter):
                     if not content:
                         continue
 
+                    before = len(messages)
                     if role == "user":
                         if content.lstrip().startswith(_USER_NOISE_PREFIXES):
                             continue
@@ -186,11 +203,19 @@ class CodexAdapter(RevienAdapter):
                     elif role == "assistant":
                         messages.append(f"Assistant: {content}")
                     # developer/system roles are instructions, not conversation.
+                    if len(messages) > before:
+                        # Envelope lines carry the time on the line; bare
+                        # (older) items may carry it on the item itself.
+                        ts = parse_message_timestamp(
+                            obj.get("timestamp", item.get("timestamp")))
+                        if ts is not None:
+                            stamps.append(ts)
 
         except Exception:
-            return None, project_name
+            return None, project_name, None
 
-        return ("\n".join(messages) if messages else None), project_name
+        return (("\n".join(messages) if messages else None), project_name,
+                (min(stamps) if stamps else None))
 
     def _extract_content(self, item: Dict) -> Optional[str]:
         """Extract text from a message item's content blocks."""

@@ -40,6 +40,7 @@ from revien.ingestion.extractor_llm import (
     CLOUD_BACKENDS as CLOUD_EXTRACTORS,
     DEFAULT_EXTRACTOR,
 )
+from revien.semantic._ort import ort_telemetry_state
 from revien.semantic.index import (
     CLOUD_EMBEDDERS,
     DEFAULT_EMBEDDER,
@@ -127,6 +128,7 @@ def network_egress_zero(
     cloud_calls: int = 0,
     answerer: Optional[str] = None,
     judge: Optional[str] = None,
+    decompose: Optional[str] = None,
 ) -> Check:
     """PASS only if EVERY active backend is local; FAIL naming any cloud backend.
 
@@ -147,15 +149,42 @@ def network_egress_zero(
     # the local default reader.
     answerer_spec = (answerer or "extractive").strip()
     answerer_provider, _ = parse_provider(answerer_spec)
-    # The judge is local F1 in this build (no cloud-judge wiring yet); accept an
-    # explicit override so the assertion stays honest if one is ever added.
-    judge_name = (judge or "f1").strip().lower()
+    # The judge spec is a CLI arg shaped exactly like the answerer's ('f1' /
+    # 'ollama:<model>' / '<cloud-provider>:<model>') — parse out the provider
+    # the same way, so 'openai:gpt-4o-mini' is judged on 'openai', not on the
+    # unparsed spec string (which would never match a cloud/local set).
+    judge_spec = (judge or "f1").strip()
+    # S6: parse_provider("f1") already returns ("f1", None) — no ":" to
+    # split — so the ternary this used to be was dead code with the same
+    # result either branch.
+    judge_provider, _ = parse_provider(judge_spec)
+    judge_name = judge_provider.lower()
 
     # Local determination, per backend, from config.
     extractor_local = (extractor in _LOCAL_EXTRACTORS) and (extractor not in CLOUD_EXTRACTORS)
     embedder_local = (embedder in _LOCAL_EMBEDDERS or embedder not in CLOUD_EMBEDDERS)
     answerer_local = (answerer_provider in _LOCAL_ANSWERERS) and (answerer_provider not in CLOUD_ANSWERERS)
     judge_local = (judge_name in _LOCAL_JUDGES) and (judge_name not in CLOUD_ANSWERERS)
+
+    # F9: "ollama" is only actually local if OLLAMA_HOST resolves to a
+    # loopback address — a non-loopback OLLAMA_HOST means the Ollama server
+    # is on a DIFFERENT machine, which is real network egress regardless of
+    # the provider name. Resolved the same way OllamaAnswerer/OllamaJudge do
+    # (answerers.resolve_ollama_host), so this check can never drift from
+    # what the actual transport connects to.
+    from .answerers import is_loopback_url, resolve_ollama_host
+    ollama_loopback = is_loopback_url(resolve_ollama_host())
+    if answerer_provider == "ollama" and not ollama_loopback:
+        answerer_local = False
+    if judge_name == "ollama" and not ollama_loopback:
+        judge_local = False
+
+    # Benchmark-only query decomposer (revien_bench.decompose): 'none' or
+    # unset = no decomposer; ollama only if loopback; anything else is cloud.
+    decompose_name = parse_provider((decompose or "none").strip())[0].lower()
+    decompose_local = decompose_name in ("none", "", "local") or (
+        decompose_name == "ollama" and ollama_loopback
+    )
 
     # Name every component that leaves the machine (config-derived).
     cloud_backends: List[str] = []
@@ -164,9 +193,23 @@ def network_egress_zero(
     if not embedder_local:
         cloud_backends.append(f"embedder={embedder}")
     if not answerer_local:
-        cloud_backends.append(f"answerer={answerer_provider}")
+        reason = (
+            "ollama host is not loopback" if answerer_provider == "ollama"
+            else answerer_provider
+        )
+        cloud_backends.append(f"answerer={reason}")
     if not judge_local:
-        cloud_backends.append(f"judge={judge_name}")
+        reason = (
+            "ollama host is not loopback" if judge_name == "ollama"
+            else judge_name
+        )
+        cloud_backends.append(f"judge={reason}")
+    if not decompose_local:
+        reason = (
+            "ollama host is not loopback" if decompose_name == "ollama"
+            else decompose_name
+        )
+        cloud_backends.append(f"decompose={reason}")
 
     all_local = not cloud_backends
     # PASS requires every backend local AND no observed cloud call. A cloud
@@ -185,9 +228,13 @@ def network_egress_zero(
             "answerer_local": answerer_local,
             "judge": judge_name,
             "judge_local": judge_local,
+            "decompose": decompose_name,
+            "decompose_local": decompose_local,
             "all_backends_local": all_local,
             "cloud_backends": cloud_backends,
             "cloud_calls": cloud_calls,
+            # True/False, or None when onnxruntime is not installed.
+            "ort_telemetry_disabled": ort_telemetry_state(),
         },
     )
 

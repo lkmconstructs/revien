@@ -69,10 +69,12 @@ def _end_state(old: str, new: str) -> str:
     ops = GraphOperations(store)
     pipe = IngestionPipeline(store, csl=build_governor(store, ops))
     o1 = pipe.ingest(IngestionInput(source_id="fc", content=old,
-                                    timestamp=datetime.now(timezone.utc)))
+                                    timestamp=datetime.now(timezone.utc),
+                                    timestamp_source="content"))
     old_id = o1.context_node_id
     pipe.ingest(IngestionInput(source_id="fc", content=new,
-                               timestamp=datetime.now(timezone.utc)))
+                               timestamp=datetime.now(timezone.utc),
+                               timestamp_source="content"))
     node = store.get_node(old_id)
     if node is not None and node.invalidated_at is not None:
         return UPDATED

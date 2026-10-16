@@ -31,6 +31,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .base import RevienAdapter
+# slug lives in revien.graph.text (a leaf module with no adapter imports)
+# so importers/base.py can use it without dragging in revien.adapters'
+# __init__ (which loads generic_api/ollama_adapter -> httpx). Re-exported
+# here under both names: `slug` is this module's own public name, `_slug`
+# is the back-compat alias from before it became the shared helper.
+from revien.graph.text import slug
+_slug = slug
 
 # Vault folders that are never content.
 EXCLUDED_DIRS = {".obsidian", ".trash", ".git"}
@@ -103,10 +110,6 @@ def _parse_date(value: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
-
-
-def _slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"
 
 
 def chunk_note(body: str, note_title: str) -> List[Tuple[str, str]]:
@@ -185,6 +188,7 @@ class ObsidianVaultAdapter(RevienAdapter):
                 "content": f"{label_line}\n{section}",
                 "content_type": "note",
                 "timestamp": ts.isoformat(),
+                "timestamp_source": "content" if fm.get("date") else "mtime",
                 "source_id": f"vault:{rel_path.as_posix()}#{_slug(heading)}",
                 "links": links,
                 "curated": True,

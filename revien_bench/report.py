@@ -26,6 +26,16 @@ def render(report: Dict) -> str:
     lines.append("")
     lines.append(f"- **Config:** `{cfg.get('name')}` / answerer `{cfg.get('answerer')}` "
                  f"(cluster={cfg.get('cluster')})")
+    ls = report.get("layer_status") or {}
+    lines.append(f"- **Layers:** semantic={ls.get('semantic_active')} "
+                 f"rerank={ls.get('rerank_active')} embedder={ls.get('embedder')}{':' + str(ls['embed_model']) if ls.get('embed_model') else ''} "
+                 f"rerank_top_k={ls.get('rerank_top_k')} embed_context={ls.get('embed_context')}"
+                 + (f" — DEGRADED: {ls['semantic_inactive_reason']}"
+                    if ls.get("semantic_requested") and ls.get("semantic_active") is False
+                    else ""))
+    if report.get("env_overrides"):
+        lines.append("- **Env overrides:** " + ", ".join(
+            f"`{k}={v}`" for k, v in report["env_overrides"].items()))
     lines.append(f"- **Timestamp:** {report.get('timestamp')}")
     lines.append(f"- **Dataset:** `{ds.get('path')}` "
                  f"({ds.get('conversations')} conversations) — SHA-256 `{ds.get('sha256')}`")
@@ -34,6 +44,12 @@ def render(report: Dict) -> str:
     lines.append(f"- **Questions scored:** {report.get('n_questions')}")
     lines.append(f"- **Cost:** ${report.get('cost_usd')} · **Network calls:** "
                  f"{report.get('network_calls')}")
+    dec = report.get("decompose")
+    if dec:
+        lines.append(f"- **Decompose (benchmark-only row):** `{dec.get('model')}` · "
+                     f"calls {dec.get('network_calls')} · cost ${dec.get('cost_usd')} (est.) · "
+                     f"mean sub-queries {dec.get('mean_subqueries')} (incl. original) · "
+                     f"errors {dec.get('decompose_errors')}")
     lines.append("")
 
     # ── Headline F1 ───────────────────────────────────────────────────────────
@@ -75,6 +91,52 @@ def render(report: Dict) -> str:
     )
     lines.append("")
 
+    # ── End-to-end QA (LLM judge) — SEPARATE track, never blended with F1 ─────
+    judge = report.get("judge")
+    if judge:
+        reader = report.get("reader", {})
+        lines.append("## End-to-end QA (LLM judge)")
+        lines.append("")
+        lines.append(f"- **Reader:** `{reader.get('spec')}` · **Judge:** `{judge.get('spec')}`")
+        lines.append(f"- **Cost:** ${judge.get('cost_usd')} · **Network calls:** "
+                     f"{judge.get('network_calls')} · **Judge errors:** {judge.get('judge_errors')}")
+        lines.append("")
+        acc = judge.get("accuracy_overall")
+        if acc is None:
+            lines.append("**Overall accuracy: n/a (no judged answers)**")
+        else:
+            n_correct = judge.get("n_correct")
+            if n_correct is None:
+                # Older report JSON predating n_correct: back out the count
+                # from accuracy * denominator rather than mislabeling a
+                # missing value.
+                denom = judge.get("accuracy_denominator") or 0
+                n_correct = round(acc * denom)
+            lines.append(
+                f"**Overall accuracy: {acc}** (correct/denominator = "
+                f"{n_correct}/{judge.get('accuracy_denominator')}; "
+                f"judged {judge.get('n_judged')}, errors {judge.get('judge_errors')})"
+            )
+        excl = judge.get("accuracy_excl_adversarial")
+        if excl is not None:
+            lines.append(
+                f"**Accuracy excluding adversarial: {excl}** "
+                f"(n={judge.get('n_excl_adversarial')}) - the figure comparable to "
+                "published LoCoMo LLM-judge rows, which drop category 5 because its "
+                "gold is the adversarial wrong answer and the right behaviour is refusal."
+            )
+        lines.append("")
+        lines.append("| Category | N | Accuracy |")
+        lines.append("|---|---:|---:|")
+        for cat, v in judge.get("per_category_accuracy", {}).items():
+            lines.append(f"| {cat} | {v['n']} | {v['accuracy']} |")
+        lines.append("")
+        lines.append("> **Not comparable to the retrieval / F1 metrics above.** This is a "
+                     "separate end-to-end judgment of whether the final answer matches the "
+                     "gold answer's meaning, scored by an LLM judge rather than lexical "
+                     "token-overlap — the two tracks are never blended into one number.")
+        lines.append("")
+
     # ── Sovereignty ───────────────────────────────────────────────────────────
     sov = report.get("sovereignty", {})
     lines.append("## Sovereignty assertions (THE DIFFERENTIATOR)")
@@ -92,9 +154,19 @@ def render(report: Dict) -> str:
 
     lines.append("---")
     lines.append("")
-    lines.append("_Headline track only: zero-LLM, zero-cloud, deterministic. "
-                 "Competitor comparison (Mem0 / LoCoMo-human / Letta) and LLM-judge "
-                 "accuracy are deferred to track B._")
+    # F8: the LLM-judge accuracy footer only makes sense when no judge ran
+    # (report["judge"] absent) — once a judge block exists above, "deferred to
+    # track B" is simply false. Competitor comparison (Mem0 / LoCoMo-human /
+    # Letta) is still out of scope for this report either way.
+    if judge:
+        lines.append("_Headline track: zero-LLM, zero-cloud, deterministic F1/retrieval "
+                     "(above) plus a separate end-to-end LLM-judge track (above). "
+                     "Competitor comparison (Mem0 / LoCoMo-human / Letta) is out of "
+                     "scope for this report._")
+    else:
+        lines.append("_Headline track only: zero-LLM, zero-cloud, deterministic. "
+                     "Competitor comparison (Mem0 / LoCoMo-human / Letta) and LLM-judge "
+                     "accuracy are deferred to track B._")
     lines.append("")
     return "\n".join(lines)
 

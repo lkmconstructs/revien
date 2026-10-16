@@ -923,7 +923,7 @@ class TestOriginBackfillUserVersionMarker:
             s.close()
 
             conn = sqlite3.connect(path)
-            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project"):
+            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project", "idx_nodes_session"):
                 conn.execute(f"DROP INDEX IF EXISTS {ix}")
             for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
                 conn.execute(f"ALTER TABLE nodes DROP COLUMN {col}")
@@ -955,7 +955,7 @@ class TestOriginBackfillUserVersionMarker:
             s = GraphStore(db_path=path)
             s.close()
             conn = sqlite3.connect(path)
-            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project"):
+            for ix in ("idx_nodes_origin_runtime", "idx_nodes_origin_source", "idx_nodes_project", "idx_nodes_session"):
                 conn.execute(f"DROP INDEX IF EXISTS {ix}")
             for col in ("origin_runtime", "origin_source", "project_key", "session_key"):
                 conn.execute(f"ALTER TABLE nodes DROP COLUMN {col}")
@@ -969,7 +969,7 @@ class TestOriginBackfillUserVersionMarker:
             conn = sqlite3.connect(path)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             conn.close()
-            assert version == 3
+            assert version == 4  # chain ends at 4 (recorded_at_source backfill)
         finally:
             try:
                 os.unlink(path)

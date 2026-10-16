@@ -40,6 +40,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime
+
+from revien.dates import said_date
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple
 
 # Canonical refusal string. Contains BOTH official adversarial markers so the
@@ -75,6 +78,13 @@ class RetrievedContext:
     query: str
     contents: List[str] = field(default_factory=list)  # ranked node contents
     labels: List[str] = field(default_factory=list)      # parallel node labels
+    # Parallel to contents: when each memory was said (ISO-8601, from
+    # RetrievalResult.recorded_at) or None. Only the LLM readers' prompt
+    # rendering reads it; the extractive path uses plain contents.
+    dates: List[Optional[str]] = field(default_factory=list)
+    # Parallel to dates: RetrievalResult.recorded_at_source. A date whose
+    # source is mtime is never shown to the reader.
+    date_sources: List[Optional[str]] = field(default_factory=list)
 
     def sentences(self) -> List[str]:
         """Flatten retrieved contents into candidate sentences, rank-preserving."""
@@ -160,7 +170,7 @@ class ExtractiveAnswerer:
 # edit (which would change every LLM answer) is caught: load_answer_prompt()
 # raises if the on-disk file no longer matches this digest.
 _PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "answerer.txt"
-ANSWER_PROMPT_SHA256 = "eaab3885c6591c81491c08ab762fbeeab6d2893c1d49922cb887b29a8fe5e487"
+ANSWER_PROMPT_SHA256 = "12df41d69387d3ce5abe387007fafa6cfea9c4da3b351cafe0a5a485da95db50"
 
 # How much retrieved context to hand the model. The retrieved node contents are
 # already the top-K from recall(); we cap total characters so a pathological
@@ -266,6 +276,37 @@ _ANTHROPIC = {
 
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
+# Loopback hosts a "local" Ollama backend is allowed to be at (F9). Anything
+# else means the Ollama server isn't actually on THIS machine, so it's real
+# network egress no different from a cloud provider — sovereignty.
+# network_egress_zero must FAIL and name it, not silently trust "ollama" as
+# a local-provider name regardless of where OLLAMA_HOST actually points.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def resolve_ollama_host(url: Optional[str] = None) -> str:
+    """Resolve the Ollama base URL: an explicit url arg wins, else OLLAMA_HOST
+    is RE-READ from the environment (not a stale value cached at import time —
+    OLLAMA_URL above is only a fallback default), else localhost:11434."""
+    return (url or os.environ.get("OLLAMA_HOST") or OLLAMA_URL).rstrip("/")
+
+
+def is_loopback_url(url: str) -> bool:
+    """True if `url`'s hostname is loopback (127.0.0.1 / localhost / ::1).
+
+    OLLAMA_HOST is commonly set scheme-less ("127.0.0.1:11434", just
+    "localhost") — urlparse on a scheme-less "host:port" string misparses
+    the host as the scheme and the port as the path (e.g.
+    urlparse("127.0.0.1:11434").hostname is None), which would make a
+    genuinely-loopback host read as non-loopback. Prepend a scheme before
+    parsing whenever the input doesn't already carry one."""
+    from urllib.parse import urlparse
+
+    if "://" not in url:
+        url = f"http://{url}"
+    host = (urlparse(url).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS
+
 
 def load_answer_prompt() -> str:
     """Read the frozen prompt template, verifying its sha256.
@@ -293,6 +334,18 @@ def load_answer_prompt() -> str:
     return raw.decode("utf-8")
 
 
+def _reader_date(iso: Optional[str]) -> Optional[str]:
+    """ISO-8601 -> LoCoMo gold style '7 May 2023' (no leading zero); None if
+    absent or unparseable."""
+    if not iso:
+        return None
+    try:
+        d = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    return f"{d.day} {d:%B} {d.year}"
+
+
 def _format_context(ctx: RetrievedContext) -> str:
     """Render the retrieved nodes into a compact, ranked context block.
 
@@ -306,6 +359,11 @@ def _format_context(ctx: RetrievedContext) -> str:
         if not text:
             continue
         label = ctx.labels[i] if i < len(ctx.labels) else ""
+        src = ctx.date_sources[i] if i < len(ctx.date_sources) else None
+        said = (_reader_date(ctx.dates[i])
+                if i < len(ctx.dates) and said_date(ctx.dates[i], src) else None)
+        if said:
+            text = f"[{said}] {text}"
         prefix = f"[{i + 1}] " + (f"({label}) " if label else "")
         entry = prefix + text
         if total + len(entry) > MAX_CONTEXT_CHARS:
@@ -401,7 +459,8 @@ class OllamaAnswerer:
 
     def __init__(self, model: str, url: Optional[str] = None):
         self.model = model
-        self.url = (url or OLLAMA_URL).rstrip("/")
+        # F9: resolve OLLAMA_HOST fresh — see resolve_ollama_host().
+        self.url = resolve_ollama_host(url)
         self.name = f"ollama:{model}"
         # LOCAL (loopback): no off-device egress, $0. Kept for uniform accounting.
         self.network_calls = 0
@@ -419,6 +478,60 @@ class OllamaAnswerer:
         # Ollama /api/chat -> {"message": {"role": ..., "content": "..."}}
         msg = (data.get("message") or {}).get("content", "")
         return _clean_answer(msg)
+
+
+@dataclass
+class _ProviderCfg:
+    """Everything one _chat_once() call needs to know about the target
+    provider — bundled so APIAnswerer and APIJudge (revien_bench.judges)
+    share ONE transport function instead of two copies of the same
+    OpenAI-compatible-vs-Anthropic branch (S1)."""
+    model: str
+    base_url: str
+    is_anthropic: bool
+    anthropic_version: Optional[str]
+    api_key: str
+
+
+def _chat_once(cfg: "_ProviderCfg", prompt: str, max_tokens: int) -> Tuple[str, int, int]:
+    """One chat-completion call, OpenAI-compatible or Anthropic native —
+    the shared transport behind both APIAnswerer.answer and
+    revien_bench.judges.APIJudge.judge. Returns (text, prompt_tokens,
+    completion_tokens). stdlib urllib only (via _http_post_json).
+
+    Callers own network_calls / cost accounting and must increment their
+    counter BEFORE calling this (a failed call still left the machine —
+    see answer()/judge() below)."""
+    if cfg.is_anthropic:
+        payload = {
+            "model": cfg.model,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        headers = {"x-api-key": cfg.api_key, "anthropic-version": cfg.anthropic_version}
+        data = _http_post_json(f"{cfg.base_url}/messages", payload, headers=headers)
+        parts = data.get("content") or []
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        usage = data.get("usage") or {}
+        in_tok = usage.get("input_tokens") or _approx_tokens(prompt)
+        out_tok = usage.get("output_tokens") or _approx_tokens(text)
+        return text, in_tok, out_tok
+
+    payload = {
+        "model": cfg.model,
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {"Authorization": f"Bearer {cfg.api_key}"}
+    data = _http_post_json(f"{cfg.base_url}/chat/completions", payload, headers=headers)
+    choices = data.get("choices") or []
+    text = (choices[0].get("message") or {}).get("content", "") if choices else ""
+    usage = data.get("usage") or {}
+    in_tok = usage.get("prompt_tokens") or _approx_tokens(prompt)
+    out_tok = usage.get("completion_tokens") or _approx_tokens(text)
+    return text, in_tok, out_tok
 
 
 class APIAnswerer:
@@ -466,53 +579,14 @@ class APIAnswerer:
         # Disclose BEFORE the network call (fires even if the request fails).
         _disclose_cloud(self.provider)
         key = self._api_key()
-
-        if self.is_anthropic:
-            payload = {
-                "model": self.model,
-                "max_tokens": 256,
-                "temperature": 0.0,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            headers = {
-                "x-api-key": key,
-                "anthropic-version": self.anthropic_version,
-            }
-            data = _http_post_json(
-                f"{self.base_url}/messages", payload, headers=headers
-            )
-            self.network_calls += 1
-            # Anthropic -> {"content": [{"type": "text", "text": "..."}], ...}
-            parts = data.get("content") or []
-            text = "".join(
-                p.get("text", "") for p in parts if p.get("type") == "text"
-            )
-            # Anthropic usage -> {"input_tokens": .., "output_tokens": ..}.
-            usage = data.get("usage") or {}
-            in_tok = usage.get("input_tokens") or _approx_tokens(prompt)
-            out_tok = usage.get("output_tokens") or _approx_tokens(text)
-            self.cost_usd_estimate += estimate_cost_usd(self.provider, in_tok, out_tok)
-            return _clean_answer(text)
-
-        # OpenAI-compatible /v1/chat/completions.
-        payload = {
-            "model": self.model,
-            "temperature": 0.0,
-            "max_tokens": 256,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        headers = {"Authorization": f"Bearer {key}"}
-        data = _http_post_json(
-            f"{self.base_url}/chat/completions", payload, headers=headers
+        cfg = _ProviderCfg(
+            model=self.model, base_url=self.base_url, is_anthropic=self.is_anthropic,
+            anthropic_version=self.anthropic_version, api_key=key,
         )
+        # F7: increment BEFORE the request — a failed call (HTTP 500, timeout)
+        # still left the machine and must be counted as egress.
         self.network_calls += 1
-        # OpenAI -> {"choices": [{"message": {"content": "..."}}]}
-        choices = data.get("choices") or []
-        text = (choices[0].get("message") or {}).get("content", "") if choices else ""
-        # OpenAI usage -> {"prompt_tokens": .., "completion_tokens": ..}.
-        usage = data.get("usage") or {}
-        in_tok = usage.get("prompt_tokens") or _approx_tokens(prompt)
-        out_tok = usage.get("completion_tokens") or _approx_tokens(text)
+        text, in_tok, out_tok = _chat_once(cfg, prompt, max_tokens=256)
         self.cost_usd_estimate += estimate_cost_usd(self.provider, in_tok, out_tok)
         return _clean_answer(text)
 

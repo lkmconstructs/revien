@@ -2,7 +2,7 @@
 
 OWNS: revien/**, tests/**, CHANGELOG.md, README.md
 
-Scope: the feat/v0.4-origin-skills branch delivers WS0 origin layer, the --source filter, the pairing token, and the thin WS3 skills slice with governance intact and zero egress.
+Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skills slice, the ChatGPT/Claude/Readwise importers, the LoCoMo LLM-judge track, and the recall leg (recorded_at honesty, embedder recording, bench degraded-run guard), truth maintenance that never corrupts memory (supersession safety and fact-update rate floors), with governance intact and zero egress on the default path.
 
 - [ ] G1: full test suite passes with no failures
   CHECK: python -m pytest -q -p no:cacheprovider --basetemp=.gates-tmp -x
@@ -57,6 +57,46 @@ Scope: the feat/v0.4-origin-skills branch delivers WS0 origin layer, the --sourc
 - [ ] G11: version string is untouched at 0.3.0 and CHANGELOG Unreleased names every shipped feature
   CHECK: python scripts/gates/check_docs.py
   EXPECT: docs verification passed
+  EVIDENCE: pending
+
+- [ ] G13: ChatGPT, Claude, and Readwise imports go through the pipeline, honor the deny list, stamp historical recorded_at and import origin, and are idempotent on re-run
+  CHECK: python scripts/gates/check_importers.py
+  EXPECT: importer verification passed
+  EVIDENCE: pending
+
+- [ ] G14: ChatGPT import ingests only the displayed thread, never an edited-away branch, and dry-run writes nothing
+  CHECK: python scripts/gates/check_import_branches.py
+  EXPECT: import branch verification passed
+  EVIDENCE: pending
+
+- [ ] G15: LoCoMo LLM judge is separate from F1, parses CORRECT/WRONG strictly, and a cloud judge fails the egress check even at zero measured calls
+  CHECK: python scripts/gates/check_locomo_judge.py
+  EXPECT: locomo judge verification passed
+  EVIDENCE: pending
+
+- [ ] G16: a consuming model is never shown a date for a memory unless the date is when it was said
+  CHECK: python scripts/gates/check_recorded_at_honesty.py
+  EXPECT: recorded_at honesty verification passed
+  EVIDENCE: pending
+
+- [ ] G17: the semantic index records its embedder and recipe, refuses to mix, and `revien reindex` recovers a dimension change
+  CHECK: python scripts/gates/check_embedder_record.py
+  EXPECT: embedder record verification passed
+  EVIDENCE: pending
+
+- [ ] G18: a benchmark run never produces a number from a degraded semantic layer, on cache miss or cache hit
+  CHECK: python scripts/gates/check_bench_degraded.py
+  EXPECT: bench degraded-run verification passed
+  EVIDENCE: pending
+
+- [ ] G19: the supersession gate never auto-fires unsafely, never breaches a sensitive control, and never wrongfully erases
+  CHECK: python scripts/gates/check_truth_safety.py
+  EXPECT: truth safety verification passed
+  EVIDENCE: pending
+
+- [ ] G20: truth-maintenance rates on the rule path do not regress below the recorded floor
+  CHECK: python scripts/gates/check_truth_rates.py
+  EXPECT: truth rates verification passed
   EVIDENCE: pending
 
 - [ ] G12: merge to main is the repository owner's call, never an agent's

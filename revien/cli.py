@@ -13,6 +13,7 @@ import sys
 import sysconfig
 from pathlib import Path
 from typing import Optional, Tuple
+from datetime import datetime, timezone
 
 try:
     import click
@@ -23,6 +24,7 @@ except ImportError:
 # Single version source (R4): revien.__version__ feeds the CLI banner, the
 # FastAPI app metadata, /v1/health, and the hermes plugin manifest alike.
 from revien import __version__
+from revien.dates import said_date
 
 
 def _default_db_path() -> str:
@@ -520,6 +522,8 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "origin_runtime": r.origin_runtime,
                         "origin_source": r.origin_source,
                         "project_key": r.project_key,
+                        "recorded_at": r.recorded_at,
+                        "recorded_at_source": r.recorded_at_source,
                     }
                     for r in response.results
                 ],
@@ -544,6 +548,8 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "origin_runtime": r.origin_runtime,
                         "origin_source": r.origin_source,
                         "project_key": r.project_key,
+                        "recorded_at": r.recorded_at,
+                        "recorded_at_source": r.recorded_at_source,
                     }
                     for r in response.results
                 ],
@@ -564,9 +570,10 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
 
             for i, r in enumerate(response.results, 1):
                 runtime = r.origin_runtime or "unknown"
+                said = said_date(r.recorded_at, r.recorded_at_source) or "-"
                 click.echo(f"  [{i}] {r.label}")
                 click.echo(f"      Type: {r.node_type} | Score: {r.score:.3f} "
-                           f"| Runtime: {runtime}")
+                           f"| Runtime: {runtime} | Date: {said}")
                 click.echo(f"      {r.content[:120]}{'...' if len(r.content) > 120 else ''}")
                 click.echo()
 
@@ -619,7 +626,7 @@ def tensions(db: Optional[str], include_history: bool, json_output: bool):
             click.echo(f"  [{i}] {a['content'][:100]}")
             click.echo(f"   ⇄  {b['content'][:100]}")
             if p.get("source_context"):
-                click.echo(f"      ({p['source_context']}, {p['created_at'][:10]})")
+                click.echo(f"      ({p['source_context']}, recognized {p['created_at'][:10]})")
             click.echo()
     finally:
         store.close()
@@ -773,9 +780,12 @@ def ingest(content: str, source: str, db: Optional[str]):
     pipeline = IngestionPipeline(store)
 
     try:
+        # Manual capture: when it was said is now, and that is what we stamp.
         result = pipeline.ingest(IngestionInput(
             source_id=source,
             content=content,
+            timestamp=datetime.now(timezone.utc),
+            timestamp_source="capture",
         ))
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
@@ -844,6 +854,9 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
                 content=item["content"],
                 content_type=item.get("content_type", "note"),
                 timestamp=ts,
+                # The adapter says whether the date is a frontmatter date
+                # ("content") or just the file mtime; never assume.
+                timestamp_source=item.get("timestamp_source") or "mtime",
                 metadata=item.get("metadata", {}),
                 links=item.get("links", []),
                 curated=True,
@@ -966,6 +979,10 @@ def reindex(db: Optional[str]):
         result = semantic.reindex_all()
         click.echo(f"Reindexed {result.get('indexed', 0)} nodes "
                    f"(status: {result.get('status')}).")
+        if result.get("status") != "ok":
+            click.echo(f"Reindex did NOT complete: {result.get('error')}. "
+                       f"Run `revien reindex` again.", err=True)
+            sys.exit(1)
     finally:
         store.close()
 
@@ -1009,7 +1026,19 @@ def status(db: Optional[str]):
             for runtime, count in by_runtime.items():
                 click.echo(f"  {runtime}: {count}")
 
+        by_source = store.count_nodes_by_recorded_at_source()
+        if by_source:
+            click.echo("Nodes by recorded_at_source:")
+            for src, count in by_source.items():
+                note = " (date not shown)" if src in ("mtime", "unlabeled", "undated") else ""
+                click.echo(f"  {src}: {count}{note}")
+
         click.echo(f"Pairing token: {_pairing_token_status()}")
+        from revien.semantic._ort import ort_telemetry_state
+        click.echo(
+            "ONNX Runtime telemetry: "
+            + ("disabled" if ort_telemetry_state() else "not applicable")
+        )
     finally:
         store.close()
 
@@ -1163,6 +1192,118 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
                    f"{store.count_edges()} edges")
     finally:
         store.close()
+
+
+def _run_export_import(runtime: str, file: str, db: Optional[str],
+                        dry_run: bool, limit: Optional[int]) -> None:
+    """Shared body for import-chatgpt / import-claude / import-readwise:
+    resolve the store/pipeline the same way `ingest` does (cli.py's own
+    ingest command, above), stream units from the right importer module,
+    run them through run_import() under a progress bar, then print the
+    same summary shape for all three so scripting against any of them
+    looks identical."""
+    from revien.graph.store import GraphStore
+    from revien.importers import chatgpt, claude, readwise
+    from revien.importers.base import run_import
+    from revien.ingestion.pipeline import IngestionPipeline
+
+    module = {"chatgpt": chatgpt, "claude": claude, "readwise": readwise}[runtime]
+
+    try:
+        units = list(module.iter_units(file))
+    except (FileNotFoundError, ValueError) as e:
+        click.echo(str(e))
+        sys.exit(1)
+
+    if limit is not None:
+        units = units[:limit]
+
+    if dry_run:
+        # Never touch the store: no GraphStore/IngestionPipeline construction
+        # at all, so a dry run can't accidentally create a fresh db file.
+        report = run_import(units, pipeline=None, dry_run=True)
+        click.echo("dry run: nothing written")
+    else:
+        config = _load_config()
+        db_path = db or config.get("db_path", _default_db_path())
+        store = GraphStore(db_path=db_path)
+        pipeline = IngestionPipeline(store)
+        try:
+            with click.progressbar(
+                length=len(units), label=f"Importing ({runtime})"
+            ) as bar:
+                report = run_import(
+                    units, pipeline, dry_run=False,
+                    progress=lambda _unit: bar.update(1),
+                )
+        finally:
+            store.close()
+
+    click.echo(
+        f"seen={report.units_seen} ingested={report.units_ingested} "
+        f"unchanged={report.units_unchanged} denied={report.units_denied} "
+        f"empty={report.units_skipped_empty} errors={len(report.errors)}"
+    )
+    if not dry_run:
+        click.echo(
+            f"nodes_created={report.nodes_created} "
+            f"edges_created={report.edges_created}"
+        )
+    for source_id, message in report.errors:
+        click.echo(f"  error: {source_id}: {message}")
+
+    # F11: only a hard failure is non-zero — errors happened AND nothing at
+    # all was captured (ingested or confirmed-unchanged). A partial import
+    # (some conversations ingested, one malformed one logged as an error) or
+    # a clean idempotent re-run (all unchanged, 0 ingested, 0 errors) both
+    # exit 0.
+    if report.errors and (report.units_ingested + report.units_unchanged) == 0:
+        sys.exit(1)
+
+
+@main.command(name="import-chatgpt")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--dry-run", is_flag=True,
+              help="Parse and report counts; write nothing")
+@click.option("--limit", default=None, type=int,
+              help="Only process the first N conversations")
+def import_chatgpt(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+    """Import a ChatGPT export (conversations.json, or the .zip you
+    downloaded straight from ChatGPT's Settings -> Data controls -> Export)
+    through the ingestion pipeline: one unit per conversation, on the
+    thread actually shown (edited-away branches are not ingested).
+    Idempotent — re-running an unchanged export is a no-op."""
+    _run_export_import("chatgpt", file, db, dry_run, limit)
+
+
+@main.command(name="import-claude")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--dry-run", is_flag=True,
+              help="Parse and report counts; write nothing")
+@click.option("--limit", default=None, type=int,
+              help="Only process the first N conversations")
+def import_claude(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+    """Import a Claude.ai export (conversations.json, or the .zip from
+    Claude.ai's Settings -> Account -> Export data) through the ingestion
+    pipeline: one unit per conversation. Idempotent — re-running an
+    unchanged export is a no-op."""
+    _run_export_import("claude", file, db, dry_run, limit)
+
+
+@main.command(name="import-readwise")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--db", default=None, help="Database path")
+@click.option("--dry-run", is_flag=True,
+              help="Parse and report counts; write nothing")
+@click.option("--limit", default=None, type=int,
+              help="Only process the first N highlights")
+def import_readwise(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+    """Import a Readwise highlights CSV export through the ingestion
+    pipeline: one unit per highlight, linked to its book by an entity
+    edge. Idempotent — re-running an unchanged export is a no-op."""
+    _run_export_import("readwise", file, db, dry_run, limit)
 
 
 @main.command()

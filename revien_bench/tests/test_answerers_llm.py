@@ -27,6 +27,15 @@ def test_prompt_loads_and_hash_matches():
     assert "{question}" in template
     assert "CONCISELY" in template
     assert "No information available" in template
+    assert "Each memory begins with the date it was said, in brackets." in template
+    assert "against THAT date and answer with an absolute date" in template
+
+
+def test_prompt_hash_gate_fails_on_further_edit(monkeypatch):
+    import pytest
+    monkeypatch.setattr(A, "ANSWER_PROMPT_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="drifted"):
+        A.load_answer_prompt()
 
 
 def test_assemble_prompt_wires_context_and_question():

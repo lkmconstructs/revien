@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Union
 
-from .origin import derive_origin
+from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -72,7 +72,8 @@ class GraphStore:
         self._ensure_db()
 
     def register_content_listener(
-        self, name: str, on_content_change=None, on_delete=None
+        self, name: str, on_content_change=None, on_delete=None,
+        on_successor_change=None,
     ) -> None:
         """Register callbacks fired after a node's label/content changes or a
         node is deleted. on_content_change(node_id, label, content);
@@ -82,8 +83,15 @@ class GraphStore:
         /v1/reindex before vector search saw the new content — now they queue
         a re-embed drained by the next search). Listeners fire while the
         store lock is held and MUST stay cheap: queue writes and small SQL,
-        never model inference."""
-        self._content_listeners[name] = (on_content_change, on_delete)
+        never model inference.
+
+        on_successor_change(node_id, label, content), optional: fired for the
+        NEXT CONTEXT node in the same session whenever a CONTEXT node's
+        content changes or the node is deleted. A layer that embeds a turn
+        together with its predecessor (REVIEN_EMBED_CONTEXT=prev) needs this:
+        the successor's stored vector still carries the old/deleted text."""
+        self._content_listeners[name] = (
+            on_content_change, on_delete, on_successor_change)
 
     def _fire_content_change(self, node: "Node") -> None:
         # Inside a transaction: defer until after the outer commit. Listeners
@@ -92,7 +100,7 @@ class GraphStore:
         if self._txn_depth > 0:
             self._deferred_fires.append(("change", node))
             return
-        for on_change, _ in list(self._content_listeners.values()):
+        for on_change, _d, _s in list(self._content_listeners.values()):
             if on_change is None:
                 continue
             try:
@@ -104,11 +112,23 @@ class GraphStore:
         if self._txn_depth > 0:
             self._deferred_fires.append(("delete", node_id))
             return
-        for _, on_delete in list(self._content_listeners.values()):
+        for _c, on_delete, _s in list(self._content_listeners.values()):
             if on_delete is None:
                 continue
             try:
                 on_delete(node_id)
+            except Exception:  # noqa: BLE001 - listeners must never break writes
+                pass
+
+    def _fire_successor_change(self, succ: "Node") -> None:
+        if self._txn_depth > 0:
+            self._deferred_fires.append(("successor", succ))
+            return
+        for _c, _d, on_succ in list(self._content_listeners.values()):
+            if on_succ is None:
+                continue
+            try:
+                on_succ(succ.node_id, succ.label, succ.content)
             except Exception:  # noqa: BLE001 - listeners must never break writes
                 pass
 
@@ -118,6 +138,8 @@ class GraphStore:
         for kind, payload in pending:
             if kind == "change":
                 self._fire_content_change(payload)
+            elif kind == "successor":
+                self._fire_successor_change(payload)
             else:
                 self._fire_delete(payload)
 
@@ -282,6 +304,8 @@ class GraphStore:
         # Origin Layer (WS0): add origin columns to older DBs and backfill
         # from source_id wherever derive_origin recognizes it.
         self._migrate_add_origin_columns(conn)
+        # recorded_at_source backfill (user_version 4); needs origin columns.
+        self._migrate_backfill_recorded_at_source(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -485,6 +509,34 @@ class GraphStore:
             else:
                 raise
 
+    def _migrate_backfill_recorded_at_source(self, conn: sqlite3.Connection) -> None:
+        """Label pre-existing dated rows with metadata["recorded_at_source"]
+        derived from their origin (derive_recorded_at_source). Rows that derive
+        None stay unlabeled (unknown, rendered undated). One transaction;
+        idempotent (only rows lacking the key are touched); skipped once
+        ``PRAGMA user_version`` >= 4."""
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 4:
+            return
+        rows = conn.execute(
+            "SELECT node_id, metadata, origin_runtime, origin_source FROM nodes "
+            "WHERE recorded_at IS NOT NULL"
+        ).fetchall()
+        for node_id, raw, runtime, source in rows:
+            try:
+                meta = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict) or "recorded_at_source" in meta:
+                continue
+            derived = derive_recorded_at_source(runtime, source)
+            if derived is None:
+                continue
+            meta["recorded_at_source"] = derived
+            conn.execute("UPDATE nodes SET metadata = ? WHERE node_id = ?",
+                         (json.dumps(meta), node_id))
+        conn.execute("PRAGMA user_version = 4")
+        self._commit(conn)
+
     def _migrate_add_origin_columns(self, conn: sqlite3.Connection) -> None:
         """Add Origin Layer (WS0) columns to existing DBs, then backfill.
 
@@ -528,8 +580,16 @@ class GraphStore:
             # created_at is always present: it's a NOT NULL column in this
             # store's CREATE TABLE nodes, so a nodes table missing it isn't
             # a state this store can produce.
-            conn.execute("DROP INDEX IF EXISTS idx_nodes_origin_runtime")
-            conn.execute("DROP INDEX IF EXISTS idx_nodes_project")
+            # Drop only when the stored definition is not the composite
+            # (an unconditional drop+create ran on every open). Both the old
+            # single-column form and the composite share the name, so look
+            # at the stored SQL.
+            for _name in ("idx_nodes_origin_runtime", "idx_nodes_project"):
+                _row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' "
+                    "AND name=?", (_name,)).fetchone()
+                if _row and "created_at" not in (_row[0] or ""):
+                    conn.execute(f"DROP INDEX {_name}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_origin_runtime "
                 "ON nodes(origin_runtime, created_at DESC)"
@@ -540,6 +600,19 @@ class GraphStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_nodes_project "
                 "ON nodes(project_key, created_at DESC)"
+            )
+            # previous_context_in_session: session_key equality, then order.
+            # recorded_at exists by now (temporal migration runs first).
+            # Older DBs carry (session_key, recorded_at); neighbour lookups
+            # need created_at in the key too. Drop the narrow one (idempotent).
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_nodes_session'").fetchone()
+            if row and "created_at" not in (row[0] or ""):
+                conn.execute("DROP INDEX idx_nodes_session")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_session "
+                "ON nodes(session_key, recorded_at, created_at)"
             )
             self._commit(conn)
 
@@ -793,10 +866,12 @@ class GraphStore:
 
     @_locked
     def add_node(self, node: Node) -> Node:
+        self._check_validity_window(node.valid_from, node.valid_until)
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.
         with self.transaction() as conn:
             self._add_node_stmt(conn, node)
+            self._enqueue_embed_stmt(conn, node.node_id)
             # Provenance hook: record node creation. Inside the transaction an
             # audit failure rolls the insert back — provenance is required.
             self._record_node_audit(
@@ -805,6 +880,55 @@ class GraphStore:
                 before_node=None, after_node=node,
             )
         return node
+
+    # The deferred-embedding queue is owned by SemanticIndex.PENDING_TABLE
+    # (same name, same shape). The store enqueues into it in the SAME
+    # transaction as the node write, so every route that creates or edits a
+    # node — pipeline, skills, a bare CLI store, a second connection — leaves
+    # durable pending index work for whichever process runs the next drain,
+    # with or without a live SemanticIndex listener on this instance. Plain
+    # SQL, no extension, no embedder.
+    _PENDING_EMBED_TABLE = "pending_embeds"
+
+    @classmethod
+    def _enqueue_embed_stmt(cls, conn: sqlite3.Connection, node_id: str) -> None:
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {cls._PENDING_EMBED_TABLE} "
+            f"(node_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            f"INSERT OR REPLACE INTO {cls._PENDING_EMBED_TABLE} "
+            f"(node_id, queued_at) VALUES (?, ?)",
+            (node_id, datetime.now(timezone.utc).isoformat()),
+        )
+
+    @classmethod
+    def _discard_pending_stmt(cls, conn: sqlite3.Connection, node_id=None) -> None:
+        """Drop queue row(s) of a deleted node (all rows when node_id is None);
+        a table that was never created means nothing was ever queued."""
+        try:
+            if node_id is None:
+                conn.execute(f"DELETE FROM {cls._PENDING_EMBED_TABLE}")
+            else:
+                conn.execute(
+                    f"DELETE FROM {cls._PENDING_EMBED_TABLE} WHERE node_id = ?",
+                    (node_id,))
+        except sqlite3.OperationalError:
+            pass
+
+    @_locked
+    def clear_pending_embeds(self, node_ids) -> None:
+        """Drop queue rows for nodes a caller just embedded inline."""
+        ids = [(i,) for i in node_ids]
+        if not ids:
+            return
+        conn = self._get_conn()
+        try:
+            conn.executemany(
+                f"DELETE FROM {self._PENDING_EMBED_TABLE} WHERE node_id = ?", ids)
+            self._commit(conn)
+        except sqlite3.OperationalError:  # table never created: nothing queued
+            pass
 
     @staticmethod
     def _add_node_stmt(conn: sqlite3.Connection, node: Node) -> None:
@@ -871,6 +995,79 @@ class GraphStore:
 
     # SQLite's default parameter limit is 999; chunk IN() queries below it.
     _IN_CHUNK = 500
+
+    def _context_neighbour(self, node: Node, forward: bool) -> Optional[Node]:
+        """Shared body of previous/next_context_in_session. The order key is
+        (recorded_at, created_at, rowid) with NULL recorded_at sorting first.
+        Written as plain column comparisons so SQLite range-scans
+        idx_nodes_session (session_key, recorded_at, created_at); a COALESCE
+        or a computed ORDER BY would force a scan of the whole session."""
+        if not node.session_key:
+            return None
+        conn = self._get_conn()
+        rid = conn.execute(
+            "SELECT rowid FROM nodes WHERE node_id = ?", (node.node_id,)
+        ).fetchone()
+        rid = rid[0] if rid else None
+        if rid is None:
+            return None
+        op, direction = (">", "ASC") if forward else ("<", "DESC")
+        base = ("SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
+                "AND node_id != ? AND ")
+        order = (f" ORDER BY recorded_at {direction}, created_at {direction}, "
+                 f"rowid {direction} LIMIT 1")
+        head = (node.session_key, NodeType.CONTEXT.value, node.node_id)
+        created = node.created_at.isoformat()
+        rec = node.recorded_at.isoformat() if node.recorded_at else None
+        # Candidate groups in order of proximity. A dated node's neighbour is
+        # first among dated rows past it; NULL-dated rows sort before every
+        # dated one, so going backward they are the fallback group, going
+        # forward from a NULL-dated node the dated rows are.
+        queries = []
+        if rec is not None:
+            queries.append((base + f"(recorded_at, created_at, rowid) {op} (?, ?, ?)"
+                            + order, head + (rec, created, rid)))
+            if not forward:
+                queries.append((base + "recorded_at IS NULL" + order, head))
+        else:
+            queries.append((base + "recorded_at IS NULL AND "
+                            f"(created_at, rowid) {op} (?, ?)" + order,
+                            head + (created, rid)))
+            if forward:
+                queries.append((base + "recorded_at IS NOT NULL" + order, head))
+        for sql, args in queries:
+            row = conn.execute(sql, args).fetchone()
+            if row:
+                return self._row_to_node(row)
+        return None
+
+    @_locked
+    def previous_context_in_session(self, node: Node) -> Optional[Node]:
+        """The CONTEXT node immediately before ``node`` in its session: same
+        non-null session_key, greatest (recorded_at, created_at) strictly
+        before the node's. Ties (a session whose turns share a coarse
+        recorded_at AND created_at) fall back to insertion order (rowid).
+        None when the node has no session_key or is the session's first."""
+        return self._context_neighbour(node, forward=False)
+
+    @_locked
+    def next_context_in_session(self, node: Node) -> Optional[Node]:
+        """Mirror of previous_context_in_session: the CONTEXT node
+        immediately AFTER ``node`` in its session (same ordering key,
+        reversed). None when the node has no session_key or is the last."""
+        return self._context_neighbour(node, forward=True)
+
+    def _has_successor_listener(self) -> bool:
+        return any(v[2] is not None for v in self._content_listeners.values())
+
+    def _notify_successor(self, node: Node) -> None:
+        """Tell listeners the CONTEXT node after ``node`` has a stale
+        predecessor (node edited, or about to vanish)."""
+        if node.node_type != NodeType.CONTEXT or not self._has_successor_listener():
+            return
+        succ = self.next_context_in_session(node)
+        if succ is not None:
+            self._fire_successor_change(succ)
 
     @_locked
     def get_nodes_bulk(self, node_ids) -> dict:
@@ -1254,6 +1451,11 @@ class GraphStore:
                 values,
             )
             updated = self.get_node(node_id)
+            if updated is not None and (
+                updated.label != existing.label
+                or updated.content != existing.content
+            ):
+                self._enqueue_embed_stmt(conn, node_id)
             # Provenance hook: generic update entry unless a semantic caller
             # (reinforce/correct/decay/invalidate/access) suppresses it.
             if _audit_op:
@@ -1269,11 +1471,22 @@ class GraphStore:
             or ("content" in updates and updated.content != existing.content)
         ):
             self._fire_content_change(updated)
+            self._notify_successor(updated)
         return updated
 
     @_locked
     def delete_node(self, node_id: str) -> bool:
         """Delete a node and all its connected edges. Returns True if deleted."""
+        # The successor must be found while the row still exists; its stored
+        # vector (prev-context embeds) carries the text being forgotten.
+        # Only when a layer actually listens for successor changes (the
+        # semantic index registers one only under REVIEN_EMBED_CONTEXT=prev):
+        # otherwise this is a SELECT + get_node on every delete for nothing.
+        successor = None
+        if self._has_successor_listener():
+            doomed = self.get_node(node_id)
+            if doomed is not None and doomed.node_type == NodeType.CONTEXT:
+                successor = self.next_context_in_session(doomed)
         with self.transaction() as conn:
             # Edges cascade via FK, but be explicit for safety
             conn.execute(
@@ -1282,8 +1495,11 @@ class GraphStore:
             )
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
+            self._discard_pending_stmt(conn, node_id)
         if deleted:
             self._fire_delete(node_id)
+            if successor is not None:
+                self._fire_successor_change(successor)
         return deleted
 
     @_locked
@@ -1295,6 +1511,7 @@ class GraphStore:
         offset: int = 0,
         origin_runtime: Optional[Union[str, List[str]]] = None,
         project_key: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> list[Node]:
         """List nodes, newest first. Origin Layer (WS0 Leg B): origin_runtime
         and project_key are SQL WHERE prefilters, not a post-fetch scan — a
@@ -1325,6 +1542,9 @@ class GraphStore:
         if project_key:
             query += " AND project_key = ?"
             params.append(project_key)
+        if session_key:
+            query += " AND session_key = ?"
+            params.append(session_key)
         # G7: created_at ties (same-millisecond ingest, common in bulk
         # backfills/tests) previously left paging order unstable across
         # calls — node_id is a deterministic tiebreaker so offset paging
@@ -1353,6 +1573,19 @@ class GraphStore:
     def count_nodes(self) -> int:
         conn = self._get_conn()
         return conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+
+    @_locked
+    def count_nodes_by_recorded_at_source(self) -> dict:
+        """Node counts per metadata recorded_at_source. Two honest buckets
+        instead of one "unknown": "undated" (recorded_at NULL) and
+        "unlabeled" (recorded_at set, no source recorded)."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT CASE WHEN recorded_at IS NULL THEN 'undated' ELSE "
+            "COALESCE(json_extract(metadata, '$.recorded_at_source'), 'unlabeled') END, "
+            "COUNT(*) FROM nodes GROUP BY 1 ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        return {src: count for src, count in rows}
 
     @_locked
     def count_nodes_by_origin_runtime(self) -> dict:
@@ -1417,6 +1650,19 @@ class GraphStore:
             q += " WHERE resolved_at IS NULL"
         return conn.execute(q).fetchone()[0]
 
+    @staticmethod
+    def _check_validity_window(valid_from, valid_until) -> None:
+        """Raise ValueError when valid_from is after valid_until. Equal bounds
+        are an empty window, not an inverted one. Naive datetimes read as UTC."""
+        if valid_from is None or valid_until is None:
+            return
+        vf = valid_from if valid_from.tzinfo else valid_from.replace(tzinfo=timezone.utc)
+        vu = valid_until if valid_until.tzinfo else valid_until.replace(tzinfo=timezone.utc)
+        if vf > vu:
+            raise ValueError(
+                f"inverted validity window: valid_from {vf.isoformat()} is "
+                f"after valid_until {vu.isoformat()}")
+
     @_locked
     def set_node_validity(
         self, node_id: str, valid_from=None, valid_until=None,
@@ -1430,6 +1676,10 @@ class GraphStore:
         node = self.get_node(node_id)
         if node is None:
             return False
+        # Never persist an inverted window. The bound that would stand after
+        # this call (an already-set bound wins) must not put from after until.
+        self._check_validity_window(
+            node.valid_from or valid_from, node.valid_until or valid_until)
         updates, params = [], []
         if valid_from is not None and node.valid_from is None:
             updates.append("valid_from = ?")
@@ -1878,6 +2128,7 @@ class GraphStore:
                 # when the semantic index is rebuilt wholesale below.
                 conn.execute("DELETE FROM edges")
                 conn.execute("DELETE FROM nodes")
+                self._discard_pending_stmt(conn)
             for node in new_nodes:
                 self.add_node(node)  # rides this transaction; audit included
                 result["nodes_added"] += 1

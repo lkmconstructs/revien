@@ -78,6 +78,8 @@ except ImportError:  # pragma: no cover - exercised only without the extra
 # inside FastEmbedProvider._ensure_model, under offline-first control.
 import importlib.util
 
+from ._ort import ort_telemetry_state
+
 _FASTEMBED_AVAILABLE = importlib.util.find_spec("fastembed") is not None
 
 # The vector STORAGE requires sqlite-vec. A cloud embedder can supply vectors
@@ -121,6 +123,47 @@ def _semantic_required() -> bool:
     return raw.strip().lower() in ("require", "required", "strict")
 
 
+# ── Embed-context recipe (REVIEN_EMBED_CONTEXT) ───────────────────────
+# What gets embedded for a CONTEXT (verbatim turn) node. "off" (default) is the
+# node alone, exactly as before. "prev" prepends the preceding CONTEXT node of
+# the same session_key so "I ran it last Saturday" carries its referent. Only
+# the string handed to the embedder changes; stored node content never does.
+EMBED_CONTEXT_OFF = "off"
+EMBED_CONTEXT_PREV = "prev"
+EMBED_CONTEXT_MAX_CHARS = 1200   # combined cap; the PREVIOUS turn is trimmed, never the current
+_EMBED_CONTEXT_OFF_VALUES = ("", "0", "off", "false", "no", "none")
+
+
+def embed_context_mode() -> str:
+    """Current REVIEN_EMBED_CONTEXT setting: "off" (default) or "prev".
+    Read per call so the env can change between operations. An unrecognised
+    value is loud and treated as off."""
+    raw = os.environ.get("REVIEN_EMBED_CONTEXT", "").strip().lower()
+    if raw in _EMBED_CONTEXT_OFF_VALUES:
+        return EMBED_CONTEXT_OFF
+    if raw == EMBED_CONTEXT_PREV:
+        return EMBED_CONTEXT_PREV
+    sys.stderr.write(
+        f"[revien.semantic] Unknown REVIEN_EMBED_CONTEXT={raw!r}; "
+        f"valid: off, prev. Treating as off.\n"
+    )
+    return EMBED_CONTEXT_OFF
+
+
+def _with_previous_turn(prev_content: str, content: str) -> str:
+    """prev + newline + content, capped at EMBED_CONTEXT_MAX_CHARS. Over the
+    cap, the previous turn loses characters from its LEFT (its tail survives);
+    the current turn is never cut."""
+    prev_content = (prev_content or "").strip()
+    content = (content or "").strip()
+    if not prev_content:
+        return content
+    room = EMBED_CONTEXT_MAX_CHARS - len(content) - 1
+    if room <= 0:
+        return content
+    return f"{prev_content[-room:]}\n{content}"
+
+
 # ── Cloud disclosure (mirrors leg-4 extractor_llm._disclose_cloud) ─────
 _DISCLOSED_PROVIDERS: set = set()
 
@@ -140,6 +183,11 @@ def _disclose_cloud(provider: str) -> None:
         f"to keep it on-device.\n"
     )
     sys.stderr.flush()
+
+
+class EmbedDimMismatch(RuntimeError):
+    """The configured embedder's vector size differs from the stored vec
+    table's. Inserting would corrupt or fail; `revien reindex` rebuilds."""
 
 
 # ── Embedding provider abstraction ────────────────────────────────────
@@ -177,6 +225,8 @@ class FastEmbedProvider:
             raise RuntimeError(
                 "fastembed not installed (pip install revien[semantic])"
             )
+        from ._ort import disable_ort_telemetry
+        disable_ort_telemetry()  # before any ORT session exists
         from fastembed import TextEmbedding
         # OFFLINE-FIRST via the per-call `local_files_only` PARAMETER — NOT the
         # HF_HUB_OFFLINE env var. huggingface_hub reads HF_HUB_OFFLINE into a
@@ -313,6 +363,9 @@ class SemanticIndex:
     # Per-search drain bound: keeps a pathological backlog from turning one
     # recall into a bulk reindex. Normal capture volume drains in one batch.
     PENDING_DRAIN_BATCH = 256
+    # Recipe record: one key/value table in the same db. Holds the
+    # embed-context mode the vectors in TABLE were built under.
+    META_TABLE = "semantic_meta"
 
     def __init__(
         self,
@@ -331,6 +384,11 @@ class SemanticIndex:
         # How many deferred captures the MOST RECENT search() embedded —
         # surfaced on the recall response so a drain is visible, not silent.
         self._last_search_drained = 0
+        # Open-time recipe/embedder warnings (shown by status() and the recall
+        # response's semantic_note, not only stderr).
+        self._open_warnings: List[str] = []
+        self._rebuilding = False          # reindex_all may drop+recreate the vec table
+        self._dim_mismatch = False        # broken BECAUSE of a dim change (reindex recovers)
 
         # Resolve enablement: explicit arg wins, else env gate.
         if enabled is None:
@@ -356,6 +414,9 @@ class SemanticIndex:
         # any live instance can serve).
         if self._enabled:
             self._register_store_listener()
+            self._warn_on_embed_context_mismatch()
+            self._warn_on_embedder_mismatch()
+            self._warn_on_incomplete_reindex()
 
     def _register_store_listener(self) -> None:
         """Wire this index to the store's content-change/delete hooks.
@@ -365,6 +426,11 @@ class SemanticIndex:
                 "semantic_index",
                 on_content_change=self._on_node_content_change,
                 on_delete=self.remove_node,
+                # Only under prev: the store skips its successor lookup when
+                # nobody listens, so the knob-off hot path pays nothing.
+                on_successor_change=(
+                    self._on_successor_change
+                    if embed_context_mode() == EMBED_CONTEXT_PREV else None),
             )
 
     # ── State ──────────────────────────────────────────────
@@ -389,6 +455,21 @@ class SemanticIndex:
             "broken_reason": self._broken_reason,
             "required": _semantic_required(),
             "dim": self._dim,
+            # Live provider state (None until built / when inactive). dim is
+            # the provider's, refined after the first real embed.
+            "embed_model": (getattr(self._embedder, "model_name", None)
+                            if self.is_enabled else None),
+            "embed_dim": (getattr(self._embedder, "dim", None)
+                          if self.is_enabled and self._embedder is not None else None),
+            # The CURRENT REVIEN_EMBED_CONTEXT recipe (what new vectors use).
+            # The recipe the stored vectors were built under is in
+            # semantic_meta; a difference is warned about at open.
+            "embed_context": embed_context_mode() if self.is_enabled else None,
+            # Open-time warnings (mixed recipe / embedder swapped since the
+            # vectors were built). Empty list = none.
+            "warnings": list(self._open_warnings),
+            # True/False/None (None = onnxruntime not installed).
+            "ort_telemetry_disabled": ort_telemetry_state(),
         }
 
     def inactive_reason(self) -> Optional[str]:
@@ -403,6 +484,10 @@ class SemanticIndex:
         if not _semantic_enabled_by_env():
             return "force-disabled via REVIEN_SEMANTIC"
         return "disabled at construction (enabled=False)"
+
+    def warnings_note(self) -> Optional[str]:
+        """Open-time warnings joined for a recall response; None when none."""
+        return "; ".join(self._open_warnings) if self._open_warnings else None
 
     def _db(self):
         """The store's connection lock, held for each execute/commit block.
@@ -427,13 +512,38 @@ class SemanticIndex:
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
 
+    def _stored_dim(self, conn) -> Optional[int]:
+        """Dimension of the existing vec table (parsed from its DDL), or None
+        when the table does not exist."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (self.TABLE,),
+        ).fetchone()
+        if row is None:
+            return None
+        import re
+        m = re.search(r"float\[(\d+)\]", row[0] or "")
+        return int(m.group(1)) if m else None
+
     def _ensure_table(self, dim: int) -> None:
-        """Create the vec0 virtual table once, sized to the embedder dim."""
-        if self._table_ready:
+        """Create the vec0 virtual table once, sized to the embedder dim.
+        An existing table of a DIFFERENT dim raises EmbedDimMismatch (recall
+        degrades loudly) unless a full reindex is rebuilding it."""
+        if self._table_ready and self._dim is not None:
             return
         with self._db():
             conn = self.store._get_conn()
             self._load_extension(conn)
+            stored = self._stored_dim(conn)
+            if stored is not None and stored != dim:
+                if not self._rebuilding:
+                    raise EmbedDimMismatch(
+                        f"vectors were built at dim {stored} but the configured "
+                        f"embedder produces dim {dim}; run `revien reindex`")
+                conn.execute(f"DROP TABLE IF EXISTS {self.TABLE}")
+                conn.commit()
+                stored = None
+            fresh = stored is None
             # Cosine distance: bge-small (and most sentence embedders) are trained
             # for cosine similarity. The default L2 metric compresses every pair
             # into a narrow band on these dense vectors, killing discrimination;
@@ -444,6 +554,20 @@ class SemanticIndex:
                 f"embedding float[{dim}] distance_metric=cosine)"
             )
             conn.commit()
+            if fresh and self._rebuilding:
+                # A full reindex owns the recipe: record only the INTENDED
+                # model/dim now and the final recipe once every batch has
+                # succeeded (reindex_all). A failure part-way must not leave
+                # meta claiming the new model with a fraction of the vectors.
+                model = getattr(self._embedder, "model_name", None)
+                pairs = {"embed_state": "rebuilding",
+                         "embed_dim_intended": int(dim)}
+                if model:
+                    pairs["embed_model_intended"] = model
+                self._record_meta(**pairs)
+            elif fresh:
+                self._record_embed_context(embed_context_mode())
+                self._record_embedder(dim)
         self._dim = dim
         self._table_ready = True
 
@@ -461,6 +585,9 @@ class SemanticIndex:
             ) from exc
         self._broken = True
         self._broken_reason = repr(exc)
+        if isinstance(exc, EmbedDimMismatch):
+            self._dim_mismatch = True
+            self._broken_reason = str(exc)
         sys.stderr.write(
             f"[revien.semantic] DISABLED after runtime error: {exc!r}. "
             f"Recall is now graph-only (keyword) retrieval - quality is "
@@ -479,6 +606,14 @@ class SemanticIndex:
         querying, so vector search sees the new content by the next recall
         (drain re-reads the node, so the freshest edit wins)."""
         self.defer_nodes([(node_id, label, content)])
+
+    def _on_successor_change(self, node_id: str, label: str, content: str) -> None:
+        """Store listener: the CONTEXT node AFTER an edited/deleted one. Under
+        REVIEN_EMBED_CONTEXT=prev its vector embeds the predecessor's text, so
+        it must be re-embedded or the old (possibly forgotten) text stays
+        findable through it. No-op in other modes."""
+        if embed_context_mode() == EMBED_CONTEXT_PREV:
+            self.defer_nodes([(node_id, label, content)])
 
     def _ready_existing_table(self) -> bool:
         """Make an ALREADY-CREATED vec table usable on this connection.
@@ -524,6 +659,140 @@ class SemanticIndex:
         except Exception as e:  # noqa: BLE001 - cleanup must not break deletes
             self._safe_disable(e)
 
+    # ── Embed recipe record ────────────────────────────────
+    def _recorded_embed_context(self) -> Optional[str]:
+        """Mode the stored vectors were built under, or None when there are no
+        vectors. A vec table with no recorded mode predates the knob: "off"."""
+        with self._db():
+            conn = self.store._get_conn()
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.TABLE,),
+            ).fetchone() is None:
+                return None
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.META_TABLE,),
+            ).fetchone() is None:
+                return EMBED_CONTEXT_OFF
+            row = conn.execute(
+                f"SELECT value FROM {self.META_TABLE} WHERE key = 'embed_context'"
+            ).fetchone()
+            return row[0] if row else EMBED_CONTEXT_OFF
+
+    def _record_meta(self, **pairs) -> None:
+        with self._db():
+            conn = self.store._get_conn()
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.META_TABLE} "
+                f"(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            for k, v in pairs.items():
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {self.META_TABLE}(key, value) "
+                    f"VALUES (?, ?)", (k, str(v)),
+                )
+            conn.commit()
+
+    def _record_embed_context(self, mode: str) -> None:
+        self._record_meta(embed_context=mode)
+
+    def _record_embedder(self, dim: int) -> None:
+        """Remember which model/dim the vectors in TABLE belong to."""
+        model = getattr(self._embedder, "model_name", None)
+        pairs = {"embed_dim": int(dim)}
+        if model:
+            pairs["embed_model"] = model
+        self._record_meta(**pairs)
+
+    def _recorded_meta(self, key: str) -> Optional[str]:
+        with self._db():
+            conn = self.store._get_conn()
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self.META_TABLE,),
+            ).fetchone() is None:
+                return None
+            row = conn.execute(
+                f"SELECT value FROM {self.META_TABLE} WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+
+    def _warn_on_embed_context_mismatch(self) -> None:
+        """One loud line at open when the stored vectors were built under a
+        different REVIEN_EMBED_CONTEXT than the current one. Never rebuilds."""
+        try:
+            recorded = self._recorded_embed_context()
+        except Exception:  # noqa: BLE001 - bare/mock stores, closed db
+            return
+        current = embed_context_mode()
+        if recorded is not None and recorded != current:
+            msg = (f"vectors were built under REVIEN_EMBED_CONTEXT={recorded} "
+                   f"but the current setting is {current}. Mixed recipes "
+                   f"degrade recall; run `revien reindex` to rebuild under "
+                   f"the current setting.")
+            self._open_warnings.append(msg)
+            sys.stderr.write(f"[revien.semantic] WARNING: {msg}\n")
+            sys.stderr.flush()
+
+    _PARTIAL_MSG = ("a previous `revien reindex` did not finish; the stored "
+                    "vectors are a mix of old and new. Run `revien reindex` "
+                    "again until it completes.")
+
+    def _warn_on_incomplete_reindex(self) -> None:
+        """At open: a reindex started and never finished (failed part-way, or
+        the process died). Stays until a full reindex succeeds."""
+        try:
+            state = self._recorded_meta("embed_state")
+        except Exception:  # noqa: BLE001 - bare/mock stores, closed db
+            return
+        if state in ("rebuilding", "partial"):
+            self._open_warnings.append(self._PARTIAL_MSG)
+            sys.stderr.write(f"[revien.semantic] WARNING: {self._PARTIAL_MSG}\n")
+            sys.stderr.flush()
+
+    def _warn_on_embedder_mismatch(self) -> None:
+        """At open: the configured embedder model differs from the one the
+        stored vectors were built with. Same-dim swaps keep working (warn
+        only); a dim change is caught at the first embed and degrades recall
+        to graph-only until `revien reindex`. Never loads a model."""
+        try:
+            recorded = self._recorded_meta("embed_model")
+            if recorded is None:
+                return
+            emb = self._embedder if self._embedder is not None else build_embedder()
+            current = getattr(emb, "model_name", None)
+        except Exception:  # noqa: BLE001 - bare/mock stores, closed db
+            return
+        if current and current != recorded:
+            msg = (f"vectors were built with {recorded}; the configured "
+                   f"embedder is {current}. Run `revien reindex`.")
+            self._open_warnings.append(msg)
+            sys.stderr.write(f"[revien.semantic] WARNING: {msg}\n")
+            sys.stderr.flush()
+
+    def _embed_texts(self, items: Sequence[Tuple[str, str, str]]) -> List[str]:
+        """The single place embed text is derived for stored nodes. Off: the
+        node's own text (unchanged). prev: a CONTEXT node with a session_key
+        is embedded as previous-turn + newline + this turn. Stored content is
+        never touched. Claim nodes, session-less nodes and a session's first
+        turn embed alone."""
+        texts = [self._node_text(lbl, ct) for (_id, lbl, ct) in items]
+        if embed_context_mode() != EMBED_CONTEXT_PREV or not items:
+            return texts
+        from revien.graph.schema import NodeType
+
+        nodes = self.store.get_nodes_bulk([nid for (nid, _l, _c) in items])
+        for i, (nid, _lbl, ct) in enumerate(items):
+            node = nodes.get(nid)
+            if (node is None or node.node_type != NodeType.CONTEXT
+                    or not node.session_key or not (ct or "").strip()):
+                continue
+            prev = self.store.previous_context_in_session(node)
+            if prev is not None:
+                texts[i] = _with_previous_turn(prev.content, ct)
+        return texts
+
     @staticmethod
     def _node_text(label: str, content: str) -> str:
         """Embedding text for a node: label carries the signal, content adds
@@ -544,7 +813,7 @@ class SemanticIndex:
         if not self.is_enabled:
             return False
         try:
-            text = self._node_text(label, content)
+            text = self._embed_texts([(node_id, label, content)])[0]
             if not text:
                 return False
             embedder = self._get_embedder()
@@ -576,7 +845,7 @@ class SemanticIndex:
         if not self.is_enabled or not nodes:
             return 0
         try:
-            texts = [self._node_text(lbl, ct) for (_id, lbl, ct) in nodes]
+            texts = self._embed_texts(nodes)
             keep = [(nid, t) for (nid, _l, _c), t in zip(nodes, texts) if t]
             if not keep:
                 return 0
@@ -738,18 +1007,33 @@ class SemanticIndex:
         return "; ".join(parts) if parts else None
 
     def reindex_all(self, batch_size: int = 256) -> Dict:
-        """Backfill: embed every non-context node currently in the graph.
+        """Backfill: embed every node currently in the graph.
+
+        The embed recipe (context mode, model, dim) is recorded ONLY when every
+        batch succeeded; any failure returns status "partial" with the recipe
+        untouched and a loud stderr line, so a half-built index can never
+        claim to be built under the new recipe. A dim change (embedder swapped
+        for one with a different vector size) is recovered here: the vec table
+        is dropped and recreated under the new dim, then everything re-embeds.
 
         Returns a summary dict. No-op summary when the layer is disabled.
         """
-        if not self.is_enabled:
+        recovering = self._enabled and self._broken and self._dim_mismatch
+        if not self.is_enabled and not recovering:
             return {"status": "disabled", "indexed": 0, **self.status()}
+        if recovering:
+            self._broken = False
+            self._broken_reason = None
+            self._dim_mismatch = False
+            self._table_ready = False
+            self._dim = None
+        self._rebuilding = True
         try:
-            from revien.graph.schema import NodeType
-
+            self._record_meta(embed_state="rebuilding")
             all_nodes = self.store.list_nodes(limit=999999)
             batch: List[Tuple[str, str, str]] = []
             total = 0
+            failed = False
             for node in all_nodes:
                 # Index every node, including CONTEXT (verbatim turns) — the
                 # coherent answer-bearing content for conversational memory.
@@ -757,12 +1041,44 @@ class SemanticIndex:
                 if len(batch) >= batch_size:
                     total += self.index_nodes(batch)
                     batch = []
-            if batch:
+                    if not self.is_enabled:
+                        failed = True
+                        break
+            if batch and not failed:
                 total += self.index_nodes(batch)
+            if not self.is_enabled:
+                failed = True
+            if failed:
+                msg = (f"reindex FAILED part-way after {total} node(s): "
+                       f"{self._broken_reason}. The embed recipe was NOT "
+                       f"updated; vectors are a mix of old and new.")
+                sys.stderr.write(f"[revien.semantic] ERROR: {msg}\n")
+                sys.stderr.flush()
+                try:
+                    self._record_meta(embed_state="partial")
+                except Exception:  # noqa: BLE001 - state write is best-effort here
+                    pass
+                if self._PARTIAL_MSG not in self._open_warnings:
+                    self._open_warnings.append(self._PARTIAL_MSG)
+                return {"status": "partial", "indexed": total,
+                        "error": self._broken_reason, **self.status()}
+            if self._table_ready:
+                self._record_embed_context(embed_context_mode())
+                if self._dim:
+                    self._record_embedder(self._dim)
+            self._record_meta(embed_state="ok")
+            with self._db():
+                conn = self.store._get_conn()
+                conn.execute(f"DELETE FROM {self.META_TABLE} WHERE key IN "
+                             f"('embed_model_intended','embed_dim_intended')")
+                conn.commit()
+            self._open_warnings = []
             return {"status": "ok", "indexed": total, **self.status()}
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
             return {"status": "error", "indexed": 0, "error": repr(e)}
+        finally:
+            self._rebuilding = False
 
     # ── Search ─────────────────────────────────────────────
     def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:

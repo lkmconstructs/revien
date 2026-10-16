@@ -364,6 +364,7 @@ class TestAutoReindexOnUpdate:
             return orig(nid, lbl, ct)
 
         sem.index_node = counting
+        store.clear_pending_embeds([node.node_id])  # embedded by reindex_all
         store.update_node(node.node_id, metadata={"dia_id": "D1:3"})
         store.update_node(node.node_id, access_count=5)
         assert calls["n"] == 0

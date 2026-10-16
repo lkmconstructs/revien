@@ -57,6 +57,9 @@ class FileWatcherAdapter(RevienAdapter):
                     "content": content,
                     "content_type": self._detect_content_type(filepath),
                     "timestamp": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                    # A file's mtime is when it was last written, not when
+                    # anything in it was said: never rendered as a said-at date.
+                    "timestamp_source": "mtime",
                     "metadata": {
                         "filename": filepath.name,
                         "path": str(filepath),

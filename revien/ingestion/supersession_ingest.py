@@ -49,6 +49,13 @@ from revien.supersession import (
 )
 
 
+
+def _utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Aware-UTC view of a timestamp (naive is read as UTC), or None."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
 @dataclass
 class GovernanceOutcome:
     """What the gate decided for one (existing, new) claim pair, and what was done."""
@@ -152,30 +159,65 @@ class ClaimGovernor:
     def _supersede(self, existing_node: Node, new_node: Node) -> None:
         """Soft-invalidate the existing claim and record the supersession link.
 
-        B2 (bi-temporal): the supersession IS the transition — close the old
-        claim's validity window and open the new one's at the same instant T,
-        where T is the best available CONTENT time of the new claim
-        (event_time_start > recorded_at > now). The old claim's valid_from is
-        backfilled from its own content time when known, so "where did she
-        live in March?" reads a full [from, until) window, not just an end.
-        set_node_validity never overwrites an already-set bound, so a second
-        supersession cannot silently move a recorded transition."""
-        transition = (
-            new_node.event_time_start
-            or new_node.recorded_at
-            or datetime.now(timezone.utc)
-        )
-        self.store.set_node_validity(
-            existing_node.node_id,
-            valid_from=existing_node.event_time_start or existing_node.recorded_at,
-            valid_until=transition,
-            actor="csl_supersession",
-        )
-        self.store.set_node_validity(
-            new_node.node_id,
-            valid_from=transition,
-            actor="csl_supersession",
-        )
+        Chronology comes first, by recorded_at (when each claim was SAID —
+        arrival order is not evidence of order):
+          * new later than existing: the supersession IS the transition
+            (B2 bi-temporal) — close the old claim's validity window and open
+            the new one's at the same instant T, T being the new claim's best
+            CONTENT time (event_time_start > recorded_at). The old claim's
+            valid_from is backfilled from its own content time when known.
+          * new EARLIER than existing: late history. The existing claim is
+            still the current truth and is NOT invalidated; the new claim is
+            stored as historical (soft-invalidated, window closed at the
+            existing claim's recorded_at) and the existing claim CORRECTS it.
+          * equal or missing recorded_at: order is unknowable, so no window is
+            written (a window would be a guess); the supersession itself
+            proceeds as before.
+        A window is only ever written when from < until. set_node_validity
+        never overwrites an already-set bound, so a second supersession
+        cannot silently move a recorded transition."""
+        new_at = _utc(new_node.recorded_at)
+        old_at = _utc(existing_node.recorded_at)
+
+        if new_at is not None and old_at is not None and new_at < old_at:
+            new_from = _utc(new_node.event_time_start) or new_at
+            self.store.set_node_validity(
+                new_node.node_id,
+                valid_from=new_from if new_from < old_at else None,
+                valid_until=old_at,
+                actor="csl_supersession",
+            )
+            self.ops.invalidate_node(
+                new_node.node_id,
+                reason=f"late_history:{existing_node.node_id}",
+                construct_id="csl_supersession",
+            )
+            try:
+                self.store.add_edge(Edge(
+                    edge_type=EdgeType.CORRECTS,
+                    source_node_id=existing_node.node_id,
+                    target_node_id=new_node.node_id,
+                    weight=1.0,
+                ))
+            except Exception:  # noqa: BLE001 - the link is best-effort
+                pass
+            return
+
+        if new_at is not None and old_at is not None and new_at > old_at:
+            transition = _utc(new_node.event_time_start) or new_at
+            old_from = _utc(existing_node.event_time_start) or old_at
+            if old_from < transition:
+                self.store.set_node_validity(
+                    existing_node.node_id,
+                    valid_from=old_from,
+                    valid_until=transition,
+                    actor="csl_supersession",
+                )
+                self.store.set_node_validity(
+                    new_node.node_id,
+                    valid_from=transition,
+                    actor="csl_supersession",
+                )
         self.ops.invalidate_node(
             existing_node.node_id,
             reason=f"superseded_by:{new_node.node_id}",

@@ -1,0 +1,15 @@
+You are grading whether a candidate answer is correct, given a question and a gold (reference) answer. Judge ONLY whether the candidate conveys the same essential fact as the gold answer. Wording, phrasing, and extra detail do not matter as long as the core fact is present and not contradicted.
+
+Rules:
+- Reply with exactly one word: CORRECT or WRONG.
+- Do not explain, do not add punctuation, do not repeat the inputs.
+- If the gold answer indicates the question is unanswerable (e.g. "not mentioned" or "no information available") and the candidate also refuses to answer, that is CORRECT.
+- If the candidate refuses to answer but the gold answer states a real fact, that is WRONG.
+- If the candidate states a fact that contradicts the gold answer, that is WRONG.
+
+Category: {category}
+Question: {question}
+Gold answer: {gold}
+Candidate answer: {prediction}
+
+Verdict:

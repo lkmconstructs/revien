@@ -16,11 +16,24 @@ Answerer: only `extractive` (zero-LLM) is implemented in this build.
 Output results/<timestamp>_<config>.json carries: full config, dataset SHA,
 revien version, per-category + overall F1, recall@k / MRR / nDCG, latency
 p50/p90/p99, cost ($0), network_calls (0), sovereignty pass/fail, per-question rows.
+
+Optional end-to-end LLM-judge track (--judge, default 'f1' = off): a SEPARATE
+binary CORRECT/WRONG accuracy score from an LLM comparing each prediction to
+the gold answer (revien_bench.judges), added as report["judge"]/["reader"] and
+per-question judge_correct/judge_error — NEVER blended with F1 above. The two
+publishable rows (model names are placeholders — picking them is the owner's
+call):
+  local : --answerer ollama:<model> --judge ollama:<model>          (egress PASS)
+  cloud : --answerer openrouter:<model> --judge openrouter:<model>  (egress FAIL,
+          by design — a cloud reader/judge is data leaving the machine; the
+          sovereignty check labels this honestly rather than hiding it)
 """
 
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
+import copy
 import hashlib
 import json
 import os
@@ -34,13 +47,20 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import revien
+from revien.semantic._ort import disable_ort_telemetry
+
+disable_ort_telemetry()  # before any import below can build an ORT session
+
 from revien.graph.clustering import CommunityDetector
 from revien.graph.store import GraphStore
 from revien.retrieval.engine import RetrievalEngine
-from revien.semantic.index import SemanticIndex
+from revien.semantic.index import SemanticIndex, build_embedder, embed_context_mode
+from revien.semantic.rerank import CrossEncoderReranker
 
 from . import answerers as A
 from . import failure_analysis as FA
+from . import judges as J
+from . import decompose as D
 from . import metrics as M
 from . import sovereignty as S
 from .fetch_locomo import DATA_PATH, read_locked_hash
@@ -141,6 +161,12 @@ def _sanitize(text: str) -> str:
 # META (mismatch = rebuild, same as a dataset-SHA change). Stale files are
 # left behind rather than deleted — they are small, and history is history.
 
+# How LLM readers render retrieved memories: "dated" = each memory prefixed
+# with the day it was said. Recorded in the results JSON and folded into the
+# checkpoint fingerprint.
+READER_CONTEXT = "dated-resolved"
+
+
 def _env_fingerprint(prefix_allowlist: Optional[tuple] = None) -> str:
     """Fingerprint of the REVIEN_* environment (or an allowlisted subset)."""
     items = sorted(
@@ -179,26 +205,79 @@ _INGEST_ENV_KEYS = (
 )
 
 
+def _ingest_files_fingerprint() -> str:
+    """Hash of single files that shape what an ingest stores: the date source
+    vocabulary (revien/dates.py) and the LoCoMo ingest driver itself."""
+    import revien
+    h = hashlib.sha256()
+    for path in (Path(revien.__file__).resolve().parent / "dates.py",
+                 Path(revien.__file__).resolve().parent / "claims.py",
+                 Path(revien.__file__).resolve().parent / "supersession.py",
+                 Path(__file__).resolve().parent / "ingest_locomo.py",
+                 Path(__file__).resolve().parent / "loader.py"):
+        h.update(path.name.encode("utf-8"))
+        if path.is_file():
+            h.update(path.read_bytes())
+    return h.hexdigest()[:8]
+
+
 def _ingest_fingerprint() -> str:
     return (_env_fingerprint(_INGEST_ENV_KEYS)
-            + _code_fingerprint("ingestion", "graph", "semantic", "adapters"))
+            + _code_fingerprint("ingestion", "graph", "semantic", "adapters")
+            + _ingest_files_fingerprint())
 
 
-def _run_fingerprint() -> str:
+DECOMPOSE_FUSIONS = ("rrf", "max")
+RRF_K = 60
+RRF_ORIGINAL_WEIGHT = 2.0
+
+
+def _run_fingerprint(decompose: str = "none", decompose_fuse: str = "rrf") -> str:
     """Full run identity for checkpoints: ALL REVIEN_* env (ranking knobs
-    included — that's trap #1) + retrieval-affecting code."""
+    included — that's trap #1) + retrieval-affecting code. A decompose spec
+    other than 'none' is part of the identity (sub-query recalls change every
+    row); 'none' adds nothing, so pre-existing checkpoints keep resuming. The
+    fusion mode is folded in too; 'max' (the original raw-score union) hashes
+    the bare spec, so pre-rrf decompose checkpoints still resume."""
+    dec = (decompose or "none").strip()
+    if dec.lower() != "none" and decompose_fuse != "max":
+        dec = f"{dec}|fuse={decompose_fuse}"
+    dec_fp = ("" if dec.lower() == "none"
+              else hashlib.sha256(dec.encode("utf-8")).hexdigest()[:4])
     return (_env_fingerprint()
             + _code_fingerprint("retrieval", "semantic", "graph",
-                                "ingestion", "neural"))
+                                "ingestion", "neural")
+            # How the LLM readers see context is part of run identity: an
+            # old undated checkpoint must never resume into a dated run.
+            + hashlib.sha256(READER_CONTEXT.encode("utf-8")).hexdigest()[:4]
+            + _bench_code_fingerprint()
+            + dec_fp)
 
 
-def _checkpoint_path(out_dir: Path, config_name: str, answerer_name: str) -> Path:
-    """Checkpoint path for this exact (config, answerer, env, code) identity.
-    A knob or code change yields a different filename — the old checkpoint
-    can never falsely resume; an identical relaunch resumes exactly as before."""
+def _bench_code_fingerprint() -> str:
+    """Content hash of the revien_bench source itself (fusion, prompts, readers,
+    scoring): a change there must never resume rows produced by older code.
+    Top-level modules only; tests and generated results are not part of identity."""
+    h = hashlib.sha256()
+    for py in sorted(Path(__file__).resolve().parent.glob("*.py")):
+        h.update(py.name.encode("utf-8"))
+        h.update(py.read_bytes())
+    return h.hexdigest()[:8]
+
+
+def _checkpoint_path(
+    out_dir: Path, config_name: str, answerer_name: str, judge_name: str = "f1",
+    decompose_name: str = "none", decompose_fuse: str = "rrf",
+) -> Path:
+    """Checkpoint path for this exact (config, answerer, judge, env, code)
+    identity. A knob or code change yields a different filename — the old
+    checkpoint can never falsely resume; an identical relaunch resumes exactly
+    as before. The judge spec is part of the identity (F5): resuming a
+    judge-less checkpoint under a NEW --judge would otherwise silently reuse
+    rows that were never judged, corrupting the judge accuracy denominator."""
     return out_dir / (
         f".checkpoint_{_sanitize(config_name)}_{_sanitize(answerer_name)}"
-        f"_{_run_fingerprint()}.jsonl"
+        f"_{_sanitize(judge_name)}_{_run_fingerprint(decompose_name, decompose_fuse)}.jsonl"
     )
 
 
@@ -261,7 +340,81 @@ def _cache_paths(db_cache: Path, config_name: str, conv_id: str) -> tuple:
     return base, Path(str(base) + ".meta.json")
 
 
-def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Dict]:
+_TRUTHY = ("1", "true", "yes", "on", "require", "required", "strict")
+
+
+def _semantic_requested(cfg: Dict) -> bool:
+    """Did the run's CONFIG ask for the semantic layer (REVIEN_SEMANTIC truthy)?"""
+    return str((cfg.get("env") or {}).get("REVIEN_SEMANTIC", "0")).strip().lower() in _TRUTHY
+
+
+def _layer_status(semantic, reranker=None) -> Dict:
+    """Real layer state, read off the live objects (never env vars):
+    SemanticIndex.is_enabled/inactive_reason()/status() (revien/semantic/index.py
+    -- flips False in `_safe_disable` after a runtime error) and
+    CrossEncoderReranker.is_enabled (revien/semantic/rerank.py)."""
+    active = bool(getattr(semantic, "is_enabled", False))
+    reason = None if active else (
+        semantic.inactive_reason() if hasattr(semantic, "inactive_reason")
+        else "semantic layer absent")
+    embed_model = embed_dim = embed_context = None
+    try:
+        sem_status = semantic.status()
+        embedder = str(sem_status.get("embedder", "unknown"))
+        if active:
+            embed_model = sem_status.get("embed_model")
+            embed_dim = sem_status.get("embed_dim")
+            embed_context = sem_status.get("embed_context")
+    except Exception:
+        embedder = "unknown"
+    rr = bool(getattr(reranker, "is_enabled", False)) if reranker is not None else False
+    # Resolved depth/model live on CrossEncoderReranker.top_k / .model_name
+    # (rerank.py __init__); None when there is no reranker or it is disabled.
+    return {
+        "semantic_active": active,
+        "rerank_active": rr,
+        "rerank_top_k": getattr(reranker, "top_k", None) if rr else None,
+        "rerank_model": getattr(reranker, "model_name", None) if rr else None,
+        "embedder": embedder,
+        "embed_model": embed_model,
+        "embed_dim": embed_dim,
+        "embed_context": embed_context,
+        "semantic_inactive_reason": reason,
+    }
+
+
+def _resolve_embed_model() -> Optional[str]:
+    """Model name the CURRENT run's semantic index will use, read off the same
+    provider factory SemanticIndex uses (revien/semantic/index.py build_embedder).
+    Provider construction is lazy -- no model load. Dim is NOT resolved here:
+    it is a pre-load default until the first embed, so only the name is trusted."""
+    try:
+        return getattr(build_embedder(), "model_name", None)
+    except Exception:
+        return None
+
+
+def _resolve_embed_dim() -> Optional[int]:
+    """Dim the CURRENT run's embedder will produce, only when it is knowable
+    without loading the model: the pre-load `dim` is a default that is correct
+    solely for the provider's default model. Any other model -> None (the
+    snapshot's dim is then not compared; the model-name check still is)."""
+    try:
+        from revien.semantic import index as _si
+        emb = build_embedder()
+        name = getattr(emb, "model_name", None)
+        if name in (_si.DEFAULT_LOCAL_MODEL, _si.DEFAULT_OPENAI_MODEL):
+            return int(emb.dim)
+    except Exception:
+        pass
+    return None
+
+
+def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str],
+                     semantic_requested: bool = False,
+                     embed_model: Optional[str] = None,
+                     embed_dim: Optional[int] = None,
+                     embed_context: Optional[str] = None) -> Optional[Dict]:
     """Meta for a cached DB, or None when absent/SHA-mismatched (never falsely
     reuse a cache built from a different dataset) or ingest-identity-mismatched
     (never falsely reuse an ingest built by different code or ingest env —
@@ -276,6 +429,30 @@ def _cache_load_meta(meta_path: Path, dataset_sha: Optional[str]) -> Optional[Di
         return None
     if meta.get("ingest_fp") != _ingest_fingerprint():
         return None
+    ls = meta.get("layer_status")
+    if not isinstance(ls, dict) or (semantic_requested and not ls.get("semantic_active")):
+        why = ("no layer_status recorded" if not isinstance(ls, dict)
+               else "semantic layer was inactive during its ingest")
+        print(f"[bench] db-cache: ignoring stale snapshot {meta_path.name} - {why}")
+        return None
+    if semantic_requested:
+        # Snapshot vectors belong to the model that embedded them.
+        snap_model, snap_dim = ls.get("embed_model"), ls.get("embed_dim")
+        why = None
+        if snap_model is None:
+            why = "no embed_model recorded (legacy snapshot)"
+        elif embed_model is not None and snap_model != embed_model:
+            why = f"embedded with {snap_model}, this run uses {embed_model}"
+        elif embed_dim is not None and snap_dim is not None and snap_dim != embed_dim:
+            why = f"embedded at dim {snap_dim}, this run uses dim {embed_dim}"
+        elif (embed_context is not None
+              and (ls.get("embed_context") or "off") != embed_context):
+            # A snapshot from before the knob existed was built with "off".
+            why = (f"embedded with REVIEN_EMBED_CONTEXT={ls.get('embed_context') or 'off'}, "
+                   f"this run uses {embed_context}")
+        if why:
+            print(f"[bench] db-cache: ignoring stale snapshot {meta_path.name} - {why}")
+            return None
     return meta
 
 
@@ -294,6 +471,74 @@ def _retrieved_dia_ids(store: GraphStore, results) -> List[str]:
     return ordered
 
 
+def _fuse_responses(resps: List, top_n: int, mode: str = "rrf",
+                    k: float = RRF_K, original_weight: float = RRF_ORIGINAL_WEIGHT):
+    """Fuse sub-query recalls (resps[0] is the ORIGINAL question's recall).
+    Returns (results, diagnostics).
+
+    mode 'rrf' (default): weighted reciprocal-rank fusion. Raw scores from
+    different queries are not comparable, so only ranks are used:
+        fused(node) = sum over lists containing node of w_i / (k + rank_i)
+    rank_i is 1-based, w = original_weight for the original list and 1.0 for
+    each sub-question list. Result rows carry the fused score. Sorted by fused
+    score desc (ties: first seen, original list first), cut to top_n. The
+    engine's rrf_fuse is unweighted and returns ids only, so this is local.
+
+    mode 'max' (the earlier behaviour, kept for reproducibility): UNION by
+    node_id keeping each node's best RAW score, sorted desc, cut to top_n.
+
+    Diagnostics are merged for the miss taxonomy: filter reasons come from the
+    first recall that saw the node, anchor ids are unioned. Per-node scores take
+    the max across recalls ('max'), or the fused score ('rrf', so best_rank is
+    the rank in the fused list; frontier nodes absent from every result list
+    get 0.0, i.e. rank below all fused nodes)."""
+    if mode not in DECOMPOSE_FUSIONS:
+        raise ValueError(f"unknown decompose fusion {mode!r}; expected one of {DECOMPOSE_FUSIONS}")
+    fused_scores: Dict[str, float] = {}
+    if mode == "max":
+        best: Dict[str, object] = {}
+        for resp in resps:
+            for r in resp.results:
+                cur = best.get(r.node_id)
+                if cur is None or r.score > cur.score:
+                    best[r.node_id] = r
+        results = sorted(best.values(), key=lambda r: r.score, reverse=True)[:top_n]
+    else:
+        rows: Dict[str, object] = {}
+        for i, resp in enumerate(resps):
+            w = original_weight if i == 0 else 1.0
+            for rank, r in enumerate(resp.results, start=1):
+                rows.setdefault(r.node_id, r)
+                fused_scores[r.node_id] = fused_scores.get(r.node_id, 0.0) + w / (k + rank)
+        order = sorted(fused_scores, key=lambda n: -fused_scores[n])  # stable
+        results = []
+        for nid in order[:top_n]:
+            row = copy.copy(rows[nid])
+            row.score = fused_scores[nid]
+            results.append(row)
+
+    diags = [r.diagnostics for r in resps if r.diagnostics]
+    merged: Optional[Dict] = None
+    if diags:
+        scores: Dict[str, float] = {}
+        filtered: Dict[str, str] = {}
+        anchors: Dict[str, List[str]] = {}
+        for d in diags:
+            for nid, sc in (d.get("scores") or {}).items():
+                if mode == "rrf":
+                    scores[nid] = fused_scores.get(nid, 0.0)
+                elif nid not in scores or sc > scores[nid]:
+                    scores[nid] = sc
+            for nid, why in (d.get("filtered") or {}).items():
+                filtered.setdefault(nid, why)
+            for kind, ids in (d.get("anchors") or {}).items():
+                seen = anchors.setdefault(kind, [])
+                seen.extend(i for i in ids if i not in seen)
+        merged = {"scores": scores, "filtered": filtered, "anchors": anchors,
+                  "decompose_merged": True}
+    return results, merged
+
+
 def _score_qa(
     store: GraphStore,
     engine: RetrievalEngine,
@@ -301,9 +546,26 @@ def _score_qa(
     conv: Conversation,
     answerer: A.Answerer,
     dia_map: Optional[Dict[str, List[str]]] = None,
+    judge=None,
+    decomposer=None,
+    decompose_fuse: str = "rrf",
 ) -> Dict:
     """Run one QA through recall -> extractive answer -> score."""
     now_dt = parse_session_date(conv.last_session_date) or datetime.now(timezone.utc)
+
+    # Benchmark-only decompose row: split the question first (an LLM call for a
+    # cloud spec, NOT counted in recall latency), then recall every part.
+    queries = [qa.question]
+    decompose_error: Optional[str] = None
+    decompose_ms = 0.0
+    if decomposer is not None:
+        try:
+            dec = decomposer.decompose(qa.question)
+            queries = list(dec.queries) or [qa.question]
+            decompose_error = dec.error
+            decompose_ms = dec.latency_ms
+        except Exception as e:  # noqa: BLE001 - fall back to the original query
+            decompose_error = f"{type(e).__name__}: {e}"
 
     t0 = time.perf_counter()
     # Surface verbatim turns (CONTEXT nodes): for conversational QA the answer
@@ -311,15 +573,23 @@ def _score_qa(
     # debug=True: per-node scores/filters/anchors feed the miss classification
     # below. Overhead is a few dict copies — negligible vs the ~350ms p50, and
     # it's applied to EVERY config equally so latency comparisons stay fair.
-    resp = engine.recall(
-        qa.question, top_n=RECALL_TOP_N, now=now_dt, include_context=True, debug=True
-    )
-    recall_ms = (time.perf_counter() - t0) * 1000.0
+    resps = [
+        engine.recall(q, top_n=RECALL_TOP_N, now=now_dt, include_context=True, debug=True)
+        for q in queries
+    ]
+    recall_ms = (time.perf_counter() - t0) * 1000.0  # wall time across ALL sub-recalls
+    if len(resps) == 1:
+        resp = resps[0]
+    else:
+        f_results, f_diag = _fuse_responses(resps, RECALL_TOP_N, mode=decompose_fuse)
+        resp = SimpleNamespace(results=f_results, diagnostics=f_diag)
 
     ctx = A.RetrievedContext(
         query=qa.question,
         contents=[r.content for r in resp.results],
         labels=[r.label for r in resp.results],
+        dates=[r.recorded_at for r in resp.results],
+        date_sources=[getattr(r, "recorded_at_source", None) for r in resp.results],
     )
     t1 = time.perf_counter()
     # A single hung/failing answerer call (socket timeout, HTTP error, malformed
@@ -362,6 +632,28 @@ def _score_qa(
     # Supporting node ids (for provenance check): top results that contributed.
     supporting_ids = [r.node_id for r in resp.results[:5]]
 
+    # End-to-end LLM-judge track — SEPARATE from F1, never blended (see
+    # judges.py header). None/None when no judge is configured (the default
+    # F1-only path); an older resumed checkpoint row simply lacks these keys,
+    # which .get() downstream tolerates.
+    judge_correct: Optional[bool] = None
+    judge_error: Optional[str] = None
+    if judge is not None:
+        try:
+            verdict = judge.judge(qa.question, qa.answer, prediction, qa.category_name)
+            judge_correct = verdict.correct
+            judge_error = verdict.error
+        except Exception as e:  # noqa: BLE001 - one bad judge call ≠ dead run
+            judge_correct = False
+            judge_error = f"{type(e).__name__}: {e}"
+
+    dec_fields: Dict = {}
+    if decomposer is not None:
+        dec_fields = {
+            "n_subqueries": len(queries),
+            "decompose_error": decompose_error,
+            "decompose_latency_ms": round(decompose_ms, 3),
+        }
     return {
         "conv": conv.conv_id,
         "category": qa.category,
@@ -381,6 +673,9 @@ def _score_qa(
         "ndcg@10": round(ndcg, 4),
         "recall_latency_ms": round(recall_ms, 3),
         "answer_latency_ms": round(answer_ms, 3),
+        "judge_correct": judge_correct,
+        "judge_error": judge_error,
+        **dec_fields,
         "_supporting_ids": supporting_ids,
     }
 
@@ -394,12 +689,26 @@ def run_benchmark(
     max_qa: Optional[int] = None,
     fresh: bool = False,
     db_cache: Optional[Path] = None,
+    judge_name: str = "f1",
+    allow_degraded: bool = False,
+    decompose_name: str = "none",
+    decompose_fuse: str = "rrf",
 ) -> Dict:
+    if decompose_fuse not in DECOMPOSE_FUSIONS:
+        raise ValueError(f"unknown decompose fusion {decompose_fuse!r}")
     cfg = _load_config(config_name)
+    want_semantic = _semantic_requested(cfg)
+    layer_statuses: List[Dict] = []
+    # Out-of-config knobs: REVIEN_* already in the process env that the config
+    # file does not set (snapshot BEFORE the config env is applied).
+    env_overrides = {k: v for k, v in sorted(os.environ.items())
+                     if k.startswith("REVIEN_") and k not in (cfg.get("env") or {})}
     prev_env = _apply_env(cfg.get("env", {}))
 
     try:
         answerer = A.build_answerer(answerer_name)
+        judge_obj = J.build_judge(judge_name)
+        decomposer = D.build_decomposer(decompose_name)
         conversations = load_locomo(dataset_path)
         if limit_convs is not None:
             conversations = conversations[:limit_convs]
@@ -412,7 +721,9 @@ def run_benchmark(
 
         # ── Checkpoint / resume setup ─────────────────────────────────────────
         dataset_sha = read_locked_hash()
-        ckpt_path = _checkpoint_path(out_dir, config_name, answerer_name)
+        ckpt_path = _checkpoint_path(
+            out_dir, config_name, answerer_name, judge_name, decompose_name,
+            decompose_fuse)
         if fresh:
             # --fresh: ignore + delete any prior checkpoint and start over.
             try:
@@ -441,6 +752,12 @@ def run_benchmark(
         # answerer's counters at the end so the aggregate covers resumed+new).
         resumed_cloud_calls = 0
         resumed_cost_usd = 0.0
+        # Same bookkeeping, for the judge track (0/0.0 when no judge is active
+        # or every resumed record predates the judge fields).
+        resumed_judge_calls = 0
+        resumed_judge_cost = 0.0
+        resumed_dec_calls = 0
+        resumed_dec_cost = 0.0
 
         # ── Replay resumed conversations into the accumulators FIRST ──────────
         # The final aggregate (F1, per-category, recall@k, latency, cost) must
@@ -463,6 +780,10 @@ def run_benchmark(
                 alias_pass_stats.append(rec["alias"])
             resumed_cloud_calls += int(rec.get("conv_network_calls", 0) or 0)
             resumed_cost_usd += float(rec.get("conv_cost_usd", 0.0) or 0.0)
+            resumed_judge_calls += int(rec.get("conv_judge_network_calls", 0) or 0)
+            resumed_judge_cost += float(rec.get("conv_judge_cost_usd", 0.0) or 0.0)
+            resumed_dec_calls += int(rec.get("conv_decompose_network_calls", 0) or 0)
+            resumed_dec_cost += float(rec.get("conv_decompose_cost_usd", 0.0) or 0.0)
 
         # We keep ONE store alive at provenance-check time, so we sample the
         # first FRESHLY-RUN conversation's store for the provenance/audit
@@ -482,6 +803,10 @@ def run_benchmark(
             # cost/calls to THIS conversation's checkpoint record.
             calls_before = int(getattr(answerer, "network_calls", 0))
             cost_before = float(getattr(answerer, "cost_usd_estimate", 0.0))
+            judge_calls_before = int(getattr(judge_obj, "network_calls", 0)) if judge_obj else 0
+            judge_cost_before = float(getattr(judge_obj, "cost_usd_estimate", 0.0)) if judge_obj else 0.0
+            dec_calls_before = int(getattr(decomposer, "network_calls", 0))
+            dec_cost_before = float(getattr(decomposer, "cost_usd_estimate", 0.0))
             is_first_fresh = provenance_store is None
 
             fd, db_path = tempfile.mkstemp(suffix=f"_{config_name}_{conv.conv_id}.db")
@@ -493,7 +818,11 @@ def run_benchmark(
             cache_db = cache_meta_path = None
             if db_cache is not None:
                 cache_db, cache_meta_path = _cache_paths(db_cache, config_name, conv.conv_id)
-                cached_meta = _cache_load_meta(cache_meta_path, dataset_sha)
+                cached_meta = _cache_load_meta(
+                    cache_meta_path, dataset_sha, want_semantic,
+                    embed_model=_resolve_embed_model() if want_semantic else None,
+                    embed_dim=_resolve_embed_dim() if want_semantic else None,
+                    embed_context=embed_context_mode() if want_semantic else None)
                 if cached_meta is not None and cache_db.exists():
                     shutil.copyfile(cache_db, db_path)
                 else:
@@ -504,8 +833,15 @@ def run_benchmark(
             try:
                 semantic = SemanticIndex(store)  # self-disables without the extra
 
+                if cached_meta is None and want_semantic and not allow_degraded:
+                    _st = _layer_status(semantic)
+                    if not _st["semantic_active"]:
+                        _degraded_exit(conv.conv_id, _st, "before ingest")
+
                 conv_ingest_rate = 0.0
                 if cached_meta is not None:
+                    # Rerank is retrieval-time: report THIS run's depth/model,
+                    # not whatever the snapshot was ingested under.
                     summary = {
                         "turns_ingested": cached_meta["turns_ingested"],
                         "nodes_created": cached_meta["nodes_created"],
@@ -522,7 +858,16 @@ def run_benchmark(
                     if ingest_s > 0 and summary["turns_ingested"]:
                         conv_ingest_rate = summary["turns_ingested"] / ingest_s
                         ingest_rates.append(conv_ingest_rate)
-                    if db_cache is not None:
+                    status = _layer_status(semantic, CrossEncoderReranker())
+                    degraded = want_semantic and not status["semantic_active"]
+                    if degraded:
+                        if db_cache is not None:
+                            print(f"[bench] db-cache: NOT caching {conv.conv_id} — "
+                                  f"semantic layer inactive during ingest "
+                                  f"({status['semantic_inactive_reason']})")
+                        if not allow_degraded:
+                            _degraded_exit(conv.conv_id, status, "during ingest")
+                    if db_cache is not None and not degraded:
                         # Snapshot the pristine post-ingest state via SQLite's
                         # backup API (safe on a live connection, WAL included),
                         # then the meta sidecar with the SHA guard.
@@ -540,6 +885,7 @@ def run_benchmark(
                             "turns_ingested": summary["turns_ingested"],
                             "nodes_created": summary["nodes_created"],
                             "ingest_rate": round(conv_ingest_rate, 4),
+                            "layer_status": status,
                         }), encoding="utf-8")
                 total_audit_creates_expected += summary["nodes_created"]
 
@@ -567,16 +913,41 @@ def run_benchmark(
 
                 conv_rows: List[Dict] = []
                 for qa in conv.qa:
-                    row = _score_qa(store, engine, qa, conv, answerer, dia_map=dia_map)
+                    row = _score_qa(
+                        store, engine, qa, conv, answerer,
+                        dia_map=dia_map, judge=judge_obj,
+                        decomposer=decomposer,
+                        decompose_fuse=decompose_fuse,
+                    )
                     recall_latencies.append(row["recall_latency_ms"])
                     per_q.append(row)
                     conv_rows.append(row)
+
+                # Layer status is read LIVE after the QA loop on BOTH the
+                # cache-hit and cache-miss paths: a snapshot's recorded status
+                # says what ingest saw, not whether recall actually used the
+                # semantic layer (it can be disabled mid-run by a runtime error).
+                live_status = _layer_status(semantic, CrossEncoderReranker())
+                layer_statuses.append(live_status)
+                if want_semantic and not live_status["semantic_active"] and not allow_degraded:
+                    _degraded_exit(conv.conv_id, live_status, "during recall")
 
                 n_ran += 1
 
                 # Per-conv cost/calls delta (cloud readers self-count globally).
                 conv_calls = int(getattr(answerer, "network_calls", 0)) - calls_before
                 conv_cost = float(getattr(answerer, "cost_usd_estimate", 0.0)) - cost_before
+                conv_judge_calls = (
+                    int(getattr(judge_obj, "network_calls", 0)) - judge_calls_before
+                    if judge_obj else 0
+                )
+                conv_judge_cost = (
+                    float(getattr(judge_obj, "cost_usd_estimate", 0.0)) - judge_cost_before
+                    if judge_obj else 0.0
+                )
+
+                conv_dec_calls = int(getattr(decomposer, "network_calls", 0)) - dec_calls_before
+                conv_dec_cost = float(getattr(decomposer, "cost_usd_estimate", 0.0)) - dec_cost_before
 
                 # ── Persist this conversation's checkpoint line (flush+fsync) ──
                 # Written AFTER the conversation fully completes, so an
@@ -591,6 +962,10 @@ def run_benchmark(
                         "nodes_created": summary["nodes_created"],
                         "conv_network_calls": conv_calls,
                         "conv_cost_usd": round(conv_cost, 6),
+                        "conv_judge_network_calls": conv_judge_calls,
+                        "conv_judge_cost_usd": round(conv_judge_cost, 6),
+                        "conv_decompose_network_calls": conv_dec_calls,
+                        "conv_decompose_cost_usd": round(conv_dec_cost, 6),
                         "alias": alias_stats,
                     },
                 )
@@ -641,10 +1016,28 @@ def run_benchmark(
         cost_usd_estimate = (
             float(getattr(answerer, "cost_usd_estimate", 0.0)) + resumed_cost_usd
         )
+        judge_calls_total = (
+            (int(getattr(judge_obj, "network_calls", 0)) if judge_obj else 0)
+            + resumed_judge_calls
+        )
+        judge_cost_total = (
+            (float(getattr(judge_obj, "cost_usd_estimate", 0.0)) if judge_obj else 0.0)
+            + resumed_judge_cost
+        )
 
-        # Honest egress check: config-derived, names any cloud backend.
+        dec_calls_total = int(getattr(decomposer, "network_calls", 0)) + resumed_dec_calls
+        dec_cost_total = float(getattr(decomposer, "cost_usd_estimate", 0.0)) + resumed_dec_cost
+
+        # Honest egress check: config-derived, names any cloud backend. The
+        # measured-call secondary signal covers BOTH the reader and the judge —
+        # a cloud judge with reader calls at 0 must still trip the counter.
         checks.append(
-            S.network_egress_zero(cloud_calls=cloud_calls, answerer=answerer_name)
+            S.network_egress_zero(
+                cloud_calls=cloud_calls + judge_calls_total + dec_calls_total,
+                answerer=answerer_name,
+                judge=judge_name,
+                decompose=decompose_name,
+            )
         )
         checks.extend(S.run_consent_subtests())
 
@@ -656,14 +1049,56 @@ def run_benchmark(
         report["alias"] = _aggregate_alias(alias_pass_stats, enabled=_bench_alias_enabled())
         report["normalization_merges_sample"] = norm_merges_sample
         report["sovereignty"] = S.checks_to_dict(checks)
+        report["layer_status"] = _aggregate_layer_status(layer_statuses, want_semantic)
+        report["layer_status"]["allow_degraded"] = bool(allow_degraded)
+        report["env_overrides"] = env_overrides
         report["config"] = {
             "name": config_name,
             "env": cfg.get("env", {}),
             "cluster": bool(cfg.get("cluster")),
             "answerer": answerer.name,
+            "judge": judge_obj.name if judge_obj is not None else "f1",
+            "decompose": decomposer.name if decomposer is not None else "none",
             "recall_top_n": RECALL_TOP_N,
             "recall_ks": list(RECALL_KS),
         }
+        # End-to-end LLM-judge track — SEPARATE from F1 above, never blended.
+        # Present only when an LLM judge is actually configured (spec != 'f1');
+        # the default F1-only path's report shape is unchanged.
+        if judge_obj is not None:
+            reader_provider, _ = A.parse_provider(answerer_name)
+            report["reader"] = {
+                "spec": answerer_name,
+                "model": answerer.name,
+                "prompt_sha256": (
+                    None if reader_provider == "extractive" else A.ANSWER_PROMPT_SHA256
+                ),
+            }
+            report["judge"] = _aggregate_judge(
+                per_q, judge_name, judge_obj.name, judge_calls_total, judge_cost_total
+            )
+        if decomposer is not None:
+            dec_rows = [r for r in per_q if r.get("n_subqueries") is not None]
+            report["decompose"] = {
+                "spec": decompose_name,
+                "model": decomposer.name,
+                "prompt_sha256": D.DECOMPOSE_PROMPT_SHA256,
+                "network_calls": dec_calls_total,
+                "cost_usd": round(dec_cost_total, 6),
+                "cost_usd_is_estimate": True,
+                "decompose_errors": sum(1 for r in dec_rows if r.get("decompose_error")),
+                # Sub-queries include the original question, so this is >= 1.
+                "mean_subqueries": (
+                    round(sum(r["n_subqueries"] for r in dec_rows) / len(dec_rows), 3)
+                    if dec_rows else None
+                ),
+                "n_questions": len(dec_rows),
+                "taxonomy_basis": "merged_subrecall_diagnostics",
+                "fusion": decompose_fuse,
+                "rrf_k": RRF_K,
+                "original_weight": RRF_ORIGINAL_WEIGHT,
+            }
+        report["reader_context"] = READER_CONTEXT
         report["dataset"] = {
             "path": str(dataset_path),
             "sha256": read_locked_hash(),
@@ -672,9 +1107,13 @@ def run_benchmark(
         # All-local headline run: cost_usd_estimate is 0.0 and cloud_calls is 0,
         # so this preserves the honest $0 / 0-calls local default. Cloud answerer
         # runs surface a non-zero, clearly-labelled cost ESTIMATE + real call count.
-        report["cost_usd"] = round(cost_usd_estimate, 6)
+        # Top-level cost_usd/network_calls (F1): must be the HONEST total across
+        # both the reader AND the judge — a report that only counted the reader
+        # while a cloud judge silently made calls understated both. The per-block
+        # breakdown (report["judge"]) still carries the judge-only figures.
+        report["cost_usd"] = round(cost_usd_estimate + judge_cost_total + dec_cost_total, 6)
         report["cost_usd_is_estimate"] = True
-        report["network_calls"] = cloud_calls
+        report["network_calls"] = cloud_calls + judge_calls_total + dec_calls_total
         report["environment"] = {
             "revien_version": revien.__version__,
             "python": platform.python_version(),
@@ -705,6 +1144,116 @@ def run_benchmark(
         return report
     finally:
         _restore_env(prev_env)
+
+
+def _aggregate_judge(
+    per_q: List[Dict],
+    judge_spec: str,
+    judge_model_name: str,
+    network_calls: int,
+    cost_usd: float,
+) -> Dict:
+    """Fold per-question judge_correct/judge_error rows into one run-level
+    judge block. SEPARATE from F1 (report["overall_f1"]/["per_category_f1"]) —
+    never blended, see judges.py header. Only rows carrying a non-None
+    judge_correct are counted, so an older resumed row from a pre-judge
+    checkpoint (or a run mixing a judge-less resume with a judged rerun) never
+    silently corrupts the accuracy denominator."""
+    rows = [r for r in per_q if r.get("judge_correct") is not None]
+    n = len(rows)
+    error_rows = [r for r in rows if r.get("judge_error")]
+    errors = len(error_rows)
+    # F5: judge errors are excluded from the accuracy DENOMINATOR — an
+    # unparseable/failed verdict is neither a correct nor a wrong answer, it's
+    # a missing measurement, and folding it into the denominator as an
+    # implicit "wrong" understated accuracy. accuracy_denominator is the
+    # actually-judged (non-error) count; accuracy_overall is None (not 0.0)
+    # when nothing was judged, so a report reader can't mistake "no data" for
+    # "0% accuracy".
+    denom_rows = [r for r in rows if not r.get("judge_error")]
+    accuracy_denominator = len(denom_rows)
+    n_correct = sum(1 for r in denom_rows if r["judge_correct"])
+    accuracy_overall = (
+        round(n_correct / accuracy_denominator, 4)
+        if accuracy_denominator else None
+    )
+
+    by_cat: Dict[int, List[Dict]] = {}
+    for r in denom_rows:
+        by_cat.setdefault(r["category"], []).append(r)
+    per_category: Dict[str, Dict] = {}
+    for cat, crows in sorted(by_cat.items()):
+        per_category[CATEGORY_NAMES.get(cat, str(cat))] = {
+            "n": len(crows),
+            "accuracy": round(
+                sum(1 for x in crows if x["judge_correct"]) / len(crows), 4
+            ),
+        }
+
+    # LoCoMo category 5 (adversarial) gold is the WRONG answer by construction;
+    # the right behaviour is a refusal, which a gold-comparison judge marks
+    # WRONG. Published LLM-judge accuracies exclude the category for that
+    # reason, so the comparable figure is reported alongside, never instead.
+    non_adv = [r for r in denom_rows if not r.get("is_adversarial")]
+    n_correct_excl_adv = sum(1 for r in non_adv if r["judge_correct"])
+    accuracy_excl_adversarial = (
+        round(n_correct_excl_adv / len(non_adv), 4) if non_adv else None
+    )
+
+    return {
+        "spec": judge_spec,
+        "model": judge_model_name,
+        "prompt_sha256": J.JUDGE_PROMPT_SHA256,
+        "max_tokens": J.JUDGE_MAX_TOKENS,
+        "accuracy_overall": accuracy_overall,
+        "accuracy_denominator": accuracy_denominator,
+        "n_correct": n_correct,
+        "accuracy_excl_adversarial": accuracy_excl_adversarial,
+        "n_excl_adversarial": len(non_adv),
+        "per_category_accuracy": per_category,
+        "judge_errors": errors,
+        "n_judged": n,
+        "network_calls": network_calls,
+        "cost_usd": round(cost_usd, 6),
+        "cost_usd_is_estimate": True,
+    }
+
+
+def _degraded_exit(conv_id: str, status: Dict, when: str) -> None:
+    print(f"[bench] ERROR: config requests the semantic layer but it is inactive "
+          f"{when} ({conv_id}): {status.get('semantic_inactive_reason')}. "
+          f"Refusing to produce a degraded number; pass --allow-degraded to override.")
+    raise SystemExit(3)
+
+
+def _embedder_label(ls: Dict) -> str:
+    """`<provider>:<model>` for the Layers line (provider alone when unknown)."""
+    emb, model = ls.get("embedder"), ls.get("embed_model")
+    return f"{emb}:{model}" if model else f"{emb}"
+
+
+def _aggregate_layer_status(statuses: List[Dict], requested: bool) -> Dict:
+    """Run-level layer status: active only if EVERY observed conversation was."""
+    if not statuses:
+        return {"semantic_requested": requested, "semantic_active": None,
+                "rerank_active": None, "rerank_top_k": None, "rerank_model": None,
+                "embedder": None, "embed_model": None, "embed_dim": None,
+                "embed_context": None,
+                "semantic_inactive_reason": None}
+    reasons = sorted({s["semantic_inactive_reason"] for s in statuses
+                      if s.get("semantic_inactive_reason")})
+    return {
+        "semantic_requested": requested,
+        "semantic_active": all(s.get("semantic_active") for s in statuses),
+        "rerank_active": all(s.get("rerank_active") for s in statuses),
+        "rerank_top_k": statuses[-1].get("rerank_top_k"),
+        "rerank_model": statuses[-1].get("rerank_model"),
+        "embedder": statuses[-1].get("embedder"),
+        "embed_model": statuses[-1].get("embed_model"),
+        "embed_dim": statuses[-1].get("embed_dim"),
+        "embed_context": statuses[-1].get("embed_context"),
+        "semantic_inactive_reason": "; ".join(reasons) or None,
+    }
 
 
 def _aggregate_alias(stats: List[Dict], enabled: bool) -> Dict:
@@ -783,6 +1332,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="reader spec: extractive | ollama:<model> | "
                          "openai:<model> | openrouter:<model> | together:<model> | "
                          "claude:<model>")
+    ap.add_argument("--judge", default="f1",
+                    help="end-to-end LLM-judge spec (SEPARATE from F1, never "
+                         "blended): f1 (no LLM judge, default) | ollama:<model> "
+                         "(local, egress PASS) | openai:<model> | "
+                         "openrouter:<model> | together:<model> | claude:<model> "
+                         "(cloud, egress FAIL by design, labeled)")
+    ap.add_argument("--decompose", default="none",
+                    help="BENCHMARK-ONLY query decomposition row: none (default) | "
+                         "ollama:<model> (local, egress PASS if loopback) | "
+                         "openai|openrouter|together|claude:<model> (cloud, egress "
+                         "FAIL by design, labeled). Splits each question into "
+                         "sub-questions, recalls each, unions before the reader.")
+    ap.add_argument("--decompose-fuse", default="rrf", choices=DECOMPOSE_FUSIONS,
+                    dest="decompose_fuse",
+                    help="how --decompose merges sub-recalls: rrf (default; "
+                         "reciprocal-rank fusion, original question weight 2.0, "
+                         "k=60) | max (earlier raw-score union, kept so the "
+                         "first decompose row is reproducible)")
     ap.add_argument("--out", default=str(_REPO_ROOT / "results"))
     ap.add_argument("--dataset", default=str(DATA_PATH))
     ap.add_argument("--limit", type=int, default=None,
@@ -799,6 +1366,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "skipped and recall runs against a temp COPY — the cache "
                          "is never mutated. Cuts sweep iterations from ~10min to "
                          "recall-only time.")
+    ap.add_argument("--allow-degraded", action="store_true", dest="allow_degraded",
+                    help="continue even when the config requests the semantic "
+                         "layer but it is inactive (result is labelled degraded). "
+                         "Default: exit 3 rather than emit a degraded number.")
     args = ap.parse_args(argv)
 
     dataset_path = Path(args.dataset)
@@ -816,6 +1387,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_qa=args.max_qa,
         fresh=args.fresh,
         db_cache=Path(args.db_cache) if args.db_cache else None,
+        judge_name=args.judge,
+        allow_degraded=args.allow_degraded,
+        decompose_name=args.decompose,
+        decompose_fuse=args.decompose_fuse,
     )
     _print_summary(report)
     return 0
@@ -825,6 +1400,13 @@ def _print_summary(report: Dict) -> None:
     print("\n=== Revien LoCoMo benchmark ===")
     print(f"config        : {report['config']['name']} / {report['config']['answerer']}")
     print(f"questions     : {report['n_questions']}")
+    ls = report.get("layer_status") or {}
+    print(f"layers        : semantic={ls.get('semantic_active')} "
+          f"rerank={ls.get('rerank_active')} embedder={_embedder_label(ls)} "
+          f"rerank_top_k={ls.get('rerank_top_k')}")
+    if report.get("env_overrides"):
+        print("Env overrides : " + " ".join(
+            f"{k}={v}" for k, v in report["env_overrides"].items()))
     print(f"overall F1    : {report['overall_f1']}")
     print("per-category F1:")
     for cat, v in report["per_category_f1"].items():
@@ -857,6 +1439,19 @@ def _print_summary(report: Dict) -> None:
         print(f"resume        : ran={res['conversations_ran']} "
               f"resumed={res['conversations_resumed']} "
               f"(checkpoint: {res['checkpoint_path']})")
+    dec = report.get("decompose")
+    if dec:
+        print(f"decompose     : {dec['model']} calls={dec['network_calls']} "
+              f"cost=${dec['cost_usd']} mean_subqueries={dec['mean_subqueries']} "
+              f"errors={dec['decompose_errors']}")
+    judge = report.get("judge")
+    if judge:
+        print(f"judge (LLM)   : {judge['spec']} accuracy={judge['accuracy_overall']} "
+              f"(excl. adversarial: {judge.get('accuracy_excl_adversarial')}, "
+              f"n={judge.get('n_excl_adversarial')}) "
+              f"n={judge['n_judged']} errors={judge['judge_errors']} "
+              f"cost=${judge['cost_usd']} calls={judge['network_calls']} "
+              f"— NOT comparable to the F1/retrieval numbers above")
     print(f"results JSON  : {report.get('_out_path')}")
 
 

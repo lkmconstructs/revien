@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .base import RevienAdapter
+from .base import RevienAdapter, parse_message_timestamp
 
 
 # Common locations for Claude Code session logs
@@ -57,8 +57,16 @@ class ClaudeCodeAdapter(RevienAdapter):
             if mtime <= since_ts:
                 continue
 
-            conversation = self._parse_session_log(jsonl_file)
+            conversation, first_ts = self._parse_session_log_ts(jsonl_file)
             if conversation and conversation.strip():
+                # recorded_at = when the session's first message was SAID, not
+                # when the file was last written (mtime moves on every append).
+                # No message timestamp at all -> mtime, labelled as such.
+                if first_ts is not None:
+                    ts_iso, ts_source = first_ts.isoformat(), "content"
+                else:
+                    ts_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+                    ts_source = "mtime"
                 # Derive project name from directory structure
                 project_name = self._extract_project_name(jsonl_file)
                 source_id = f"claude-code:{project_name}:{jsonl_file.stem}"
@@ -66,7 +74,8 @@ class ClaudeCodeAdapter(RevienAdapter):
                 results.append({
                     "content": conversation,
                     "content_type": "conversation",
-                    "timestamp": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                    "timestamp": ts_iso,
+                    "timestamp_source": ts_source,
                     "metadata": {
                         "adapter": "claude_code",
                         "project": project_name,
@@ -98,7 +107,12 @@ class ClaudeCodeAdapter(RevienAdapter):
         Parse a Claude Code JSONL session log into conversation text.
         Extracts human and assistant messages, skips tool use noise.
         """
+        return self._parse_session_log_ts(filepath)[0]
+
+    def _parse_session_log_ts(self, filepath: Path):
+        """(conversation text | None, earliest message timestamp | None)."""
         messages = []
+        stamps = []
 
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -120,6 +134,7 @@ class ClaudeCodeAdapter(RevienAdapter):
                     if not content:
                         continue
 
+                    before = len(messages)
                     # Only include conversational messages
                     if msg_type in ("human", "user"):
                         messages.append(f"User: {content}")
@@ -133,10 +148,16 @@ class ClaudeCodeAdapter(RevienAdapter):
                         elif role in ("assistant", "ai"):
                             messages.append(f"Assistant: {content}")
 
-        except Exception:
-            return None
+                    if len(messages) > before:
+                        ts = parse_message_timestamp(obj.get("timestamp"))
+                        if ts is not None:
+                            stamps.append(ts)
 
-        return "\n".join(messages) if messages else None
+        except Exception:
+            return None, None
+
+        return ("\n".join(messages) if messages else None), (
+            min(stamps) if stamps else None)
 
     def _extract_content(self, obj: Dict) -> Optional[str]:
         """Extract text content from a message object."""

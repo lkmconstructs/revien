@@ -5,7 +5,64 @@ All notable changes to Revien are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed (read this: some memories lose their date)
+- **Existing memories from Claude Code, Codex, every Obsidian note (the upgrade backfill cannot tell a frontmatter date from a file date, so all `obsidian` rows are labeled `mtime`), and the file watcher will no longer show a date.** Their stored `recorded_at` was a file modification time (when a file was last written), not when anything was said, so showing it as "when said" was false. They keep their `recorded_at` for ordering but are labeled `mtime` (or `unlabeled`/`undated` when no source can be derived) and render with no date and no date note. Nothing is deleted. Re-ingest does NOT restore a date for an unchanged keyed session (the keyed re-ingest is a no-op), and `sync-vault --full` adds a second context node beside the old one rather than relabeling it; a true date comes only from newly ingested content.
+- **Session adapters (Claude Code, Codex) now stamp the first message's time, not the file mtime**, labeled `content` (`mtime` only when no message carries a time). Obsidian notes carry `content` only when the note has a frontmatter date, otherwise `mtime`.
+- **Hermes and MCP `store` capture now stamp the capture time** (labeled `capture`) instead of leaving `recorded_at` empty. This changes recency scoring for those rows: they now rank as recent-as-of-capture instead of undated.
+- **`recorded_at` on the API means "when it was said" only when `recorded_at_source` is `content`, `capture` or `import`.** For `mtime`, unlabeled, or null, treat it as unknown; consumers that render a date should gate on the source (`revien.dates.said_date`).
+- **Every ingest path now declares an honest `timestamp_source`:** `sync-vault` passes the adapter's source through (a note without a frontmatter date is `mtime`), `revien ingest` and MCP stamp the capture time as `capture`, `POST /v1/ingest` accepts `timestamp_source` (a request that supplies its own `timestamp` and no source is `content`; with no timestamp at all nothing is stamped), importers are `content`, reconcile claims, skill ingest and skill proposals are `capture`.
+- **Distilled vault notes no longer print a date for mtime or unlabeled memories** (the provenance line previously rendered `recorded_at` unconditionally).
+- **`revien status` splits the old `unknown` bucket** into `undated` (no `recorded_at`) and `unlabeled` (`recorded_at` set, no source), and marks `mtime`/`unlabeled`/`undated` as `(date not shown)`.
+- **Successor lookup on edit/delete runs only under `REVIEN_EMBED_CONTEXT=prev`**, and the previous/next-turn lookup now range-scans `idx_nodes_session (session_key, recorded_at, created_at)` (older databases drop and recreate the narrower index automatically on open).
+
 ### Added
+- **ONNX Runtime telemetry emission is disabled before any model loads; the sovereignty report records it (`ort_telemetry_disabled`).** OS-level diagnostic upload of events ONNX Runtime already emitted is outside Revien's control.
+- **Pre-existing rows are labeled with `recorded_at_source`; an unknown or mtime date is never shown as "when said".** A `user_version` 4 backfill (and standalone migration 004) derives the source from each row's origin; `said_date()` renders a date and the note only for content/capture/import, so unlabeled and mtime rows are undated; `revien status` counts nodes by source.
+- **Recall results carry `recorded_at`.** Every recall result now has `recorded_at` (when the memory was said, ISO-8601 in the speaker's own UTC offset, or null when unknown) across the daemon, MCP, CLI and TOON; memory-context blocks show each memory's date as `[YYYY-MM-DD]` so a consuming model can resolve "yesterday" or "next month".
+- **No relative age is shown to a reader or model.** Memory blocks show the absolute `[YYYY-MM-DD]` date of when a memory was said (`recorded_at`), never an age computed from ingest time (`created_at`); the date is omitted when unknown, and the Ollama memory-context line now shows it instead of a misleading "N days ago".
+- **TOON recall gains `recorded_at` and `recorded_at_source` columns.** The tabular recall rows carry when each memory was said and where that time came from; `parse_recall` tolerates TOON from an older daemon that has neither column.
+- **`REVIEN_EMBED_CONTEXT=prev` (opt-in).** Embeds each conversation turn together with the turn before it in the same session; the recipe is recorded in the store and a mismatch at open warns in `status()` and the recall `semantic_note`, not only on stderr. Editing or deleting a turn re-queues the next turn for embedding so forgotten text cannot stay findable through its successor's vector. New index `idx_nodes_session` backs the previous/next-turn lookup (created automatically on open).
+- **The embedder is recorded in the store.** `semantic_meta` keeps `embed_model` and `embed_dim`. Opening with a different model warns (`revien reindex`); a dimension change degrades recall to graph-only with a clear note instead of failing silently, and `revien reindex` now recovers by rebuilding the vector table under the new dimension. `reindex` records the new recipe only when every batch succeeded. While it runs the store holds `embed_state=rebuilding` (the intended model/dim under separate keys); a failure part-way leaves `embed_state=partial`, a warning in `status()["warnings"]` and the recall `semantic_note` on every open until a full reindex succeeds, a loud stderr line, and `revien reindex` exits non-zero.
+- **Readers are told what the bracketed date means.** The benchmark answerer prompt gains one rule (the bracketed date is when a memory was said; resolve "yesterday"/"last week"/"next month" against it) and the Hermes, Ollama and LangChain memory blocks carry a one-line note to the same effect when any memory is dated; `READER_CONTEXT` is now `dated-resolved`.
+- **Importers — `revien import-chatgpt` / `import-claude` / `import-readwise`.**
+  Batch-import a ChatGPT export, a Claude.ai export, or a Readwise
+  highlights CSV through the same ingestion pipeline every live adapter
+  uses (`revien/importers/`): deny list, context fence, dedup, and
+  idempotent `ingest_key` refresh all apply, so re-running an unchanged
+  export is a no-op. ChatGPT and Claude each become one unit per
+  conversation; for ChatGPT the unit is the thread actually displayed
+  (`current_node`'s parent chain back to root) — a message on an edited-
+  away branch is never ingested. Readwise becomes one unit per highlight,
+  linked to its book via a declared entity edge. Every command accepts
+  `--dry-run` (parses and reports counts, writes nothing) and `--limit N`.
+  Origin fields are stamped `chatgpt` / `claude` / `readwise` with
+  `origin_source="import"`. Zero new dependencies — stdlib `zipfile`/
+  `csv`/`json` only, and an export .zip is read straight out of the
+  archive, never extracted to disk.
+  - Known limits: (a) re-importing an EDITED conversation refreshes the
+    verbatim text and adds new claims but does not retract claims extracted
+    from the old text — the pipeline's keyed refresh is add-only; (b) an
+    unclosed recall-marker (e.g. a truncated export, or a conversation that
+    itself quotes Revien's memory-context marker) makes the context fence
+    drop the whole remainder of that conversation's import unit from the
+    marker line onward, not just the turn the marker appears in.
+- **Benchmark: end-to-end LoCoMo LLM-judge track.** `revien_bench/judges.py` —
+  a SEPARATE, never-blended binary CORRECT/WRONG accuracy score from an LLM
+  comparing each predicted answer to the LoCoMo gold answer, alongside (not
+  instead of) the official token-F1 metric. `runner.py --judge {f1|ollama:<m>|
+  openai:<m>|openrouter:<m>|together:<m>|claude:<m>}` (default `f1` = no LLM
+  judge, report shape unchanged). Mirrors the LLM-reader track's transport,
+  once-to-stderr cloud disclosure, cost-ESTIMATE table, and frozen/sha256-gated
+  prompt (`prompts/judge.txt`) exactly — same env vars, same egress honesty.
+  `sovereignty.network_egress_zero` now judges the `--judge` spec the same way
+  it already judged `--answerer`: a cloud judge FAILS and is named, even at 0
+  measured calls; `ollama:<model>` is loopback-local and PASSes. Report gains
+  `judge` (spec, model, prompt sha256, overall + per-category accuracy, judge
+  errors, network_calls, cost_usd) and `reader` blocks, and `report.py` renders
+  them as a separate "End-to-end QA (LLM judge)" table explicitly labeled "not
+  comparable to the retrieval metrics above." Per-question rows gain
+  `judge_correct`/`judge_error`; older checkpoints without these keys resume
+  fine (tolerated as absent, not corrupting the aggregate).
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/
@@ -261,6 +318,12 @@ All notable changes to Revien are documented here. Format follows
   context nodes (stamps and refreshes it) instead of appending yet another copy. Known
   limitation: the older historical duplicates remain in the graph — retroactive merge
   is out of scope here; the consolidate (dream) pass is the future home for that cleanup.
+- **A date is shown as "when it was said" only when it is.** Session adapters (Claude Code, Codex) stamp the earliest message timestamp in the file instead of the file's mtime; mtime-derived times (file watcher, session files with no message timestamps) are labelled `recorded_at_source=mtime`, never rendered as a date, and never trigger the "dates in brackets" note. A keyed refresh from an mtime source keeps the earlier `recorded_at`. `IngestionInput.timestamp_source` (`content` | `capture` | `mtime` | `import`) is stamped on nodes and carried on recall results (`recorded_at_source`). Rows ingested before the source existed keep their old rendering.
+- **The speaker's calendar day is kept.** `recorded_at` is serialized in its own UTC offset (naive = UTC), so a 9:30pm-EDT message renders as that day everywhere.
+- **Hermes and MCP stores carry a capture time** (`capture` source) when the caller gives none.
+- **The context fence strips only the exact "dates in brackets" note Revien emits,** not any user line that starts the same way.
+- **Benchmark layer status is read live on db-cache hits** (a dead embedder at recall time now exits 3 / is labelled, instead of reporting the snapshot's status); the checkpoint fingerprint covers the benchmark's own source; the cache compares embedder dimension.
+
 
 ## [0.3.0] — 2026-07-11
 

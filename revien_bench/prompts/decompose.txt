@@ -1,0 +1,11 @@
+You split a question into smaller search queries for a memory lookup over a long conversation history.
+
+Rules:
+- Write 2 to 3 short, self-contained sub-questions that together cover everything needed to answer the question.
+- Each sub-question must make sense on its own: repeat names and key terms instead of using pronouns.
+- One sub-question per line. No numbering, no bullets, no preamble, no explanation.
+- If the question is already atomic and cannot be usefully split, reply with the question unchanged on a single line.
+
+Question: {question}
+
+Sub-questions:

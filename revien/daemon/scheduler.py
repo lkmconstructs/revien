@@ -146,6 +146,9 @@ class SyncScheduler:
                 content=item.get("content", ""),
                 content_type=item.get("content_type", "conversation"),
                 timestamp=ts,
+                # Adapters declare where the time came from; absent means the
+                # item's own time (the envelope default).
+                timestamp_source=item.get("timestamp_source") or "content",
                 metadata=item.get("metadata", {}),
                 links=item.get("links", []) or [],
                 curated=bool(item.get("curated", False)),

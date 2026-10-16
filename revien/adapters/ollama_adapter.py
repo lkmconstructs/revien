@@ -24,6 +24,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from revien.graph.schema import Node, NodeType
+from revien.dates import DATE_NOTE, said_date
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline, IngestionOutput
 from revien.retrieval.engine import RetrievalEngine, RetrievalResponse
@@ -182,6 +183,7 @@ class OllamaAdapter:
             content=full_conversation,
             content_type="conversation",
             timestamp=datetime.now(timezone.utc),
+            timestamp_source="capture",
             metadata={"message_count": len(history)},
             origin_runtime="ollama",
             origin_source="live",
@@ -226,17 +228,13 @@ class OllamaAdapter:
             "The following context is retrieved from persistent memory based on relevance to the current query:\n",
         ]
 
+        if any(said_date(r.recorded_at, getattr(r, "recorded_at_source", None))
+               for r in response.results):
+            lines.append(DATE_NOTE)
+
         for result in response.results:
             # Format score as percentage
             score_pct = int(result.score * 100)
-
-            # Format time delta
-            now = datetime.now(timezone.utc)
-            node = self.store.get_node(result.node_id)
-            if node:
-                time_delta = self._format_time_delta(node.created_at, now)
-            else:
-                time_delta = "unknown time"
 
             # Build context line
             label = result.label or "Untitled"
@@ -244,7 +242,11 @@ class OllamaAdapter:
             if len(result.content) > 100:
                 content_preview += "..."
 
-            line = f"- [Score: {score_pct}%] ({time_delta}) {label}: {content_preview}"
+            # Age comes from when it was said (recorded_at), never from
+            # ingest time (created_at); omitted when unknown.
+            day = said_date(result.recorded_at, getattr(result, "recorded_at_source", None))
+            said = f"[{day}] " if day else ""
+            line = f"- {said}[Score: {score_pct}%] {label}: {content_preview}"
             lines.append(line)
 
         lines.append("\n[End Memory Context]")
@@ -342,6 +344,7 @@ class OllamaAdapter:
             content=exchange,
             content_type="conversation",
             timestamp=now,
+            timestamp_source="capture",
             metadata={
                 "role": "exchange",
                 "message_length": len(message),
@@ -356,43 +359,6 @@ class OllamaAdapter:
         except Exception as e:
             # Log but don't fail — ingestion errors shouldn't break the chat
             logger.warning(f"Failed to ingest exchange into graph: {e}")
-
-    def _format_time_delta(self, created_at: datetime, now: datetime) -> str:
-        """
-        Format a time delta as human-readable relative time.
-
-        Args:
-            created_at: The creation timestamp.
-            now: The reference timestamp (usually now).
-
-        Returns:
-            Human-readable time delta (e.g., "2 days ago", "1 hour ago").
-        """
-        delta = now - created_at
-        total_seconds = int(delta.total_seconds())
-
-        if total_seconds < 60:
-            return "just now"
-        if total_seconds < 3600:
-            minutes = total_seconds // 60
-            return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-        if total_seconds < 86400:
-            hours = total_seconds // 3600
-            return f"{hours} hour{'s' if hours != 1 else ''} ago"
-        if total_seconds < 604800:
-            days = total_seconds // 86400
-            return f"{days} day{'s' if days != 1 else ''} ago"
-
-        weeks = total_seconds // 604800
-        if weeks < 4:
-            return f"{weeks} week{'s' if weeks != 1 else ''} ago"
-
-        months = total_seconds // 2592000
-        if months < 12:
-            return f"{months} month{'s' if months != 1 else ''} ago"
-
-        years = total_seconds // 31536000
-        return f"{years} year{'s' if years != 1 else ''} ago"
 
     def close(self) -> None:
         """
