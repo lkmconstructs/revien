@@ -1450,50 +1450,111 @@ def sync():
     pass
 
 
+def _sqlite_problem(db_path: str) -> Optional[str]:
+    """One-line reason this path cannot be a Revien database, else None.
+    Checked BEFORE opening a GraphStore, which would write a schema into an
+    empty or foreign file."""
+    p = Path(db_path)
+    if not p.exists():
+        return "No Revien database found. Run 'revien start' first."
+    if p.is_dir():
+        return f"{db_path} is a directory, not a Revien database."
+    try:
+        with open(p, "rb") as f:
+            head = f.read(16)
+    except OSError as e:
+        return f"Cannot read {db_path}: {e.strerror or e}"
+    if not head:
+        return f"{db_path} is empty, not a Revien database."
+    if head != b"SQLite format 3\x00":
+        return f"{db_path} is not a SQLite database."
+    return None
+
+
 @sync.command(name="reset")
 @click.argument("adapter_name")
 @click.option("--db", default=None, help="Database path")
-def sync_reset(adapter_name: str, db: Optional[str]):
-    """Forget an adapter's sync position so its next sync re-reads its full
-    history (for example 'revien sync reset claude-code').
+@click.option("--yes", is_flag=True,
+              help="Proceed even though forgotten content could be captured again")
+def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
+    """Forget a connected adapter's sync position so its next sync re-reads
+    its full history (for example 'revien sync reset claude-code').
 
-    Safe to repeat: sessions are re-ingested by a stable key, so already
-    captured ones are refreshed in place, not duplicated. Nothing is deleted
-    from the graph."""
+    Only adapters that tag every item with a stable key (claude-code, codex)
+    can be reset: their sessions are refreshed in place, not duplicated, so
+    the reset is safe to repeat. Other adapters would ingest everything again
+    as new nodes, so they are refused. Nothing is deleted from the graph.
+    The new position is used at the next sync (default every 6 hours)."""
+    import sqlite3
+
+    from revien.adapters import adapter_type_rereads_idempotently
     from revien.graph.store import GraphStore
+
+    if adapter_name.startswith("usage:"):
+        click.echo(f"'{adapter_name}' is the usage observer's position, not an "
+                   "adapter. To rescan, run 'revien usage scan --full'.")
+        raise SystemExit(1)
 
     config = _load_config()
     db_path = db or config.get("db_path", _default_db_path())
-    if not Path(db_path).exists():
-        click.echo("No Revien database found. Run 'revien start' first.")
+    problem = _sqlite_problem(db_path)
+    if problem:
+        click.echo(problem)
         raise SystemExit(1)
 
-    connected = list((config.get("adapters") or {}).keys())
-    store = GraphStore(db_path=db_path)
+    adapters = config.get("adapters") or {}
+    connected = list(adapters.keys())
+    entry = adapters.get(adapter_name)
+
     try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        if entry is None:
+            known = [n for n in store.list_sync_cursor_names()
+                     if not n.startswith("usage:")]
+            click.echo(f"No connected adapter named '{adapter_name}'.")
+            names = sorted(set(connected) | set(known))
+            if names:
+                click.echo(f"Known: {', '.join(names)}")
+            raise SystemExit(1)
+        atype = entry.get("type", "") if isinstance(entry, dict) else ""
+        if not adapter_type_rereads_idempotently(atype):
+            click.echo(
+                f"Refusing to reset '{adapter_name}': its items carry no stable "
+                "key, so a full re-read would add everything again as new "
+                "nodes instead of refreshing them. Only claude-code and codex "
+                "adapters can be reset.")
+            raise SystemExit(1)
+        tombstones = store.count_forget_tombstones()
+        if tombstones and not yes:
+            click.echo(
+                f"This database has {tombstones} right-to-forget record(s). "
+                "A full re-read captures every session file that still exists, "
+                "including sessions whose content you forgot. Delete or move "
+                "those session files first, or re-run with --yes to proceed.")
+            raise SystemExit(1)
         existed = store.delete_sync_cursor(adapter_name)
-        known = [] if existed else store.list_sync_cursor_names()
+    except sqlite3.Error as e:
+        click.echo(f"Database error: {e}")
+        raise SystemExit(1)
     finally:
         store.close()
 
-    if existed:
-        click.echo(f"Cleared the sync position for '{adapter_name}'.")
-        click.echo("The next daemon sync will re-read its full history. "
-                   "Already captured items are refreshed in place, not "
-                   "duplicated. Nothing was deleted.")
-        click.echo("If the daemon is not running, start it with 'revien start'. "
-                   "A sync already in progress may re-save its position once "
-                   "more; if so, run this again.")
-        return
-    if adapter_name in connected:
+    if not existed:
         click.echo(f"'{adapter_name}' has no saved sync position, so its next "
                    "sync already reads its full history. Nothing to reset.")
         return
-    click.echo(f"No adapter or sync position named '{adapter_name}'.")
-    names = sorted(set(connected) | set(known))
-    if names:
-        click.echo(f"Known: {', '.join(names)}")
-    raise SystemExit(1)
+    click.echo(f"Cleared the sync position for '{adapter_name}'.")
+    click.echo("It takes effect at the next sync (default every 6 hours), "
+               "which re-reads the full history. Already captured sessions "
+               "are refreshed in place, not duplicated. Nothing was deleted.")
+    click.echo("If the daemon is in the middle of a sync right now, it may "
+               "save its old position again when it finishes; run this again "
+               "after it ends. If the daemon is not running, start it with "
+               "'revien start'.")
 
 
 @main.group()

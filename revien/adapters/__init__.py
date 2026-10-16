@@ -14,6 +14,22 @@ try:
 except ImportError:
     _LANGCHAIN_EXPORTS = []
 
+_ADAPTER_CLASSES = {
+    "claude_code": ClaudeCodeAdapter,
+    "codex": CodexAdapter,
+    "file_watcher": FileWatcherAdapter,
+    "generic_api": GenericAPIAdapter,
+    "obsidian": ObsidianVaultAdapter,
+}
+
+
+def adapter_type_rereads_idempotently(adapter_type: str) -> bool:
+    """True when the config ``type`` names an adapter class that declares
+    IDEMPOTENT_REREAD (no instance is built, so nothing is auto-detected)."""
+    cls = _ADAPTER_CLASSES.get(adapter_type or "")
+    return bool(cls is not None and getattr(cls, "IDEMPOTENT_REREAD", False))
+
+
 def build_adapter_from_config(entry: dict):
     """Construct an adapter from a ``~/.revien/config.json`` adapters entry.
 

@@ -6,16 +6,24 @@ All notable changes to Revien are documented here. Format follows
 ## [Unreleased]
 
 ### Added
-- **`revien sync reset <adapter>` — re-read an adapter's full history.**
+- **`revien sync reset <adapter>` — re-read a connected adapter's full history.**
   Clears that adapter's persisted sync cursor (new
-  `GraphStore.delete_sync_cursor`), so the next daemon sync starts at EPOCH.
-  It deletes nothing from the graph and is safe to repeat: keyed sessions
-  (claude-code, codex) refresh their one context node instead of duplicating
-  (`tests/test_sync_reset.py`). The name must be a connected adapter or have a
-  saved cursor, otherwise it exits 1 and lists the known names. No
-  confirmation prompt, since nothing is lost. The usage observer's separate
-  `usage:claude-code` cursor needs no reset (it never used the adapter's
-  session parser); `revien usage scan --full` rescans if wanted.
+  `GraphStore.delete_sync_cursor`), so the next sync starts at EPOCH;
+  the change is picked up at the daemon's next sync (default every 6 hours),
+  and a sync already running when you reset may save its old position again,
+  in which case run it again once that sync ends. It deletes nothing from
+  the graph. Only adapters whose items all carry a stable `ingest_key`
+  (claude-code, codex; declared by `IDEMPOTENT_REREAD` on the adapter class)
+  can be reset: their sessions refresh one context node instead of
+  duplicating, so a repeat is safe (`tests/test_sync_reset.py`). Other
+  adapters (file watcher, Obsidian, generic API) are refused with exit 1,
+  because a full re-read would add everything again as new nodes. The name
+  must be a connected adapter; `usage:*` positions are refused with a pointer
+  to `revien usage scan --full`. If the database holds right-to-forget
+  records, a full re-read would capture forgotten sessions again when their
+  files still exist, so the command prints a warning and needs `--yes`.
+  A missing, empty, directory, non-SQLite or locked `--db` gives a one-line
+  error and exit 1, and an empty or foreign file is never written to.
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/

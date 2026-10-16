@@ -1176,6 +1176,15 @@ class GraphStore:
         self._commit(conn)
         return deleted
 
+    @_locked
+    def count_forget_tombstones(self) -> int:
+        """Number of right-to-forget operations recorded in the audit trail."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE op = 'forget'"
+        ).fetchone()
+        return int(row[0])
+
     # ── Usage ledger (N1) ─────────────────────────────────
 
     @_locked

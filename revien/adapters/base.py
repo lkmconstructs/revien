@@ -14,6 +14,12 @@ class RevienAdapter(ABC):
     Each connected AI system needs an adapter that implements this interface.
     """
 
+    # True only when re-reading the adapter's FULL history (sync cursor at
+    # EPOCH) is provably idempotent: every item it emits carries an
+    # ``ingest_key`` so the pipeline refreshes the existing node in place.
+    # `revien sync reset` refuses adapters that do not declare this.
+    IDEMPOTENT_REREAD = False
+
     @abstractmethod
     async def fetch_new_content(
         self, since: datetime
