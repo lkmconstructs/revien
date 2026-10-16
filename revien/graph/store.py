@@ -1185,6 +1185,24 @@ class GraphStore:
         ).fetchone()
         return int(row[0])
 
+    @_locked
+    def count_user_forgets(self) -> int:
+        """Right-to-forget operations in the audit trail, EXCLUDING retention
+        expiry (which also writes op='forget' but with the tombstone reason
+        'retention_expire'). Hard deletes that bypass the audit trail
+        (DELETE /v1/nodes, LangChain clear()) are not, and cannot be, counted."""
+        conn = self._get_conn()
+        count = 0
+        for (after,) in conn.execute(
+                "SELECT after_json FROM audit_log WHERE op = 'forget'"):
+            try:
+                reason = (json.loads(after) or {}).get("reason") if after else None
+            except (ValueError, AttributeError):
+                reason = None
+            if reason != "retention_expire":
+                count += 1
+        return count
+
     # ── Usage ledger (N1) ─────────────────────────────────
 
     @_locked

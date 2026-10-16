@@ -1450,10 +1450,31 @@ def sync():
     pass
 
 
+# Columns a Revien database must have in the tables it always creates. A
+# table of the same name with other columns means a foreign database.
+_REVIEN_TABLE_COLUMNS = {
+    "nodes": {"node_id", "node_type", "label", "content"},
+    "edges": {"edge_id", "edge_type", "source_node_id", "target_node_id"},
+    "audit_log": {"node_id", "op", "after_json"},
+    "sync_cursors": {"adapter_name", "cursor", "updated_at"},
+}
+
+
 def _sqlite_problem(db_path: str) -> Optional[str]:
     """One-line reason this path cannot be a Revien database, else None.
-    Checked BEFORE opening a GraphStore, which would write a schema into an
-    empty or foreign file."""
+    Checked BEFORE opening a GraphStore, which would write a full schema into
+    an empty or foreign file.
+
+    A SQLite header alone is not enough (any app's database has one), so the
+    file is opened READ-ONLY (``mode=ro`` URI: it cannot be written, not even
+    a journal) and its own catalog is read: it must hold the ``nodes`` and
+    ``edges`` tables every Revien database has, and any of ``nodes``,
+    ``edges``, ``audit_log`` and ``sync_cursors`` that exist must have
+    Revien's columns. Tables a Revien database may lack (older versions) are
+    not required, so older Revien files are still accepted."""
+    import sqlite3
+    import urllib.parse
+
     p = Path(db_path)
     if not p.exists():
         return "No Revien database found. Run 'revien start' first."
@@ -1467,6 +1488,30 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
     if not head:
         return f"{db_path} is empty, not a Revien database."
     if head != b"SQLite format 3\x00":
+        return f"{db_path} is not a SQLite database."
+    uri = "file:" + urllib.parse.quote(str(p.resolve())) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not {"nodes", "edges"} <= tables:
+                return (f"{db_path} is a SQLite database but not a Revien "
+                        "database (no nodes/edges tables). Not touching it.")
+            for table, wanted in _REVIEN_TABLE_COLUMNS.items():
+                if table not in tables:
+                    continue
+                have = {r[1] for r in conn.execute(
+                    f"PRAGMA table_info({table})")}
+                if not wanted <= have:
+                    return (f"{db_path} has a '{table}' table that is not "
+                            "Revien's, so it is not a Revien database. "
+                            "Not touching it.")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        return f"Cannot read {db_path}: {e}"
+    except sqlite3.DatabaseError:
         return f"{db_path} is not a SQLite database."
     return None
 
@@ -1487,7 +1532,8 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
     The new position is used at the next sync (default every 6 hours)."""
     import sqlite3
 
-    from revien.adapters import adapter_type_rereads_idempotently
+    from revien.adapters import (
+        _ADAPTER_CLASSES, adapter_type_rereads_idempotently)
     from revien.graph.store import GraphStore
 
     if adapter_name.startswith("usage:"):
@@ -1513,14 +1559,28 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
         raise SystemExit(1)
     try:
         if entry is None:
-            known = [n for n in store.list_sync_cursor_names()
-                     if not n.startswith("usage:")]
-            click.echo(f"No connected adapter named '{adapter_name}'.")
-            names = sorted(set(connected) | set(known))
-            if names:
-                click.echo(f"Known: {', '.join(names)}")
+            has_cursor = adapter_name in store.list_sync_cursor_names()
+            connected_txt = ", ".join(sorted(connected)) or "none"
+            if has_cursor:
+                click.echo(
+                    f"'{adapter_name}' has a saved sync position but is not a "
+                    "connected adapter in your config, so its type cannot be "
+                    "checked and it is not reset. Connected adapters: "
+                    f"{connected_txt}. Connect it again ('revien connect') "
+                    "or use one of those names.")
+            else:
+                click.echo(f"No connected adapter named '{adapter_name}'. "
+                           f"Connected adapters: {connected_txt}.")
             raise SystemExit(1)
-        atype = entry.get("type", "") if isinstance(entry, dict) else ""
+        atype = entry.get("type", "") if isinstance(entry, dict) else None
+        if not isinstance(atype, str) or atype not in _ADAPTER_CLASSES:
+            click.echo(
+                f"Cannot reset '{adapter_name}': its config entry has "
+                + ("no usable 'type'" if not atype or not isinstance(atype, str)
+                   else f"unknown type '{atype}'")
+                + " (known types: " + ", ".join(sorted(_ADAPTER_CLASSES))
+                + "). Fix the entry in the config file. Nothing was changed.")
+            raise SystemExit(1)
         if not adapter_type_rereads_idempotently(atype):
             click.echo(
                 f"Refusing to reset '{adapter_name}': its items carry no stable "
@@ -1528,13 +1588,17 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
                 "nodes instead of refreshing them. Only claude-code and codex "
                 "adapters can be reset.")
             raise SystemExit(1)
-        tombstones = store.count_forget_tombstones()
-        if tombstones and not yes:
+        forgets = store.count_user_forgets()
+        if forgets and not yes:
             click.echo(
-                f"This database has {tombstones} right-to-forget record(s). "
-                "A full re-read captures every session file that still exists, "
-                "including sessions whose content you forgot. Delete or move "
-                "those session files first, or re-run with --yes to proceed.")
+                f"This database records {forgets} explicit forget "
+                "operation(s). A full re-read captures every session file "
+                "that still exists, including sessions whose content you "
+                "forgot. Delete or move those session files first, or "
+                "re-run with --yes to proceed. (Content removed by retention "
+                "expiry is not counted, and DELETE /v1/nodes and LangChain "
+                "clear() leave no record, so those cannot be warned about "
+                "and may be captured again too.)")
             raise SystemExit(1)
         existed = store.delete_sync_cursor(adapter_name)
     except sqlite3.Error as e:
@@ -1551,9 +1615,9 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
     click.echo("It takes effect at the next sync (default every 6 hours), "
                "which re-reads the full history. Already captured sessions "
                "are refreshed in place, not duplicated. Nothing was deleted.")
-    click.echo("If the daemon is in the middle of a sync right now, it may "
-               "save its old position again when it finishes; run this again "
-               "after it ends. If the daemon is not running, start it with "
+    click.echo("If the daemon is in the middle of a sync right now, it will "
+               "save the time that sync started when it finishes, which "
+               "undoes this reset; run this again after it ends. If the daemon is not running, start it with "
                "'revien start'.")
 
 

@@ -9,21 +9,34 @@ All notable changes to Revien are documented here. Format follows
 - **`revien sync reset <adapter>` — re-read a connected adapter's full history.**
   Clears that adapter's persisted sync cursor (new
   `GraphStore.delete_sync_cursor`), so the next sync starts at EPOCH;
-  the change is picked up at the daemon's next sync (default every 6 hours),
-  and a sync already running when you reset may save its old position again,
-  in which case run it again once that sync ends. It deletes nothing from
-  the graph. Only adapters whose items all carry a stable `ingest_key`
-  (claude-code, codex; declared by `IDEMPOTENT_REREAD` on the adapter class)
-  can be reset: their sessions refresh one context node instead of
-  duplicating, so a repeat is safe (`tests/test_sync_reset.py`). Other
-  adapters (file watcher, Obsidian, generic API) are refused with exit 1,
-  because a full re-read would add everything again as new nodes. The name
-  must be a connected adapter; `usage:*` positions are refused with a pointer
-  to `revien usage scan --full`. If the database holds right-to-forget
-  records, a full re-read would capture forgotten sessions again when their
-  files still exist, so the command prints a warning and needs `--yes`.
-  A missing, empty, directory, non-SQLite or locked `--db` gives a one-line
-  error and exit 1, and an empty or foreign file is never written to.
+  the change is picked up at the daemon's next sync (default every 6 hours).
+  A sync already running when you reset saves the time that sync started
+  when it finishes, which undoes the reset; run it again once that sync ends.
+  It deletes nothing from the graph. Only adapters whose items all carry a
+  stable `ingest_key` (claude-code, codex; declared by `IDEMPOTENT_REREAD` on
+  the adapter class, and checked against what each adapter actually emits in
+  `tests/test_sync_reset.py`) can be reset: re-reading a session refreshes
+  its one context node instead of duplicating it. Other adapters (file
+  watcher, Obsidian, generic API) are refused with exit 1, because a full
+  re-read would add everything again as new nodes; a config entry with a
+  missing or unknown `type` is refused as a config error instead. The name
+  must be a connected adapter; a name that only has a saved position is
+  refused and the connected names are listed; `usage:*` positions are refused
+  with a pointer to `revien usage scan --full`.
+  If the audit trail records explicit forgets (retention expiry, which also
+  writes `forget` rows, is excluded by its `retention_expire` reason), a full
+  re-read would capture those sessions again when their files still exist,
+  so the command prints a warning and needs `--yes`. Limits, stated plainly:
+  content removed by retention expiry is not counted, and `DELETE
+  /v1/nodes` and LangChain `clear()` leave no audit record at all, so the
+  command cannot warn about any of those and a re-read may capture that
+  content again. Known and unchanged: keying is per project +
+  file stem, so same-stem files in one project collide; and nodes extracted
+  from an edited session are not refreshed (only its context node is).
+  A missing, empty, directory, non-SQLite, locked or non-Revien `--db` gives
+  a one-line error and exit 1. A foreign file is recognised read-only (a
+  `mode=ro` connection reading its table list: it must have Revien's `nodes`
+  and `edges` tables with Revien's columns) and is left byte-identical.
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
   (claude-code/codex/hermes/ollama/openai/langchain/obsidian/file/api/

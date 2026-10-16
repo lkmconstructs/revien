@@ -111,6 +111,8 @@ class TestCLI:
         assert "next sync" in r.output
         assert "6 hours" in r.output
         assert "in the middle of a sync" in r.output
+        assert "save the time that sync started" in r.output
+        assert "may save its old position" not in r.output
         assert "run this again" in r.output
         s = GraphStore(db_path=db_path)
         try:
@@ -139,7 +141,7 @@ class TestCLI:
         r = self._invoke(monkeypatch, db_path, "claude_code")  # typo
         assert r.exit_code == 1
         assert "No connected adapter named 'claude_code'" in r.output
-        assert "claude-code" in r.output
+        assert "Connected adapters: claude-code" in r.output
 
     def test_cursor_without_connected_adapter_is_refused(
             self, store, db_path, monkeypatch):
@@ -148,6 +150,9 @@ class TestCLI:
         store.close()
         r = self._invoke(monkeypatch, db_path, "claude-code", adapters={})
         assert r.exit_code == 1
+        assert "No connected adapter named" not in r.output  # not contradictory
+        assert "saved sync position but is not a connected adapter" in r.output
+        assert "Connected adapters: none" in r.output
         s = GraphStore(db_path=db_path)
         try:
             assert s.get_sync_cursor("claude-code") == T
@@ -166,7 +171,7 @@ class TestCLI:
 class TestOnlyKeyedAdapters:
     @pytest.mark.parametrize("name,atype", [
         ("watch", "file_watcher"), ("vault", "obsidian"),
-        ("api", "generic_api"), ("mystery", "no_such_type"),
+        ("api", "generic_api"),
     ])
     def test_unkeyed_adapter_is_refused_and_cursor_kept(
             self, store, db_path, monkeypatch, name, atype):
@@ -223,7 +228,7 @@ class TestForgetWarning:
         self._forgotten_db(store)
         r = self._run(monkeypatch, db_path)
         assert r.exit_code == 1
-        assert "right-to-forget" in r.output
+        assert "explicit forget" in r.output
         assert "--yes" in r.output
         s = GraphStore(db_path=db_path)
         try:
@@ -252,6 +257,90 @@ class TestForgetWarning:
         store.record_audit("n1", "forget", actor="x")
         store.record_audit("n2", "update", actor="x")
         assert store.count_forget_tombstones() == 1
+
+
+    def test_retention_expiry_is_not_a_user_forget(self, store, db_path, monkeypatch):
+        """Retention expire writes op='forget' too (reason retention_expire):
+        a retention-only database must not get the 'content you forgot' block."""
+        from revien.graph.operations import GraphOperations
+        from revien.graph.schema import Node
+        store.set_sync_cursor("claude-code", T)
+        n = Node(node_type=NodeType.FACT, label="old", content="old fact",
+                 last_accessed=datetime(2020, 1, 1, tzinfo=timezone.utc),
+                 created_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+        store.add_node(n)
+        ops = GraphOperations(store)
+        ops.forget_node(n.node_id, reason="retention_expire")
+        assert [r for r in store.get_all_audit() if r["op"] == "forget"]
+        assert store.count_forget_tombstones() == 1
+        assert store.count_user_forgets() == 0
+        store.close()
+        r = self._run(monkeypatch, db_path)
+        assert r.exit_code == 0, r.output
+        assert "explicit forget" not in r.output
+
+    def test_user_forget_still_counts_alongside_retention(self, store):
+        from revien.graph.operations import GraphOperations
+        from revien.graph.schema import Node
+        ops = GraphOperations(store)
+        for reason in ("retention_expire", "user asked", ""):
+            n = Node(node_type=NodeType.FACT, label=reason or "x", content="c " + reason)
+            store.add_node(n)
+            ops.forget_node(n.node_id, reason=reason)
+        assert store.count_user_forgets() == 2
+
+    def test_hard_delete_leaves_no_record_and_warning_says_so(
+            self, store, db_path, monkeypatch):
+        """DELETE /v1/nodes (store.delete_node) writes no audit row; the
+        warning text must not claim to cover it."""
+        from revien.graph.schema import Node
+        n = Node(node_type=NodeType.FACT, label="x", content="gone")
+        store.add_node(n)
+        store.delete_node(n.node_id)
+        assert store.count_user_forgets() == 0
+        store.set_sync_cursor("claude-code", T)
+        store.record_audit("n1", "forget", actor="tester")
+        store.close()
+        r = self._run(monkeypatch, db_path)
+        assert r.exit_code == 1
+        assert "DELETE /v1/nodes" in r.output
+        assert "cannot be warned about" in r.output
+        assert "retention expiry is not counted" in r.output
+
+
+# -- type problems are config problems, not "no stable key" ------------------
+
+class TestConfigTypeMessages:
+    @pytest.mark.parametrize("entry", [
+        {"type": "no_such_type"}, {"type": ""}, {}, {"type": None},
+        {"type": ["x"]}, "claude-code",
+    ])
+    def test_bad_type_is_a_config_error(self, store, db_path, monkeypatch, entry):
+        store.set_sync_cursor("mystery", T)
+        store.close()
+        monkeypatch.setattr("revien.cli._load_config", lambda: {
+            "adapters": {"mystery": entry}, "db_path": db_path})
+        res = CliRunner().invoke(main, ["sync", "reset", "mystery", "--db", db_path])
+        assert res.exit_code == 1, res.output
+        assert "no stable key" not in res.output
+        assert "Refusing to reset" not in res.output
+        assert "Fix the entry in the config file" in res.output
+        assert "known types: claude_code, codex" in res.output
+        assert "Traceback" not in res.output
+        s = GraphStore(db_path=db_path)
+        try:
+            assert s.get_sync_cursor("mystery") == T
+        finally:
+            s.close()
+
+    def test_known_unkeyed_type_still_says_no_stable_key(
+            self, store, db_path, monkeypatch):
+        store.close()
+        monkeypatch.setattr("revien.cli._load_config", lambda: {
+            "adapters": {"v": {"type": "obsidian"}}, "db_path": db_path})
+        res = CliRunner().invoke(main, ["sync", "reset", "v", "--db", db_path])
+        assert res.exit_code == 1
+        assert "no stable" in res.output and "config" not in res.output.lower()
 
 
 # -- non-adapter names ------------------------------------------------------
@@ -319,6 +408,77 @@ class TestBadDbPaths:
         assert r.exit_code == 1
         assert "not a SQLite database" in r.output
         assert p.read_bytes() == before
+
+    def _bytes_and_run(self, monkeypatch, p):
+        before = p.read_bytes()
+        r = self._run(monkeypatch, p)
+        assert r.exit_code == 1, r.output
+        assert "Traceback" not in r.output
+        assert len(r.output.strip().splitlines()) == 1, r.output
+        assert p.read_bytes() == before  # byte-identical
+        assert sorted(x.name for x in p.parent.iterdir()) == [p.name]  # no journal
+        return r
+
+    def test_foreign_sqlite_file_is_refused_and_untouched(self, tmp_path, monkeypatch):
+        import sqlite3
+        p = tmp_path / "photos.db"
+        c = sqlite3.connect(p)
+        c.execute("CREATE TABLE photos (id INTEGER PRIMARY KEY, path TEXT)")
+        c.execute("INSERT INTO photos (path) VALUES ('a.jpg')")
+        c.commit()
+        c.close()
+        r = self._bytes_and_run(monkeypatch, p)
+        assert "not a Revien database" in r.output
+
+    def test_foreign_sync_cursors_shape_is_refused_and_untouched(
+            self, tmp_path, monkeypatch):
+        import sqlite3
+        p = tmp_path / "other.db"
+        c = sqlite3.connect(p)
+        c.execute("CREATE TABLE sync_cursors (name TEXT, pos INTEGER)")
+        c.commit()
+        c.close()
+        r = self._bytes_and_run(monkeypatch, p)
+        assert "not a Revien database" in r.output
+
+    def test_foreign_nodes_table_is_refused_and_untouched(self, tmp_path, monkeypatch):
+        import sqlite3
+        p = tmp_path / "graph.db"
+        c = sqlite3.connect(p)
+        c.execute("CREATE TABLE nodes (id TEXT, x TEXT)")
+        c.execute("CREATE TABLE edges (a TEXT, b TEXT)")
+        c.commit()
+        c.close()
+        r = self._bytes_and_run(monkeypatch, p)
+        assert "'nodes' table that is not Revien's" in r.output
+
+    def test_valid_sqlite_header_but_corrupt_body_is_refused(self, tmp_path, monkeypatch):
+        p = tmp_path / "bad.db"
+        p.write_bytes(b"SQLite format 3\x00" + b"\xff" * 4000)
+        self._bytes_and_run(monkeypatch, p)
+
+    def test_real_revien_database_is_accepted(self, store, db_path, monkeypatch):
+        store.set_sync_cursor("claude-code", T)
+        store.close()
+        from revien.cli import _sqlite_problem
+        assert _sqlite_problem(db_path) is None
+        assert self._run(monkeypatch, db_path).exit_code == 0
+
+    def test_old_revien_database_without_later_tables_is_accepted(
+            self, tmp_path):
+        """Only nodes+edges are required; tables added by later versions may
+        be missing (GraphStore creates them on open)."""
+        import sqlite3
+        p = tmp_path / "old.db"
+        c = sqlite3.connect(p)
+        c.execute("CREATE TABLE nodes (node_id TEXT PRIMARY KEY, node_type TEXT, "
+                  "label TEXT, content TEXT)")
+        c.execute("CREATE TABLE edges (edge_id TEXT PRIMARY KEY, edge_type TEXT, "
+                  "source_node_id TEXT, target_node_id TEXT)")
+        c.commit()
+        c.close()
+        from revien.cli import _sqlite_problem
+        assert _sqlite_problem(str(p)) is None
 
     def test_locked_database_is_one_clean_line(self, store, db_path, monkeypatch):
         store.set_sync_cursor("claude-code", T)
@@ -411,3 +571,139 @@ class TestPreExistingUsageObserver:
         report = UsageObserver(store, mode="shadow").run_claude_code(adapter)
         assert report.files_scanned == 1
         assert store.get_sync_cursor(USAGE_CURSOR) is not None
+
+
+# -- capability drift --------------------------------------------------------
+
+def _fetch(adapter):
+    return run_async(adapter.fetch_new_content(EPOCH))
+
+
+def _make_adapters(tmp_path):
+    """One real instance of every adapter class, over real files, plus the
+    items each fetches from the beginning of time."""
+    import httpx
+    from revien.adapters import (
+        CodexAdapter, FileWatcherAdapter, GenericAPIAdapter,
+        ObsidianVaultAdapter)
+    from tests.test_codex_adapter import MOCK_CODEX_ROLLOUT, _write_rollout
+
+    cc_root = tmp_path / "cc"
+    _write_real_session(cc_root, [("user", "We chose PostgreSQL for storage."),
+                                  ("assistant", "Noted, PostgreSQL.")])
+    codex_root = tmp_path / "codex"
+    _write_rollout(codex_root / "2026" / "07" / "01" / "rollout-a.jsonl",
+                   MOCK_CODEX_ROLLOUT)
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    (watch / "note.md").write_text("We decided to adopt Redis for caching.")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Plan.md").write_text("# Plan\n\nWe will migrate to Postgres.\n\n"
+                                   "## Risks\n\nDowntime during the cutover.\n")
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return [{"content": "an api item", "timestamp": T.isoformat()}]
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _Resp()
+
+    return {
+        "claude_code": ClaudeCodeAdapter(session_dir=str(cc_root)),
+        "codex": CodexAdapter(session_dir=str(codex_root)),
+        "file_watcher": FileWatcherAdapter(watch_dir=str(watch)),
+        "obsidian": ObsidianVaultAdapter(vault_dir=str(vault)),
+        "generic_api": GenericAPIAdapter(url="http://example.invalid/x"),
+    }, _Client, httpx
+
+
+class TestCapabilityDrift:
+    def test_flag_matches_what_each_adapter_actually_emits(
+            self, tmp_path, monkeypatch):
+        from revien.adapters import _ADAPTER_CLASSES
+        adapters, client, httpx = _make_adapters(tmp_path)
+        monkeypatch.setattr(httpx, "AsyncClient", client)
+        assert set(adapters) == set(_ADAPTER_CLASSES)  # a new class needs a case here
+        for atype, adapter in adapters.items():
+            assert type(adapter) is _ADAPTER_CLASSES[atype]
+            items = _fetch(adapter)
+            assert items, f"{atype} fetched nothing: the test would prove nothing"
+            keyed = [bool((i.get("ingest_key") or "").strip()) for i in items]
+            if type(adapter).IDEMPOTENT_REREAD:
+                assert all(keyed), f"{atype} is flagged idempotent but emits unkeyed items"
+            else:
+                assert not any(keyed), f"{atype} emits ingest_key but is not flagged"
+
+    def test_keys_are_stable_across_reads(self, tmp_path):
+        adapters, _, _ = _make_adapters(tmp_path)
+        for atype in ("claude_code", "codex"):
+            a = [i["ingest_key"] for i in _fetch(adapters[atype])]
+            b = [i["ingest_key"] for i in _fetch(adapters[atype])]
+            assert a == b and len(set(a)) == len(a)
+
+    def test_registry_agrees_with_build_adapter_from_config(self, tmp_path):
+        import inspect
+        import re
+        from revien.adapters import _ADAPTER_CLASSES, build_adapter_from_config
+        entries = {
+            "claude_code": {"session_dir": str(tmp_path)},
+            "codex": {"session_dir": str(tmp_path)},
+            "file_watcher": {"watch_dir": str(tmp_path)},
+            "generic_api": {"url": "http://example.invalid/x"},
+            "obsidian": {"vault_dir": str(tmp_path)},
+        }
+        # Every registered type is buildable and builds that very class...
+        assert set(entries) == set(_ADAPTER_CLASSES)
+        for atype, extra in entries.items():
+            built = build_adapter_from_config({"type": atype, **extra})
+            assert type(built) is _ADAPTER_CLASSES[atype], atype
+        # ...and the builder handles no type the registry lacks.
+        src = inspect.getsource(build_adapter_from_config)
+        handled = set(re.findall(r'adapter_type == "([^"]+)"', src))
+        assert handled == set(_ADAPTER_CLASSES)
+        assert build_adapter_from_config({"type": "no_such_type"}) is None
+
+
+# -- real codex re-read through the CLI + scheduler --------------------------
+
+class TestCodexRereadIdempotent:
+    def test_codex_reset_then_reread_refreshes_not_duplicates(
+            self, store, db_path, tmp_path, monkeypatch):
+        from revien.adapters.codex import CodexAdapter
+        from tests.test_codex_adapter import MOCK_CODEX_ROLLOUT, _write_rollout
+
+        root = tmp_path / "sessions"
+        _write_rollout(root / "2026" / "07" / "01" / "rollout-a.jsonl",
+                       MOCK_CODEX_ROLLOUT)
+        _write_rollout(root / "2026" / "07" / "02" / "rollout-b.jsonl",
+                       MOCK_CODEX_ROLLOUT)
+
+        def sync():
+            sched = SyncScheduler(pipeline=IngestionPipeline(store))
+            sched.register_adapter("codex", CodexAdapter(session_dir=str(root)))
+            return run_async(sched.sync_one("codex"))
+
+        def contexts():
+            return [n for n in store.list_nodes(node_type=NodeType.CONTEXT, limit=999)
+                    if (n.source_id or "").startswith("codex:")]
+
+        first = sync()
+        assert first["items_ingested"] >= 1
+        ids = sorted(n.node_id for n in contexts())
+        total = store.count_nodes()
+        assert ids and sync()["items_ingested"] == 0  # cursor moved on
+
+        for _ in range(3):  # reset through the real CLI, repeatedly
+            store._get_conn().commit()
+            monkeypatch.setattr("revien.cli._load_config", lambda: {
+                "adapters": {"codex": {"type": "codex"}}, "db_path": db_path})
+            r = CliRunner().invoke(main, ["sync", "reset", "codex", "--db", db_path])
+            assert r.exit_code == 0, r.output
+            assert store.get_sync_cursor("codex") is None
+            assert sync()["items_ingested"] == first["items_ingested"]
+            assert sorted(n.node_id for n in contexts()) == ids
+            assert store.count_nodes() == total
