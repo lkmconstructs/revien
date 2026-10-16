@@ -51,9 +51,11 @@ All notable changes to Revien are documented here. Format follows
   A new content-free table `ingest_suppressions` holds one row per stable
   source identity (`identity`, `kind`, `created_at`, `reason`, `actor`, plus a
   skip counter). It is written, in the same transaction as the delete, by an
-  explicit user forget (`forget_node` / `POST /v1/nodes/{id}/forget`, any
-  reason except `retention_expire`) and by `DELETE /v1/nodes/{id}`. Retention
-  expiry never writes one. Ordinary ingestion of a suppressed identity
+  explicit user forget (`forget_node` / `POST /v1/nodes/{id}/forget`, with
+  any reason text) and by `DELETE /v1/nodes/{id}`. Automatic cleanup (retention
+  expiry) never writes one: it is identified by an internal argument no REST,
+  CLI or MCP surface exposes, never by the reason string, so a user who types
+  `retention_expire` as a reason still gets a tombstone and is counted. Ordinary ingestion of a suppressed identity
   (adapter sync, MCP store, REST ingest, `revien ingest`) is skipped, printed,
   counted (`ingest_suppressions.skipped_count`, the sync result's
   `items_suppressed`, `suppressed` in the REST/MCP ingest response) and never
@@ -63,25 +65,77 @@ All notable changes to Revien are documented here. Format follows
   unless `--override-suppressions` / `override_suppressions=true`, the
   explicit reimport, which lifts them (audited). A restored session is read
   again when its file next changes or after `revien sync reset`.
-  Decisions (owner to confirm): the identity is the node's `source_id` plus
-  its context node's `ingest_key`, so it survives the file changing.
-  Forgetting ONE extracted node suppresses that node's whole source session
-  (the node's content cannot be matched without storing it): the session's
-  other nodes stay, but its future turns are no longer captured until
-  restored. Only source ids that name one unit are tombstoned
-  (`claude-code:`, `codex:`, `openai:conversation:`, `file:`, `vault:`);
-  shared channel ids ("mcp", "hermes", "ollama_*", "langchain", `api:<feed>`)
-  are not, because that would block everything the channel sends, and the
-  forget/delete response says so (`suppression_unavailable` /
-  `suppression: "unavailable"`). The identity string itself (a project or file
-  name) remains in the table; the content does not.
+  Identity: the node's `source_id`, its context node's `ingest_key`, and for
+  Claude Code and Codex sessions the runtime-assigned session UUID
+  (`claude-code-session:<uuid>`, `codex-session:<uuid>`), which does not depend
+  on the project folder or the dated Codex folder, so a session moved to
+  another project, or whose Codex project (`session_meta.cwd`) was renamed,
+  stays suppressed. The UUID identity is used only when the session file stem
+  really contains a UUID. Tombstones written by the previous build get the
+  session row derived from the identity they already hold, when the database
+  is opened. `revien restore` lifts all rows of one unit together.
+  Owner decision (confirmed for now): forgetting ONE extracted node
+  suppresses that node's whole source session, because the node's content
+  cannot be matched without storing it. The forgotten node itself is gone
+  (deleted, its audit snapshots blanked, absent from recall and every
+  export); SIBLING nodes already captured from that session remain, including
+  the session's verbatim context (transcript) node, which still holds the
+  original text unless it is forgotten too. Every forget/delete response
+  (`suppression_notice`, `context_nodes_remaining`) and `revien suppressions`
+  say this: "This forgets this node and suppresses all future imports from
+  <identity>. Sibling facts already captured from that source remain."
+  Only source ids that name one unit are tombstoned (`claude-code:`, `codex:`,
+  `openai:conversation:`, `file:`, `vault:`, `skill:`); shared channel ids
+  ("mcp", "hermes", "ollama_*", "langchain", `api:<feed>`) are not, because
+  that would block everything the channel sends. For those the response says
+  plainly: "Deleted now, but eligible for recapture because the source supplied
+  no stable item identity" (`recapture_eligible`, `suppression_unavailable`).
+  This is an acknowledged failure mode, not a completed right-to-forget (see
+  Known gaps). The identity string itself (a project, file or skill path)
+  remains in the table; the content does not.
   The `sync reset` forget warning now counts only what is provably not
   covered (`count_unprotected_forgets`: forgets recorded before this change,
   or of a source with no stable identity) and needs `--yes` for those.
-- **Fixed: forget and delete left node content in the audit trail.** Earlier
-  `add`/`update` audit rows keep full node snapshots, so a forgotten or
-  deleted node's content survived there. `GraphStore.delete_node` now blanks
-  the snapshots of that node's audit rows (op, actor and time are kept).
+- **The OpenAI importer and skill ingest are gated too.** Both write through the
+  store, not the pipeline, so each applies the tombstone check itself: a
+  forgotten `openai:conversation:<id>` is skipped on single and bulk import
+  (`suppressed` / `conversations_suppressed`), and a forgotten skill is skipped
+  by `revien skills ingest` (counted, reported).
+- **Stdio MCP is no longer corrupted by ingest notices.** The suppression,
+  deny-list and context-fence notices, and the migration note, go to stderr;
+  stdout carries only JSON-RPC under `revien mcp`. Tested against the real
+  stdio server process.
+- **`revien sync reset` says only what it can prove about a running daemon.**
+  `/v1/health` now reports `features` and a `db_id` (hash of the database path,
+  never the path). The command probes `--daemon-url` (default
+  `http://127.0.0.1:7437`): a current daemon on this database is reported as
+  protected against the reset being undone; a daemon that does not report the
+  features is reported as started before this version (it ignores suppressions
+  and the reset fence: restart it); nothing answering is reported as "nothing
+  was checked". Older daemons cannot be made to refuse writes from outside the
+  process, so restarting any daemon started before the upgrade is required.
+- **Privacy fix: forgotten and deleted content survived outside the node row.**
+  `GraphStore.delete_node` (the one path under forget, `DELETE /v1/nodes`
+  and LangChain `clear()`; `revien import --replace` applies the same audit
+  scrub to the graph it replaces) now also: blanks the audit snapshots of the
+  node AND of every edge attached to it (ALIAS_OF audit rows carry the endpoint
+  labels in `source_context`; op, actor and time are kept); deletes
+  supersession candidates that name the node (their reason/trace quote claims),
+  the node's distill-manifest hash rows, its embedding-queue row and its vector
+  row (sqlite-vec is loaded on demand, so a CLI or plain store delete removes
+  it too); runs with `PRAGMA secure_delete` so deleted pages are zeroed; and
+  truncates the WAL after a forget/delete. The neural signal log
+  (`retrieval_signals`, node labels) is purged in processes running the
+  engine with neural logging on. A test seeds a unique secret, forgets it, then
+  scans every table, the raw database and WAL bytes, `/v1/export`, `/v1/graph`,
+  `export_everything`, `revien export`, recall and TOON output.
+  One-time migration on open: audit rows still holding the content of nodes
+  deleted by EARLIER versions are blanked, narrowly (only rows shaped like a
+  node snapshot whose node no longer exists, or an edge snapshot with a missing
+  endpoint; forget/suppress rows and rows of live nodes and edges are never
+  touched; nothing is deleted). Recorded in `store_meta`, so it runs once.
+  Limit: content that left the database cannot be recalled by it (see Known
+  gaps: vault notes, backups, copies of earlier exports).
 
 - **Origin layer — every node now carries where it came from.** Four
   nullable columns on `nodes` (`revien/graph/schema.py`): `origin_runtime`
@@ -426,21 +480,52 @@ All notable changes to Revien are documented here. Format follows
   is out of scope here; the consolidate (dream) pass is the future home for that cleanup.
 
 ### Known gaps / required follow-up
-- LangChain `RevienMemory.clear()` writes no tombstone (decision: it wipes the
-  whole store from application code and its source ids are caller-chosen, so
-  it is not treated as a user forget). Follow-up: owner to confirm.
-- Forgetting or deleting content whose source has no stable identity (REST/MCP
-  default ids, hermes, ollama, langchain, `api:<feed>`) cannot be suppressed;
-  a later sync or ingest can capture it again. Follow-up: a content-free
-  identity for these, or caller-supplied keys.
-- Skill nodes are not gated by suppression (skill ingest bypasses the
-  pipeline). An Obsidian section's identity includes its heading slug, so
-  renaming the heading or moving the file creates a new identity.
+- **REQUIRED: stable per-item provenance for shared channels** (REST/MCP default
+  ids, hermes, ollama, langchain, `api:<feed>`, especially API-fed items).
+  Until sources supply a stable item identity, forgetting such an item deletes
+  it now but leaves it eligible for recapture; the response says so. This is
+  not a completed right-to-forget for those sources.
+- Item-level stable ids should eventually narrow the blast radius of a
+  single-node forget, which today suppresses the whole source session.
+- Tombstones bind to identities that exist, not to content: a file-watcher
+  file is bound to its basename, a vault note to its relative path and heading
+  slug, a skill to its resolved path. Renaming or moving any of them creates a
+  new identity and the content can be captured again. Content-free stable
+  identities were evaluated and rejected: an inode is reused and changes on an
+  editor's atomic save; a content hash is not content-free. Claude Code and
+  Codex are covered by their session UUID; a session whose stem has no UUID is
+  bound to its project folder, and a session the runtime copies into a NEW
+  session id (resume/fork) is a different identity.
+- Distilled Obsidian vault notes live outside the database: a forget removes
+  the distill-manifest row but the note keeps the claim until the next
+  `revien distill-vault`, which drops or rewrites it. Required follow-up:
+  re-distill the configured vault as part of a forget.
+- Forgetting an extracted node does not remove the session's verbatim context
+  node, nor near-duplicate sibling claims; the response names the context
+  node(s). Cascade-forget from the context node removes what is derived from it.
+- LangChain `RevienMemory.clear()` writes no tombstone (decision: it is
+  infrastructure bulk-clearing, i.e. cleanup; Revien does not infer intent from
+  a method name). An application that exposes it as a user-facing "forget my
+  memories" control must call the explicit forget semantics instead. Its audit
+  snapshots are still scrubbed.
 - Forgets and `DELETE`s made before this change have no tombstone and are not
-  retroactively protected; `DELETE` of an unsuppressible source leaves no
-  audit row, so the warning cannot count it.
-- Suppressions apply to ingestion through the pipeline and to graph import; no
-  other writer is gated.
+  retroactively protected (their old audit snapshots ARE scrubbed by the
+  one-time migration); `DELETE` of an unsuppressible source leaves no audit
+  row, so the warning cannot count it.
+- Suppressions apply to ingestion through the pipeline, the OpenAI importer,
+  skill ingest and graph import. The only other store writers are the
+  LangChain wrapper's edge links and the vault reconciler's user-authored
+  claims; neither ingests external content.
+- A daemon started before the upgrade ignores tombstones and the reset fence
+  and can recapture content or undo a reset until it is restarted. `revien sync
+  reset` detects one at `--daemon-url` and warns; it cannot stop one it cannot
+  reach, and cannot detect one elsewhere. Restart every daemon after upgrading.
+- `GET /v1/suppressions` is open like every other read (recall, `/v1/graph`,
+  `/v1/export`); `/v1/export` already returns the same identities in its audit
+  rows, so gating one route would protect nothing. Keep the daemon on loopback.
+- Secure deletion is best effort: `secure_delete` and a WAL truncate cover the
+  database file, but not filesystem snapshots, backups, earlier exports, the
+  vault, or a WAL that another open connection prevents from checkpointing.
 
 ## [0.3.0] — 2026-07-11
 
