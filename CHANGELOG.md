@@ -287,7 +287,9 @@ All notable changes to Revien are documented here. Format follows
   [--filter used|unused]` shows each judgment with its evidence. The daemon
   schedules the pass only when `REVIEN_USAGE_INTERVAL_HOURS` is set (opt-in,
   like dream mode). New `SemanticIndex.embed_texts()` embeds arbitrary text
-  without touching the vector table.
+  without touching the vector table. Starting bars in `judge.py`: at least
+  2 shared terms (or all of a 1-2 word memory's) and similarity >= 0.75;
+  it abstains when the memory has no distinctive words.
 - **Usage receipts: the same judgment for any runtime, not only Claude
   Code.**
   - `POST /v1/recall` with `"receipt": true` (and an optional `"runtime"`
