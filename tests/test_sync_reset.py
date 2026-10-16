@@ -551,6 +551,33 @@ class TestBadDbPaths:
         assert sorted(os.listdir(tmp_path)) == listing
         assert p.read_bytes() == before
 
+    def test_readonly_uri_cannot_write_and_makes_no_sidecars_while_open(
+            self, tmp_path):
+        """Sidecars are removed again on close, so the directory is checked
+        WHILE the connection is open; a write attempt must also fail (this is
+        what catches mode=rwc)."""
+        import sqlite3
+        from pathlib import Path
+        from revien.cli import _readonly_uri
+        p = tmp_path / "w.db"
+        c = sqlite3.connect(p)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE t (a)")
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        for side in ("-wal", "-shm"):
+            (tmp_path / ("w.db" + side)).unlink(missing_ok=True)
+        listing = sorted(os.listdir(tmp_path))
+        ro = sqlite3.connect(_readonly_uri(Path(p)), uri=True)
+        try:
+            ro.execute("SELECT name FROM sqlite_master").fetchall()
+            assert sorted(os.listdir(tmp_path)) == listing  # none created
+            with pytest.raises(sqlite3.OperationalError):
+                ro.execute("CREATE TABLE x (a)")
+        finally:
+            ro.close()
+
     def test_foreign_wal_database_with_revien_names_is_also_untouched(
             self, tmp_path, monkeypatch):
         import sqlite3
