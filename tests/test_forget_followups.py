@@ -209,8 +209,9 @@ class TestStableIdentities:
         sched.register_adapter("fw", FileWatcherAdapter(watch_dir=str(w)))
         run_async(sched.sync_one("fw"))
         out = forget_context(store, "file:")
-        assert out["suppressed_identities"] == ["file:notes.txt"]
-        assert any("renamed or moved" in n for n in out["suppression_notice"])
+        assert set(out["suppressed_identities"]) == {"file:notes.txt",
+                                                      os.path.realpath(f)}
+        assert any("is renamed" in n for n in out["suppression_notice"])
         # unchanged name: still suppressed
         f.write_text(f"Meeting notes. {SECRET} edited\n")
         bump(f, 5000)
@@ -222,13 +223,15 @@ class TestStableIdentities:
         run_async(sched.sync_one("fw"))
         assert hits(store)
 
-    def test_file_watcher_identity_is_the_basename_both_ways(self, store, tmp_path):
-        """A moved file stays suppressed; an unrelated file with the same
-        basename in another folder is suppressed too. Both are stated in the
-        forget notice. Content-free: the identity is a name, never text."""
+    def test_file_watcher_tombstone_blocks_the_file_not_every_same_name(
+            self, store, tmp_path):
+        """The tombstone holds the file's real path next to its base name. A
+        different file with the same name is captured while the forgotten
+        path exists; the forgotten file stays blocked, and a file that took
+        its place after a move is blocked too (the stated trade-off)."""
         w = tmp_path / "watch"
-        (w / "a").mkdir(parents=True)
-        (w / "b").mkdir()
+        for d in "abcd":
+            (w / d).mkdir(parents=True)
         f = w / "a" / "notes.txt"
         f.write_text(f"Meeting notes. {SECRET}\n")
         bump(f, -1000)
@@ -237,18 +240,28 @@ class TestStableIdentities:
         run_async(sched.sync_one("fw"))
         out = forget_context(store, "file:")
         text = " ".join(out["suppression_notice"])
-        assert "base name only" in text and "stays skipped" in text
-        assert out["suppressed_identities"] == ["file:notes.txt"]
-        moved = w / "b" / "notes.txt"
-        shutil.move(str(f), str(moved))
-        bump(moved, 9000)
-        unrelated = w / "a" / "notes.txt"          # different file, same name
-        unrelated.write_text("A completely different shopping list.\n")
-        bump(unrelated, 9000)
+        assert "blocked by its path" in text and "may be this one" in text
+        assert set(out["suppressed_identities"]) == {"file:notes.txt",
+                                                      os.path.realpath(f)}
+        other = w / "b" / "notes.txt"            # unrelated, same name
+        other.write_text("A completely different shopping list.\n")
+        bump(other, 9000)
+        f.write_text(f"Meeting notes. {SECRET} edited\n")
+        bump(f, 9000)
         r = run_async(sched.sync_one("fw"))
-        assert r["items_suppressed"] == 2
+        assert r["items_ingested"] == 1 and r["items_suppressed"] == 1
+        assert [n for n in store.list_nodes(limit=99) if "shopping" in n.content]
         assert not hits(store)
-        assert not [n for n in store.list_nodes(limit=99) if "shopping" in n.content]
+        # the forgotten file moves: the old path is gone, so the name matches
+        moved = w / "c" / "notes.txt"
+        shutil.move(str(f), str(moved))
+        bump(moved, 12000)
+        later = w / "d" / "notes.txt"            # unrelated, appears afterwards
+        later.write_text("Another unrelated list.\n")
+        bump(later, 12000)
+        r = run_async(sched.sync_one("fw"))
+        assert r["items_suppressed"] >= 1
+        assert not hits(store)
 
     def test_old_tombstone_gets_session_identity_on_open(self, db_path):
         s = GraphStore(db_path=db_path)
@@ -785,7 +798,9 @@ class TestBlastRadiusIsNamed:
         monkeypatch.setenv("REVIEN_HOME", tempfile.mkdtemp())
         r = CliRunner().invoke(main, ["suppressions", "--db", db_path])
         assert r.exit_code == 0, r.output
-        assert "WHOLE source" in r.output and "Sibling facts" in r.output
+        assert "blocks EVERY file with this name" in r.output
+        assert "Sibling facts" not in r.output
+        assert "whole session or conversation with cascade" in r.output
 
     def test_langchain_clear_documents_the_boundary(self):
         from revien.adapters.langchain_adapter import RevienMemory

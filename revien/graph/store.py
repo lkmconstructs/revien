@@ -5,6 +5,7 @@ Every node, every edge, every relationship — stored, never compacted.
 
 import functools
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -16,7 +17,10 @@ from typing import Dict, List, Optional, Union
 
 from . import provenance
 from .origin import derive_origin
-from .suppression import parent_session_identity, session_identity_for, unit_key
+from .suppression import (
+    KIND_FILE_PATH, file_path_of, parent_session_identity, session_identity_for,
+    unit_key,
+)
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
@@ -1650,6 +1654,19 @@ class GraphStore:
         name (``file:<name>``) then blocks it only when it cannot be told
         apart from the forgotten file: see revien/graph/suppression.py."""
         conn = self._get_conn()
+        sel = ("SELECT identity, kind, created_at, reason, actor, skipped_count "
+               "FROM ingest_suppressions WHERE identity = ? AND kind = ?")
+
+        def as_hit(row) -> dict:
+            return {"identity": row[0], "kind": row[1], "created_at": row[2],
+                    "reason": row[3], "actor": row[4],
+                    "skipped_count": int(row[5])}
+
+        path = file_path_of(source_id, metadata)
+        if path:
+            row = conn.execute(sel, (path, KIND_FILE_PATH)).fetchone()
+            if row is not None:
+                return as_hit(row)
         candidates = [(source_id, "source_id"), (ingest_key, "ingest_key")]
         parent = parent_session_identity(metadata)
         if parent:
@@ -1661,16 +1678,31 @@ class GraphStore:
         for identity, kind in candidates:
             if not identity:
                 continue
-            row = conn.execute(
-                "SELECT identity, kind, created_at, reason, actor, skipped_count "
-                "FROM ingest_suppressions WHERE identity = ? AND kind = ?",
-                (identity, kind),
-            ).fetchone()
-            if row is not None:
-                return {"identity": row[0], "kind": row[1], "created_at": row[2],
-                        "reason": row[3], "actor": row[4],
-                        "skipped_count": int(row[5])}
+            row = conn.execute(sel, (identity, kind)).fetchone()
+            if row is None:
+                continue
+            if kind == "source_id" and identity.startswith("file:") \
+                    and not self._name_row_applies(conn, identity, path):
+                continue
+            return as_hit(row)
         return None
+
+    @staticmethod
+    def _name_row_applies(conn, identity: str, path: Optional[str]) -> bool:
+        """Does a base-name tombstone block this file? Name-wide when no path
+        was ever recorded for that name (legacy / extracted node); otherwise
+        only when this item is not provably a different, still-present file."""
+        base = identity[len("file:"):]
+        recorded = [r[0] for r in conn.execute(
+            "SELECT identity FROM ingest_suppressions WHERE kind = ?",
+            (KIND_FILE_PATH,)).fetchall() if os.path.basename(r[0]) == base]
+        if not recorded:
+            return True
+        if path is None:
+            return True
+        # Same name, another path: a different file while every forgotten
+        # path is still on disk; possibly the forgotten file moved otherwise.
+        return any(not os.path.exists(p) for p in recorded)
 
     @_locked
     def note_suppressed_skip(self, identity: str, kind: str) -> None:
@@ -1702,19 +1734,56 @@ class GraphStore:
             "SELECT COUNT(*) FROM ingest_suppressions").fetchone()[0])
 
     @_locked
+    def plan_lift_ingest_suppression(
+        self, identity: str, exact: bool = False,
+    ) -> List[tuple]:
+        """The (identity, kind) rows a restore of ``identity`` lifts.
+
+        * a file's real path: that file only (and its base-name row when no
+          other forgotten path of that name remains, because the name row
+          alone would be name-wide);
+        * ``file:<name>``: the name and every path recorded under it (the
+          user asked for the name), unless ``exact``;
+        * anything else: every row naming the same unit (a source_id row and
+          the session_id row derived from it).
+        """
+        conn = self._get_conn()
+        allrows = [(r[0], r[1]) for r in conn.execute(
+            "SELECT identity, kind FROM ingest_suppressions").fetchall()]
+        ident = identity.strip()
+        paths = [r for r in allrows if r[1] == KIND_FILE_PATH]
+        if ident.startswith("file:"):
+            base = ident[len("file:"):]
+            out = [r for r in allrows if r == (ident, "source_id")]
+            if out and not exact:
+                out += [r for r in paths if os.path.basename(r[0]) == base]
+            return out
+        real = os.path.realpath(ident) if ident else ident
+        hit = [r for r in paths if r[0] in (ident, real)]
+        if hit:
+            out = list(hit)
+            for (p, _k) in hit:
+                base = os.path.basename(p)
+                left = [r for r in paths if os.path.basename(r[0]) == base
+                        and r not in hit]
+                if not left and not exact and (f"file:{base}", "source_id") in allrows:
+                    out.append((f"file:{base}", "source_id"))
+            return out
+        target = unit_key(ident)
+        return [r for r in allrows
+                if r[1] != KIND_FILE_PATH
+                and (r[0] == ident or unit_key(r[0]) == target)]
+
+    @_locked
     def lift_ingest_suppression(
         self, identity: str, actor: str = "", reason: str = "restore",
         exact: bool = False,
     ) -> int:
-        """Explicit override: remove every suppression row for this identity
-        (either kind). Audited. Returns rows lifted (0 = none existed)."""
+        """Explicit override: remove the suppression rows a restore of this
+        identity covers (see ``plan_lift_ingest_suppression``). Audited.
+        Returns rows lifted (0 = none existed)."""
         conn = self._get_conn()
-        # Rows that name the same unit (a source_id row and the session_id row
-        # derived from it) are lifted together, or the restore would not work.
-        target = unit_key(identity)
-        rows = [(r[0], r[1]) for r in conn.execute(
-            "SELECT identity, kind FROM ingest_suppressions").fetchall()
-            if r[0] == identity or unit_key(r[0]) == target]
+        rows = self.plan_lift_ingest_suppression(identity, exact=exact)
         if not rows:
             return 0
         kinds = [k for _, k in rows]
@@ -2900,9 +2969,13 @@ class GraphStore:
                 if hit is None:
                     kept.append(n)
                     continue
+                # A path-qualified file hit lifts that file, not every file
+                # with the same name.
+                named = () if (sid.startswith("file:")
+                               and hit["kind"] == KIND_FILE_PATH) else (sid,)
                 hit_identities.update(
-                    x for x in (sid, key, session_identity_for(sid),
-                                session_identity_for(key))
+                    x for x in (*named, key, session_identity_for(sid),
+                                session_identity_for(key), hit["identity"])
                     if x and x in known_identities)
                 if suppressions == "override":
                     kept.append(n)

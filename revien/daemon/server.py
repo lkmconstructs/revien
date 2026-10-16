@@ -781,13 +781,14 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         """Explicit override: lift the suppression for one source identity
         (audited). Ingestion of it resumes; already-read files are only
         re-read after `revien sync reset`."""
+        rows = store.plan_lift_ingest_suppression(request.identity.strip())
         lifted = store.lift_ingest_suppression(
             request.identity.strip(), actor="rest:restore")
         if not lifted:
             raise HTTPException(
                 404, f"No suppression for identity: {request.identity}")
         return {"status": "restored", "identity": request.identity.strip(),
-                "lifted": lifted}
+                "lifted": lifted, "lifted_identities": [i for i, _ in rows]}
 
     # ── POST /v1/edges ─────────────────────────────────
 

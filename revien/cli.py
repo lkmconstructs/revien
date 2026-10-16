@@ -1869,10 +1869,25 @@ def suppressions_cmd(db: Optional[str]):
         click.echo(f"  {r['identity']}  [{r['kind']}]  since {r['created_at'][:10]}"
                    f"  skipped {r['skipped_count']}x  by {r['actor'] or '-'}"
                    + (f"  reason: {r['reason']}" if r['reason'] else ""))
-    click.echo("Each row blocks the WHOLE source (a session, conversation, file "
-               "or skill), not just the node you forgot. Sibling facts "
-               "captured from it before remain in the graph. Lift one with: "
-               "revien restore <identity>")
+    names = {r["identity"] for r in rows if r["kind"] == "source_id"
+             and r["identity"].startswith("file:")}
+    paths = [r["identity"] for r in rows if r["kind"] == "file_path"]
+    wide = sorted(n for n in names
+                  if not any(os.path.basename(p) == n[len("file:"):]
+                             for p in paths))
+    click.echo("A row blocks future ingestion of its source: a session, a "
+               "conversation, a skill, or a file. A 'file_path' row blocks "
+               "that one file by its real path; the 'file:<name>' row next to "
+               "it also blocks the same name elsewhere, but only while that "
+               "path no longer exists (the file may have moved). Forgetting "
+               "a single node leaves the other facts captured from the "
+               "source; forgetting a whole session or conversation with "
+               "cascade removed what only it supplied and kept what another "
+               "source also states.")
+    if wide:
+        click.echo("Name-wide (no path recorded, blocks EVERY file with this "
+                   f"name): {', '.join(wide)}")
+    click.echo("Lift one with: revien restore <identity or file path>")
 
 
 @main.command(name="restore")
@@ -1894,12 +1909,15 @@ def restore_cmd(identity: str, db: Optional[str]):
         raise SystemExit(1)
     store = GraphStore(db_path=db_path)
     try:
+        rows = store.plan_lift_ingest_suppression(identity.strip())
         lifted = store.lift_ingest_suppression(identity.strip(), actor="cli:restore")
     finally:
         store.close()
     if not lifted:
         click.echo(f"No suppression for '{identity}'. See 'revien suppressions'.")
         raise SystemExit(1)
+    if len(rows) > 1:
+        click.echo("Lifted: " + ", ".join(i for i, _ in rows))
     click.echo(f"Restored '{identity}': ingestion of it resumes. Run "
                "'revien sync reset <adapter>' to re-read it now; otherwise it "
                "is picked up when its file next changes.")

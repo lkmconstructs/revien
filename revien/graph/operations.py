@@ -533,8 +533,20 @@ class GraphOperations:
         {"status": "created"|"exists"|"unavailable", "identities": [...],
         "gap": str|None}. Callers run this inside the same transaction as the
         delete so a node never vanishes without its tombstone."""
+        meta = node.metadata
+        if (node.source_id.startswith("file:") and not
+                (meta or {}).get("source_path")):
+            # An extracted node carries no path; its file's context node does.
+            # Use it only when every context node of that name agrees on one
+            # recorded path, so a name shared by several files stays name-wide.
+            ctxs = self.store.list_nodes(
+                node_type=NodeType.CONTEXT, source_id=node.source_id,
+                limit=999999)
+            paths = {(c.metadata or {}).get("source_path") for c in ctxs}
+            if len(paths) == 1 and None not in paths and "" not in paths:
+                meta = {**(meta or {}), "source_path": next(iter(paths))}
         identities, gap = identities_for(
-            node.source_id, node.metadata, node.node_type)
+            node.source_id, meta, node.node_type)
         if not identities:
             return {"status": "unavailable", "identities": [], "gap": gap,
                     "notice": notices_for([], gap)}
@@ -639,8 +651,10 @@ class GraphOperations:
                 "were rendered from this and may still hold the claim as "
                 "text in the vault; the next `revien distill-vault` removes it.")
 
-    def _unit_notice(self, plan: Dict, forgotten: List[str]) -> List[str]:
-        """Exactly what a whole-session cascade removed and what it kept."""
+    def _unit_notice(self, plan: Dict, forgotten: List[str],
+                     path_qualified: bool = False) -> List[str]:
+        """Exactly what a whole-session cascade removed and what it kept,
+        counted from what was actually deleted."""
         out: List[str] = []
         ctxs = [c for c in plan["contexts"] if c in forgotten]
         gone_un = [x for x in sorted(plan["unattested_shared"]) if x in forgotten]
@@ -682,10 +696,15 @@ class GraphOperations:
                 f"node(s) carry the same source id "
                 f"({', '.join(plan['other_contexts_same_source'])}): another "
                 "file with the same name, or another version of this file. "
-                "They were not touched, but the suppression written above "
-                "names that shared identity, so future imports of every item "
-                "with it are skipped too; forget those nodes to remove them, "
-                "and 'revien restore' lifts the suppression.")
+                "They were not touched. "
+                + ("The suppression written above is bound to this file's "
+                   "path, so a file with the same name in another folder is "
+                   "still captured while this path exists."
+                   if path_qualified else
+                   "The suppression written above names that shared "
+                   "identity, so future imports of every item with it are "
+                   "skipped too; forget those nodes to remove them, and "
+                   "'revien restore' lifts the suppression."))
         return out
 
     def forget_node(
@@ -845,7 +864,11 @@ class GraphOperations:
                 "kept, because nothing ties them to this message alone. "
                 "Forget those nodes individually if they should go.")
         if plan and forgotten:
-            notice.extend(self._unit_notice(plan, forgotten))
+            notice.extend(self._unit_notice(
+                plan, forgotten,
+                path_qualified=any(
+                    k == "file_path" for t in forgotten
+                    for (_i, k) in outcome.get(t, {}).get("pairs", []))))
         if forgotten and distilled_notes:
             notice.append(self.distilled_notice(distilled_notes))
         # Deduplicate, keep order.

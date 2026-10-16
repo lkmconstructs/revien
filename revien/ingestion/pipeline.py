@@ -16,7 +16,7 @@ from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
 from revien.graph.origin import derive_origin, validate_origin
-from revien.graph.suppression import parent_session_identity
+from revien.graph.suppression import file_path_of, parent_session_identity
 
 
 def _ingest_deny_set() -> set:
@@ -499,6 +499,14 @@ class IngestionPipeline:
             if input_data.curated:
                 node.confidence = 1.0
                 node.metadata = {**(node.metadata or {}), "curated": True}
+            # A watched file's real path (a path, never text): lets a forget
+            # block this file and not every file that shares its name.
+            if node.node_id == ctx_id and file_path_of(
+                    input_data.source_id, input_data.metadata):
+                node.metadata = {
+                    **(node.metadata or {}),
+                    "source_path": file_path_of(
+                        input_data.source_id, input_data.metadata)}
 
         # 1c. Temporal resolution (Leg 2): resolve the FIRST bounded temporal
         # expression in the content against recorded_at and attach an event-time

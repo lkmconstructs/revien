@@ -22,14 +22,28 @@ Identity kinds:
                 real UUID is present.
 
 A file-watcher file's identity is its BASENAME (``file:<name>``), which is
-also the source_id its nodes carry. Consequences, both stated to the user: a
-moved file keeps its identity (stays suppressed), and an unrelated file with
-the same basename in another folder is suppressed too. Decision: kept as is.
-A watched-dir-relative path would stop the false match but make a moved file
-a new identity (recapturable) and strand every existing tombstone for a nested
-file; a false match is loud (printed, counted, listed by ``revien
-suppressions``, lifted by ``revien restore``) while a recapture is silent.
-Both identities stay content-free.
+also the source_id its nodes carry, and, since the context node records where
+it was read from, ALSO its real path (``file_path`` row, an absolute path with
+symlinks resolved). The basename row alone would block every unrelated file
+with the same name (every ``README.md``) for as long as the tombstone stands,
+so a path-qualified tombstone blocks like this (``Store.find_ingest_suppression``):
+
+* the same real path: always skipped;
+* the same basename at another path: skipped only while a recorded path no
+  longer exists on disk (the forgotten file was moved or deleted, and this may
+  be it); allowed while every recorded path still exists (this is a different
+  file);
+* an item with no path (a graph import of an extracted node, an adapter that
+  sends none): skipped, because nothing can tell it from the forgotten file.
+
+Bounds, all disclosed to the user: a tombstone written before the context
+node recorded its path (or for an extracted node of several same-named files)
+has only the name and stays name-wide; the paths of forgotten files are stored
+in the suppression (a path is as revealing as the name already stored);
+after the forgotten file is deleted or moved, a new unrelated file with the
+same name is skipped until the user restores that path; the same file moved
+and later edited under a new name is a gap, as before. A moved file keeps
+matching by name. Both identities stay content-free.
 
 Gaps (no stable content-free identity exists): a file-watcher file renamed
 (identity is its basename), a vault note renamed or moved (its relative
@@ -40,6 +54,7 @@ A tombstone holds no content. Lifting it is an explicit act (restore or a
 graph import with the override flag) and is audited.
 """
 
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -49,6 +64,7 @@ from revien.graph.schema import NodeType
 KIND_SOURCE_ID = "source_id"
 KIND_INGEST_KEY = "ingest_key"
 KIND_SESSION_ID = "session_id"
+KIND_FILE_PATH = "file_path"
 
 _UUID = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -99,6 +115,18 @@ def parent_session_identity(metadata: Optional[Dict]) -> Optional[str]:
     return f"claude-code-session:{m.group(1).lower()}"
 
 
+def file_path_of(source_id: str, metadata: Optional[Dict]) -> Optional[str]:
+    """The real path of a file-watcher file, or None. The adapter sends it as
+    ``path``; the pipeline keeps it on the context node as ``source_path``.
+    Symlinks are resolved so two spellings of one directory are one path."""
+    if not (source_id or "").startswith("file:"):
+        return None
+    raw = (metadata or {}).get("source_path") or (metadata or {}).get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return os.path.realpath(raw.strip())
+
+
 def unit_key(identity: str) -> str:
     """Rows that name the same unit share a key (a source_id row and the
     session_id row derived from it), so restore lifts them together."""
@@ -135,6 +163,9 @@ def identities_for(
     sid = (source_id or "").strip()
     if sid and is_unit_source_id(sid):
         found.append((sid, KIND_SOURCE_ID))
+    path = file_path_of(sid, metadata)
+    if path:
+        found.append((path, KIND_FILE_PATH))
     key = ((metadata or {}).get("ingest_key") or "")
     if isinstance(key, str):
         key = key.strip()
@@ -175,6 +206,7 @@ def notices_for(
             f"supplied no stable item identity ({gap or 'no source identity'})."
         ]
     units = sorted({i for i, k in identities if k == KIND_SESSION_ID}
+                   or {i for i, k in identities if k == KIND_FILE_PATH}
                    or {i for i, k in identities if k == KIND_SOURCE_ID}
                    or {i for i, _ in identities})
     what = "this node" if count == 1 else f"{count} nodes"
@@ -206,17 +238,37 @@ def notices_for(
         for ident, kind in identities:
             for prefix, noun in _RENAMEABLE.items():
                 if kind == KIND_SOURCE_ID and ident.startswith(prefix):
-                    out.append(
-                        f"The suppression is bound to the {noun}; if it is "
-                        "renamed or moved it is a different identity and may "
-                        "be captured again.")
                     if ident.startswith("file:"):
                         out.append(
-                            "The name is the file's base name only: a file "
-                            "with the same name anywhere in a watched folder "
-                            "is skipped too, and the same file moved to "
-                            "another folder stays skipped. "
-                            "'revien suppressions' lists what was skipped.")
+                            "The suppression is bound to the file name and "
+                            "path; if the file is renamed it is a different "
+                            "identity and may be captured again.")
+                    else:
+                        out.append(
+                            f"The suppression is bound to the {noun}; if it "
+                            "is renamed or moved it is a different identity "
+                            "and may be captured again.")
+                    if ident.startswith("file:"):
+                        paths = [i for i, k in identities if k == KIND_FILE_PATH]
+                        if paths:
+                            out.append(
+                                f"This file is blocked by its path "
+                                f"({', '.join(paths)}), which is stored in the "
+                                "suppression. A file with the same name in "
+                                "another folder is still captured while this "
+                                "path exists; if this file is moved or deleted, "
+                                "a file with the same name is skipped too (it "
+                                "may be this one). 'revien restore <path>' "
+                                "lifts only this file. 'revien suppressions' "
+                                "lists what was skipped.")
+                        else:
+                            out.append(
+                                "No path was recorded for this item, so the "
+                                "suppression is the file's base name only: a "
+                                "file with the same name anywhere in a watched "
+                                "folder is skipped too, and the same file moved "
+                                "to another folder stays skipped. "
+                                "'revien suppressions' lists what was skipped.")
             if kind == KIND_SOURCE_ID and ident.startswith(
                     ("claude-code:", "codex:")):
                 out.append(

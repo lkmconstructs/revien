@@ -233,16 +233,19 @@ class TestCollidingIdentities:
         assert b"Quorvex11" not in raw(db_path)
         assert b"Kafka" in raw(db_path)
         assert out["other_contexts_same_source"] == [b.node_id]
-        # the tombstone is the shared basename and the response says so
-        assert out["suppressed_identities"] == ["file:notes.md"]
+        # the tombstone holds this file's path next to the shared name, and
+        # the response says the other file is still captured
+        assert set(out["suppressed_identities"]) == {
+            "file:notes.md", os.path.realpath(w / "projA" / "notes.md")}
         text = " ".join(out["suppression_notice"])
         assert b.node_id in text and "same source id" in text
-        assert "future imports of every item with it are skipped" in text
-        # disclosed consequence is real: projB's next change is skipped too
+        assert "still captured while this path exists" in text
+        # disclosed consequence is real: only the forgotten file is skipped
         for f in (w / "projA" / "notes.md", w / "projB" / "notes.md"):
             bump(f, 5000)
         r = self._sync_files(store, w)
-        assert r.get("items_suppressed", 0) == 2
+        assert r.get("items_suppressed", 0) == 1
+        assert r["items_ingested"] == 1
 
     def test_vault_relative_path_collision_spares_the_other_note(
             self, store, db_path):
