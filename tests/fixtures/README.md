@@ -7,3 +7,6 @@ database created by running the named Revien code on a tiny graph (3 nodes,
 - `db_main_03217f4.sql`: origin/main at 03217f4 (user_version 4, no usage layer).
 - `db_v030_tag_7bf8738.sql`: tag v0.3.0 (7bf8738), user_version 0.
 - `db_v030_7757085.sql`: commit 7757085 "Revien 0.3.0", user_version 0.
+- `db_main_used_03217f4.sql`: origin/main at 03217f4 after real use: ChatGPT,
+  Claude.ai and Readwise imports, a Claude Code adapter sync via the
+  scheduler, an mcp-source ingest and a recall (user_version 4).

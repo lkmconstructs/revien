@@ -2,8 +2,10 @@
 and sync_cursors.generation.
 
 Existing databases are real ones: tests/fixtures/*.sql are dumps of databases
-made by running origin/main (03217f4, migrations 001-004) and Revien 0.3.0
-(the v0.3.0 tag and commit 7757085) on a tiny graph.
+made by running origin/main (03217f4, migrations 001-004 applied) and Revien
+0.3.0 (the v0.3.0 tag and commit 7757085). "main-used" was built by main's
+real flows: the ChatGPT, Claude.ai and Readwise importers, a Claude Code
+adapter sync through the scheduler, an mcp-source ingest and a recall.
 """
 import importlib
 import inspect
@@ -18,6 +20,7 @@ from revien.graph.store import GraphStore
 FIX = Path(__file__).parent / "fixtures"
 FIXTURES = {
     "main-03217f4": "db_main_03217f4.sql",
+    "main-used-03217f4": "db_main_used_03217f4.sql",
     "v0.3.0-tag": "db_v030_tag_7bf8738.sql",
     "v0.3.0-7757085": "db_v030_7757085.sql",
 }
@@ -113,7 +116,7 @@ class TestUpgrade:
         s = GraphStore(db_path=path)
         try:
             nodes = s.list_nodes(limit=10)
-            assert len(nodes) == 3
+            assert len(nodes) >= 3
             node = nodes[0]
             assert s.record_use_judgment(
                 episode_key="e#1", node_id=node.node_id, used=True, reason="r",
@@ -238,3 +241,63 @@ class TestConvention:
         mod = migration()
         assert callable(mod.migrate)
         assert (Path(mod.__file__).name) == "005_usage_layer.py"
+
+
+class TestMainDatabaseThatWasUsed:
+    """A database created AND USED by origin/main (migration 004 already
+    applied), then opened by this branch."""
+    NAME = "main-used-03217f4"
+
+    def test_it_really_holds_importer_and_adapter_data(self, tmp_path):
+        path = made_by(self.NAME, tmp_path)
+        conn = sqlite3.connect(path)
+        runtimes = {r[0] for r in conn.execute(
+            "SELECT DISTINCT origin_runtime FROM nodes")}
+        labelled = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE "
+            "json_extract(metadata,'$.recorded_at_source') IS NOT NULL").fetchone()[0]
+        conn.close()
+        assert {"chatgpt", "claude", "readwise", "claude-code"} <= runtimes
+        assert labelled > 0
+        assert catalogue(path)[2] == 4
+
+    def test_004_is_not_rerun_and_origin_and_dates_are_untouched(self, tmp_path):
+        path = made_by(self.NAME, tmp_path)
+        def snap():
+            c = sqlite3.connect(path)
+            try:
+                return c.execute(
+                    "SELECT node_id, origin_runtime, origin_source, project_key, "
+                    "session_key, recorded_at, metadata FROM nodes ORDER BY node_id"
+                ).fetchall()
+            finally:
+                c.close()
+        before = snap()
+        GraphStore(db_path=path).close()
+        assert snap() == before
+        assert catalogue(path)[2] == 5
+
+    def test_recall_sync_and_reset_work_on_the_upgraded_database(self, tmp_path):
+        import asyncio
+        from revien.adapters.claude_code import ClaudeCodeAdapter
+        from revien.daemon.scheduler import SyncScheduler
+        from revien.ingestion.pipeline import IngestionPipeline
+        from revien.retrieval.engine import RetrievalEngine
+
+        path = made_by(self.NAME, tmp_path)
+        s = GraphStore(db_path=path)
+        try:
+            assert RetrievalEngine(s).recall("PostgreSQL billing").results
+            cursor, gen = s.get_sync_state("claude-code")
+            assert cursor is not None and gen == 0
+            (tmp_path / "none").mkdir()
+            sched = SyncScheduler(pipeline=IngestionPipeline(s))
+            sched.register_adapter("claude-code", ClaudeCodeAdapter(
+                session_dir=str(tmp_path / "none")))
+            res = asyncio.new_event_loop().run_until_complete(
+                sched.sync_one("claude-code"))
+            assert res["status"] == "ok"      # fenced write at generation 0
+            assert s.reset_sync_cursor("claude-code") is True
+            assert s.get_sync_state("claude-code") == (None, 1)
+        finally:
+            s.close()
