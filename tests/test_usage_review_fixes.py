@@ -62,7 +62,6 @@ class TestOffMode:
         assert store.list_use_judgments() == []
 
     def test_rest_says_so_and_writes_nothing(self, monkeypatch):
-        monkeypatch.setenv("REVIEN_USAGE", "off")
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         with TestClient(create_app(db_path=path)) as c:
@@ -70,6 +69,8 @@ class TestOffMode:
                    "content": "We chose Postgres over SQLite for billing."})
             body = c.post("/v1/recall", json={"query": "Postgres billing",
                                               "receipt": True}).json()
+            assert body["recall_id"]  # issued while the signal was on
+            monkeypatch.setenv("REVIEN_USAGE", "off")  # turned off before redeeming
             r = c.post("/v1/usage/observe", json={
                 "recall_id": body["recall_id"], "answer": "Postgres for billing."})
             assert r.status_code == 200, r.text
@@ -299,3 +300,60 @@ class TestSkillEvidence:
         from revien.retrieval import engine
         from revien.usage import observer
         assert observer.recalled_content is engine.recalled_content
+
+
+class TestOffRecallIssuesNoReceipt:
+    def test_receipted_recall_under_off_issues_none(self, monkeypatch):
+        monkeypatch.setenv("REVIEN_USAGE", "off")
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        with TestClient(create_app(db_path=path)) as c:
+            c.post("/v1/ingest", json={"source_id": "s", "content_type": "note",
+                   "content": "We chose Postgres over SQLite for billing."})
+            body = c.post("/v1/recall", json={"query": "Postgres billing",
+                                              "receipt": True}).json()
+            assert body["results"]
+            assert body["recall_id"] is None and body["receipt_expires_at"] is None
+            assert "usage signal is off" in body["receipt_note"]
+        s = GraphStore(db_path=path)
+        try:
+            assert s.expire_recall_receipts(
+                now=datetime.now(timezone.utc) + timedelta(days=2)) == 0
+            assert s.list_receipt_flags() == []
+        finally:
+            s.close()
+
+
+class TestApplyUnknownIsShownHonestly:
+    def _stuck(self, tmp_path):
+        s = GraphStore(db_path=str(tmp_path / "u.db"))
+        s.add_node(Node(node_id="n", node_type=NodeType.FACT, label="L", content="c",
+                        source_id="t", source_type=SourceType.EXTRACTED))
+        for nid, ep in (("n", "e1"), ("n", "e2"), ("n", "e3")):
+            s.record_use_judgment(episode_key=ep, node_id=nid, used=True, reason="",
+                                  shared_terms=[], similarity=None, query="q",
+                                  mode="apply", applied=False)
+        assert s.claim_use_application("e1", "n")        # stuck at 2
+        assert s.claim_use_application("e2", "n")
+        s.finish_use_application("e2", "n", True)        # applied
+        return s                                          # e3: not applied
+
+    def test_counts_keep_unknown_apart(self, tmp_path):
+        s = self._stuck(tmp_path)
+        c = s.use_judgment_counts()
+        assert (c["applied"], c["apply_unknown"], c["judged"]) == (1, 1, 3)
+        states = {r["episode_key"]: r["apply_state"] for r in s.list_use_judgments()}
+        assert states == {"e1": "unknown", "e2": "applied", "e3": "not_applied"}
+        s.close()
+
+    def test_usage_list_says_unknown(self, tmp_path):
+        from click.testing import CliRunner
+        from revien.cli import main
+        s = self._stuck(tmp_path)
+        path = s.db_path
+        s.close()
+        out = CliRunner().invoke(main, ["usage", "list", "--db", path]).output
+        assert "1 apply unknown" in out and "[apply unknown]" in out
+        js = CliRunner().invoke(main, ["usage", "list", "--db", path,
+                                       "--json-output"]).output
+        assert '"apply_unknown": 1' in js and '"apply_state": "unknown"' in js

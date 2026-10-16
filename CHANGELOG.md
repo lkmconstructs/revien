@@ -344,7 +344,9 @@ All notable changes to Revien are documented here. Format follows
     marked applied only after `mark_used` succeeds. If it fails, the next
     pass or retry applies that used-but-unapplied judgment exactly once
     (concurrent retries cannot both apply it; a process that dies mid-apply
-    leaves it unretried rather than risk applying twice);
+    leaves it unretried rather than risk applying twice, and `revien usage
+    list` and the counts show it as "apply unknown", a separate bucket from
+    applied);
   - `off` disables the pass.
   Unrecognized values fall back to shadow, so a typo never writes to the graph.
   `revien usage scan [--mode] [--full] [--path]` runs a pass with its own
@@ -366,8 +368,9 @@ All notable changes to Revien are documented here. Format follows
     written on an error (the expiry pass runs first, so such a call can still
     flag other overdue receipts).
   - A recall that returns no results gets no receipt (nothing could have been
-    used): `recall_id` and `receipt_expires_at` are `null` and `receipt_note`
-    says so.
+    used), and neither does any receipted recall while `REVIEN_USAGE=off`
+    (nothing would judge it): `recall_id` and `receipt_expires_at` are `null`
+    and `receipt_note` says which.
   - With `REVIEN_USAGE=off`, `POST /v1/usage/observe` judges and records
     nothing; it closes the receipt (status `closed_off`, so it does not
     expire into a flag) and answers `status: "signal_off"` with a note. A

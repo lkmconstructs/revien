@@ -619,7 +619,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # this query. Always present, possibly [].
             "skill_proposals": response.skill_proposals,
         }
-        if request.receipt and not response.results:
+        from revien.usage.observer import usage_mode
+
+        if request.receipt and usage_mode() == "off":
+            # REVIEN_USAGE=off: nothing will judge it, so a receipt would only
+            # expire into a false flag.
+            payload["recall_id"] = None
+            payload["receipt_expires_at"] = None
+            payload["receipt_note"] = ("no receipt issued: the usage signal is "
+                                       "off (REVIEN_USAGE=off)")
+        elif request.receipt and not response.results:
             # Nothing was recalled, so nothing could be used: a receipt would
             # only expire into a meaningless flag.
             payload["recall_id"] = None

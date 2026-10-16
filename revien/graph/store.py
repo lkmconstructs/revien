@@ -1635,6 +1635,9 @@ class GraphStore:
                 "query": r[6] or "",
                 "mode": r[7],
                 "applied": r[8] == 1,
+                # 2 = an apply was claimed and never finished: mark_used may
+                # or may not have run, so it is neither applied nor not.
+                "apply_state": {1: "applied", 2: "unknown"}.get(r[8], "not_applied"),
                 "judged_at": r[9],
             }
             for r in rows
@@ -1729,17 +1732,21 @@ class GraphStore:
 
     @_locked
     def use_judgment_counts(self) -> Dict[str, int]:
-        """Totals over the whole ledger: judged, used, unused, applied."""
+        """Totals over the whole ledger: judged, used, unused, applied, and
+        apply_unknown (a separate bucket, not part of applied)."""
         conn = self._get_conn()
-        judged, used, applied = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied = 1), 0) "
-            "FROM use_judgments"
+        judged, used, applied, unknown = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied = 1), 0), "
+            "COALESCE(SUM(applied = 2), 0) FROM use_judgments"
         ).fetchone()
         return {
             "judged": int(judged),
             "used": int(used),
             "unused": int(judged) - int(used),
             "applied": int(applied),
+            # claimed for apply and never finished (in progress, or the
+            # process died): mark_used may have run. Not counted as applied.
+            "apply_unknown": int(unknown),
         }
 
     @_locked

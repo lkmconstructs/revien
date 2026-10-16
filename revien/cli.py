@@ -1997,13 +1997,17 @@ def usage_list(db: Optional[str], limit: int, which: str, json_output: bool):
         click.echo(_json.dumps({"counts": counts, "judgments": rows}, indent=2))
         return
     click.echo(f"\n{counts['judged']} judgment(s): {counts['used']} used, "
-               f"{counts['unused']} not used, {counts['applied']} applied\n")
+               f"{counts['unused']} not used, {counts['applied']} applied"
+               + (f", {counts['apply_unknown']} apply unknown (in progress, "
+                  "or interrupted: mark_used may have run)"
+                  if counts["apply_unknown"] else "") + "\n")
     for row in rows:
         similarity = ("-" if row["similarity"] is None
                       else f"{row['similarity']:.2f}")
         verdict = "USED  " if row["used"] else "unused"
+        mark = "  [apply unknown]" if row["apply_state"] == "unknown" else ""
         click.echo(f"  {verdict} sim={similarity} terms={len(row['shared_terms'])} "
-                   f"[{row['mode']}] {row['label'][:60]}")
+                   f"[{row['mode']}] {row['label'][:60]}{mark}")
         if row["shared_terms"]:
             click.echo(f"         shared: {', '.join(row['shared_terms'][:8])}")
         click.echo(f"         query : {row['query'][:70]}")
