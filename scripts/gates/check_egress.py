@@ -23,11 +23,32 @@ def fail(msg):
     sys.exit(1)
 
 
-NETWORK_MODULES = ("httpx", "requests", "urllib.request", "socket", "aiohttp")
-_IMPORT_RE = re.compile(
-    r"^\+\s*(?:import\s+(" + "|".join(re.escape(m) for m in NETWORK_MODULES) + r")\b"
-    r"|from\s+(" + "|".join(re.escape(m) for m in NETWORK_MODULES) + r")\b)"
+NETWORK_MODULES = (
+    "httpx", "requests", "urllib.request", "urllib3", "socket", "aiohttp",
+    "http.client", "ftplib", "smtplib", "poplib", "imaplib", "telnetlib",
+    "xmlrpc.client", "websockets", "websocket",
 )
+_ALT = "|".join(re.escape(m) for m in NETWORK_MODULES)
+_IMPORT_RE = re.compile(
+    r"^\+\s*(?:import\s+(" + _ALT + r")\b"
+    r"|from\s+(" + _ALT + r")\b"
+    # `from http import client` / `from urllib import request`
+    r"|from\s+(http)\s+import\s+client\b"
+    r"|from\s+(urllib)\s+import\s+request\b)"
+)
+
+# Network-client imports that are known and reviewed, keyed by file and module.
+# Anything else added to revien/ fails the gate. The reason is the review:
+# a new entry needs a test that pins the behaviour it justifies.
+ALLOWED = {
+    ("revien/cli.py", "http.client"):
+        "`revien sync reset` asks a LOOPBACK daemon for /v1/health; "
+        "_probe_daemon refuses any non-loopback host before connecting "
+        "(pinned by tests/test_forget_followups.py::"
+        "TestResetSaysOnlyWhatItCanProve::test_probe_egress_is_loopback_only)",
+}
+PROBE_TEST = ("tests/test_forget_followups.py::TestResetSaysOnlyWhatItCanProve"
+              "::test_probe_egress_is_loopback_only")
 
 
 def added_network_import(diff_line: str):
@@ -41,7 +62,7 @@ def added_network_import(diff_line: str):
     m = _IMPORT_RE.match(diff_line)
     if not m:
         return None
-    return m.group(1) or m.group(2)
+    return m.group(1) or m.group(2) or m.group(3) or m.group(4)
 
 
 def main():
@@ -56,6 +77,25 @@ def main():
     control_context_line = added_network_import("+++ b/revien/foo.py")
     if control_context_line is not None:
         fail("positive control false-positive: a '+++' file-header line was flagged")
+
+    for line, want in (("+import http.client", "http.client"),
+                       ("+    import http.client", "http.client"),
+                       ("+from http import client", "http"),
+                       ("+import socket", "socket")):
+        got = added_network_import(line)
+        if got != want:
+            fail(f"positive control failed: {line!r} gave {got!r}, want {want!r}")
+
+    # ── the allowlisted probe is covered by a test that must pass: it fails
+    # if the loopback-only guard is removed from _probe_daemon ──
+    probe = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"--basetemp={tempfile.mkdtemp(prefix='revien-gate8p-')}", PROBE_TEST],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=300,
+    )
+    if probe.returncode != 0 or "1 passed" not in probe.stdout:
+        fail(f"loopback probe test did not pass (exit {probe.returncode}):\n"
+             f"{probe.stdout[-2000:]}")
 
     # ── pytest -k "egress or sovereign" ──
     basetemp = tempfile.mkdtemp(prefix="revien-gate8-")
@@ -107,8 +147,15 @@ def main():
                 fail(f"git diff main -- {rel_path} failed: {diff_proc.stderr}")
             for line in diff_proc.stdout.splitlines():
                 hit = added_network_import(line)
-                if hit:
+                if hit and (rel_path, hit) not in ALLOWED:
                     violations.append((rel_path, hit, line))
+
+    # Full-tree check as well: an allowlisted import must still exist where
+    # the allowlist says (a stale entry would silently stop covering it).
+    for (rel_path, module), _why in ALLOWED.items():
+        src = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        if not re.search(rf"^\s*import\s+{re.escape(module)}\b", src, re.M):
+            fail(f"allowlist entry {rel_path}:{module} no longer matches the source")
 
     if violations:
         fail(f"changed files add a new network-client import on the default path: {violations}")
