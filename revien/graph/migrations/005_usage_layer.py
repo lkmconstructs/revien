@@ -6,7 +6,7 @@ migration 004) up to the usage layer:
 
     use_judgments       table + idx_use_judgments_node         -> created
     recall_receipts     table + idx_recall_receipts_status     -> created
-    store_meta          table (key/value: database id, daemon heartbeat)
+    store_meta          table (key/value: daemon heartbeats)
                                                                 -> created
     sync_cursors.generation  INTEGER NOT NULL DEFAULT 0         -> added
 

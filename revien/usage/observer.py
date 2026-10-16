@@ -223,7 +223,9 @@ class UsageObserver:
     ) -> ObserveResult:
         """Judge an answer against the memories its receipt says it was
         handed. Raises ReceiptError (unknown, expired, already redeemed,
-        empty answer); nothing is written in those cases.
+        empty answer); no judgment is written in those cases. (The expiry
+        pass runs first, since "expired" is decided by it, so a failing call
+        can still flag other overdue receipts.)
 
         Memories are compared as they are now, not as recalled — the
         receipt holds ids only. The receipt is closed only after judging,

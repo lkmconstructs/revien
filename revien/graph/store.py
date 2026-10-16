@@ -589,9 +589,9 @@ class GraphStore:
         CREATE INDEX IF NOT EXISTS idx_recall_receipts_status
             ON recall_receipts(status, expires_at);
 
-        -- Per-database key/value facts: a random database id and the running
-        -- daemon's heartbeat (features, pid, time). Not derived from the
-        -- path or the contents.
+        -- Per-database key/value facts. Today: the running daemons' heartbeats
+        -- (daemon_heartbeat:<pid> -> features, pid, time). No path, no
+        -- content.
         CREATE TABLE IF NOT EXISTS store_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
