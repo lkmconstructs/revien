@@ -198,5 +198,9 @@ class Graph(BaseModel):
     """Full graph export/import format."""
     nodes: List[Node] = Field(default_factory=list)
     edges: List[Edge] = Field(default_factory=list)
+    # Write-time provenance rows (node_id, unit_id, label_ok, wording_ok): ids
+    # and flags only, no text. An export from an older build has none; the
+    # importer then infers them from the edges and the context text.
+    provenance: List[Dict[str, Any]] = Field(default_factory=list)
     exported_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     version: str = "1.0"

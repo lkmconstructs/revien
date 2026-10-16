@@ -1203,11 +1203,14 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         audit entry and re-points children's lineage to a tombstone marker.
         cascade=True forgets the whole DERIVED_FROM subtree; on a session's
         verbatim context node it forgets that context node, its sub-agent
-        context nodes and every node linked ONLY to them (the pipeline never
-        writes DERIVED_FROM). A node another live context node also links is
-        kept, with this session's links removed; the response lists what was
-        kept (`kept_shared`) and which other context nodes carry the same
-        source id (`other_contexts_same_source`). GET .../forget/preview
+        context nodes and every node only they wrote (the pipeline never
+        writes DERIVED_FROM; ownership is the provenance each writer records).
+        A node another live unit also wrote or merged into is kept, with this
+        session's rows removed, and its content reset to its label when that
+        unit only said the label; the response lists what was kept
+        (`kept_shared`), reset (`reset_to_label`) and which other context
+        nodes carry the same source id (`other_contexts_same_source`).
+        GET .../forget/preview
         returns the same lists before anything is deleted.
         """
         req = request or ForgetRequest()

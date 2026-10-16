@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType, SourceType
+from revien.graph import provenance
 from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
@@ -277,6 +278,7 @@ class IngestionPipeline:
                 target_node_id=node_id,
                 weight=self.MENTION_EDGE_WEIGHT,
             ))
+            self._record_mention(ctx_id, self.store.get_node(node_id), False)
             created += 1
         return created
 
@@ -532,6 +534,7 @@ class IngestionPipeline:
                 candidate_node, allow_semantic=not input_data.defer_embed
             )
             id_map[old_id] = actual_node.node_id
+            self._record_candidate(ctx_id, candidate_node, actual_node, is_new)
             if is_new:
                 nodes_created += 1
                 self._register_entity(actual_node)
@@ -604,6 +607,9 @@ class IngestionPipeline:
                     nodes_created += 1
                     self._register_entity(target)
                     newly_created.append((target.node_id, target.label, target.content))
+                    self._record_mention(link_ctx_id, target, created=True)
+                else:
+                    self._record_mention(link_ctx_id, target, created=False)
                 if target.node_id == link_ctx_id:
                     continue
                 if not self._edge_exists(link_ctx_id, target.node_id, EdgeType.RELATED_TO):
@@ -827,6 +833,7 @@ class IngestionPipeline:
                     candidate_node, allow_semantic=False
                 )
                 id_map[old_id] = actual_node.node_id
+                self._record_candidate(ctx_id, candidate_node, actual_node, is_new)
                 if is_new:
                     nodes_created += 1
                     self._register_entity(actual_node)
@@ -882,6 +889,9 @@ class IngestionPipeline:
                     newly_created.append(
                         (target.node_id, target.label, target.content)
                     )
+                    self._record_mention(ctx_id, target, created=True)
+                else:
+                    self._record_mention(ctx_id, target, created=False)
                 if target.node_id == ctx_id:
                     continue
                 if not self._edge_exists(ctx_id, target.node_id, EdgeType.RELATED_TO):
@@ -924,6 +934,32 @@ class IngestionPipeline:
             governance=governance,
             fenced_spans=fenced_spans,
         )
+
+    def _record_candidate(self, unit_id: Optional[str], candidate: Node,
+                          actual: Node, is_new: bool) -> None:
+        """Write-time provenance for one extracted node: this unit created it
+        (is_new) or dedup reused ``actual`` for it. See graph/provenance.py."""
+        if not unit_id or actual.node_type == NodeType.CONTEXT:
+            return
+        if is_new:
+            self.store.record_provenance(actual.node_id, unit_id, True, True)
+            return
+        label_ok, wording_ok = provenance.flags_for_merge(candidate, actual)
+        self.store.record_provenance(
+            actual.node_id, unit_id, label_ok, wording_ok, merged=True)
+
+    def _record_mention(self, unit_id: Optional[str], node: Optional[Node],
+                        created: bool) -> None:
+        """Provenance for a node the unit names by label without extracting it
+        (a declared link, a known-entity mention)."""
+        if not unit_id or node is None or node.node_type == NodeType.CONTEXT:
+            return
+        if created:
+            self.store.record_provenance(node.node_id, unit_id, True, True)
+            return
+        label_ok, wording_ok = provenance.flags_for_mention(node)
+        self.store.record_provenance(
+            node.node_id, unit_id, label_ok, wording_ok, merged=True)
 
     def _edge_exists(
         self, source_id: str, target_id: str, edge_type: EdgeType

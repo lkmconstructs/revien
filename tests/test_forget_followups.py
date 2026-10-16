@@ -695,7 +695,8 @@ class TestLegacyAuditScrub:
         s = GraphStore(db_path=db_path)        # second open: marker, no rescan
         try:
             assert s._get_conn().execute(
-                "SELECT COUNT(*) FROM store_meta").fetchone()[0] == 1
+                "SELECT COUNT(*) FROM store_meta WHERE key = ?",
+                (GraphStore._LEGACY_SCRUB_MARK,)).fetchone()[0] == 1
         finally:
             s.close()
 

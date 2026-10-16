@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import re
 from typing import Dict, List, Optional, Tuple, Union
 
+from . import provenance
 from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
 from .suppression import (
@@ -358,46 +359,16 @@ class GraphOperations:
                 children.append(edge.source_node_id)
         return children
 
-    def _live_context_neighbours(self, node_id: str) -> List[str]:
-        """Ids of live (non-tombstone) CONTEXT nodes directly linked to
-        ``node_id`` by any edge, either direction."""
-        out: List[str] = []
-        for e in self.store.get_edges_for_node(node_id):
-            other = (e.target_node_id if e.source_node_id == node_id
-                     else e.source_node_id)
-            if other == node_id or other in out:
-                continue
-            if other.startswith(self.TOMBSTONE_PREFIX):
-                continue
-            n = self.store.get_node(other)
-            if n is not None and n.node_type == NodeType.CONTEXT:
-                out.append(other)
-        return out
-
-    _SENTENCE_TYPES = (NodeType.DECISION, NodeType.ACTION, NodeType.FACT,
-                       NodeType.PREFERENCE)
-
-    @staticmethod
-    def _squash(text: str) -> str:
-        return " " + re.sub(r"[\W_]+", " ", (text or "").lower()).strip() + " "
-
-    def _attested_by(self, n: Node, context_ids: List[str]) -> bool:
-        """True when everything the node stores that came from text (its label,
-        and for sentence-type nodes its content sentence) is found, ignoring
-        case, punctuation and spacing, in the verbatim text of one of these
-        live context nodes. Entities and topics have generated content
-        ("Entity: <label>"), so their label is the wording."""
-        needles = [self._squash(n.label)]
-        if n.node_type in self._SENTENCE_TYPES:
-            needles.append(self._squash(n.content))
-        for cid in context_ids:
-            ctx = self.store.get_node(cid)
-            if ctx is None:
-                continue
-            hay = self._squash(ctx.content)
-            if all(nd.strip() and nd in hay for nd in needles):
-                return True
-        return False
+    def _live_unit(self, unit_id: str, unit_ids: set) -> bool:
+        """A provenance row outside the forgotten unit still vouches for a
+        node only if its writer is the external sentinel or a context node
+        that exists."""
+        if unit_id in unit_ids:
+            return False
+        if unit_id == provenance.EXTERNAL:
+            return True
+        n = self.store.get_node(unit_id)
+        return n is not None and n.node_type == NodeType.CONTEXT
 
     def _unit_plan(self, node_id: str) -> Optional[Dict]:
         """What belongs EXCLUSIVELY to the unit whose verbatim CONTEXT node is
@@ -406,41 +377,35 @@ class GraphOperations:
         unit).
 
         The rule is "the forgotten unit is gone, everything else remains".
-        What links an extracted node to its context node: nothing that records
-        derivation (the pipeline never writes DERIVED_FROM). Every node the
-        extractor produces gets an edge to the context node it came from
-        (MENTIONED_BY / DECIDED_IN / RELATED_TO), and the pipeline's dedup then
-        REUSES an existing node when a later unit says the same thing, adding
-        that later unit's edge to it. Neither ``source_id`` alone (a basename
-        or a vault relative path is shared by different files) nor reachability
-        alone (it reaches nodes other units created) is therefore a definition
-        of ownership. The definition used:
+        Ownership is read from the provenance every writer records when it
+        writes (``node_provenance``, see graph/provenance.py), not inferred
+        from edges or ``source_id``:
 
         * the unit is this context node, plus the Claude Code sub-agent
-          context nodes that name this session as ``parent_session_id`` (their
-          transcripts are part of the session; the tombstone already covers
-          future ones);
-        * a node is the unit's when it is DIRECTLY linked to one of the unit's
-          context nodes, carries that context's ``source_id`` (or the
-          source_id of a unit that no longer has any live context node, an
-          orphan left by an older build), and is linked to NO live context
-          node outside the unit. Those go.
-        * a node directly linked to the unit but ALSO linked to a live context
-          node outside it is SHARED: it stays, minus this unit's links, and is
-          re-attributed to a live unit that still links it (so forgetting that
-          unit later removes it), PROVIDED that live context's own verbatim
-          text contains the node's stored wording (``_attested_by``). That is
-          why keeping it keeps no forgotten content: every word the node holds
-          is also in a unit that has not been forgotten. The pipeline reuses a
-          node on a normalized-label match, but also on an edit distance of 2
-          or (opt-in) a semantic match, and then the stored wording is the
-          FIRST unit's ("service3 uses queue Q3x" kept for a unit that said
-          "service4 ..."). Such a node is not attested by the other unit, so it
-          is removed with this one and reported (``unattested_shared``); the
-          other unit's verbatim text is untouched.
-        * another unit's CONTEXT node is never in the set, even when it has the
-          same ``source_id`` (a same-named file in another folder, an earlier
-          or later version of this file): those are listed, not deleted.
+          context nodes that name this session as ``parent_session_id``;
+        * a node the unit wrote or merged into, that no other live writer
+          also wrote or merged into, is EXCLUSIVE: it goes (OpenAI messages
+          chained by FOLLOWED_BY, entities stamped with the session but never
+          linked, all of it, because the writer recorded it);
+        * a node another live writer also wrote or merged into stays, minus
+          this unit's rows, and is re-attributed to a live writer, but only on
+          what a live writer vouches for. A live writer whose own text
+          carries the node's stored wording (``wording_ok``) keeps it as is.
+          One that carries only its label (``label_ok``: an LLM description,
+          or a merge by similar rather than identical wording of the content)
+          keeps the node with its content reset to the label
+          (``reset_to_label``), so the forgotten wording goes. A node no live
+          writer vouches for even by label (a merge by edit distance or
+          semantic similarity) is removed (``unattested_shared``);
+        * a node with no row at all is first given inferred rows
+          (``infer_provenance``: edges, source_id and the context text), the
+          same inference that backfilled existing databases, so a writer that
+          does not record is still covered. A node nothing links to any unit
+          (a manually added fact, even one whose source_id looks like a
+          file's) is not this unit's and is never touched;
+        * another unit's CONTEXT node is never in the set, even with the same
+          ``source_id`` (a same-named file in another folder, an earlier or
+          later version of this file): those are listed, not deleted.
         """
         node = self.store.get_node(node_id)
         if (node is None or node.node_type != NodeType.CONTEXT
@@ -457,45 +422,33 @@ class GraphOperations:
                     unit_ctx.append(sub)
         unit_ids = {c.node_id for c in unit_ctx}
         unit_sources = {c.source_id for c in unit_ctx}
+        self.store.infer_provenance(sorted(unit_ids))
 
         exclusive: List[str] = []
         shared: Dict[str, List[str]] = {}
+        reset: Dict[str, List[str]] = {}
         unattested: Dict[str, List[str]] = {}
-        seen = set(unit_ids)
-        live_sources: Dict[str, bool] = {}
-
-        def source_has_live_context(sid: str) -> bool:
-            if sid not in live_sources:
-                live_sources[sid] = any(
-                    c.node_id not in unit_ids
-                    and not c.node_id.startswith(self.TOMBSTONE_PREFIX)
-                    for c in self.store.list_nodes(
-                        node_type=NodeType.CONTEXT, source_id=sid, limit=999999))
-            return live_sources[sid]
-
-        for ctx in unit_ctx:
-            for e in self.store.get_edges_for_node(ctx.node_id):
-                nid = (e.target_node_id if e.source_node_id == ctx.node_id
-                       else e.source_node_id)
-                if nid in seen or nid.startswith(self.TOMBSTONE_PREFIX):
-                    continue
-                seen.add(nid)
-                n = self.store.get_node(nid)
-                if n is None or n.node_type == NodeType.CONTEXT:
-                    continue
-                own = (n.source_id == ctx.source_id or n.source_id in unit_sources
-                       or (bool(n.source_id) and is_unit_source_id(n.source_id)
-                           and not source_has_live_context(n.source_id)))
-                if not own:
-                    continue
-                others = [c for c in self._live_context_neighbours(nid)
-                          if c not in unit_ids]
-                if others and self._attested_by(n, others):
-                    shared[nid] = others
-                else:
-                    exclusive.append(nid)
-                    if others:
-                        unattested[nid] = others
+        for nid in self.store.provenance_nodes_of_units(sorted(unit_ids)):
+            n = self.store.get_node(nid)
+            if (n is None or n.node_type == NodeType.CONTEXT
+                    or nid.startswith(self.TOMBSTONE_PREFIX)):
+                continue
+            live = [(u, lo, wo) for (u, lo, wo)
+                    in self.store.provenance_for_node(nid)
+                    if self._live_unit(u, unit_ids)]
+            if not live:
+                exclusive.append(nid)
+                continue
+            worded = [u for (u, lo, wo) in live if wo]
+            labelled = [u for (u, lo, wo) in live if lo]
+            if worded:
+                shared[nid] = worded
+            elif labelled:
+                shared[nid] = labelled
+                reset[nid] = labelled
+            else:
+                exclusive.append(nid)
+                unattested[nid] = [u for (u, _, _) in live]
         same_source = [
             c.node_id for c in self.store.list_nodes(
                 node_type=NodeType.CONTEXT, source_id=node.source_id,
@@ -507,6 +460,7 @@ class GraphOperations:
             "subagent_contexts": [c.node_id for c in unit_ctx[1:]],
             "exclusive": exclusive,
             "shared": shared,
+            "reset_to_label": reset,
             "unattested_shared": unattested,
             "other_contexts_same_source": same_source,
             "unit_sources": sorted(unit_sources),
@@ -517,12 +471,14 @@ class GraphOperations:
 
         ``node_ids`` is the node itself plus every descendant reachable via
         DERIVED_FROM and, when the node is a session's verbatim CONTEXT node,
-        the unit's exclusive nodes and sub-agent context nodes (see
-        ``_unit_plan``). ``kept_shared`` lists nodes this unit links that a
-        live context node of ANOTHER unit also links: they are kept.
-        ``other_contexts_same_source`` lists context nodes that share this
-        node's source_id but are not part of the unit (a same-named file in
-        another folder, another version of this file); they are not touched.
+        the unit's exclusive nodes (those only it wrote, by provenance) and
+        sub-agent context nodes (see ``_unit_plan``). ``kept_shared`` lists
+        nodes this unit wrote that another live unit also wrote or merged
+        into: they are kept, and those in ``reset_to_label`` lose their
+        stored wording. ``other_contexts_same_source`` lists context nodes
+        that share this node's source_id but are not part of the unit (a
+        same-named file in another folder, another version of this file);
+        they are not touched.
         Cycle-safe.
         """
         root = self.store.get_node(node_id)
@@ -542,8 +498,15 @@ class GraphOperations:
             seen.add(current)
             to_delete.append(current)
             for child in self._children_derived_from(current):
-                if child not in seen:
-                    frontier.append(child)
+                if child in seen:
+                    continue
+                if plan is not None and child not in plan["contexts"]:
+                    cn = self.store.get_node(child)
+                    if cn is not None and cn.node_type == NodeType.CONTEXT:
+                        # another unit's verbatim text is never part of this
+                        # unit, whatever edge reaches it
+                        continue
+                frontier.append(child)
 
         return {
             "node_id": node_id,
@@ -557,6 +520,7 @@ class GraphOperations:
                 sorted(plan["unattested_shared"]) if plan else [],
             "kept_shared_linked_from": (
                 {k: v for k, v in sorted(plan["shared"].items())} if plan else {}),
+            "reset_to_label": sorted(plan["reset_to_label"]) if plan else [],
             "other_contexts_same_source":
                 plan["other_contexts_same_source"] if plan else [],
         }
@@ -679,34 +643,39 @@ class GraphOperations:
         """Exactly what a whole-session cascade removed and what it kept."""
         out: List[str] = []
         ctxs = [c for c in plan["contexts"] if c in forgotten]
+        gone_un = [x for x in sorted(plan["unattested_shared"]) if x in forgotten]
         excl = [x for x in plan["exclusive"]
                 if x in forgotten and x not in plan["unattested_shared"]]
         out.append(
             f"Removed: {len(ctxs)} context node(s) (the verbatim text) and "
-            f"{len(excl)} node(s) linked only to "
-            + ("them" if len(ctxs) > 1 else "it")
+            f"{len(excl)} node(s) only this unit wrote"
             + (f", including {len(plan['subagent_contexts'])} sub-agent "
                "transcript(s) that name this session as their parent"
                if plan["subagent_contexts"] else "") + ".")
         if plan["shared"]:
+            kept = sorted(plan["shared"])
+            resets = [x for x in plan.get("reset_done", [])]
             out.append(
-                f"Kept: {len(plan['shared'])} node(s) that a live context "
-                "node of another source also links "
-                f"({', '.join(sorted(plan['shared']))}). They hold a claim "
-                "that other source's own text also makes, so they remain, "
-                "with this session's links and attribution removed; if a "
-                "merge matched by similar rather than identical wording, the "
-                "wording of the first sentence is what stays. Forget the "
-                "other source (or those nodes) to remove them.")
-        gone_un = [x for x in sorted(plan["unattested_shared"]) if x in forgotten]
+                f"Kept: {len(kept)} node(s) that another unit also wrote or "
+                f"merged into and still vouches for ({', '.join(kept)}). "
+                "They stay with this unit's provenance and attribution "
+                "removed; forget the other unit (or those nodes) to remove "
+                "them.")
+            if resets:
+                out.append(
+                    f"Reset: {len(resets)} kept node(s) ({', '.join(resets)}) "
+                    "were worded by this unit but the other unit only said "
+                    "their label (an LLM description, or content that differed "
+                    "from this unit's): the content was reset to the label and "
+                    "the old wording was removed from the node, its embedding, "
+                    "its audit snapshots and its usage judgments.")
         if gone_un:
             out.append(
-                f"Also removed: {len(gone_un)} node(s) another source links "
-                f"({', '.join(gone_un)}) whose stored wording is this "
-                "session's own, not that source's: they were merged by "
-                "similarity, not by identical wording, so keeping them would "
-                "keep this session's text. That source's verbatim text is "
-                "unchanged.")
+                f"Also removed: {len(gone_un)} node(s) another unit merged "
+                f"into ({', '.join(gone_un)}) by similarity, not by its own "
+                "label: the stored wording was this unit's and no other unit "
+                "vouches for even the label, so keeping them would keep this "
+                "unit's text. That unit's verbatim text is unchanged.")
         if plan["other_contexts_same_source"]:
             out.append(
                 f"{len(plan['other_contexts_same_source'])} other context "
@@ -735,10 +704,10 @@ class GraphOperations:
         trace to the tombstone marker.
         cascade=True: also forget every node DERIVED_FROM this one, recursively
         (each tombstoned). Called on a session's verbatim CONTEXT node it
-        forgets the whole session: every node carrying that session's
-        source_id (the pipeline never writes DERIVED_FROM, so this is what
-        "derived from the session" means; see ``_session_unit``), in one call,
-        with the same tombstones. Use ``forget_preview`` first to see the
+        forgets the whole session: every node only that session wrote (the
+        pipeline never writes DERIVED_FROM; ownership is the provenance the
+        writers record, see ``_unit_plan``), in one call, with the same
+        tombstones. Use ``forget_preview`` first to see the
         blast radius. Cascade from an extracted node follows DERIVED_FROM only.
 
         suppress: an explicit user forget (the default) also writes a
@@ -770,6 +739,7 @@ class GraphOperations:
 
         plan = None
         preview: Dict = {}
+        reset_done: List[str] = []
         root = self.store.get_node(node_id)
         if cascade:
             # Resolve the full set first (preview), then forget LEAVES-FIRST so a
@@ -792,11 +762,14 @@ class GraphOperations:
                                 suppress=suppress, outcome=outcome):
                 forgotten.append(tid)
 
-        # Shared nodes the unit linked stay; the unit that first created one
-        # is gone, so a node still naming it moves to a live unit that links
-        # it (otherwise forgetting that unit later would not find it).
+        # Nodes another live writer also wrote or merged into stay. The unit
+        # that first created one is gone, so a node still naming it moves to
+        # a live unit that vouches for its wording (otherwise forgetting that
+        # unit later would not find it); a node only vouched for by label has
+        # its content reset to the label.
         kept_shared: List[str] = []
         kept_from: Dict[str, List[str]] = {}
+        reset_done: List[str] = []
         if plan and forgotten:
             gone_sources = set(plan["unit_sources"])
             for nid, others in sorted(plan["shared"].items()):
@@ -805,14 +778,20 @@ class GraphOperations:
                     continue
                 kept_shared.append(nid)
                 kept_from[nid] = others
+                if nid in plan["reset_to_label"]:
+                    if self.store.rewrite_kept_wording(
+                            nid, provenance.generic_content(n.node_type, n.label)):
+                        reset_done.append(nid)
                 if n.source_id in gone_sources:
                     owner = next((self.store.get_node(o) for o in others
-                                  if self.store.get_node(o) is not None), None)
+                                  if o != provenance.EXTERNAL
+                                  and self.store.get_node(o) is not None), None)
                     if owner is not None:
                         self.store.reattribute_node(
                             nid, owner.source_id, owner.origin_runtime,
                             owner.origin_source, owner.project_key,
                             owner.session_key, actor=construct_id)
+            plan["reset_done"] = reset_done
 
         suppressed = sorted({i for t in forgotten
                              for i in outcome.get(t, {}).get("identities", [])})
@@ -891,6 +870,7 @@ class GraphOperations:
                 if plan else []),
             "kept_shared": kept_shared,
             "kept_shared_linked_from": kept_from,
+            "reset_to_label": reset_done,
             "removed_unattested_shared": (
                 [x for x in sorted(plan["unattested_shared"]) if x in forgotten]
                 if plan else []),

@@ -155,7 +155,7 @@ class TestCascadeKeepsEveryOtherUnit:
         assert {m.node_id for m in merged} <= set(out["removed_unattested_shared"])
         assert b"Q3xray" not in raw(db_path)
         assert "Q4xray" in store.get_node(b.node_id).content
-        assert "whose stored wording is this session's own" in \
+        assert "no other unit vouches for even the label" in \
             " ".join(out["suppression_notice"])
 
     def test_twelve_sessions_lose_nothing_that_is_not_accounted_for(self, tmp_path):

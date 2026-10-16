@@ -414,6 +414,9 @@ class OpenAIAdapter:
                 session_key=conv_id,
             )
             self.store.add_node(msg_node)
+            # Every message belongs to the conversation, whatever edge (the
+            # FOLLOWED_BY chain, the root link) happens to reach it.
+            self.store.record_provenance(msg_node.node_id, context_node.node_id)
             node_map[node_id] = msg_node
             message_count += 1
 

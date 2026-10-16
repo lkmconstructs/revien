@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from . import provenance
 from .origin import derive_origin
 from .suppression import parent_session_identity, session_identity_for, unit_key
 from .schema import (
@@ -321,6 +322,15 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
+            CREATE TABLE IF NOT EXISTS node_provenance (
+                node_id TEXT NOT NULL,
+                unit_id TEXT NOT NULL,
+                label_ok INTEGER NOT NULL DEFAULT 0,
+                wording_ok INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (node_id, unit_id),
+                FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_prov_unit ON node_provenance(unit_id);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
@@ -360,6 +370,30 @@ class GraphStore:
         self._migrate_add_sync_cursor_generation(conn)
         self._backfill_session_suppressions(conn)
         self._migrate_scrub_legacy_audit(conn)
+        self._backfill_node_provenance(conn)
+
+    _PROVENANCE_MARK = "node_provenance_backfill_done"
+
+    def _backfill_node_provenance(self, conn: sqlite3.Connection) -> None:
+        """One-time: give every node written before write-time provenance
+        existed its rows, inferred from edges, source_id and the live context
+        text (see revien/graph/provenance.py). Later writers record their own."""
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS store_meta "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            if conn.execute("SELECT 1 FROM store_meta WHERE key = ?",
+                            (self._PROVENANCE_MARK,)).fetchone():
+                return
+            n = provenance.infer_rows(conn)
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES (?, ?)",
+                (self._PROVENANCE_MARK,
+                 json.dumps({"at": datetime.now(timezone.utc).isoformat(),
+                             "nodes": n})))
+            self._commit(conn)
+        except sqlite3.Error as e:
+            print(f"Migration note: provenance backfill: {e}", file=sys.stderr)
 
     def _backfill_session_suppressions(self, conn: sqlite3.Connection) -> None:
         """Tombstones written before session ids were bound get their
@@ -1277,6 +1311,105 @@ class GraphStore:
                 out.append(n)
         return out
 
+    # ── Write-time provenance (see revien/graph/provenance.py) ──
+
+    @_locked
+    def record_provenance(
+        self, node_id: str, unit_id: str, label_ok: bool = True,
+        wording_ok: bool = True, merged: bool = False,
+    ) -> None:
+        """Record that the unit whose CONTEXT node is ``unit_id`` wrote
+        ``node_id`` (merged=False) or merged into it (merged=True), and
+        whether its own text supports the node's label and stored wording.
+        Content-free. A merge into a node no unit ever recorded (a manual
+        add, a node written before provenance existed) first records the
+        external writer, so forgetting the merging unit cannot take a node it
+        did not create. Flags only ever get stronger for the same unit."""
+        if not unit_id or not node_id:
+            return
+        conn = self._get_conn()
+        with self.transaction():
+            if merged and not conn.execute(
+                    "SELECT 1 FROM node_provenance WHERE node_id = ? LIMIT 1",
+                    (node_id,)).fetchone():
+                conn.execute(
+                    "INSERT OR IGNORE INTO node_provenance "
+                    "(node_id, unit_id, label_ok, wording_ok) VALUES (?, ?, 1, 1)",
+                    (node_id, provenance.EXTERNAL))
+            conn.execute(
+                "INSERT INTO node_provenance (node_id, unit_id, label_ok, "
+                "wording_ok) VALUES (?, ?, ?, ?) ON CONFLICT(node_id, unit_id) "
+                "DO UPDATE SET label_ok = MAX(label_ok, excluded.label_ok), "
+                "wording_ok = MAX(wording_ok, excluded.wording_ok)",
+                (node_id, unit_id, 1 if label_ok else 0, 1 if wording_ok else 0))
+
+    @_locked
+    def provenance_for_node(self, node_id: str) -> List[tuple]:
+        """[(unit_id, label_ok, wording_ok)] for one node."""
+        return [(r[0], bool(r[1]), bool(r[2])) for r in self._get_conn().execute(
+            "SELECT unit_id, label_ok, wording_ok FROM node_provenance "
+            "WHERE node_id = ? ORDER BY unit_id", (node_id,)).fetchall()]
+
+    @_locked
+    def provenance_nodes_of_units(self, unit_ids: List[str]) -> List[str]:
+        """Node ids that any of these units wrote or merged into."""
+        out: List[str] = []
+        conn = self._get_conn()
+        for i in range(0, len(unit_ids), 400):
+            chunk = unit_ids[i:i + 400]
+            for (nid,) in conn.execute(
+                    "SELECT DISTINCT node_id FROM node_provenance WHERE unit_id "
+                    f"IN ({','.join('?' * len(chunk))})", chunk).fetchall():
+                if nid not in out:
+                    out.append(nid)
+        return out
+
+    @_locked
+    def infer_provenance(self, unit_ids: Optional[List[str]] = None) -> int:
+        """Rows for row-less nodes that these units link or whose source_id
+        they carry (a writer that does not record, an older build)."""
+        conn = self._get_conn()
+        with self.transaction():
+            return provenance.infer_rows(conn, unit_ids=unit_ids)
+
+    @_locked
+    def rewrite_kept_wording(self, node_id: str, content: str) -> bool:
+        """Reset a kept node's stored content to ``content`` because the only
+        live unit that vouches for it vouches for its label, not its wording.
+        The old wording must be gone everywhere the node keeps it: the row,
+        the embedding, the audit snapshots and the usage judgments."""
+        conn = self._get_conn()
+        with self.transaction():
+            cur = conn.execute(
+                "UPDATE nodes SET content = ? WHERE node_id = ?",
+                (content, node_id))
+            if not cur.rowcount:
+                return False
+            # The content is now generated from the label, so any writer that
+            # vouches for the label vouches for it.
+            conn.execute("UPDATE node_provenance SET wording_ok = 1 "
+                         "WHERE node_id = ? AND label_ok = 1", (node_id,))
+            self._scrub_audit_rows(conn, [node_id])
+            conn.execute("DELETE FROM use_judgments WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "UPDATE use_judgments SET query = '' WHERE episode_key IN "
+                "(SELECT episode_key FROM use_judgments WHERE node_id = ?)",
+                (node_id,))
+            conn.execute(
+                "DELETE FROM supersession_candidates "
+                "WHERE existing_node_id = ? OR new_node_id = ?", (node_id, node_id))
+            self._delete_vector_row(conn, node_id)
+            try:
+                conn.execute("DELETE FROM pending_embeds WHERE node_id = ?",
+                             (node_id,))
+            except sqlite3.OperationalError:
+                pass
+        updated = self.get_node(node_id)
+        if updated is not None:
+            self._fire_content_change(updated)
+        self.truncate_wal()
+        return True
+
     @_locked
     def reattribute_node(
         self, node_id: str, source_id: str, origin_runtime: Optional[str],
@@ -1510,7 +1643,12 @@ class GraphStore:
         metadata: Optional[dict] = None,
     ) -> Optional[dict]:
         """The suppression row matching this ingest, else None. ``metadata``
-        may carry ``parent_session_id`` (a sub-agent file's parent session)."""
+        may carry ``parent_session_id`` (a sub-agent file's parent session)
+        and, for a watched file, its ``path``.
+
+        A watched file is matched on its real path first. A row for its base
+        name (``file:<name>``) then blocks it only when it cannot be told
+        apart from the forgotten file: see revien/graph/suppression.py."""
         conn = self._get_conn()
         candidates = [(source_id, "source_id"), (ingest_key, "ingest_key")]
         parent = parent_session_identity(metadata)
@@ -1566,6 +1704,7 @@ class GraphStore:
     @_locked
     def lift_ingest_suppression(
         self, identity: str, actor: str = "", reason: str = "restore",
+        exact: bool = False,
     ) -> int:
         """Explicit override: remove every suppression row for this identity
         (either kind). Audited. Returns rows lifted (0 = none existed)."""
@@ -1586,7 +1725,7 @@ class GraphStore:
         self.record_audit(
             f"suppression:{identity}", "suppression_lift", actor=actor,
             after={"_tombstone": True, "identity": identity, "kinds": kinds,
-                   "reason": reason},
+                   "lifted": [i for i, _ in rows], "reason": reason},
         )
         self._commit(conn)
         return len(kinds)
@@ -2081,6 +2220,18 @@ class GraphStore:
             except sqlite3.OperationalError:
                 pass  # queue table never created
             self._delete_vector_row(conn, node_id)
+            # A unit's rows go with its context node. Nodes it alone wrote
+            # survive a deliberate non-cascade forget of the context (that is
+            # the documented behaviour), so they take the external row: the
+            # cascade of some other unit must not mistake them for its own.
+            conn.execute(
+                "INSERT OR IGNORE INTO node_provenance (node_id, unit_id, "
+                "label_ok, wording_ok) SELECT node_id, ?, 1, 1 FROM "
+                "node_provenance WHERE unit_id = ? AND node_id NOT IN "
+                "(SELECT node_id FROM node_provenance WHERE unit_id != ?)",
+                (provenance.EXTERNAL, node_id, node_id))
+            conn.execute("DELETE FROM node_provenance WHERE unit_id = ? "
+                         "OR node_id = ?", (node_id, node_id))
             # The audit trail keeps full node snapshots (add/update ops).
             # A deleted node's content must not survive there: blank the
             # snapshots, keep op/actor/ts (the history that it existed). The
@@ -2602,7 +2753,11 @@ class GraphStore:
         conn = self._get_conn()
         edge_rows = conn.execute("SELECT * FROM edges").fetchall()
         edges = [self._row_to_edge(r) for r in edge_rows]
-        return Graph(nodes=nodes, edges=edges)
+        prov = [{"node_id": r[0], "unit_id": r[1], "label_ok": bool(r[2]),
+                 "wording_ok": bool(r[3])} for r in conn.execute(
+                     "SELECT node_id, unit_id, label_ok, wording_ok "
+                     "FROM node_provenance ORDER BY node_id, unit_id").fetchall()]
+        return Graph(nodes=nodes, edges=edges, provenance=prov)
 
     @_locked
     def import_graph(
@@ -2788,6 +2943,7 @@ class GraphStore:
                     "SELECT edge_id FROM edges").fetchall()]
                 self._scrub_audit_rows(conn, removed_node_ids + removed_edge_ids)
                 conn.execute("DELETE FROM edges")
+                conn.execute("DELETE FROM node_provenance")
                 conn.execute("DELETE FROM nodes")
             for node in new_nodes:
                 self.add_node(node)  # rides this transaction; audit included
@@ -2795,6 +2951,20 @@ class GraphStore:
             for edge in new_edges:
                 self.add_edge(edge)  # rides this transaction
                 result["edges_added"] += 1
+            # Provenance rows travel with the nodes they describe. A node the
+            # payload gives no rows for (an export from a build that did not
+            # record them) gets them inferred from the imported edges/text.
+            imported = {n.node_id for n in new_nodes}
+            for row in getattr(graph, "provenance", None) or []:
+                if row.get("node_id") in imported and row.get("unit_id"):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO node_provenance "
+                        "(node_id, unit_id, label_ok, wording_ok) "
+                        "VALUES (?, ?, ?, ?)",
+                        (row["node_id"], row["unit_id"],
+                         1 if row.get("label_ok") else 0,
+                         1 if row.get("wording_ok") else 0))
+            provenance.infer_rows(conn, node_ids=imported)
 
         # ── Semantic index, post-commit ──
         result["semantic_rebuild"] = self._semantic_after_import(
