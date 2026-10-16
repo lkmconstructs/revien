@@ -754,6 +754,13 @@ class TestCodexRereadIdempotent:
                        MOCK_CODEX_ROLLOUT)
         _write_rollout(root / "2026" / "07" / "02" / "rollout-b.jsonl",
                        MOCK_CODEX_ROLLOUT)
+        # The cursor is stamped at sync start, and a file modified in the same
+        # clock tick is re-read on purpose (never missed). Windows' coarse
+        # datetime.now() can land at or before a just-written mtime, so age the
+        # files so "cursor moved on" tests the cursor, not the clock.
+        old = datetime.now(timezone.utc).timestamp() - 60
+        for f in root.rglob("*.jsonl"):
+            os.utime(f, (old, old))
 
         def sync():
             sched = SyncScheduler(pipeline=IngestionPipeline(store))
