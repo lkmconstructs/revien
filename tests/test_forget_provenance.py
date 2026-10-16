@@ -111,6 +111,8 @@ class TestEveryWriterRecordsProvenance:
             assert len(chain) == 4
             assert len(linked(s, ctx.node_id)) == 1, \
                 "control: only the root message links the context node"
+            assert set(s.provenance_nodes_of_units([ctx.node_id])) == \
+                {n.node_id for n in chain}, "the importer recorded every message"
             ops = GraphOperations(s)
             prev = ops.forget_preview(ctx.node_id)
             out = ops.forget_node(ctx.node_id, cascade=True, reason="private")
@@ -156,6 +158,12 @@ class TestEveryWriterRecordsProvenance:
                               "We chose Redis for Refreshkey9 caching.")
         ctx = ctx_of(store, sid(1))
         assert len(ctx) == 1
+        added = [n for n in non_context(store) if "Refreshkey9" in n.content
+                 or n.label == "Redis"]
+        assert added
+        for n in added:
+            assert ctx[0].node_id in {
+                u for (u, _l, _w) in store.provenance_for_node(n.node_id)}
         out = forget(store, ctx[0])
         assert non_context(store) == []
         assert out["kept_shared"] == []
@@ -379,10 +387,13 @@ class TestKeptContentIsAttestedByALiveUnit:
         finally:
             s.close()
 
-    def test_reattribution_goes_to_a_unit_that_said_the_wording(self, tmp_path):
+    @pytest.mark.parametrize("trial", range(8))
+    def test_reattribution_goes_to_a_unit_that_said_the_wording(
+            self, tmp_path, trial):
         """A said it, B merged a different claim into the node by similarity,
         C said it. Forget A: the node must be owned by C, not by whichever
-        unit comes first."""
+        unit comes first. (Context node ids are random, so repeated trials
+        cover both orders.)"""
         s = GraphStore(db_path=str(tmp_path / "g.db"))
         try:
             ingest(s, sid(1), "User: We decided service3 uses queue Q3xray.")
@@ -508,6 +519,28 @@ class TestOnlyTheUnitsOwnNodesGo:
         forget(store, ctx_of(store, sid(2))[0])
         assert set(survivors) <= alive(store), \
             "another unit's cascade does not adopt them"
+
+    def test_leftovers_of_a_non_cascade_forget_are_not_adopted_by_a_namesake(
+            self, store):
+        """Two files share a source_id (same name, another folder). Forgetting
+        one's context node without cascade leaves its facts, by the documented
+        rule; a later cascade of the other file must not take them just
+        because they carry the shared source_id."""
+        v = "vault:daily/2026-07-01.md#standup"
+        ingest(store, v, "We decided vault1 uses SQLite. Carol leads vault1.",
+               key=False)
+        ingest(store, v, "We decided vault2 uses Mongo. Dave leads vault2.",
+               key=False)
+        one = [c for c in ctx_of(store, v) if "vault1" in c.content][0]
+        two = [c for c in ctx_of(store, v) if "vault2" in c.content][0]
+        mine = {n.node_id for n in non_context(store) if "vault1" in n.content
+                or "SQLite" in n.content or "Carol" in n.content}
+        assert mine
+        GraphOperations(store).forget_node(one.node_id, reason="private")
+        assert mine <= alive(store)
+        forget(store, two)
+        assert mine <= alive(store)
+        assert not [n for n in non_context(store) if "Mongo" in n.content]
 
     def test_manual_node_a_unit_merged_into_survives_that_unit(self, store):
         man = store.add_node(Node(node_type=NodeType.ENTITY, label="Quillfeather",
