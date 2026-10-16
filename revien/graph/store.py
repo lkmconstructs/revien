@@ -2541,6 +2541,10 @@ class GraphStore:
                 # when the semantic index is rebuilt wholesale below.
                 conn.execute("DELETE FROM edges")
                 conn.execute("DELETE FROM nodes")
+                # Same promise as delete_node: judgments carry the removed
+                # memories' own words, receipts their ids.
+                conn.execute("DELETE FROM use_judgments")
+                conn.execute("UPDATE recall_receipts SET node_ids = '[]'")
                 self._discard_pending_stmt(conn)
             for node in new_nodes:
                 self.add_node(node)  # rides this transaction; audit included

@@ -393,6 +393,31 @@ class TestClaudeCodeRealTranscript:
         results = self._fetch(tmp_path)
         assert [r["source_id"] for r in results] == ["claude-code:billing:sess-1"]
 
+    def test_real_transcript_date_is_when_it_was_said(self, tmp_path):
+        """With main's recorded_at honesty: the date is the first spoken
+        message's timestamp (labelled "content"), never a harness-injected
+        isMeta entry's and never the file mtime."""
+        self._write(tmp_path / "projects" / "billing" / "sess-2.jsonl", [
+            {"type": "user", "isMeta": True, "timestamp": "2026-01-01T00:00:00Z",
+             "message": {"role": "user", "content": "HARNESS-INJECTED"}},
+            {"type": "user", "timestamp": "2026-03-05T10:00:00Z",
+             "message": {"role": "user", "content": "Which database?"}},
+            {"type": "assistant", "timestamp": "2026-03-05T10:00:09Z",
+             "message": {"role": "assistant", "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "PostgreSQL."}]}},
+        ])
+        (item,) = self._fetch(tmp_path)
+        assert item["timestamp_source"] == "content"
+        assert item["timestamp"].startswith("2026-03-05T10:00:00")
+
+    def test_real_transcript_without_timestamps_falls_back_to_labelled_mtime(
+            self, tmp_path):
+        self._write(tmp_path / "projects" / "billing" / "sess-3.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": "Hi there"}},
+        ])
+        (item,) = self._fetch(tmp_path)
+        assert item["timestamp_source"] == "mtime"
+
 
 # ── File Watcher Adapter Tests ────────────────────────────
 
