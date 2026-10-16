@@ -222,6 +222,34 @@ class TestStableIdentities:
         run_async(sched.sync_one("fw"))
         assert hits(store)
 
+    def test_file_watcher_identity_is_the_basename_both_ways(self, store, tmp_path):
+        """A moved file stays suppressed; an unrelated file with the same
+        basename in another folder is suppressed too. Both are stated in the
+        forget notice. Content-free: the identity is a name, never text."""
+        w = tmp_path / "watch"
+        (w / "a").mkdir(parents=True)
+        (w / "b").mkdir()
+        f = w / "a" / "notes.txt"
+        f.write_text(f"Meeting notes. {SECRET}\n")
+        bump(f, -1000)
+        sched = SyncScheduler(pipeline=IngestionPipeline(store))
+        sched.register_adapter("fw", FileWatcherAdapter(watch_dir=str(w)))
+        run_async(sched.sync_one("fw"))
+        out = forget_context(store, "file:")
+        text = " ".join(out["suppression_notice"])
+        assert "base name only" in text and "stays skipped" in text
+        assert out["suppressed_identities"] == ["file:notes.txt"]
+        moved = w / "b" / "notes.txt"
+        shutil.move(str(f), str(moved))
+        bump(moved, 9000)
+        unrelated = w / "a" / "notes.txt"          # different file, same name
+        unrelated.write_text("A completely different shopping list.\n")
+        bump(unrelated, 9000)
+        r = run_async(sched.sync_one("fw"))
+        assert r["items_suppressed"] == 2
+        assert not hits(store)
+        assert not [n for n in store.list_nodes(limit=99) if "shopping" in n.content]
+
     def test_old_tombstone_gets_session_identity_on_open(self, db_path):
         s = GraphStore(db_path=db_path)
         s.add_ingest_suppression(f"claude-code:proj-a:{UUID1}", "source_id",
@@ -823,15 +851,20 @@ class TestResetSaysOnlyWhatItCanProve:
     def seeded(self, db_path):
         s = GraphStore(db_path=db_path)
         s.set_sync_cursor("claude-code", datetime(2026, 7, 1, tzinfo=timezone.utc))
+        s.database_id()  # a daemon serving this database has created it
         s.close()
         return db_path
 
     def test_health_reports_features_and_db_id(self, db_path):
-        from revien.daemon.server import db_identity
         with TestClient(create_app(db_path=db_path)) as c:
             h = c.get("/v1/health").json()
+            h2 = c.get("/v1/health").json()
         assert {"suppression_tombstones", "sync_reset_fence"} <= set(h["features"])
-        assert h["db_id"] == db_identity(db_path)
+        s = GraphStore(db_path=db_path)
+        try:
+            assert h["db_id"] == s.database_id() == h2["db_id"]
+        finally:
+            s.close()
         assert db_path not in json.dumps(h)
 
     def test_old_daemon_is_flagged_not_reassured(self, seeded, monkeypatch):
@@ -846,9 +879,12 @@ class TestResetSaysOnlyWhatItCanProve:
         assert "cannot undo this reset" not in r.output
 
     def test_current_daemon_on_this_db_is_reported_fenced(self, seeded, monkeypatch):
-        from revien.daemon.server import DAEMON_FEATURES, db_identity
+        from revien.daemon.server import DAEMON_FEATURES
+        s = GraphStore(db_path=seeded)
+        this_id = s.database_id()
+        s.close()
         srv, url = _serve(dict(self.OLD, features=list(DAEMON_FEATURES),
-                               db_id=db_identity(seeded)))
+                               db_id=this_id))
         try:
             r = self._reset(monkeypatch, seeded, url)
         finally:
@@ -874,6 +910,55 @@ class TestResetSaysOnlyWhatItCanProve:
         assert "cannot undo this reset" not in r.output
         r.output.encode("cp1252")  # stays ASCII
 
+
+    def test_probe_egress_is_loopback_only(self, monkeypatch):
+        """Observes every connection attempt instead of trusting a refused
+        result: an unreachable host also returns None, so a probe that had
+        lost its loopback check would still pass a return-value test. Records
+        http.client connections, DNS lookups and socket connects; none may
+        name anything but a loopback address. (Fails if the guard in
+        _probe_daemon is removed.)"""
+        import http.client
+        import socket
+        from revien.cli import _probe_daemon
+
+        seen = {"http": [], "dns": [], "connect": []}
+
+        class _Conn:
+            def __init__(self, host, port=None, **kw):
+                seen["http"].append(host)
+
+            def request(self, *a, **kw):
+                raise OSError("recorded, not sent")
+
+            def close(self):
+                pass
+
+        def _dns(host, *a, **kw):
+            seen["dns"].append(host)
+            raise socket.gaierror("recorded")
+
+        def _connect(self, address):
+            seen["connect"].append(address)
+            raise ConnectionRefusedError("recorded")
+
+        monkeypatch.setattr(http.client, "HTTPConnection", _Conn)
+        monkeypatch.setattr(socket, "getaddrinfo", _dns)
+        monkeypatch.setattr(socket.socket, "connect", _connect)
+
+        for bad in ("http://example.com:7437", "http://192.0.2.1:7437",
+                    "http://127.0.0.1.evil.example:7437",
+                    "http://localhost.evil.example:7437",
+                    "http://user@evil.example:7437", "http://0.0.0.0:7437",
+                    "https://127.0.0.1:7437", "ftp://127.0.0.1/",
+                    "//127.0.0.1:7437", "127.0.0.1:7437", ""):
+            assert _probe_daemon(bad) is None
+        assert seen == {"http": [], "dns": [], "connect": []}, seen
+
+        for good in ("http://127.0.0.1:7437", "http://localhost:7437",
+                     "http://[::1]:7437"):
+            assert _probe_daemon(good) is None  # the recorder refuses to send
+        assert seen["http"] == ["127.0.0.1", "localhost", "::1"], seen
 
     def test_probe_never_leaves_loopback(self, seeded, monkeypatch):
         from revien.cli import _probe_daemon
@@ -939,3 +1024,460 @@ class TestImportReplaceScrubsAudit:
         store.import_graph(Graph(nodes=[], edges=[]), mode="replace")
         assert store.count_nodes() == 0
         assert "Zanzibar" not in json.dumps(store.get_all_audit())
+
+
+# ======================================================================
+# Review round 4: session purge, sub-agent files, query text, proposals,
+# database id, vault notice, gates
+# ======================================================================
+
+def _ingest_session(store, sid, text):
+    return IngestionPipeline(store).ingest(IngestionInput(
+        source_id=sid, ingest_key=sid, content_type="conversation",
+        content=text))
+
+
+def _session_nodes(store, sid):
+    return [n for n in store.list_nodes(limit=99999) if n.source_id == sid]
+
+
+class TestSessionCascade:
+    """What links an extracted node to its context node, and a one-call purge
+    of a whole session. The pipeline never writes DERIVED_FROM; the evidence
+    is asserted here so the CHANGELOG sentence stays true."""
+
+    TEXT = ("User: We decided to use Postgres for billing. We decided to set "
+            f"the vault password to {SECRET} now. I prefer dark mode.\n"
+            "Assistant: ok")
+
+    def test_pipeline_links_by_source_id_not_derived_from(self, store):
+        sid = f"claude-code:proj-a:{UUID1}"
+        _ingest_session(store, sid, self.TEXT)
+        nodes = store.list_nodes(limit=999)
+        ctx = [n for n in nodes if n.node_type == NodeType.CONTEXT][0]
+        others = [n for n in nodes if n.node_type != NodeType.CONTEXT]
+        assert others and all(n.source_id == sid for n in others)
+        types = set()
+        for n in nodes:
+            for e in store.get_edges_for_node(n.node_id):
+                types.add(e.edge_type)
+        assert EdgeType.DERIVED_FROM not in types
+        assert {EdgeType.RELATED_TO, EdgeType.MENTIONED_BY} & types
+        # edges to the context node exist for the extracted claims ...
+        linked = {e.source_node_id for e in store.get_edges_for_node(ctx.node_id)
+                  if e.target_node_id == ctx.node_id}
+        assert linked
+        # ... but they are not a safe definition of "this session's data":
+        # a second session's context links to an entity the FIRST created.
+        sid2 = f"claude-code:proj-a:{UUID2}"
+        _ingest_session(store, sid2, "User: We decided to use Postgres for "
+                                     "billing. I use Postgres daily.\n"
+                                     "Assistant: ok")
+        ctx2 = [n for n in store.list_nodes(node_type=NodeType.CONTEXT,
+                                            source_id=sid2, limit=9)][0]
+        foreign = [store.get_node(e.source_node_id if e.target_node_id == ctx2.node_id
+                                  else e.target_node_id)
+                   for e in store.get_edges_for_node(ctx2.node_id)]
+        assert any(n.source_id == sid for n in foreign), \
+            "fixture must show an edge from session 2's context into session 1"
+
+    def test_cascade_from_context_removes_the_whole_session_only(self, store):
+        sid = f"claude-code:proj-a:{UUID1}"
+        sid2 = f"claude-code:proj-a:{UUID2}"
+        _ingest_session(store, sid, self.TEXT)
+        _ingest_session(store, sid2, "User: We decided to use Postgres for "
+                                     "billing. I prefer vim.\nAssistant: ok")
+        keep = {n.node_id for n in _session_nodes(store, sid2)}
+        mine = {n.node_id for n in _session_nodes(store, sid)}
+        assert len(mine) > 2
+        ctx = [n for n in _session_nodes(store, sid)
+               if n.node_type == NodeType.CONTEXT][0]
+        ops = GraphOperations(store)
+        prev = ops.forget_preview(ctx.node_id)
+        assert set(prev["node_ids"]) == mine and prev["count"] == len(mine)
+        out = ops.forget_node(ctx.node_id, cascade=True, reason="private",
+                              construct_id="me")
+        assert set(out["forgotten"]) == mine
+        assert not _session_nodes(store, sid)
+        assert keep <= {n.node_id for n in store.list_nodes(limit=99999)}
+        assert out["suppressed_identities"] == sorted(
+            [f"claude-code-session:{UUID1}", sid])
+        assert out["context_nodes_remaining"] == []
+        # each forgotten node has its content-free tombstone row
+        forgets = [r for r in store.get_all_audit() if r["op"] == "forget"]
+        assert {r["node_id"] for r in forgets} >= mine
+        assert SECRET not in json.dumps(store.get_all_audit())
+        # and the session is not recaptured
+        r = _ingest_session(store, sid, self.TEXT + "\nUser: more")
+        assert r.suppressed
+        assert not _session_nodes(store, sid)
+
+    def test_cascade_from_an_extracted_node_does_not_take_the_session(self, store):
+        sid = f"claude-code:proj-a:{UUID1}"
+        _ingest_session(store, sid, self.TEXT)
+        claim = [n for n in _session_nodes(store, sid)
+                 if SECRET in n.content and n.node_type != NodeType.CONTEXT][0]
+        out = GraphOperations(store).forget_node(
+            claim.node_id, cascade=True, reason="private")
+        assert out["forgotten"] == [claim.node_id]
+        assert out["context_nodes_remaining"]
+        assert any("cascade from the context node forgets the whole session" in n
+                   for n in out["suppression_notice"])
+        assert any(n.node_type == NodeType.CONTEXT for n in _session_nodes(store, sid))
+
+    def test_shared_channel_context_cascade_stays_one_node(self, store):
+        """source_id 'mcp' names a whole channel, not a session: a cascade
+        from one of its context nodes must never sweep the channel."""
+        for i in range(3):
+            _ingest_session(store, "mcp", f"User: note {i} about Redis {i}.")
+        ctxs = store.list_nodes(node_type=NodeType.CONTEXT, source_id="mcp", limit=9)
+        before = store.count_nodes()
+        out = GraphOperations(store).forget_node(
+            ctxs[0].node_id, cascade=True, reason="private")
+        assert out["forgotten"] == [ctxs[0].node_id]
+        assert store.count_nodes() == before - 1
+
+    def test_rest_cascade_and_preview(self, db_path):
+        sid = f"claude-code:proj-a:{UUID1}"
+        s = GraphStore(db_path=db_path)
+        _ingest_session(s, sid, self.TEXT)
+        ctx = [n for n in _session_nodes(s, sid)
+               if n.node_type == NodeType.CONTEXT][0]
+        total = len(_session_nodes(s, sid))
+        s.close()
+        with TestClient(create_app(db_path=db_path)) as c:
+            p = c.get(f"/v1/nodes/{ctx.node_id}/forget/preview").json()
+            assert p["count"] == total
+            r = c.post(f"/v1/nodes/{ctx.node_id}/forget",
+                       json={"cascade": True, "reason": "private"}).json()
+            assert r["count"] == total
+            assert SECRET not in c.get("/v1/export").text
+        raw = Path(db_path).read_bytes()
+        assert b"Zanzibar" not in raw and b"hunter2" not in raw
+
+
+def _subagent_lines(session_uuid, text, sidechain):
+    out = []
+    for role, t in (("user", text), ("assistant", "Done: " + text)):
+        out.append(json.dumps({
+            "parentUuid": None, "isSidechain": sidechain, "userType": "external",
+            "cwd": "/home/me/acme", "sessionId": session_uuid,
+            "agentId": "a1b2c3d4", "version": "2.0.14", "type": role,
+            "message": {"role": role,
+                        "content": t if role == "user"
+                        else [{"type": "text", "text": t}]},
+            "timestamp": "2026-07-01T10:00:00.000Z"}))
+    return "\n".join(out) + "\n"
+
+
+class TestSubagentTranscripts:
+    def _sync(self, store, root):
+        sched = SyncScheduler(pipeline=IngestionPipeline(store))
+        sched.register_adapter("cc", ClaudeCodeAdapter(session_dir=str(root)))
+        return run_async(sched.sync_one("cc"))
+
+    def _subagent(self, root, uuid, text, sidechain, name="agent-a1b2c3d4"):
+        d = root / "projects" / "-home-me-acme" / uuid / "subagents"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{name}.jsonl"
+        p.write_text(_subagent_lines(uuid, text, sidechain))
+        return p
+
+    def test_real_subagent_files_are_sidechain_and_ingest_nothing(
+            self, store, tmp_path):
+        """Real Claude Code sub-agent transcripts mark every entry
+        isSidechain=true, which the adapter skips. The earlier probe fixture
+        left the flag out; that shape is not what Claude Code writes."""
+        root = tmp_path / "cc"
+        self._subagent(root, UUID1, f"Task: rotate {SECRET}", sidechain=True)
+        r = self._sync(store, root)
+        assert r.get("items_ingested", 0) == 0
+        assert not hits(store)
+
+    def test_tombstone_covers_subagent_files_even_without_the_flag(
+            self, store, tmp_path):
+        root = tmp_path / "cc"
+        main = cc_session(root, "-home-me-acme", UUID1, f"We rotate {SECRET}.")
+        sub = self._subagent(root, UUID1, f"Task: rotate {SECRET}", sidechain=False)
+        other = self._subagent(root, UUID2, "Task: write docs for Redis",
+                               sidechain=False, name="agent-ffff0000")
+        bump(main, -1000); bump(sub, -1000); bump(other, -1000)
+        self._sync(store, root)
+        # non-vacuous: before the forget, the sub-agent file IS ingested
+        srcs = {n.source_id for n in store.list_nodes(limit=9999)}
+        assert "claude-code:-home-me-acme:agent-a1b2c3d4" in srcs
+        # metadata carries the parent UUID and nothing else from the file
+        sub_ctx = [n for n in store.list_nodes(node_type=NodeType.CONTEXT, limit=99)
+                   if n.source_id.endswith("agent-a1b2c3d4")][0]
+        assert sub_ctx.metadata["parent_session_id"] == UUID1
+        out = forget_context(store, f"claude-code:-home-me-acme:{UUID1}")
+        assert f"claude-code-session:{UUID1}" in out["suppressed_identities"]
+        for n in store.list_nodes(limit=9999):
+            if n.source_id.endswith("agent-a1b2c3d4"):
+                GraphOperations(store).forget_node(n.node_id, cascade=True,
+                                                   reason="private")
+        assert not hits(store)
+        bump(sub, 5000); bump(main, 5000)
+        r = self._sync(store, root)
+        assert not hits(store), "sub-agent file of a forgotten session recaptured"
+        assert r.get("items_suppressed", 0) >= 1
+        # an unrelated session's sub-agent file is not blocked
+        assert any("Redis" in n.content for n in store.list_nodes(limit=9999))
+
+    def test_subagent_parent_id_must_be_a_uuid(self, store, tmp_path):
+        root = tmp_path / "cc"
+        d = root / "projects" / "-p"
+        d.mkdir(parents=True)
+        (d / "agent-x.jsonl").write_text(
+            _subagent_lines("not-a-uuid", "hello there friend", False))
+        items = run_async(ClaudeCodeAdapter(session_dir=str(root)).fetch_new_content(
+            datetime(2020, 1, 1, tzinfo=timezone.utc)))
+        assert items and "parent_session_id" not in items[0]["metadata"]
+
+
+class TestQueryTextIsPurged:
+    QUERY = "what is the Quokkazord vault key"
+
+    def _bytes(self, path):
+        out = b""
+        for suffix in ("", "-wal", "-journal"):
+            f = Path(str(path) + suffix)
+            if f.exists():
+                out += f.read_bytes()
+        return out
+
+    def test_training_db_and_receipts_hold_no_query_after_forget(
+            self, store, db_path, tmp_path):
+        from revien.retrieval.engine import RetrievalEngine
+        tdb = str(tmp_path / "training.db")
+        engine = RetrievalEngine(store, training_db=tdb,
+                                 model_dir=str(tmp_path / "models"))
+        n = store.add_node(Node(node_type=NodeType.FACT, label="vault key",
+                                content=f"the vault key is {SECRET}"))
+        m = store.add_node(Node(node_type=NodeType.FACT, label="other",
+                                content="unrelated fact about Redis"))
+        # one recall surfaced both; another surfaced only the unrelated node
+        engine.training_loop.log_retrieval(self.QUERY, [
+            {"node_id": n.node_id, "label": n.label, "node_type": "fact", "score": .9},
+            {"node_id": m.node_id, "label": m.label, "node_type": "fact", "score": .5}])
+        engine.training_loop.log_retrieval("Redis cache question", [
+            {"node_id": m.node_id, "label": m.label, "node_type": "fact", "score": .7}])
+        now = datetime.now(timezone.utc)
+        from datetime import timedelta
+        store.add_recall_receipt(recall_id="r1", runtime="x", query=self.QUERY,
+                                 node_ids=[n.node_id, m.node_id],
+                                 issued_at=now, expires_at=now + timedelta(hours=1))
+        store.add_recall_receipt(recall_id="r2", runtime="x", query="Redis cache",
+                                 node_ids=[m.node_id],
+                                 issued_at=now, expires_at=now + timedelta(hours=1))
+        for p in (tdb, db_path):
+            assert b"Quokkazord" in self._bytes(p), "fixture must plant the query"
+
+        GraphOperations(store).forget_node(n.node_id, reason="private")
+
+        for p in (tdb, db_path):
+            assert b"Quokkazord" not in self._bytes(p), f"query text survives in {p}"
+        r1 = store.get_recall_receipt("r1")
+        assert r1["query"] == "" and r1["node_ids"] == [m.node_id]
+        assert store.get_recall_receipt("r2")["query"] == "Redis cache"
+        c = sqlite3.connect(tdb)
+        try:
+            rows = c.execute("SELECT query, node_id FROM retrieval_signals").fetchall()
+        finally:
+            c.close()
+        assert rows == [("Redis cache question", m.node_id)]
+
+    def test_training_db_sets_secure_delete_and_cleans_a_legacy_file(self, tmp_path):
+        from revien.neural.training import TrainingLoop
+        tdb = tmp_path / "training.db"
+        # a file as an older version left it: deleted rows still in free pages
+        c = sqlite3.connect(str(tdb))
+        c.execute("PRAGMA secure_delete = OFF")  # some builds default to ON
+        c.execute("CREATE TABLE retrieval_signals (id INTEGER PRIMARY KEY "
+                  "AUTOINCREMENT, query TEXT NOT NULL, node_id TEXT NOT NULL, "
+                  "node_label TEXT, node_type TEXT, score REAL, "
+                  "was_used INTEGER DEFAULT 0, timestamp TEXT NOT NULL)")
+        for i in range(200):
+            c.execute("INSERT INTO retrieval_signals (query, node_id, timestamp) "
+                      "VALUES (?, ?, 't')", (f"leftover Quokkazord {i} " * 5, f"n{i}"))
+        c.commit()
+        c.execute("INSERT INTO retrieval_signals (query, node_id, timestamp) "
+                  "VALUES ('keeper', 'k', 't')")
+        c.execute("DELETE FROM retrieval_signals WHERE id <= 200")
+        c.commit()
+        c.close()
+        assert b"Quokkazord" in tdb.read_bytes(), "control: legacy residue exists"
+        loop = TrainingLoop(db_path=str(tdb), model_dir=str(tmp_path / "m"))
+        assert b"Quokkazord" not in tdb.read_bytes()
+        assert loop._connect().execute("PRAGMA secure_delete").fetchone()[0] == 1
+
+
+class TestSkillProposalsRespectForget:
+    def _seed(self, store):
+        from datetime import timedelta
+        t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        for si in range(3):
+            sid = f"claude-code:p:3f2b8c1e-5d4a-4e7b-9a10-0c6d2e8f1a4{si}"
+            for k, step in enumerate(["run migrations",
+                                      "deploy to staging with key Quillfeather99",
+                                      "notify ops"]):
+                store.add_node(Node(
+                    node_type=NodeType.ACTION, label=step, content=step,
+                    source_id=sid, project_key="p", session_key=f"s{si}",
+                    recorded_at=t0 + timedelta(minutes=si * 10 + k)))
+
+    def test_forgotten_proposal_is_not_recreated_and_notice_is_accurate(self, store):
+        import revien.skills.proposals as P
+        self._seed(store)
+        assert P.propose_skills(store)["created"] == 1
+        prop = [n for n in store.list_nodes(limit=999)
+                if n.node_type == NodeType.SKILL][0]
+        out = GraphOperations(store).forget_node(prop.node_id, reason="private")
+        assert out["suppressed_identities"] == [prop.source_id]
+        assert out["recapture_eligible"] == []
+        text = " ".join(out["suppression_notice"])
+        assert "shared channel" not in text and "eligible for recapture" not in text
+        assert "not proposed again" in text
+        again = P.propose_skills(store)
+        assert again["created"] == 0 and again.get("suppressed") == 1
+        assert not [n for n in store.list_nodes(limit=999)
+                    if n.node_type == NodeType.SKILL]
+        # the tombstone is counted, and restore brings the proposal back
+        assert store.list_ingest_suppressions()[0]["skipped_count"] == 1
+        store.lift_ingest_suppression(prop.source_id, actor="me")
+        assert P.propose_skills(store)["created"] == 1
+
+
+class TestDatabaseId:
+    def test_random_stored_once_and_not_derived_from_the_path(self, tmp_path):
+        import hashlib
+        a, b = str(tmp_path / "a.db"), str(tmp_path / "b.db")
+        s = GraphStore(db_path=a)
+        first = s.database_id()
+        assert s.database_id() == first
+        s.close()
+        s = GraphStore(db_path=a)
+        assert s.database_id() == first          # persisted in store_meta
+        s.close()
+        t = GraphStore(db_path=b)
+        other = t.database_id()
+        t.close()
+        assert other != first
+        assert len(first) >= 16
+        for path in (a, str(Path(a).resolve())):
+            for n in (8, 12, 16, 32, 64):
+                assert first != hashlib.sha256(path.encode()).hexdigest()[:n]
+                assert first != hashlib.md5(path.encode()).hexdigest()[:n]
+                assert first != hashlib.sha1(path.encode()).hexdigest()[:n]
+        row = sqlite3.connect(a).execute(
+            "SELECT value FROM store_meta WHERE key='database_id'").fetchone()
+        assert row[0] == first
+
+    def test_health_serves_it_and_cli_reads_it_without_writing(self, tmp_path):
+        from revien.cli import _read_database_id
+        db = str(tmp_path / "h.db")
+        with TestClient(create_app(db_path=db)) as c:
+            h = c.get("/v1/health").json()
+        assert h["db_id"] == _read_database_id(db)
+        assert not (tmp_path / "plain.db").exists()
+        assert _read_database_id(str(tmp_path / "plain.db")) is None
+        assert not (tmp_path / "plain.db").exists()
+
+
+class TestForgetNamesDistilledNotes:
+    def test_notice_names_vault_notes_that_hold_the_claim(self, store, tmp_path):
+        from revien.distill import VaultDistiller
+        ent = store.add_node(Node(node_type=NodeType.ENTITY, label="Acme",
+                                  content="Acme", source_id="s"))
+        fact = store.add_node(Node(node_type=NodeType.FACT, label="k",
+                                   content=f"Acme stores {SECRET} keys",
+                                   source_id="s"))
+        plain = store.add_node(Node(node_type=NodeType.FACT, label="p",
+                                    content="Acme likes tea", source_id="t"))
+        store.add_edge(Edge(edge_type=EdgeType.RELATED_TO,
+                            source_node_id=ent.node_id, target_node_id=fact.node_id))
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        VaultDistiller(store, str(vault)).distill()
+        out = GraphOperations(store).forget_node(fact.node_id, reason="private")
+        assert out["distilled_notes_remaining"] == ["Acme"]
+        text = " ".join(out["suppression_notice"])
+        assert "distilled vault note" in text
+        assert "next `revien distill-vault` removes it" in text
+        # a node no note was rendered from says nothing about the vault
+        unrelated = store.add_node(Node(node_type=NodeType.FACT, label="z",
+                                        content="never distilled", source_id="u"))
+        out2 = GraphOperations(store).forget_node(unrelated.node_id, reason="x")
+        assert out2["distilled_notes_remaining"] == []
+        assert "vault" not in " ".join(out2["suppression_notice"])
+        # and the stated remedy works
+        VaultDistiller(store, str(vault)).distill()
+        note = vault / "Revien" / "Acme.md"
+        assert not note.exists() or "Zanzibar" not in note.read_text()
+
+
+class TestSingleNodeForgetIsHonest:
+    """Privacy scan for a SINGLE-node forget. Decision A is pending: the
+    session's verbatim context node keeps the text, and so do near-duplicate
+    sibling claims. This test pins exactly that and nothing wider: the
+    forgotten node's own rows are gone everywhere, and every other place the
+    text still appears is a node of the same session (named in the response)
+    or that node's own audit/vector rows."""
+
+    def test_only_the_context_node_and_siblings_keep_the_text(self, store, db_path):
+        sid = f"claude-code:proj-a:{UUID1}"
+        _ingest_session(store, sid, TestSessionCascade.TEXT)
+        store.add_candidate(
+            [n for n in _session_nodes(store, sid) if SECRET in n.content][0].node_id,
+            [n for n in _session_nodes(store, sid)
+             if n.node_type == NodeType.CONTEXT][0].node_id,
+            "candidate", reason=f"about {SECRET}", trace=SECRET)
+        claim = [n for n in _session_nodes(store, sid)
+                 if SECRET in n.content and n.node_type != NodeType.CONTEXT][0]
+        out = GraphOperations(store).forget_node(claim.node_id, reason="private")
+        survivors = {n.node_id for n in _session_nodes(store, sid)
+                     if SECRET in n.content}
+        ctx_ids = {n.node_id for n in _session_nodes(store, sid)
+                   if n.node_type == NodeType.CONTEXT}
+        assert ctx_ids & survivors, "decision A: the context node keeps the text"
+        assert set(out["context_nodes_remaining"]) == ctx_ids
+        assert claim.node_id not in {n.node_id for n in store.list_nodes(limit=9999)}
+        for table, text in _all_rows_text(store._get_conn()).items():
+            if "Zanzibar" not in text:
+                continue
+            rows = json.loads(text)
+            for row in rows:
+                if "Zanzibar" in json.dumps(row):
+                    assert claim.node_id not in json.dumps(row), \
+                        f"forgotten node's row survives in {table}"
+                    assert any(s in json.dumps(row) for s in survivors), \
+                        f"text survives in {table} outside the session's own nodes: {row!r}"
+
+
+class TestEgressGateCoversTheProbe:
+    def _gate(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "check_egress_gate", REPO / "scripts" / "gates" / "check_egress.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_http_client_and_socket_imports_are_detected(self):
+        g = self._gate()
+        for line, want in (("+import http.client", "http.client"),
+                           ("+    import http.client", "http.client"),
+                           ("+from http.client import HTTPConnection", "http.client"),
+                           ("+from http import client", "http"),
+                           ("+import socket", "socket"),
+                           ("+    import urllib3", "urllib3"),
+                           ("+import smtplib", "smtplib")):
+            assert g.added_network_import(line) == want, line
+        assert g.added_network_import("+import json") is None
+
+    def test_probe_is_allowlisted_with_its_test(self):
+        g = self._gate()
+        assert ("revien/cli.py", "http.client") in g.ALLOWED
+        assert "test_probe_egress_is_loopback_only" in g.PROBE_TEST
+        assert g.PROBE_TEST.split("::")[-1] in (REPO / "tests" /
+            "test_forget_followups.py").read_text()
