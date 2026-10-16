@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from .schema import Edge, EdgeType, Graph, Node, NodeType, SourceType
 from .store import GraphStore
+from .suppression import REASON_RETENTION, identities_for
 
 
 # ── Governance Layer (leg 6b): retention config ──────────────────────────────
@@ -383,7 +384,30 @@ class GraphOperations:
             "node_ids": to_delete,
         }
 
-    def _forget_one(self, node_id: str, reason: str, construct_id: str) -> bool:
+    def suppress_node_source(
+        self, node: Node, reason: str, actor: str,
+    ) -> Dict:
+        """Write content-free ingestion suppression tombstones for the stable
+        source identity of ``node`` (see revien/graph/suppression.py). Returns
+        {"status": "created"|"exists"|"unavailable", "identities": [...],
+        "gap": str|None}. Callers run this inside the same transaction as the
+        delete so a node never vanishes without its tombstone."""
+        identities, gap = identities_for(
+            node.source_id, node.metadata, node.node_type)
+        if not identities:
+            return {"status": "unavailable", "identities": [], "gap": gap}
+        created = False
+        for identity, kind in identities:
+            if self.store.add_ingest_suppression(
+                    identity, kind, reason=reason, actor=actor):
+                created = True
+        return {"status": "created" if created else "exists",
+                "identities": [i for i, _ in identities], "gap": None}
+
+    def _forget_one(
+        self, node_id: str, reason: str, construct_id: str,
+        suppress: bool = True, outcome: Optional[Dict] = None,
+    ) -> bool:
         """Hard-delete ONE node's content + row; tombstone it; re-point children.
 
         Privacy semantics: the content is actually GONE (row removed). A
@@ -425,6 +449,14 @@ class GraphOperations:
         #    the row can never vanish without its gravestone, and a failed
         #    audit write aborts the delete instead of losing provenance.
         with self.store.transaction():
+            # Explicit user forget binds a content-free suppression to the
+            # node's stable source identity; automatic cleanup (suppress=False)
+            # never does. Same transaction as the delete.
+            supp = (self.suppress_node_source(node, reason, construct_id)
+                    if suppress else
+                    {"status": "not_applicable", "identities": [], "gap": None})
+            if outcome is not None:
+                outcome[node_id] = supp
             self.store.record_audit(
                 node_id, "forget", actor=construct_id,
                 before=None,  # NO content snapshot — it is being forgotten
@@ -433,6 +465,9 @@ class GraphOperations:
                     "original_node_id": node_id,
                     "deleted_at": now.isoformat(),
                     "reason": reason,
+                    # Status only, never the identity: lets the sync-reset
+                    # warning count forgets that are NOT covered by a tombstone.
+                    "suppression": supp["status"],
                 },
                 ts=now,
             )
@@ -442,7 +477,7 @@ class GraphOperations:
 
     def forget_node(
         self, node_id: str, cascade: bool = False, reason: str = "",
-        construct_id: str = "",
+        construct_id: str = "", suppress: Optional[bool] = None,
     ) -> Dict:
         """Right-to-forget: hard-delete a node's content (privacy).
 
@@ -456,7 +491,17 @@ class GraphOperations:
         trace to the tombstone marker.
         cascade=True: also forget every node DERIVED_FROM this one, recursively
         (each tombstoned). Use ``forget_preview`` first to see the blast radius.
+
+        suppress: an explicit user forget (the default) also writes a
+        content-free ingestion suppression keyed on the node's stable source
+        identity, so ordinary sync/ingest can never silently capture that
+        session again (the WHOLE source session, not just this node: the
+        node's content cannot be matched without storing it). Automatic
+        cleanup never suppresses: reason "retention_expire" defaults to
+        False. Only ``revien restore`` / a graph import override lifts it.
         """
+        if suppress is None:
+            suppress = reason != REASON_RETENTION
         if node_id.startswith(self.TOMBSTONE_PREFIX):
             # Refuse to forget a gravestone — that would orphan lineage.
             return {"status": "skipped", "node_id": node_id,
@@ -476,16 +521,27 @@ class GraphOperations:
             targets = [node_id]
 
         forgotten: List[str] = []
+        outcome: Dict[str, Dict] = {}
         for tid in targets:
-            if self._forget_one(tid, reason=reason, construct_id=construct_id):
+            if self._forget_one(tid, reason=reason, construct_id=construct_id,
+                                suppress=suppress, outcome=outcome):
                 forgotten.append(tid)
 
+        suppressed = sorted({i for t in forgotten
+                             for i in outcome.get(t, {}).get("identities", [])})
+        unavailable = [{"node_id": t, "reason": outcome[t]["gap"]}
+                       for t in forgotten
+                       if outcome.get(t, {}).get("status") == "unavailable"]
         return {
             "status": "forgotten",
             "node_id": node_id,
             "cascade": cascade,
             "forgotten": forgotten,
             "count": len(forgotten),
+            # Identities now suppressed from ordinary ingestion, and nodes
+            # whose source has no stable identity (nothing could be bound).
+            "suppressed_identities": suppressed,
+            "suppression_unavailable": unavailable,
         }
 
     # ── Governance Layer (leg 6b): retention sweep ───────────
@@ -566,8 +622,8 @@ class GraphOperations:
         elif mode == RETENTION_EXPIRE:
             for nid in stale_ids:
                 outcome = self.forget_node(
-                    nid, cascade=False, reason="retention_expire",
-                    construct_id=construct_id,
+                    nid, cascade=False, reason=REASON_RETENTION,
+                    construct_id=construct_id, suppress=False,
                 )
                 if outcome.get("count", 0) > 0:
                     result["expired"] += 1

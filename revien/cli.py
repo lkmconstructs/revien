@@ -777,6 +777,10 @@ def ingest(content: str, source: str, db: Optional[str]):
             source_id=source,
             content=content,
         ))
+        if result.suppressed:
+            click.echo(f"Not ingested: '{source}' was forgotten by you. "
+                       "'revien restore' lifts this.")
+            return
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
                    f"{result.total_edges_in_graph} edges")
@@ -832,7 +836,7 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
 
         items = asyncio.run(adapter.fetch_new_content(since))
         pipeline = IngestionPipeline(store)
-        nodes = edges = 0
+        nodes = edges = suppressed_chunks = 0
         for item in items:
             ts = None
             try:
@@ -850,6 +854,7 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
             ))
             nodes += out.nodes_created
             edges += out.edges_created
+            suppressed_chunks += 1 if out.suppressed else 0
     finally:
         store.close()
 
@@ -859,6 +864,9 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
         notes = len({i["metadata"]["note"] for i in items})
         click.echo(f"Vault sync: {notes} notes -> {len(items)} chunks, "
                    f"{nodes} nodes, {edges} edges (curated).")
+        if suppressed_chunks:
+            click.echo(f"{suppressed_chunks} chunk(s) skipped: you forgot "
+                       "those sources ('revien suppressions').")
     elif not (rec["corrected"] or rec["added"] or rec["forgotten"]):
         click.echo("Vault is up to date — nothing to reconcile or ingest.")
 
@@ -1095,7 +1103,12 @@ def export(file: Optional[str], output: Optional[str], db: Optional[str]):
 @click.option("--replace", "replace", is_flag=True,
               help="Replace the existing graph wholesale — delete + insert in "
                    "one transaction (a failure leaves the original intact)")
-def import_(file: str, db: Optional[str], merge: bool, replace: bool):
+@click.option("--override-suppressions", "override_suppressions", is_flag=True,
+              help="Explicit reimport of sources you forgot or deleted: lifts "
+                   "their suppressions (audited) and imports them. Without "
+                   "this, such nodes are skipped and counted.")
+def import_(file: str, db: Optional[str], merge: bool, replace: bool,
+            override_suppressions: bool):
     """Import a graph exported by `revien export`: revien import graph.json
 
     Same schema and code path as POST /v1/graph/import. Refuses a non-empty
@@ -1134,7 +1147,10 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
         semantic = SemanticIndex(store)
 
         try:
-            result = store.import_graph(graph, mode=mode, semantic=semantic)
+            result = store.import_graph(
+                graph, mode=mode, semantic=semantic,
+                suppressions="override" if override_suppressions else "skip",
+                actor="cli:import")
         except ImportRefusedError:
             click.echo(
                 f"Target database is not empty ({existing_nodes} nodes, "
@@ -1160,6 +1176,17 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
         else:
             click.echo(f"Imported {result['nodes_added']} nodes, "
                        f"{result['edges_added']} edges into {db_path}")
+
+        if result["suppressed_nodes"]:
+            click.echo(
+                f"Skipped {result['suppressed_nodes']} node(s) "
+                f"({result['suppressed_edges']} edge(s)) from "
+                f"{len(result['suppressed_identities'])} source(s) you "
+                "forgot or deleted. Re-run with --override-suppressions to "
+                "import them anyway.")
+        if result["lifted_identities"]:
+            click.echo("Lifted suppression for: "
+                       + ", ".join(result["lifted_identities"]))
 
         if result["semantic_rebuild"] != "skipped (disabled)":
             click.echo(f"Semantic index: {result['semantic_rebuild']}")
@@ -1458,6 +1485,23 @@ _REVIEN_TABLE_COLUMNS = {
     "audit_log": {"node_id", "op", "after_json"},
     "sync_cursors": {"adapter_name", "cursor", "updated_at"},
 }
+_REVIEN_REQUIRED_TABLES = {"nodes", "edges"}
+
+
+def _readonly_uri(p: Path) -> str:
+    """SQLite URI for a read that changes nothing on disk. A WAL-mode file
+    opened plain read-only still CREATES -wal/-shm sidecars, so when no -wal
+    file exists the file is opened immutable (no locks, no sidecars; with no
+    -wal file the main file holds everything). When a -wal file exists (an
+    open or crashed WAL database) it is opened read-only instead, because
+    recent data lives in the WAL and immutable would not see it."""
+    import urllib.parse
+    resolved = p.resolve()
+    quoted = urllib.parse.quote(str(resolved))
+    wal = Path(str(resolved) + "-wal")
+    if wal.exists():
+        return "file:" + quoted + "?mode=ro"
+    return "file:" + quoted + "?mode=ro&immutable=1"
 
 
 def _sqlite_problem(db_path: str) -> Optional[str]:
@@ -1466,14 +1510,13 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
     an empty or foreign file.
 
     A SQLite header alone is not enough (any app's database has one), so the
-    file is opened READ-ONLY (``mode=ro`` URI: it cannot be written, not even
-    a journal) and its own catalog is read: it must hold the ``nodes`` and
-    ``edges`` tables every Revien database has, and any of ``nodes``,
-    ``edges``, ``audit_log`` and ``sync_cursors`` that exist must have
-    Revien's columns. Tables a Revien database may lack (older versions) are
-    not required, so older Revien files are still accepted."""
+    file is opened READ-ONLY (see ``_readonly_uri``: it cannot be written and
+    creates no journal, -wal or -shm file, even for a WAL-mode database) and
+    its own catalog is read: it must hold the
+    ``nodes``, ``edges`` and ``audit_log`` tables every Revien version has,
+    each with every column the oldest real version has. ``sync_cursors``,
+    added later, is checked only when present."""
     import sqlite3
-    import urllib.parse
 
     p = Path(db_path)
     if not p.exists():
@@ -1489,15 +1532,16 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
         return f"{db_path} is empty, not a Revien database."
     if head != b"SQLite format 3\x00":
         return f"{db_path} is not a SQLite database."
-    uri = "file:" + urllib.parse.quote(str(p.resolve())) + "?mode=ro"
+    uri = _readonly_uri(p)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=1.0)
         try:
             tables = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
-            if not {"nodes", "edges"} <= tables:
+            if not _REVIEN_REQUIRED_TABLES <= tables:
                 return (f"{db_path} is a SQLite database but not a Revien "
-                        "database (no nodes/edges tables). Not touching it.")
+                        "database (no nodes/edges tables). "
+                        "Not touching it.")
             for table, wanted in _REVIEN_TABLE_COLUMNS.items():
                 if table not in tables:
                     continue
@@ -1520,8 +1564,12 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
 @click.argument("adapter_name")
 @click.option("--db", default=None, help="Database path")
 @click.option("--yes", is_flag=True,
-              help="Proceed even though forgotten content could be captured again")
-def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
+              help="Proceed even though some forgotten content is not "
+                   "protected by a suppression and could be captured again")
+@click.option("--orphaned", is_flag=True,
+              help="Reset a saved sync position whose adapter is no longer in "
+                   "your config (only works when a saved position exists)")
+def sync_reset(adapter_name: str, db: Optional[str], yes: bool, orphaned: bool):
     """Forget a connected adapter's sync position so its next sync re-reads
     its full history (for example 'revien sync reset claude-code').
 
@@ -1529,7 +1577,13 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
     can be reset: their sessions are refreshed in place, not duplicated, so
     the reset is safe to repeat. Other adapters would ingest everything again
     as new nodes, so they are refused. Nothing is deleted from the graph.
-    The new position is used at the next sync (default every 6 hours)."""
+    A sync already running when you reset cannot undo the reset: its newer
+    position is discarded. The new position is used at the next sync
+    (default every 6 hours).
+
+    --orphaned resets a saved position whose adapter was removed from your
+    config. Its type cannot be checked, so the reset is allowed only because
+    a saved position exists."""
     import sqlite3
 
     from revien.adapters import (
@@ -1551,26 +1605,34 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
     adapters = config.get("adapters") or {}
     connected = list(adapters.keys())
     entry = adapters.get(adapter_name)
+    connected_txt = ", ".join(sorted(connected)) or "none"
 
-    try:
-        store = GraphStore(db_path=db_path)
-    except (sqlite3.Error, OSError) as e:
-        click.echo(f"Cannot open {db_path}: {e}")
-        raise SystemExit(1)
-    try:
-        if entry is None:
-            has_cursor = adapter_name in store.list_sync_cursor_names()
-            connected_txt = ", ".join(sorted(connected)) or "none"
-            if has_cursor:
+    # Everything that can be decided from the config and a read-only look at
+    # the database is decided BEFORE a GraphStore is opened: opening one
+    # migrates (writes to) the database, and a mistyped name must not do that.
+    if entry is None:
+        if not orphaned:
+            if _has_sync_row(db_path, adapter_name):
                 click.echo(
                     f"'{adapter_name}' has a saved sync position but is not a "
                     "connected adapter in your config, so its type cannot be "
                     "checked and it is not reset. Connected adapters: "
-                    f"{connected_txt}. Connect it again ('revien connect') "
-                    "or use one of those names.")
+                    f"{connected_txt}. Connect it again ('revien connect'), "
+                    "use one of those names, or re-run with --orphaned to "
+                    "reset the saved position anyway.")
             else:
                 click.echo(f"No connected adapter named '{adapter_name}'. "
                            f"Connected adapters: {connected_txt}.")
+            raise SystemExit(1)
+        if not _has_sync_row(db_path, adapter_name):
+            click.echo(f"No saved sync position for '{adapter_name}', so "
+                       "--orphaned has nothing to reset. Connected adapters: "
+                       f"{connected_txt}. Nothing was changed.")
+            raise SystemExit(1)
+    else:
+        if orphaned:
+            click.echo(f"'{adapter_name}' is a connected adapter, so "
+                       "--orphaned does not apply. Run the command without it.")
             raise SystemExit(1)
         atype = entry.get("type", "") if isinstance(entry, dict) else None
         if not isinstance(atype, str) or atype not in _ADAPTER_CLASSES:
@@ -1588,37 +1650,137 @@ def sync_reset(adapter_name: str, db: Optional[str], yes: bool):
                 "nodes instead of refreshing them. Only claude-code and codex "
                 "adapters can be reset.")
             raise SystemExit(1)
-        forgets = store.count_user_forgets()
-        if forgets and not yes:
+
+    try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        unprotected = store.count_unprotected_forgets()
+        protected = store.count_ingest_suppressions()
+        if unprotected and not yes:
             click.echo(
-                f"This database records {forgets} explicit forget "
-                "operation(s). A full re-read captures every session file "
-                "that still exists, including sessions whose content you "
-                "forgot. Delete or move those session files first, or "
-                "re-run with --yes to proceed. (Content removed by retention "
-                "expiry is not counted, and DELETE /v1/nodes and LangChain "
-                "clear() leave no record, so those cannot be warned about "
-                "and may be captured again too.)")
+                f"This database holds {unprotected} forgotten node(s) that "
+                "are not protected by a suppression (forgotten before "
+                "suppressions existed, or from a source with no stable "
+                "identity). A full re-read captures every session file that "
+                "still exists, so those could be captured again. Delete or "
+                "move those session files first, or re-run with --yes to "
+                "proceed.")
+            if protected:
+                click.echo(f"{protected} suppressed source(s) are skipped "
+                           "by the re-read and are not affected.")
             raise SystemExit(1)
-        existed = store.delete_sync_cursor(adapter_name)
+        had_position = store.reset_sync_cursor(adapter_name)
     except sqlite3.Error as e:
         click.echo(f"Database error: {e}")
         raise SystemExit(1)
     finally:
         store.close()
 
-    if not existed:
+    if had_position is None:
         click.echo(f"'{adapter_name}' has no saved sync position, so its next "
                    "sync already reads its full history. Nothing to reset.")
         return
-    click.echo(f"Cleared the sync position for '{adapter_name}'.")
+    if not had_position:
+        click.echo(f"'{adapter_name}' was already reset; its next sync reads "
+                   "its full history. The reset was recorded again.")
+    else:
+        click.echo(f"Cleared the sync position for '{adapter_name}'.")
+    if orphaned:
+        click.echo("Its adapter type is unknown (it is not in your config). If "
+                   "you connect it again as anything other than claude-code or "
+                   "codex, its first sync adds everything as new nodes.")
     click.echo("It takes effect at the next sync (default every 6 hours), "
                "which re-reads the full history. Already captured sessions "
                "are refreshed in place, not duplicated. Nothing was deleted.")
-    click.echo("If the daemon is in the middle of a sync right now, it will "
-               "save the time that sync started when it finishes, which "
-               "undoes this reset; run this again after it ends. If the daemon is not running, start it with "
-               "'revien start'.")
+    click.echo("A sync that is running right now cannot undo this reset: when "
+               "it finishes, its position is discarded. If the daemon is not "
+               "running, start it with 'revien start'.")
+    if protected:
+        click.echo(f"{protected} suppressed source(s) (forgotten by you) are "
+                   "skipped by the re-read, not recaptured. See "
+                   "'revien suppressions'.")
+    click.echo("Not covered: forgotten content from a source with no stable "
+               "identity, anything forgotten or deleted before suppressions "
+               "existed, and LangChain clear() leave no suppression and can "
+               "be captured again if its source still exists.")
+
+
+def _has_sync_row(db_path: str, name: str) -> bool:
+    """True if sync_cursors holds a row for ``name``. Read-only and
+    (see _readonly_uri): creates no files."""
+    import sqlite3
+
+    uri = _readonly_uri(Path(db_path))
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sync_cursors WHERE adapter_name = ?",
+                (name,)).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+@main.command(name="suppressions")
+@click.option("--db", default=None, help="Database path")
+def suppressions_cmd(db: Optional[str]):
+    """List sources you forgot or deleted that ingestion now skips."""
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        raise SystemExit(1)
+    store = GraphStore(db_path=db_path)
+    try:
+        rows = store.list_ingest_suppressions()
+    finally:
+        store.close()
+    if not rows:
+        click.echo("No suppressed sources.")
+        return
+    click.echo(f"{len(rows)} suppressed source identity row(s):")
+    for r in rows:
+        click.echo(f"  {r['identity']}  [{r['kind']}]  since {r['created_at'][:10]}"
+                   f"  skipped {r['skipped_count']}x  by {r['actor'] or '-'}"
+                   + (f"  reason: {r['reason']}" if r['reason'] else ""))
+    click.echo("Lift one with: revien restore <identity>")
+
+
+@main.command(name="restore")
+@click.argument("identity")
+@click.option("--db", default=None, help="Database path")
+def restore_cmd(identity: str, db: Optional[str]):
+    """Lift the suppression on a source you forgot, so ingestion of it
+    resumes (for example: revien restore claude-code:myproj:abc123).
+
+    This is the explicit override: nothing else lifts a suppression. It is
+    recorded in the audit trail. A session already read is only re-read
+    after 'revien sync reset <adapter>' or when its file changes."""
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        raise SystemExit(1)
+    store = GraphStore(db_path=db_path)
+    try:
+        lifted = store.lift_ingest_suppression(identity.strip(), actor="cli:restore")
+    finally:
+        store.close()
+    if not lifted:
+        click.echo(f"No suppression for '{identity}'. See 'revien suppressions'.")
+        raise SystemExit(1)
+    click.echo(f"Restored '{identity}': ingestion of it resumes. Run "
+               "'revien sync reset <adapter>' to re-read it now; otherwise it "
+               "is picked up when its file next changes.")
 
 
 @main.group()

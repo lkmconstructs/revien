@@ -110,10 +110,8 @@ class TestCLI:
         assert "Cleared the sync position for 'claude-code'" in r.output
         assert "next sync" in r.output
         assert "6 hours" in r.output
-        assert "in the middle of a sync" in r.output
-        assert "save the time that sync started" in r.output
-        assert "may save its old position" not in r.output
-        assert "run this again" in r.output
+        assert "cannot undo this reset" in r.output
+        assert "run this again" not in r.output
         s = GraphStore(db_path=db_path)
         try:
             assert s.get_sync_cursor("claude-code") is None
@@ -228,7 +226,8 @@ class TestForgetWarning:
         self._forgotten_db(store)
         r = self._run(monkeypatch, db_path)
         assert r.exit_code == 1
-        assert "explicit forget" in r.output
+        assert "forgotten node(s)" in r.output
+        assert "not protected by a suppression" in r.output
         assert "--yes" in r.output
         s = GraphStore(db_path=db_path)
         try:
@@ -289,23 +288,18 @@ class TestForgetWarning:
             ops.forget_node(n.node_id, reason=reason)
         assert store.count_user_forgets() == 2
 
-    def test_hard_delete_leaves_no_record_and_warning_says_so(
+    def test_warning_states_what_is_not_covered(
             self, store, db_path, monkeypatch):
-        """DELETE /v1/nodes (store.delete_node) writes no audit row; the
-        warning text must not claim to cover it."""
-        from revien.graph.schema import Node
-        n = Node(node_type=NodeType.FACT, label="x", content="gone")
-        store.add_node(n)
-        store.delete_node(n.node_id)
-        assert store.count_user_forgets() == 0
-        store.set_sync_cursor("claude-code", T)
-        store.record_audit("n1", "forget", actor="tester")
-        store.close()
-        r = self._run(monkeypatch, db_path)
-        assert r.exit_code == 1
-        assert "DELETE /v1/nodes" in r.output
-        assert "cannot be warned about" in r.output
-        assert "retention expiry is not counted" in r.output
+        """The text claims only what suppressions provide, and says plainly
+        what they do not cover (see tests/test_suppression.py for the
+        behaviour behind each claim)."""
+        self._forgotten_db(store)
+        r = self._run(monkeypatch, db_path, "--yes")
+        assert r.exit_code == 0, r.output
+        assert "Not covered" in r.output
+        assert "no stable identity" in r.output
+        assert "before suppressions existed" in r.output
+        assert "LangChain clear()" in r.output
 
 
 # -- type problems are config problems, not "no stable key" ------------------

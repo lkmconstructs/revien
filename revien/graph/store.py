@@ -224,10 +224,35 @@ class GraphStore:
             -- starts that adapter at EPOCH so pre-daemon history is ingested.
             -- Memory-only cursors reset to now() on every daemon restart and
             -- silently skipped everything from the offline window.
+            --
+            -- generation (reset/sync fencing): bumped by every reset. A sync
+            -- reads it before fetching and may persist its cursor only if it
+            -- is unchanged (compare-and-set), so a sync that started before
+            -- an acknowledged reset cannot overwrite it. A reset KEEPS the
+            -- row (cursor = '' reads as "never synced") so the generation
+            -- survives; deleting the row would let a stale writer re-create it.
             CREATE TABLE IF NOT EXISTS sync_cursors (
                 adapter_name TEXT PRIMARY KEY,
                 cursor TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Ingestion suppression tombstones: CONTENT-FREE. One row per
+            -- stable source identity (a session's source_id / ingest_key) the
+            -- user explicitly forgot or deleted. Ordinary ingestion of a
+            -- suppressed identity is skipped and counted; only an explicit
+            -- restore or graph-import override lifts it. Retention/automatic
+            -- cleanup never writes here.
+            CREATE TABLE IF NOT EXISTS ingest_suppressions (
+                identity TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                reason TEXT DEFAULT '',
+                actor TEXT DEFAULT '',
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                last_skipped_at TEXT,
+                PRIMARY KEY (identity, kind)
             );
 
             -- Distill manifest (editable-vault leg): the last-rendered snapshot
@@ -329,6 +354,25 @@ class GraphStore:
         # Origin Layer (WS0): add origin columns to older DBs and backfill
         # from source_id wherever derive_origin recognizes it.
         self._migrate_add_origin_columns(conn)
+        # Reset/sync fencing: add sync_cursors.generation to older DBs.
+        self._migrate_add_sync_cursor_generation(conn)
+
+    def _migrate_add_sync_cursor_generation(self, conn: sqlite3.Connection) -> None:
+        """Add sync_cursors.generation to databases created before reset
+        fencing. Idempotent; existing rows start at generation 0."""
+        try:
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(sync_cursors)")}
+            if columns and "generation" not in columns:
+                conn.execute(
+                    "ALTER TABLE sync_cursors ADD COLUMN generation "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" in str(e) or "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -1128,21 +1172,34 @@ class GraphStore:
     # ── Adapter-sync cursors (repair leg R3) ───────────────────────────
     @_locked
     def get_sync_cursor(self, adapter_name: str) -> Optional[datetime]:
-        """Persisted sync position for one adapter. None = never synced —
-        the scheduler treats that as EPOCH (full history on first sync)."""
+        """Persisted sync position for one adapter. None = never synced (or
+        reset) — the scheduler treats that as EPOCH (full history)."""
+        return self.get_sync_state(adapter_name)[0]
+
+    @_locked
+    def get_sync_state(self, adapter_name: str) -> tuple:
+        """(cursor or None, generation). No row = (None, 0). A reset row
+        (blank cursor) = (None, generation). Read this BEFORE fetching and
+        pass the generation to ``set_sync_cursor_if_generation``."""
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            "SELECT cursor, generation FROM sync_cursors WHERE adapter_name = ?",
             (adapter_name,),
         ).fetchone()
         if row is None:
-            return None
-        return datetime.fromisoformat(row[0])
+            return (None, 0)
+        cursor = datetime.fromisoformat(row[0]) if row[0] else None
+        return (cursor, int(row[1] or 0))
+
+    @_locked
+    def get_sync_generation(self, adapter_name: str) -> int:
+        return self.get_sync_state(adapter_name)[1]
 
     @_locked
     def set_sync_cursor(self, adapter_name: str, cursor: datetime) -> None:
-        """Persist an adapter's sync position (upsert). Called only after a
-        fully successful sync — a failed/unhealthy sync never advances it."""
+        """Persist an adapter's sync position (upsert, unfenced; keeps the
+        row's generation). For callers that cannot be reset (usage observer).
+        The adapter scheduler uses ``set_sync_cursor_if_generation``."""
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
@@ -1155,8 +1212,38 @@ class GraphStore:
         self._commit(conn)
 
     @_locked
+    def set_sync_cursor_if_generation(
+        self, adapter_name: str, cursor: datetime, expected_generation: int,
+    ) -> bool:
+        """Compare-and-set: persist the cursor only if the row's generation
+        still equals ``expected_generation`` (the one read before the fetch).
+        Returns False, writing nothing, when a reset happened in between.
+        Atomic in SQL, so it also fences a reset from another process.
+        Absent row is generation 0."""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
+            "WHERE adapter_name = ? AND generation = ?",
+            (cursor.isoformat(), now, adapter_name, expected_generation),
+        )
+        ok = cur.rowcount > 0
+        if not ok and expected_generation == 0:
+            # No row yet? INSERT OR IGNORE loses to any row that exists.
+            ins = conn.execute(
+                "INSERT OR IGNORE INTO sync_cursors "
+                "(adapter_name, cursor, updated_at, generation) "
+                "VALUES (?, ?, ?, 0)",
+                (adapter_name, cursor.isoformat(), now),
+            )
+            ok = ins.rowcount > 0
+        self._commit(conn)
+        return ok
+
+    @_locked
     def list_sync_cursor_names(self) -> List[str]:
-        """Names of all adapters with a persisted sync position."""
+        """Names of all adapters with a sync_cursors row (recorded state),
+        including rows left blank by a reset."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT adapter_name FROM sync_cursors ORDER BY adapter_name"
@@ -1164,9 +1251,33 @@ class GraphStore:
         return [r[0] for r in rows]
 
     @_locked
+    def reset_sync_cursor(self, adapter_name: str) -> Optional[bool]:
+        """Acknowledged reset: blank the cursor (next sync starts at EPOCH)
+        and BUMP the generation, so any sync already in flight fails its
+        compare-and-set and cannot write its older position back. Returns
+        None if the adapter has no row (nothing recorded, nothing changed),
+        else True if it held a real position, False if already blank."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            (adapter_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        had_position = bool(row[0])
+        conn.execute(
+            "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
+            "updated_at = ? WHERE adapter_name = ?",
+            (datetime.now(timezone.utc).isoformat(), adapter_name),
+        )
+        self._commit(conn)
+        return had_position
+
+    @_locked
     def delete_sync_cursor(self, adapter_name: str) -> bool:
-        """Remove one adapter's sync position so its next sync starts at EPOCH
-        (full history). Returns True if a row existed. Deletes nothing else."""
+        """Remove one adapter's sync row outright. Not fenced: a stale writer
+        can re-create the row. ``reset_sync_cursor`` is the fenced reset;
+        this remains for housekeeping. Returns True if a row existed."""
         conn = self._get_conn()
         cur = conn.execute(
             "DELETE FROM sync_cursors WHERE adapter_name = ?",
@@ -1175,6 +1286,103 @@ class GraphStore:
         deleted = cur.rowcount > 0
         self._commit(conn)
         return deleted
+
+    # ── Ingestion suppression tombstones ──────────────────
+
+    @_locked
+    def add_ingest_suppression(
+        self, identity: str, kind: str, reason: str = "", actor: str = "",
+    ) -> bool:
+        """Record a content-free suppression for one stable identity.
+        Idempotent (first row wins). Audited. True if newly created."""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO ingest_suppressions "
+            "(identity, kind, created_at, reason, actor) VALUES (?, ?, ?, ?, ?)",
+            (identity, kind, now.isoformat(), reason or "", actor or ""),
+        )
+        created = cur.rowcount > 0
+        if created:
+            self.record_audit(
+                f"suppression:{identity}", "suppress", actor=actor,
+                after={"_tombstone": True, "identity": identity, "kind": kind,
+                       "reason": reason or ""},
+                ts=now,
+            )
+        self._commit(conn)
+        return created
+
+    @_locked
+    def find_ingest_suppression(
+        self, source_id: str = "", ingest_key: str = "",
+    ) -> Optional[dict]:
+        """The suppression row matching this ingest, else None."""
+        conn = self._get_conn()
+        for identity, kind in ((source_id, "source_id"), (ingest_key, "ingest_key")):
+            if not identity:
+                continue
+            row = conn.execute(
+                "SELECT identity, kind, created_at, reason, actor, skipped_count "
+                "FROM ingest_suppressions WHERE identity = ? AND kind = ?",
+                (identity, kind),
+            ).fetchone()
+            if row is not None:
+                return {"identity": row[0], "kind": row[1], "created_at": row[2],
+                        "reason": row[3], "actor": row[4],
+                        "skipped_count": int(row[5])}
+        return None
+
+    @_locked
+    def note_suppressed_skip(self, identity: str, kind: str) -> None:
+        """Count one skipped ingest against its tombstone (never silent)."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE ingest_suppressions SET skipped_count = skipped_count + 1, "
+            "last_skipped_at = ? WHERE identity = ? AND kind = ?",
+            (datetime.now(timezone.utc).isoformat(), identity, kind),
+        )
+        self._commit(conn)
+
+    @_locked
+    def list_ingest_suppressions(self) -> List[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT identity, kind, created_at, reason, actor, skipped_count, "
+            "last_skipped_at FROM ingest_suppressions "
+            "ORDER BY created_at, identity, kind"
+        ).fetchall()
+        return [{"identity": r[0], "kind": r[1], "created_at": r[2],
+                 "reason": r[3], "actor": r[4], "skipped_count": int(r[5]),
+                 "last_skipped_at": r[6]} for r in rows]
+
+    @_locked
+    def count_ingest_suppressions(self) -> int:
+        conn = self._get_conn()
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM ingest_suppressions").fetchone()[0])
+
+    @_locked
+    def lift_ingest_suppression(
+        self, identity: str, actor: str = "", reason: str = "restore",
+    ) -> int:
+        """Explicit override: remove every suppression row for this identity
+        (either kind). Audited. Returns rows lifted (0 = none existed)."""
+        conn = self._get_conn()
+        kinds = [r[0] for r in conn.execute(
+            "SELECT kind FROM ingest_suppressions WHERE identity = ?",
+            (identity,)).fetchall()]
+        if not kinds:
+            return 0
+        conn.execute(
+            "DELETE FROM ingest_suppressions WHERE identity = ?", (identity,))
+        self.record_audit(
+            f"suppression:{identity}", "suppression_lift", actor=actor,
+            after={"_tombstone": True, "identity": identity, "kinds": kinds,
+                   "reason": reason},
+        )
+        self._commit(conn)
+        return len(kinds)
 
     @_locked
     def count_forget_tombstones(self) -> int:
@@ -1200,6 +1408,30 @@ class GraphStore:
             except (ValueError, AttributeError):
                 reason = None
             if reason != "retention_expire":
+                count += 1
+        return count
+
+    @_locked
+    def count_unprotected_forgets(self) -> int:
+        """Explicit user forgets (retention expiry excluded) that are NOT
+        covered by an ingestion suppression: forgets recorded before
+        tombstones existed (their audit row has no ``suppression`` status),
+        and forgets of a source with no stable identity (status
+        'unavailable'). A full re-read can capture those again; a forget
+        whose status is 'created' or 'exists' cannot be recaptured by
+        ordinary sync."""
+        conn = self._get_conn()
+        count = 0
+        for (after,) in conn.execute(
+                "SELECT after_json FROM audit_log WHERE op = 'forget'"):
+            try:
+                data = json.loads(after) if after else {}
+                data = data if isinstance(data, dict) else {}
+            except ValueError:
+                data = {}
+            if data.get("reason") == "retention_expire":
+                continue
+            if data.get("suppression") not in ("created", "exists"):
                 count += 1
         return count
 
@@ -1567,6 +1799,17 @@ class GraphStore:
                     "UPDATE recall_receipts SET node_ids = ? WHERE recall_id = ?",
                     (json.dumps(remaining), recall_id),
                 )
+            # The audit trail keeps full node snapshots (add/update ops).
+            # A deleted node's content must not survive there: blank the
+            # snapshots, keep op/actor/ts (the history that it existed). The
+            # content-free 'forget' tombstone row is left as written.
+            conn.execute(
+                "UPDATE audit_log SET "
+                "before_json = CASE WHEN before_json IS NULL THEN NULL "
+                "ELSE '{\"_scrubbed\": true}' END, "
+                "after_json = CASE WHEN after_json IS NULL THEN NULL "
+                "ELSE '{\"_scrubbed\": true}' END "
+                "WHERE node_id = ? AND op != 'forget'", (node_id,))
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
         if deleted:
@@ -2049,6 +2292,8 @@ class GraphStore:
         mode: str = "refuse",
         clear_existing: Optional[bool] = None,
         semantic=None,
+        suppressions: str = "skip",
+        actor: str = "",
     ) -> dict:
         """Import a graph — prevalidated, transactional, honest about outcome.
 
@@ -2077,6 +2322,14 @@ class GraphStore:
         (disabled)" when no enabled index is available — honestly, never
         silently).
 
+        suppressions: nodes whose source identity carries an ingestion
+        suppression tombstone (the user forgot/deleted that session) are
+        SKIPPED by default, with their edges, and counted in the result
+        (suppressed_nodes / suppressed_edges / suppressed_identities) — an
+        old export must not silently resurrect forgotten content.
+        suppressions="override" is the explicit reimport: it lifts those
+        tombstones (audited, attributed to ``actor``) and imports the nodes.
+
         clear_existing is DEPRECATED: True maps to mode="replace", False to
         mode="merge". New callers pass mode.
         """
@@ -2092,6 +2345,11 @@ class GraphStore:
         if mode not in ("refuse", "merge", "replace"):
             raise ValueError(
                 f"import_graph mode must be 'refuse', 'merge' or 'replace', got {mode!r}"
+            )
+        if suppressions not in ("skip", "override"):
+            raise ValueError(
+                f"import_graph suppressions must be 'skip' or 'override', "
+                f"got {suppressions!r}"
             )
 
         conn = self._get_conn()
@@ -2139,6 +2397,8 @@ class GraphStore:
             "nodes_added": 0, "edges_added": 0,
             "skipped_nodes": 0, "skipped_edges": 0,
             "removed_nodes": 0, "removed_edges": 0,
+            "suppressed_nodes": 0, "suppressed_edges": 0,
+            "suppressed_identities": [], "lifted_identities": [],
         }
         removed_node_ids: list = []
 
@@ -2152,8 +2412,46 @@ class GraphStore:
         else:
             new_nodes, new_edges = list(graph.nodes), list(graph.edges)
 
+        # ── Ingestion suppression: skip (default) or lift (override) ──
+        hit_identities: set = set()
+        if self.count_ingest_suppressions():
+            kept, skipped_ids = [], set()
+            known_identities = {r["identity"]
+                                for r in self.list_ingest_suppressions()}
+            for n in new_nodes:
+                sid = n.source_id or ""
+                key = (n.metadata or {}).get("ingest_key") or ""
+                key = key if isinstance(key, str) else ""
+                hit = self.find_ingest_suppression(sid, key)
+                if hit is None:
+                    kept.append(n)
+                    continue
+                hit_identities.update(
+                    x for x in (sid, key) if x in known_identities)
+                if suppressions == "override":
+                    kept.append(n)
+                else:
+                    skipped_ids.add(n.node_id)
+                    self.note_suppressed_skip(hit["identity"], hit["kind"])
+            if skipped_ids:
+                kept_edges = [e for e in new_edges
+                              if e.source_node_id not in skipped_ids
+                              and e.target_node_id not in skipped_ids]
+                result["suppressed_nodes"] = len(skipped_ids)
+                result["suppressed_edges"] = len(new_edges) - len(kept_edges)
+                result["suppressed_identities"] = sorted(hit_identities)
+                new_nodes, new_edges = kept, kept_edges
+
         # ── One transaction: wipe (replace only) + inserts + their audits ──
         with self.transaction():
+            if suppressions == "override":
+                lifted = []
+                for identity in sorted(hit_identities):
+                    if self.lift_ingest_suppression(
+                            identity, actor=actor or "import",
+                            reason="graph_import_override"):
+                        lifted.append(identity)
+                result["lifted_identities"] = lifted
             if mode == "replace":
                 removed_node_ids = [
                     r[0] for r in conn.execute("SELECT node_id FROM nodes").fetchall()

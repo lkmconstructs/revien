@@ -109,7 +109,9 @@ class SyncScheduler:
         from revien.ingestion.pipeline import IngestionInput
 
         store = self.pipeline.store
-        since = store.get_sync_cursor(name)
+        # Generation BEFORE the fetch (reset fencing): the cursor below is
+        # persisted only if no reset bumped it while this sync was running.
+        since, generation = store.get_sync_state(name)
         if since is None:
             since = EPOCH
 
@@ -124,12 +126,15 @@ class SyncScheduler:
         # Fetch new content
         new_content = await adapter.fetch_new_content(since)
         if not new_content:
-            store.set_sync_cursor(name, sync_started)
+            if not store.set_sync_cursor_if_generation(
+                    name, sync_started, generation):
+                return self._fenced_result(name, 0)
             return {"status": "ok", "adapter": name, "items_ingested": 0}
 
         # Ingest each piece of content
         ingested = 0
         skipped = 0
+        suppressed = 0
         for item in new_content:
             # timestamp was previously dropped here — every synced item
             # ingested with recorded_at=None, so temporal resolution and
@@ -169,21 +174,45 @@ class SyncScheduler:
             # without this the cursor never advances and the adapter re-fetches
             # and re-fails the same item on every sync, forever.
             try:
-                self.pipeline.ingest(input_data)
-                ingested += 1
+                out = self.pipeline.ingest(input_data)
+                if getattr(out, "suppressed", False):
+                    suppressed += 1
+                    logger.warning(
+                        f"Suppressed item from {name} ({input_data.source_id}): "
+                        "user forgot this source; `revien restore` lifts it"
+                    )
+                else:
+                    ingested += 1
             except ValueError as exc:
                 skipped += 1
                 logger.warning(
                     f"Skipped item from {name} ({input_data.source_id}): {exc}"
                 )
 
-        # Success: persist the pre-fetch stamp as the new cursor.
-        store.set_sync_cursor(name, sync_started)
-        logger.info(f"Synced {name}: {ingested} items ingested, {skipped} skipped")
+        # Success: persist the pre-fetch stamp as the new cursor, but only if
+        # no reset happened meanwhile (compare-and-set on the generation).
+        if not store.set_sync_cursor_if_generation(
+                name, sync_started, generation):
+            return self._fenced_result(name, ingested)
+        logger.info(
+            f"Synced {name}: {ingested} items ingested, {skipped} skipped, "
+            f"{suppressed} suppressed")
         result = {"status": "ok", "adapter": name, "items_ingested": ingested}
         if skipped:
             result["items_skipped"] = skipped
+        if suppressed:
+            result["items_suppressed"] = suppressed
         return result
+
+    @staticmethod
+    def _fenced_result(name: str, ingested: int) -> dict:
+        """A reset landed while this sync ran: its position is discarded so
+        the acknowledged reset stands; the next sync re-reads full history."""
+        logger.warning(
+            f"Sync of {name} finished after a reset; its position was "
+            "discarded and the reset stands")
+        return {"status": "reset_during_sync", "adapter": name,
+                "items_ingested": ingested}
 
     async def drain_pending_embeds(self) -> int:
         """Idle sweep for the deferred-embed queue (capture leg): embed

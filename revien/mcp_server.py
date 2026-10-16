@@ -283,6 +283,8 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             "edges_created": result.edges_created,
             "total_nodes_in_graph": result.total_nodes_in_graph,
             "total_edges_in_graph": result.total_edges_in_graph,
+            # Present only when the user forgot this source: nothing stored.
+            **({"suppressed": True} if result.suppressed else {}),
         }
 
     return server

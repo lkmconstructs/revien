@@ -58,6 +58,9 @@ class IngestResponse(BaseModel):
     edges_created: int
     total_nodes_in_graph: int
     total_edges_in_graph: int
+    # True when the source identity was forgotten/deleted by the user and
+    # nothing was captured (see /v1/suppressions, `revien restore`).
+    suppressed: bool = False
 
 
 class ConsolidateRequest(BaseModel):
@@ -502,6 +505,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             edges_created=result.edges_created,
             total_nodes_in_graph=result.total_nodes_in_graph,
             total_edges_in_graph=result.total_edges_in_graph,
+            suppressed=result.suppressed,
         )
 
     # ── POST /v1/recall ───────────────────────────────
@@ -699,11 +703,50 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.delete("/v1/nodes/{node_id}", dependencies=[_mutation_auth])
     async def delete_node(node_id: str):
-        """Delete a node and its edges. Permanent."""
-        deleted = store.delete_node(node_id)
+        """Delete a node and its edges. Permanent.
+
+        An explicit user delete: also writes a content-free ingestion
+        suppression for the node's stable source identity (the whole source
+        session, see revien/graph/suppression.py), in the same transaction,
+        so ordinary sync cannot silently capture it again. A node whose
+        source has no stable identity (a shared channel such as "mcp") is
+        deleted without a tombstone and the response says so."""
+        node = store.get_node(node_id)
+        if node is None:
+            raise HTTPException(404, f"Node not found: {node_id}")
+        with store.transaction():
+            supp = ops.suppress_node_source(node, "rest_delete", "rest:delete")
+            deleted = store.delete_node(node_id)
         if not deleted:
             raise HTTPException(404, f"Node not found: {node_id}")
-        return {"status": "deleted", "node_id": node_id}
+        return {"status": "deleted", "node_id": node_id,
+                "suppression": supp["status"],
+                "suppressed_identities": supp["identities"],
+                "suppression_gap": supp["gap"]}
+
+    # ── Ingestion suppressions (content-free tombstones) ──
+
+    @app.get("/v1/suppressions")
+    async def list_suppressions():
+        """Identities the user forgot/deleted that ordinary ingestion skips.
+        Identity, timestamp, reason, actor and skip counts only."""
+        return {"suppressions": store.list_ingest_suppressions()}
+
+    class RestoreRequest(BaseModel):
+        identity: str
+
+    @app.post("/v1/suppressions/restore", dependencies=[_mutation_auth])
+    async def restore_suppression(request: RestoreRequest):
+        """Explicit override: lift the suppression for one source identity
+        (audited). Ingestion of it resumes; already-read files are only
+        re-read after `revien sync reset`."""
+        lifted = store.lift_ingest_suppression(
+            request.identity.strip(), actor="rest:restore")
+        if not lifted:
+            raise HTTPException(
+                404, f"No suppression for identity: {request.identity}")
+        return {"status": "restored", "identity": request.identity.strip(),
+                "lifted": lifted}
 
     # ── POST /v1/edges ─────────────────────────────────
 
@@ -794,7 +837,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/v1/graph/import", dependencies=[_mutation_auth])
     async def import_graph(
-        graph_data: Dict[str, Any], mode: str = Query("refuse")
+        graph_data: Dict[str, Any], mode: str = Query("refuse"),
+        override_suppressions: bool = Query(False),
     ):
         """Import a graph from JSON. For restore/migration.
 
@@ -802,6 +846,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         must never silently eat an existing graph (the old shape hardcoded a
         wipe). mode=merge skips colliding IDs; mode=replace swaps the whole
         graph in one transaction (any failure leaves the original intact).
+
+        Nodes whose source the user forgot/deleted are skipped and counted
+        (suppressed_nodes) unless override_suppressions=true, the explicit
+        reimport, which lifts those tombstones (audited) and imports them.
         """
         from revien.graph.store import ImportRefusedError, ImportValidationError
 
@@ -812,7 +860,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         except Exception as e:
             raise HTTPException(400, f"Invalid graph data: {str(e)}")
         try:
-            result = store.import_graph(graph, mode=mode, semantic=semantic)
+            result = store.import_graph(
+                graph, mode=mode, semantic=semantic,
+                suppressions="override" if override_suppressions else "skip",
+                actor="rest:import")
         except ImportRefusedError as e:
             raise HTTPException(409, str(e))
         except ImportValidationError as e:

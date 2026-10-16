@@ -162,6 +162,11 @@ class IngestionOutput:
     # consumers construct their own response dicts field-by-field, so a new
     # dataclass field with a default is additive, not breaking.
     fenced_spans: int = 0
+    # Ingestion suppression: True when this input's source identity carries a
+    # tombstone from an explicit user forget/delete, so NOTHING was captured.
+    # suppressed_identity names which identity matched (never content).
+    suppressed: bool = False
+    suppressed_identity: str = ""
 
 
 class IngestionPipeline:
@@ -281,6 +286,32 @@ class IngestionPipeline:
         # 0. Per-source ingestion policy (leg 6b). If this source_id is on the
         #    deny list, capture is a clean no-op: nothing is extracted, stored,
         #    or embedded, and the reason is logged. The graph is untouched.
+        # 00. Suppression tombstone: the user explicitly forgot/deleted this
+        #     source identity. Ordinary ingestion (sync, adapters, MCP store,
+        #     REST ingest) is skipped, logged and counted; only `revien
+        #     restore` or a graph-import override lifts it. Checked before
+        #     anything is extracted or stored.
+        hit = self.store.find_ingest_suppression(
+            input_data.source_id or "", (input_data.ingest_key or "").strip())
+        if hit is not None:
+            self.store.note_suppressed_skip(hit["identity"], hit["kind"])
+            print(
+                f"[revien] ingest suppressed for {hit['kind']}="
+                f"{hit['identity']!r} (forgotten by the user on "
+                f"{hit['created_at'][:10]}) — nothing captured. "
+                f"`revien restore` lifts this."
+            )
+            return IngestionOutput(
+                context_node_id="",
+                nodes_created=0,
+                nodes_deduplicated=0,
+                edges_created=0,
+                total_nodes_in_graph=self.store.count_nodes(),
+                total_edges_in_graph=self.store.count_edges(),
+                suppressed=True,
+                suppressed_identity=hit["identity"],
+            )
+
         deny = _ingest_deny_set()
         if input_data.source_id in deny:
             print(
