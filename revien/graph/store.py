@@ -1491,6 +1491,41 @@ class GraphStore:
         self._commit(conn)
         return deleted
 
+    # ── store_meta (per-database key/value facts) ─────────
+
+    @_locked
+    def set_meta(self, key: str, value: str) -> None:
+        """Upsert one ``store_meta`` row (table created by migration 005)."""
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+        self._commit(conn)
+
+    @_locked
+    def get_meta(self, key: str) -> Optional[str]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT value FROM store_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    @_locked
+    def delete_meta(self, key: str) -> bool:
+        conn = self._get_conn()
+        cur = conn.execute("DELETE FROM store_meta WHERE key = ?", (key,))
+        self._commit(conn)
+        return cur.rowcount > 0
+
+    @_locked
+    def list_meta(self, prefix: str) -> Dict[str, str]:
+        """Every ``store_meta`` row whose key starts with ``prefix``."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT key, value FROM store_meta WHERE substr(key, 1, ?) = ?",
+            (len(prefix), prefix)).fetchall()
+        return {k: v for k, v in rows}
+
     # ── Usage ledger (N1) ─────────────────────────────────
 
     @_locked

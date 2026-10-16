@@ -39,3 +39,25 @@ def _disable_rerank_by_default(monkeypatch):
     by the bench, not unit tests."""
     monkeypatch.setenv("REVIEN_RERANK", "0")
     yield
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_probe: use the real loopback health probe (revien/loopback_probe.py) "
+        "instead of the default stub that reports 'no daemon answered'")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_daemon_probe(request, monkeypatch):
+    """`revien sync reset` asks a loopback daemon for /v1/health. A developer
+    machine may really have one on 7437, which would make unrelated tests
+    refuse or flake. Stub the probe to 'nothing answered' unless a test marks
+    itself real_probe."""
+    if request.node.get_closest_marker("real_probe"):
+        yield
+        return
+    import revien.loopback_probe as lp
+
+    monkeypatch.setattr(lp, "probe_daemon", lambda url: None)
+    yield

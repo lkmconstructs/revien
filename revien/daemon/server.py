@@ -3,6 +3,7 @@ Revien REST API Server — FastAPI application exposing all Revien endpoints.
 Runs as local daemon on port 7437 or as hosted service.
 """
 
+import asyncio
 import time
 import os
 from contextlib import asynccontextmanager
@@ -16,6 +17,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from revien import __version__, pairing
+from revien.daemon.heartbeat import (
+    DAEMON_FEATURES, HEARTBEAT_INTERVAL, clear_heartbeat, write_heartbeat)
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -166,6 +169,10 @@ class HealthResponse(BaseModel):
     edge_count: int
     uptime_seconds: float
     version: str
+    # What this daemon can do (revien/daemon/heartbeat.py:DAEMON_FEATURES).
+    # A daemon from before fencing has no such field, which is how
+    # `revien sync reset` recognises it. Names only: no path, no id.
+    features: List[str] = []
 
 
 class SyncResponse(BaseModel):
@@ -338,6 +345,16 @@ def _mcp_http_enabled() -> bool:
 
 # ── App Factory ───────────────────────────────────────────
 
+async def _heartbeat_loop(store) -> None:
+    """Write the daemon heartbeat now and every HEARTBEAT_INTERVAL seconds."""
+    while True:
+        try:
+            write_heartbeat(store)
+        except Exception:  # noqa: BLE001 - never take the daemon down
+            pass
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -387,6 +404,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         scheduler = getattr(app.state, "scheduler", None)
         if scheduler is not None and not scheduler.is_running:
             scheduler.start()
+        # A daemon (the app has a scheduler) says so in the database it
+        # serves, so an operation that depends on fencing can tell. Refreshed
+        # while it runs, removed on a clean exit. Best effort: a failure here
+        # never stops the daemon.
+        beat_task = None
+        if scheduler is not None:
+            beat_task = asyncio.ensure_future(_heartbeat_loop(store))
         # The MCP session manager needs a running task group for the life of
         # the app. Mounted sub-app lifespans don't run under Starlette, so it
         # is wired here. No-op when MCP is off.
@@ -406,6 +430,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # the db file handle when a TestClient exits: without it, the
             # connection create_app opened lived until GC and Windows
             # refused the temp-db unlink (WinError 32).
+            if beat_task is not None:
+                beat_task.cancel()
+                clear_heartbeat(store)
             scheduler = getattr(app.state, "scheduler", None)
             if scheduler is not None:
                 scheduler.stop()
@@ -877,6 +904,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             edge_count=store.count_edges(),
             uptime_seconds=round(time.time() - start_time, 2),
             version=__version__,
+            features=list(DAEMON_FEATURES),
         )
 
     # ── POST /v1/sync ─────────────────────────────────

@@ -1698,7 +1698,11 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
 @click.option("--orphaned", is_flag=True,
               help="Reset a saved sync position whose adapter is no longer in "
                    "your config (only works when a saved position exists)")
-def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool):
+@click.option("--daemon-url", default="http://127.0.0.1:7437",
+              help="Where to look for a running daemon (loopback addresses "
+                   "only; default http://127.0.0.1:7437)")
+def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
+               daemon_url: str):
     """Clear a connected adapter's sync position so its next sync re-reads
     its full history (for example 'revien sync reset claude-code').
 
@@ -1706,9 +1710,13 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool):
     can be reset: their sessions are refreshed in place, not duplicated, so
     the reset is safe to repeat. Other adapters would ingest everything again
     as new nodes, so they are refused. Nothing is deleted from the graph.
-    A sync already running when you reset cannot undo the reset: its newer
-    position is discarded. The new position is used at the next sync
-    (default every 6 hours).
+    A sync already running in a current daemon when you reset cannot undo
+    the reset: its newer position is discarded. A daemon started before
+    this protection existed cannot do that, so the reset is refused while
+    one is running ("restart required"): it checks the daemon heartbeats in
+    the database and asks the daemon at --daemon-url for /v1/health. No
+    daemon answering means nothing to restart. The new position is used at
+    the next sync (default every 6 hours).
 
     --orphaned resets a saved position whose adapter was removed from your
     config. Its type cannot be checked, so the reset is allowed only because
@@ -1780,6 +1788,14 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool):
                 "adapters can be reset.")
             raise SystemExit(1)
 
+    # A reset is only safe against a daemon that fences its sync positions.
+    # Decided before anything is written (and before a GraphStore migrates).
+    old = _old_daemon_problem(db_path, daemon_url)
+    if old:
+        click.echo(old)
+        click.echo("Nothing was changed.")
+        raise SystemExit(1)
+
     try:
         store = GraphStore(db_path=db_path)
     except (sqlite3.Error, OSError) as e:
@@ -1809,9 +1825,51 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool):
     click.echo("It takes effect at the next sync (default every 6 hours), "
                "which re-reads the full history. Already captured sessions "
                "are refreshed in place, not duplicated. Nothing was deleted.")
-    click.echo("A sync that is running right now cannot undo this reset: when "
-               "it finishes, its position is discarded. If the daemon is not "
-               "running, start it with 'revien start'.")
+    click.echo("A sync that is running right now in a current daemon cannot "
+               "undo this reset: when it finishes, its position is "
+               "discarded. If the daemon is not running, start it with "
+               "'revien start'.")
+
+
+def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
+    """Why an operation that depends on sync-reset fencing must not run now,
+    else None. Two independent sources:
+
+    * the heartbeats current daemons write into THIS database: a live one that
+      lacks the feature refuses;
+    * ONE loopback health check (revien/loopback_probe.py, the single pinned
+      module that may open a connection): an answer without a features list
+      is a daemon from before fencing. Whether it serves this database cannot
+      be told from its answer, so it refuses either way.
+
+    No heartbeat and no answer: no daemon is running, nothing to restart."""
+    from revien.daemon.heartbeat import RESET_REQUIRES, live_heartbeats_readonly
+    from revien.loopback_probe import probe_daemon
+
+    need = set(RESET_REQUIRES)
+    restart = ("Restart required: stop that daemon ('Ctrl+C' in its "
+               "terminal), start it again with 'revien start', then run this "
+               "command again.")
+    for beat in live_heartbeats_readonly(_readonly_uri(Path(db_path))):
+        if not need <= set(beat["features"]):
+            return ("A daemon (pid " + str(beat["pid"]) + ") is serving this "
+                    "database but does not protect a reset from a sync that "
+                    "is running. " + restart)
+    health = probe_daemon(daemon_url)
+    if health is None:
+        return None
+    ver = health.get("version") or "unknown"
+    if health["features"] is None:
+        return (f"A Revien daemon answering at {daemon_url} (version {ver}) was "
+                "started before sync-reset protection existed. A sync it is "
+                "running would write its old position back and undo the "
+                "reset, and it cannot read a reset position. The answer does "
+                "not say which database it serves, so this is refused either "
+                "way. " + restart)
+    if not need <= set(health["features"]):
+        return (f"The daemon answering at {daemon_url} (version {ver}) does "
+                "not report sync-reset protection. " + restart)
+    return None
 
 
 def _has_sync_row(db_path: str, name: str) -> bool:
