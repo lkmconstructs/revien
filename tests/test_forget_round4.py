@@ -123,6 +123,33 @@ class TestEverywhereContract:
         finally:
             s.close()
 
+    def test_a_node_another_source_vouched_for_by_name_is_cut_in_place_not_cut_back(self, store):
+        a = "session:claude-code:sA"
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="A", content=f"User: {TARGET}\nUser: {A_TAIL}",
+                            metadata={"ingest_key": "claude-code:proj:sA"}), owner=(a, 1, 1))
+        fact = store.add_node(Node(node_type=NodeType.FACT, label="f", content=TARGET), owner=(a, 1, 1))
+        shared = store.add_node(Node(node_type=NodeType.DECISION, label="Deployment decision",
+                                     content=f"{TARGET} Also a different reminder about tulips."), owner=(a, 1, 1))
+        store.record_provenance(shared.node_id, "session:claude-code:sB", label_ok=True, wording_ok=False)
+        res = GraphOperations(store).forget_node(fact.node_id, everywhere=True)
+        survivor = store.get_node(shared.node_id)
+        assert survivor is not None and survivor.label == "Deployment decision"
+        assert survivor.content == "Also a different reminder about tulips."       # not reduced to its label
+        assert res["cut_back"] == [] and shared.node_id in {c["node_id"] for c in res["cut_in_place"]}
+        assert {r["unit_id"] for r in store.get_provenance(shared.node_id)} >= {"session:claude-code:sB"}
+        # (a plain forget of the same node does cut it back to its label)
+        store2 = GraphStore(db_path=store.db_path + ".plain")
+        try:
+            store2.add_node(Node(node_type=NodeType.CONTEXT, label="A", content=f"User: {TARGET}\nUser: {A_TAIL}"), owner=(a, 1, 1))
+            f2 = store2.add_node(Node(node_type=NodeType.FACT, label="f", content=TARGET), owner=(a, 1, 1))
+            s2 = store2.add_node(Node(node_type=NodeType.DECISION, label="Deployment decision",
+                                      content=f"{TARGET} Also a different reminder about tulips."), owner=(a, 1, 1))
+            store2.record_provenance(s2.node_id, "session:claude-code:sB", label_ok=True, wording_ok=False)
+            plain = GraphOperations(store2).forget_node(f2.node_id)
+            assert s2.node_id in plain["cut_back"]
+        finally:
+            store2.close()
+
     def test_a_single_known_writer_is_the_only_source_suppressed(self, store):
         sentence = TARGET
         store.add_node(Node(node_type=NodeType.CONTEXT, label="A", content=f"User: {sentence}\nUser: {A_TAIL}",
@@ -360,6 +387,7 @@ class TestBusyDatabase:
                 h.close()
         assert res["status"] == "busy" and res["denylist_written"] is True
         assert "already kept out of new captures" in res["message"]
+        assert "nothing was changed" not in res["message"]      # the denylist was written, so that would be false
         assert store.get_node(c.node_id) is not None            # nothing was removed yet
 
     def test_the_retry_waits_for_a_short_lock(self, store, monkeypatch):

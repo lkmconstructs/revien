@@ -184,3 +184,37 @@ def test_the_source_classes_named_are_the_ones_in_the_code():
     sec = forget_section()
     assert "a Codex rollout by the `id` in its `session_meta` line" in sec
     assert "a Codex rollout file (its unit is the file name" not in sec
+
+
+def test_sentences_that_were_false_are_gone_and_the_true_ones_are_there():
+    sec = forget_section()
+    spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")
+    for text in (sec, spec):
+        assert "no source is suppressed on a guess" not in text
+        assert "Nothing is deleted, cut back to its label or suppressed because of it" not in text
+        assert "at most 8 nodes" not in text
+    # what is claimed now (each is exercised in tests/test_forget_round4.py)
+    for phrase in (
+            "The only source it suppresses is the forgotten origin's own identity",
+            "a node written by several sources keeps all of its owners",
+            "has no single origin, so none of them is suppressed",
+            "Every node whose wording was cut is listed with its source in `cut_in_place`",
+            "no surviving node holding what was forgotten",
+            "Every such node is named under `other_units` and `still_held_by`",
+            "it keeps trying for up to 25 seconds, then answers `busy` (HTTP 503)",
+            "the unit id stays the file name"):
+        assert phrase in sec, phrase
+
+
+def test_the_sentence_that_depends_on_the_copy_rule_is_marked_for_revision():
+    sec = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")
+    marker = "<!-- REVISE after the owner's ruling on the copy rule: this sentence is not final -->"
+    assert marker in sec and marker in spec
+
+
+def test_the_numbers_in_the_changelog_are_the_code_s():
+    from revien.forget.engine import ForgetEngine
+    sec = forget_section()
+    assert ForgetEngine.BUSY_WAIT_SECONDS == 25.0 and "up to 25 seconds" in sec
+    assert ForgetEngine.DISTINCTIVE_MAX_ELSEWHERE == 2 and "at most 2 nodes another live unit vouches for" in sec
