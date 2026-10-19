@@ -42,29 +42,94 @@ def _pattern(strings: List[str]):
     return re.compile("|".join(re.escape(s) for s in strings), re.IGNORECASE)
 
 
-def cut_text(text: str, strings: List[str]) -> Tuple[str, int]:
-    """(text with every occurrence removed, number of occurrences)."""
+_TERMINATORS = ".!?"
+_SPEAKER = re.compile(r"^(?:User|Assistant|Human|AI|System)\s*:\s*", re.IGNORECASE)
+
+
+def _sentence_span(text: str, start: int, end: int):
+    """The sentence around text[start:end]: from after the previous sentence
+    end (or the start of the line) to the next sentence end (or the end of the
+    line). A '.', '!' or '?' ends a sentence only when whitespace or the end of
+    the text follows it, so 'blue.example.com' or '3.5' stay whole."""
+    left = start
+    while left > 0:
+        ch = text[left - 1]
+        if ch == "\n":
+            break
+        if ch.isspace() and left - 2 >= 0 and text[left - 2] in _TERMINATORS:
+            break
+        left -= 1
+    right = end
+    n = len(text)
+    while right < n:
+        ch = text[right]
+        if ch == "\n":
+            break
+        if ch in _TERMINATORS and (right + 1 >= n or text[right + 1].isspace()):
+            right += 1
+            break
+        right += 1
+    return left, right
+
+
+def _remove_spans(text: str, spans) -> str:
+    spans.sort()
+    merged = []
+    for l, r in spans:
+        if merged and l <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], r)
+        else:
+            merged.append([l, r])
+    out, pos = [], 0
+    for l, r in merged:
+        line_start = text.rfind("\n", 0, l) + 1
+        prefix = text[line_start:l]
+        # a speaker label with nothing left to say goes with its sentence
+        if prefix.strip() and _SPEAKER.fullmatch(prefix.strip() + " "):
+            l = line_start
+            prefix = ""
+        line_end = text.find("\n", r)
+        line_end = len(text) if line_end == -1 else line_end
+        # the whole line was the sentence: take its line break too
+        if not prefix.strip() and not text[r:line_end].strip():
+            r = min(line_end + 1, len(text))
+        out.append(text[pos:l])
+        pos = r
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def cut_text(text: str, strings: List[str], sentences: bool = True) -> Tuple[str, int]:
+    """(text with the forgotten wording cut out, number of occurrences).
+
+    With ``sentences`` (the default) the whole sentence around each occurrence
+    goes, because a forgotten sentence is what the user asked to lose
+    (docs/FORGET_SPEC.md §2); a half-cut sentence would leave the rest of the
+    secret behind. ``sentences=False`` cuts the matched characters only."""
     pat = _pattern(strings)
     if pat is None or not text:
         return text, 0
     normalized = _nfc(text)
-    new, n = pat.subn("", normalized)
-    if n == 0:
+    spans = []
+    for m in pat.finditer(normalized):
+        if sentences:
+            spans.append(list(_sentence_span(normalized, m.start(), m.end())))
+        else:
+            spans.append([m.start(), m.end()])
+    if not spans:
         return text, 0
-    return new, n
+    n = len(spans)
+    return _remove_spans(normalized, [tuple(s) for s in spans]), n
 
 
 def cut_json(value: Any, strings: List[str]) -> Tuple[Any, int]:
     """Cut inside every string of a decoded JSON value (keys left alone)."""
-    pat = _pattern(strings)
-    if pat is None:
-        return value, 0
     total = 0
 
     def walk(v):
         nonlocal total
         if isinstance(v, str):
-            new, n = pat.subn("", _nfc(v))
+            new, n = cut_text(v, strings)
             if n:
                 total += n
                 return new

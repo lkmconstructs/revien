@@ -154,8 +154,11 @@ class ForgetEngine:
                 n = store.get_node(nid)
                 if n is None or is_tombstone(nid):
                     continue
-                if not unit_cascade and not self._carries(n, primary):
-                    continue
+                if not unit_cascade:
+                    # The unit's stored conversation is cut, not removed; any
+                    # other node is removed only if it carries the wording.
+                    if is_holder(n) or not self._carries(n, primary):
+                        continue
                 v, by = self._classify(store.get_provenance(nid), fset)
                 if v == "unproven":
                     unproven[nid] = n
@@ -191,10 +194,6 @@ class ForgetEngine:
         strings: List[str] = list(primary)
         for n in list(remove.values()) + list(cut_back.values()):
             strings.append(n.content)
-            if n.node_id != target.node_id and n.node_id in remove \
-                    and any(_word_in(n.label.strip(), w) for w in primary
-                            if len(n.label.strip()) >= _MIN_LABEL_CUT):
-                strings.append(n.label)
         folded_primary = [w.casefold() for w in primary]
         for n in unproven.values():
             # An unproven node whose own words are part of the forgotten
