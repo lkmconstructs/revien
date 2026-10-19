@@ -130,9 +130,13 @@ class TestOriginScope:
         GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
         s.close()
         copy = seeded.source_file.parent / "renamed-copy.jsonl"
-        copy.write_text(seeded.source_file.read_text() + json.dumps({
+        # (so much new text that the copy rule cannot recognise it: only the
+        # sessionId inside the file, which travels with the copy, can)
+        later = "".join(json.dumps({
             "type": "user", "sessionId": "uuid-claude-1", "timestamp": "2026-07-01T10:01:00Z",
-            "message": {"role": "user", "content": [{"type": "text", "text": "An unrelated later remark about parking."}]}}) + "\n")
+            "message": {"role": "user", "content": [{"type": "text", "text": f"Later remark number {i} about parking permits and the quarterly budget."}]}}) + "\n"
+            for i in range(8))
+        copy.write_text(seeded.source_file.read_text() + later)
         fs._age(copy)
         seeded.recapture()
         s = GraphStore(db_path=seeded.db)
@@ -225,6 +229,8 @@ class TestEverywhereDoesNotOverreach:
         listed = {c["node_id"] for c in res["cut_in_place"]}
         assert hand.node_id in listed
         assert all(store.get_node(i) is not None for i in listed)
+        # a node that was only the cut sentence stays, as a marker
+        assert [n for n in store.list_nodes(limit=100) if n.content == "[removed]"]
         for c in res["cut_in_place"]:
             assert c["node_id"] in res["message"]
         # ...and the exact wording is banned in every source from now on
@@ -1008,17 +1014,29 @@ class TestSkillPaths:
 
 
 class TestVaultReconcilePaths:
-    def test_the_exact_wording_of_an_everywhere_forget_cannot_be_typed_back_into_a_note(self, tmp_path):
+    SENTENCE = "We decided to use ZQXTYPED for the billing service."
+
+    def _reconciler(self, tmp_path):
         from revien.distill import VaultReconciler
         from revien.semantic.index import SemanticIndex
         s = GraphStore(db_path=str(tmp_path / "vr.db"))
         ent = s.add_node(Node(node_type=NodeType.ENTITY, label="Atlas", content="Atlas"))
-        sentence = "We decided to use ZQXTYPED for the billing service."
-        fact = s.add_node(Node(node_type=NodeType.FACT, label="pg", content=sentence), owner=(UA, 1, 1))
-        GraphOperations(s).forget_node(fact.node_id, everywhere=True)
         rec = VaultReconciler(s, str(tmp_path), semantic=SemanticIndex(s, enabled=False))
-        # a different shape of the same sentence (not the node's whole text), typed back
-        assert rec._new_claim_node(ent.node_id, sentence, None) is None
+        return s, ent, rec
+
+    def test_a_forgotten_nodes_text_typed_back_into_a_note_is_not_captured(self, tmp_path):
+        s, ent, rec = self._reconciler(tmp_path)
+        fact = s.add_node(Node(node_type=NodeType.FACT, label="pg", content=self.SENTENCE), owner=(UA, 1, 1))
+        GraphOperations(s).forget_node(fact.node_id)
+        assert rec._new_claim_node(ent.node_id, self.SENTENCE, None) is None
+        assert rec._new_claim_node(ent.node_id, "A different claim typed into a note.", None) is not None
+        s.close()
+
+    def test_a_banned_sentence_inside_a_longer_claim_typed_back_into_a_note_is_not_captured(self, tmp_path):
+        s, ent, rec = self._reconciler(tmp_path)
+        fact = s.add_node(Node(node_type=NodeType.FACT, label="pg", content=self.SENTENCE), owner=(UA, 1, 1))
+        GraphOperations(s).forget_node(fact.node_id, everywhere=True)
+        assert rec._new_claim_node(ent.node_id, self.SENTENCE + " And a separate point.", None) is None
         s.close()
 
 
@@ -1037,3 +1055,16 @@ class TestTheGlobalBanCanBeLifted:
         assert done["status"] == "restored"
         b_grows(pipe)
         assert SHARED in contexts(store)[(UB,)]
+
+
+class TestSpecAndChangelogAgree:
+    def test_scope_is_the_origin_in_section_2_5_and_in_section_6(self):
+        spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")
+        log = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+        for text in (spec, log):
+            assert "bound to the origin that was forgotten" in text
+            assert "for every source, inside the write transaction" not in text
+            assert "removes the wording from every unit that holds it" not in text
+        assert "only the exact wording that was targeted" in spec
+        assert "cuts only the exact wording that was targeted" in log
+        assert "Every response" in spec or "Every response states" in spec

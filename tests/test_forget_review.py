@@ -357,7 +357,7 @@ class TestStandingDenylist:
         res = GraphOperations(s).forget_node(t.node_id)
         assert res["fallback"]["fragments"] >= 1
         assert "shorter than 20 characters" in res["fallback"]["note"]
-        assert "not by a text match anywhere else" in res["message"]
+        assert "never matched on their own in another source" in res["message"]
         f.write_text(f.read_text() + " A new line appended at the end of this file.")
         out = IngestionPipeline(s).ingest(IngestionInput(
             source_id="file:pins.md", origin_runtime="file", content=f.read_text(),

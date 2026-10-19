@@ -599,9 +599,10 @@ class ForgetEngine:
                 "note": (f"{short_total} forgotten fragment(s) are shorter than "
                          f"{scrub.MIN_SENTENCE} characters. A short text match "
                          "would hit unrelated sentences, so they are kept out "
-                         "of the source they came from only, by that source's "
-                         "identity and their keyed fingerprint, not by a text "
-                         "match anywhere else.")}
+                         "of the source they came from (and of a copy of it) "
+                         "only, by that source's identity and their keyed "
+                         "fingerprint, never matched on their own in another "
+                         "source.")}
         return suppressed, not_suppressed, fallback
 
     def _execute(self, plan: Plan, actor: str, suppressed, not_suppressed,

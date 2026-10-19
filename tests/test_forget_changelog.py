@@ -112,3 +112,72 @@ def test_the_changelog_does_not_promise_what_a_limit_denies():
     """The limits are in the same section as the claims."""
     sec = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "### Known limits of the forget work" in sec
+
+
+def test_the_retrain_story_matches_the_code(tmp_path):
+    """The CHANGELOG says what retrains the model; every part of it is checked."""
+    from revien.neural.training import TrainingLoop
+    sec = forget_section()
+    assert "nothing retrains it automatically" not in sec
+    assert "there is no scheduled or nightly job" in sec
+    assert TrainingLoop.INITIAL_THRESHOLD == 100 and TrainingLoop.RETRAIN_INTERVAL == 500
+    assert "100 retrieval signals" in sec and "every 500 more" in sec
+    for method in ("mark_stale", "is_stale"):
+        assert callable(getattr(TrainingLoop, method))
+    assert "`model_stale`" in sec and "POST /v1/training/run" in sec
+    app = create_app(db_path=str(tmp_path / "t.db"))
+    have = {(m, getattr(r, "path", "")) for r in app.routes for m in getattr(r, "methods", ())}
+    assert ("POST", "/v1/training/run") in have
+    # no scheduler job calls the trainer
+    for rel in ("daemon/scheduler.py", "daemon/daemon.py", "consolidate.py"):
+        src = (REPO / "revien" / rel).read_text(encoding="utf-8")
+        assert "force_train" not in src and "training_loop.train" not in src
+
+
+def test_the_origin_scope_and_everywhere_fields_named_exist(tmp_path):
+    from tests import forget_seed as fs
+    seeded = fs.seed("pipeline", tmp_path)
+    s = GraphStore(db_path=seeded.db)
+    try:
+        res = GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True, everywhere=True)
+    finally:
+        s.close()
+    sec = forget_section()
+    for field in ("reentry", "cut_in_place", "still_held_by", "model", "model_stale",
+                  "fallback", "identity_note"):
+        assert field in sec, field
+    for field in ("reentry", "cut_in_place", "still_held_by", "model", "model_stale"):
+        assert field in res, field
+    assert set(res["reentry"]) >= {"scope", "stops", "does_not_stop"}
+    assert set(res["model"]) >= {"neural_ranking", "retrained", "stale", "note"}
+    out = CliRunner().invoke(main, ["forget", "--help"])
+    assert "--everywhere" in out.output and "forget --everywhere" in sec
+    out = CliRunner().invoke(main, ["restore", "--help"])
+    assert "--list" in out.output and "revien restore forget:<id>" in sec
+
+
+def test_the_copy_rule_in_the_changelog_is_the_one_in_the_code():
+    from revien.forget import gate
+    sec = forget_section()
+    assert gate.COPY_OF_ORIGIN == 0.8 and gate.COPY_OF_CAPTURE == 0.5 and gate.COPY_MIN_SHARED == 2
+    assert "at least 80% of the forgotten source's own sentences of 20 or more characters" in sec
+    assert "(and at least two of them)" in sec and "at least half of the capture's own" in sec
+
+
+def test_the_known_limit_about_concurrent_forgets_is_the_true_one():
+    sec = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "is not serialised with a daemon" not in sec
+    assert "take turns on SQLite's write lock" in sec
+
+
+def test_the_source_classes_named_are_the_ones_in_the_code():
+    """(1) an id that travels with a copy, (2) path and inode, (3) content
+    alone: the adapters and the gate say the same."""
+    src = (REPO / "revien" / "adapters" / "codex.py").read_text(encoding="utf-8")
+    assert '"session_key": jsonl_file.stem' in src and "session_id" not in src
+    cc = (REPO / "revien" / "adapters" / "claude_code.py").read_text(encoding="utf-8")
+    assert 'meta_extra["session_id"] = session_id' in cc and "sessionId" in cc
+    gate_src = (REPO / "revien" / "forget" / "gate.py").read_text(encoding="utf-8")
+    assert 'runtime == "claude-code"' in gate_src         # only Claude Code's sessionId overrides the file name
+    sec = forget_section()
+    assert "a Codex rollout file (its unit is the file name" in sec
