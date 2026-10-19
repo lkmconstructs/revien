@@ -309,8 +309,184 @@ All notable changes to Revien are documented here. Format follows
   pre-fence behavior byte-identically); stripped spans are logged with source_id,
   count, chars, and which marker families fired, and content that fences down to
   nothing is skipped rather than stored as an empty husk.
+- **Usage signal (N1) — did an answer actually draw on what recall handed it?**
+  `mark_used` existed (access count +1, an "access" audit row, +0.05 on the
+  node's edges) but its only caller was `POST /v1/mark_used`: the MCP server
+  exposes only `revien_recall` and `revien_store`, nothing produced the signal,
+  and the frequency term counted dedup hits instead of use. New
+  `revien/usage/` closes that loop for Claude Code. `episodes.py` reads each
+  session transcript for `revien_recall` calls (bare or
+  `mcp__<server>__revien_recall`), the memories each returned, and the
+  assistant's answer that followed. An episode is emitted only once its turn has
+  closed (`stop_reason: "end_turn"`, or a new human prompt), so an answer still
+  being written is never judged. Thinking blocks, tool inputs, `isMeta` and
+  sidechain entries are never part of the answer. `evidence.py` gathers two
+  independent signals per memory: shared distinctive terms, with the prompt's
+  and query's own words removed first so restating the question proves
+  nothing; and the best cosine between the memory and any answer paragraph,
+  from the configured embedder (local by default), or `None` when the
+  semantic layer is off. `judge.py:judge_use` is the rule: both signals must
+  agree, it abstains when one is missing or when the memory has no distinctive
+  words, and it is precision-first because a false "used" compounds. The
+  starting bars are at least 2 shared terms (or every term of a one- or
+  two-word memory) and similarity >= 0.75; they are constants meant to be
+  tuned from shadow-mode data. Judgments land in a new `use_judgments` ledger,
+  one row per (episode, memory), claimed by `INSERT OR IGNORE`. That makes
+  rescans of a grown session no-ops, and two processes can never count one use
+  twice; abstentions are not written. `shared_terms` holds the memory's own
+  words, so every path that removes nodes takes their rows with it:
+  `delete_node` (and with it forget, retention expiry, `DELETE /v1/nodes` and
+  the scoped LangChain clear) and a `replace` import. The observer also skips any
+  recalled memory whose node no longer exists, so a rescan can't copy
+  forgotten words back in from the transcript. `REVIEN_USAGE` picks the mode:
+  - `shadow` (default) records judgments only;
+  - `apply` also calls `mark_used`: a judgment is recorded unapplied and
+    marked applied only after `mark_used` succeeds. If it fails, the next
+    pass or retry applies that used-but-unapplied judgment exactly once
+    (concurrent retries cannot both apply it; a process that dies mid-apply
+    leaves it unretried rather than risk applying twice, and `revien usage
+    list` and the counts show it as "apply unknown", a separate bucket from
+    applied);
+  - `off` disables the pass.
+  Unrecognized values fall back to shadow, so a typo never writes to the graph.
+  `revien usage scan [--mode] [--full] [--path]` runs a pass with its own
+  cursor (`usage:claude-code` in `sync_cursors`), and `revien usage list
+  [--filter used|unused]` shows each judgment with its evidence. The daemon
+  schedules the pass only when `REVIEN_USAGE_INTERVAL_HOURS` is set (opt-in,
+  like dream mode). New `SemanticIndex.embed_texts()` embeds arbitrary text
+  without touching the vector table.
+- **Usage receipts: the same judgment for any runtime, not only Claude
+  Code.**
+  - `POST /v1/recall` with `"receipt": true` (and an optional `"runtime"`
+    name) returns a `recall_id` plus `receipt_expires_at`. The default
+    response is unchanged.
+  - The client hands the answer back to `POST /v1/usage/observe {recall_id,
+    answer, prompt?}`. That call returns, for every memory on the receipt,
+    its verdict (used / unused / abstain), shared terms, similarity, the
+    rule's reason, and whether it was applied. Errors: 404 unknown receipt,
+    409 already redeemed, 410 expired, 400 empty answer. No judgment is
+    written on an error (the expiry pass runs first, so such a call can still
+    flag other overdue receipts).
+  - A recall that returns no results gets no receipt (nothing could have been
+    used), and neither does any receipted recall while `REVIEN_USAGE=off`
+    (nothing would judge it): `recall_id` and `receipt_expires_at` are `null`
+    and `receipt_note` says which.
+  - With `REVIEN_USAGE=off`, `POST /v1/usage/observe` judges and records
+    nothing; it closes the receipt (status `closed_off`, so it does not
+    expire into a flag) and answers `status: "signal_off"` with a note. A
+    second call gets 409 (`already_closed`).
+  - A receipt's row is in the new `recall_receipts` table. It holds ids, the
+    runtime and the query (so restated words can be discounted), never memory
+    content. Memories are judged as they are now, not as they were recalled, and
+    against exactly the text recall returned (a SKILL's index row, never its
+    hidden body).
+  - A receipt not redeemed within 24 hours becomes a flag. Flags are never
+    deleted: `revien status` shows a count, `revien usage flags` lists them
+    and `--dismiss` marks one as seen, and `GET /v1/usage/flags` returns
+    them. A judgment that fails leaves its receipt open, so it expires into a
+    flag rather than vanishing. Removing a node removes its id from receipts
+    and flags.
+  - Issuing a receipt and calling the usage endpoints take the same
+    pairing-token gate as other writes (a remote caller needs the token;
+    loopback is never gated); plain recall stays ungated.
+  - The Hermes provider issues a receipt at `prefetch` and redeems it with
+    the reply in `sync_turn`, on the existing worker, so turns stay
+    non-blocking. The Ollama adapter does the same inside `chat()`. Both run
+    only when `REVIEN_USAGE` is explicitly `shadow` or `apply`; unset, they
+    issue nothing.
+  - Not covered yet: Codex sessions (whose real format needs verifying against
+    a live session first), receipts on the MCP `revien_recall` tool (Claude
+    Code is covered by its transcripts), and the activation-level probe
+    (tier 2, local open-weight models).
+- **`revien sync reset <adapter>` re-reads an adapter's full history.** It
+  clears the adapter's saved sync position so the next sync (default every 6
+  hours) starts from the beginning. Only adapters that tag every item with a
+  stable key (`claude-code`, `codex`) can be reset: their sessions are
+  refreshed in place, not duplicated, so a reset is safe to repeat and
+  nothing is deleted. Other adapters would add everything again as new nodes
+  and are refused, as is the usage observer's `usage:` position (use `revien
+  usage scan --full`). The command refuses without touching anything when the
+  path is not a Revien database (a directory, an empty or non-SQLite file, a
+  SQLite file whose `nodes`, `edges` or `audit_log` tables lack Revien's
+  columns), checked on a read-only handle that creates no file; a database
+  error is one clean line, not a traceback. Name and type are validated from
+  the config before the database is opened, so a mistyped name does not
+  migrate it.
+  - `--orphaned` resets a saved position whose adapter is no longer in your
+    config (its type cannot be checked, so it is allowed only when a saved
+    position exists).
+  - Reset/sync fencing: a reset keeps the `sync_cursors` row, blanks its
+    position and bumps its new `generation`. The scheduler reads the
+    generation before it fetches and saves its position only with a
+    compare-and-set on it, so a sync that was running when you reset cannot
+    write its older position back (the sync reports `reset_during_sync`).
+  - Old-daemon detection: that protection exists only in a daemon built with
+    it. A daemon from before it would write its old position back, and cannot
+    read the blank position a reset leaves. So the reset is refused with
+    "Restart required" (and "Nothing was changed.") while one may be running.
+    A current daemon writes a heartbeat (features, pid, time) into the
+    database's new `store_meta` table, refreshed every 10 s and removed on a
+    clean exit (a row older than 60 s is ignored), and `GET /v1/health` now
+    lists `features`; it adds no path and no id derived from one. A daemon
+    from before reports no features: the command makes at most ONE health
+    request, to a loopback address (`--daemon-url`, default
+    `http://127.0.0.1:7437`), in `revien/loopback_probe.py`, and an answer
+    without the features list refuses. Nothing answering means no daemon, and
+    the reset proceeds. Only an IP literal in 127.0.0.0/8, `[::1]`, or the
+    literal `localhost` (mapped to 127.0.0.1 by the probe itself) is
+    accepted; any other `--daemon-url` (another IP, any other host name, a
+    non-http scheme, a port that is not 1-65535) refuses the reset with "Use a loopback --daemon-url" and
+    nothing is resolved or contacted, so no name leaves the machine. The probe
+    never follows a redirect, never reads proxy settings, and returns only the
+    features list and version. Limit: an old daemon on another port is found only if
+    you point `--daemon-url` at it; an old daemon whose answer cannot say
+    which database it serves refuses either way.
+  - The egress gate (`scripts/gates/check_egress.py`) pins the SHA-256 of
+    `revien/loopback_probe.py` and fails if any other file imports it other
+    than as `from revien.loopback_probe import probe_daemon` used as a call,
+    or reaches into it (alias, attribute, `__globals__`, `setattr`, a string
+    naming it). The gate parses every file and flags those forms, which catches
+    re-exporting its network module or patching it through the shapes it
+    knows (it is a heuristic: for example a module name assembled at run time
+    is not seen). It also flags `pkgutil.resolve_name` and `builtins.__dict__`
+    use as dynamic imports; importing by file location or loader (`importlib.util`,
+    `importlib.machinery` loaders, a module's `__loader__`), `runpy`, and
+    reaching `import_module` through `operator.attrgetter` are known not to
+    be caught and are listed as limits. The gate's self-tests cover both; its limits are listed
+    when it runs.
+- **Schema: migration 005 (`PRAGMA user_version` 5).** All of the above
+  creates its tables in one numbered migration,
+  `revien/graph/migrations/005_usage_layer.py` (the work lives in
+  `GraphStore._migrate_add_usage_layer`, as for 003 and 004): `use_judgments`
+  and `recall_receipts` with their indexes, `store_meta`, and
+  `sync_cursors.generation` (existing cursors get generation 0; no existing
+  row is rewritten). It runs on every connect until the marker is 5 and the
+  schema is really complete, is idempotent, and upgrades databases created by
+  main, by v0.3.0 and by the v0.3.0 commit; it can be run standalone with
+  `python -m revien.graph.migrations.005_usage_layer [db]`. A build from
+  before it still opens an upgraded database and ignores the new tables, with
+  one exception: it cannot read a sync position that a reset left blank
+  (`ValueError` from `get_sync_cursor`), so run a reset only with current code.
 
 ### Fixed
+- **The Claude Code adapter now reads real Claude Code sessions.** It read
+  only a top-level `content` field. Real transcripts nest the text under
+  `message.content`, so every real session parsed to nothing and the adapter
+  fetched 0 items. Verified against a live transcript: 0 items before, the full
+  conversation after. The test fixtures used a flat `{"type": "human",
+  "content": ...}` shape Claude Code never writes, so the suite stayed green.
+  The adapter now reads `message.content` (the flat shape still works) and
+  skips two kinds of entry that aren't the human's words: `isMeta` entries
+  (harness-injected skill bodies, command caveats, agent reports) and
+  `isSidechain` entries. Sidechain entries make up every subagent transcript
+  under `<session>/subagents/`, where the "user" is the parent agent, so those
+  files ingest as nothing. `session_files(since)` and `source_id_for(path)` are
+  now public, so anything else that reads sessions sees exactly the files
+  ingest reads. A session's date is the first spoken message's timestamp (an
+  `isMeta` entry's is never used). Known limitation: an existing install's
+  `claude-code` sync position has already moved past older sessions, so only
+  sessions that change from now on are captured until it is reset with
+  `revien sync reset claude-code`.
 - **Auto-sync fires immediately at daemon startup**, then every interval — no more
   silent 6-hour wait before the first sync of connected adapters.
 - **Pre-existing duplicate session contexts stop growing.** The first keyed ingest of a

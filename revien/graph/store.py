@@ -11,7 +11,7 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
@@ -306,6 +306,8 @@ class GraphStore:
         self._migrate_add_origin_columns(conn)
         # recorded_at_source backfill (user_version 4); needs origin columns.
         self._migrate_backfill_recorded_at_source(conn)
+        # Usage layer (user_version 5): ALL of its DDL lives in one guard.
+        self._migrate_add_usage_layer(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -536,6 +538,102 @@ class GraphStore:
                          (json.dumps(meta), node_id))
         conn.execute("PRAGMA user_version = 4")
         self._commit(conn)
+
+    # Migration 005 — usage layer. This is the ONLY place the usage layer's
+    # DDL lives; _ensure_db does not create these objects inline. Fresh and
+    # existing databases take the same path.
+    _USAGE_LAYER_DDL = """
+        -- Usage ledger (N1, metacognition tier 1): one row per judgment of
+        -- whether an answer actually drew on a memory it was handed by
+        -- recall. episode_key = "{session source_id}#{tool_use_id}". The
+        -- UNIQUE pair makes a rescan of a grown session a no-op, and the
+        -- INSERT OR IGNORE claim is what decides who may apply, so two
+        -- processes can never both count one use. Abstentions are not
+        -- judgments and are never written here. applied = 1 only when
+        -- mark_used ran (mode "apply"). shared_terms holds the memory's own
+        -- words, so delete_node removes a node's rows.
+        CREATE TABLE IF NOT EXISTS use_judgments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_key TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            used INTEGER NOT NULL,
+            reason TEXT DEFAULT '',
+            shared_terms TEXT DEFAULT '[]',
+            similarity REAL,
+            query TEXT DEFAULT '',
+            mode TEXT NOT NULL,
+            applied INTEGER NOT NULL DEFAULT 0,
+            judged_at TEXT NOT NULL,
+            UNIQUE (episode_key, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_use_judgments_node
+            ON use_judgments(node_id);
+
+        -- Recall receipts (N1, any runtime): a recall made with a receipt
+        -- gets a random recall_id the client hands back with its answer
+        -- (POST /v1/usage/observe). Ids only: node_ids is a JSON list, no
+        -- memory content; query is kept so words the client merely repeated
+        -- can be discounted. status: open -> redeemed, or open -> expired
+        -- after 24h unjudged. An expired row IS the flag: it stays until a
+        -- person dismisses it, so no recall vanishes unseen.
+        CREATE TABLE IF NOT EXISTS recall_receipts (
+            recall_id TEXT PRIMARY KEY,
+            runtime TEXT NOT NULL DEFAULT '',
+            query TEXT NOT NULL DEFAULT '',
+            node_ids TEXT NOT NULL DEFAULT '[]',
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_recall_receipts_status
+            ON recall_receipts(status, expires_at);
+
+        -- Per-database key/value facts. Today: the running daemons' heartbeats
+        -- (daemon_heartbeat:<pid> -> features, pid, time). No path, no
+        -- content.
+        CREATE TABLE IF NOT EXISTS store_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """
+
+    def _migrate_add_usage_layer(self, conn: sqlite3.Connection) -> None:
+        """Migration 005: usage ledger, recall receipts, store_meta and the
+        ``sync_cursors.generation`` fence column.
+
+        Idempotent and cheap on every connect: once ``PRAGMA user_version``
+        is >= 5 AND the schema in front of us really has every object, it
+        returns after a handful of catalogue reads. A marker never overrides
+        the schema (a table dropped out-of-band is recreated). Existing rows
+        are untouched: ``generation`` backfills 0 on every cursor row.
+        """
+        try:
+            have = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name IN "
+                "('use_judgments','recall_receipts','store_meta',"
+                "'idx_use_judgments_node','idx_recall_receipts_status')")}
+            cursor_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(sync_cursors)")}
+            complete = len(have) == 5 and "generation" in cursor_cols
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= 5 and complete:
+                return
+            conn.executescript(self._USAGE_LAYER_DDL)
+            if "generation" not in cursor_cols:
+                conn.execute(
+                    "ALTER TABLE sync_cursors ADD COLUMN generation "
+                    "INTEGER NOT NULL DEFAULT 0")
+            if version < 5:
+                conn.execute("PRAGMA user_version = 5")
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            # Swallow ONLY the idempotency race (another opener got there
+            # first). Anything else must be loud at startup.
+            if "duplicate column name" in str(e) or "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
 
     def _migrate_add_origin_columns(self, conn: sqlite3.Connection) -> None:
         """Add Origin Layer (WS0) columns to existing DBs, then backfill.
@@ -1278,21 +1376,34 @@ class GraphStore:
     # ── Adapter-sync cursors (repair leg R3) ───────────────────────────
     @_locked
     def get_sync_cursor(self, adapter_name: str) -> Optional[datetime]:
-        """Persisted sync position for one adapter. None = never synced —
-        the scheduler treats that as EPOCH (full history on first sync)."""
+        """Persisted sync position for one adapter. None = never synced (or
+        reset) — the scheduler treats that as EPOCH (full history)."""
+        return self.get_sync_state(adapter_name)[0]
+
+    @_locked
+    def get_sync_state(self, adapter_name: str) -> tuple:
+        """(cursor or None, generation). No row = (None, 0). A reset row
+        (blank cursor) = (None, generation). Read this BEFORE fetching and
+        pass the generation to ``set_sync_cursor_if_generation``."""
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            "SELECT cursor, generation FROM sync_cursors WHERE adapter_name = ?",
             (adapter_name,),
         ).fetchone()
         if row is None:
-            return None
-        return datetime.fromisoformat(row[0])
+            return (None, 0)
+        cursor = datetime.fromisoformat(row[0]) if row[0] else None
+        return (cursor, int(row[1] or 0))
+
+    @_locked
+    def get_sync_generation(self, adapter_name: str) -> int:
+        return self.get_sync_state(adapter_name)[1]
 
     @_locked
     def set_sync_cursor(self, adapter_name: str, cursor: datetime) -> None:
-        """Persist an adapter's sync position (upsert). Called only after a
-        fully successful sync — a failed/unhealthy sync never advances it."""
+        """Persist an adapter's sync position (upsert, unfenced; keeps the
+        row's generation). For callers that cannot be reset (usage observer).
+        The adapter scheduler uses ``set_sync_cursor_if_generation``."""
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
@@ -1303,6 +1414,340 @@ class GraphStore:
              datetime.now(timezone.utc).isoformat()),
         )
         self._commit(conn)
+
+    @_locked
+    def set_sync_cursor_if_generation(
+        self, adapter_name: str, cursor: datetime, expected_generation: int,
+    ) -> bool:
+        """Compare-and-set: persist the cursor only if the row's generation
+        still equals ``expected_generation`` (the one read before the fetch).
+        Returns False, writing nothing, when a reset happened in between.
+        Atomic in SQL, so it also fences a reset from another process.
+        Absent row is generation 0."""
+        conn = self._get_conn()
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
+            "WHERE adapter_name = ? AND generation = ?",
+            (cursor.isoformat(), now, adapter_name, expected_generation),
+        )
+        ok = cur.rowcount > 0
+        if not ok and expected_generation == 0:
+            # No row yet? INSERT OR IGNORE loses to any row that exists.
+            ins = conn.execute(
+                "INSERT OR IGNORE INTO sync_cursors "
+                "(adapter_name, cursor, updated_at, generation) "
+                "VALUES (?, ?, ?, 0)",
+                (adapter_name, cursor.isoformat(), now),
+            )
+            ok = ins.rowcount > 0
+        self._commit(conn)
+        return ok
+
+    @_locked
+    def list_sync_cursor_names(self) -> List[str]:
+        """Names of all adapters with a sync_cursors row (recorded state),
+        including rows left blank by a reset."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT adapter_name FROM sync_cursors ORDER BY adapter_name"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    @_locked
+    def reset_sync_cursor(self, adapter_name: str) -> Optional[bool]:
+        """Acknowledged reset: blank the cursor (next sync starts at EPOCH)
+        and BUMP the generation, so any sync already in flight fails its
+        compare-and-set and cannot write its older position back. Returns
+        None if the adapter has no row (nothing recorded, nothing changed),
+        else True if it held a real position, False if already blank."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+            (adapter_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        had_position = bool(row[0])
+        conn.execute(
+            "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
+            "updated_at = ? WHERE adapter_name = ?",
+            (datetime.now(timezone.utc).isoformat(), adapter_name),
+        )
+        self._commit(conn)
+        return had_position
+
+    @_locked
+    def delete_sync_cursor(self, adapter_name: str) -> bool:
+        """Remove one adapter's sync row outright. Not fenced: a stale writer
+        can re-create the row. ``reset_sync_cursor`` is the fenced reset;
+        this remains for housekeeping. Returns True if a row existed."""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM sync_cursors WHERE adapter_name = ?",
+            (adapter_name,),
+        )
+        deleted = cur.rowcount > 0
+        self._commit(conn)
+        return deleted
+
+    # ── store_meta (per-database key/value facts) ─────────
+
+    @_locked
+    def set_meta(self, key: str, value: str) -> None:
+        """Upsert one ``store_meta`` row (table created by migration 005)."""
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+        self._commit(conn)
+
+    @_locked
+    def get_meta(self, key: str) -> Optional[str]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT value FROM store_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    @_locked
+    def delete_meta(self, key: str) -> bool:
+        conn = self._get_conn()
+        cur = conn.execute("DELETE FROM store_meta WHERE key = ?", (key,))
+        self._commit(conn)
+        return cur.rowcount > 0
+
+    @_locked
+    def list_meta(self, prefix: str) -> Dict[str, str]:
+        """Every ``store_meta`` row whose key starts with ``prefix``."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT key, value FROM store_meta WHERE substr(key, 1, ?) = ?",
+            (len(prefix), prefix)).fetchall()
+        return {k: v for k, v in rows}
+
+    # ── Usage ledger (N1) ─────────────────────────────────
+
+    @_locked
+    def has_use_judgment(self, episode_key: str, node_id: str) -> bool:
+        """True when this (episode, node) pair has already been judged."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM use_judgments WHERE episode_key = ? AND node_id = ?",
+            (episode_key, node_id),
+        ).fetchone()
+        return row is not None
+
+    @_locked
+    def record_use_judgment(
+        self,
+        *,
+        episode_key: str,
+        node_id: str,
+        used: bool,
+        reason: str,
+        shared_terms: List[str],
+        similarity: Optional[float],
+        query: str,
+        mode: str,
+        applied: bool,
+    ) -> bool:
+        """Claim one judgment: INSERT OR IGNORE on the (episode_key, node_id)
+        pair. Returns True only for the caller whose insert landed — only that
+        caller may apply it, so a judgment is counted at most once even across
+        processes. Rows are never updated."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO use_judgments
+               (episode_key, node_id, used, reason, shared_terms, similarity,
+                query, mode, applied, judged_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (episode_key, node_id, int(bool(used)), reason,
+             json.dumps(list(shared_terms)), similarity, query, mode,
+             int(bool(applied)), datetime.now(timezone.utc).isoformat()),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
+    @_locked
+    def get_use_judgment(self, episode_key: str, node_id: str) -> Optional[Dict]:
+        """The ledger row for one (episode, memory) pair, or None. ``applied``
+        is 0 (not applied), 2 (an apply is in progress) or 1 (applied)."""
+        conn = self._get_conn()
+        r = conn.execute(
+            "SELECT used, mode, applied, reason, shared_terms, similarity "
+            "FROM use_judgments WHERE episode_key = ? AND node_id = ?",
+            (episode_key, node_id)).fetchone()
+        if r is None:
+            return None
+        return {"used": bool(r[0]), "mode": r[1], "applied": int(r[2]),
+                "reason": r[3] or "", "shared_terms": json.loads(r[4] or "[]"),
+                "similarity": r[5]}
+
+    @_locked
+    def claim_use_application(self, episode_key: str, node_id: str) -> bool:
+        """Take the right to apply one used judgment: applied 0 -> 2 in a
+        single UPDATE, so of any number of concurrent callers exactly one
+        gets True."""
+        conn = self._get_conn()
+        cur = conn.execute(
+            "UPDATE use_judgments SET applied = 2 WHERE episode_key = ? "
+            "AND node_id = ? AND used = 1 AND applied = 0",
+            (episode_key, node_id))
+        self._commit(conn)
+        return cur.rowcount == 1
+
+    @_locked
+    def finish_use_application(self, episode_key: str, node_id: str,
+                               ok: bool) -> None:
+        """After mark_used: 2 -> 1 on success, 2 -> 0 (claimable again) on
+        failure."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE use_judgments SET applied = ? WHERE episode_key = ? "
+            "AND node_id = ? AND applied = 2",
+            (1 if ok else 0, episode_key, node_id))
+        self._commit(conn)
+
+    @_locked
+    def list_use_judgments(
+        self, limit: int = 50, used: Optional[bool] = None
+    ) -> List[Dict]:
+        """Most recent judgments first. ``used`` filters to used/unused rows."""
+        conn = self._get_conn()
+        sql = ("SELECT episode_key, node_id, used, reason, shared_terms, "
+               "similarity, query, mode, applied, judged_at FROM use_judgments")
+        params: list = []
+        if used is not None:
+            sql += " WHERE used = ?"
+            params.append(int(used))
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "episode_key": r[0],
+                "node_id": r[1],
+                "used": bool(r[2]),
+                "reason": r[3] or "",
+                "shared_terms": json.loads(r[4] or "[]"),
+                "similarity": r[5],
+                "query": r[6] or "",
+                "mode": r[7],
+                "applied": r[8] == 1,
+                # 2 = an apply was claimed and never finished: mark_used may
+                # or may not have run, so it is neither applied nor not.
+                "apply_state": {1: "applied", 2: "unknown"}.get(r[8], "not_applied"),
+                "judged_at": r[9],
+            }
+            for r in rows
+        ]
+
+    # ── Recall receipts (N1, any runtime) ─────────────────
+
+    @staticmethod
+    def _receipt_row(r) -> Dict:
+        return {
+            "recall_id": r[0], "runtime": r[1] or "", "query": r[2] or "",
+            "node_ids": json.loads(r[3] or "[]"), "issued_at": r[4],
+            "expires_at": r[5], "status": r[6], "closed_at": r[7],
+        }
+
+    _RECEIPT_COLUMNS = ("recall_id, runtime, query, node_ids, issued_at, "
+                        "expires_at, status, closed_at")
+
+    @_locked
+    def add_recall_receipt(
+        self, *, recall_id: str, runtime: str, query: str,
+        node_ids: List[str], issued_at: datetime, expires_at: datetime,
+    ) -> None:
+        """Record one issued receipt (status open)."""
+        conn = self._get_conn()
+        conn.execute(
+            f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
+            (recall_id, runtime, query, json.dumps(list(node_ids)),
+             issued_at.isoformat(), expires_at.isoformat()),
+        )
+        self._commit(conn)
+
+    @_locked
+    def get_recall_receipt(self, recall_id: str) -> Optional[Dict]:
+        conn = self._get_conn()
+        row = conn.execute(
+            f"SELECT {self._RECEIPT_COLUMNS} FROM recall_receipts "
+            "WHERE recall_id = ?", (recall_id,),
+        ).fetchone()
+        return self._receipt_row(row) if row else None
+
+    @_locked
+    def close_recall_receipt(self, recall_id: str, status: str) -> bool:
+        """Move an OPEN receipt to ``status`` (redeemed). True only for the
+        caller whose update landed."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE recall_receipts SET status = ?, closed_at = ? "
+            "WHERE recall_id = ? AND status = 'open'",
+            (status, datetime.now(timezone.utc).isoformat(), recall_id),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
+    @_locked
+    def expire_recall_receipts(self, now: Optional[datetime] = None) -> int:
+        """Open receipts past their expiry become flags (status expired).
+        Never deleted. Returns how many were flagged now."""
+        now = now or datetime.now(timezone.utc)
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE recall_receipts SET status = 'expired', closed_at = ? "
+            "WHERE status = 'open' AND expires_at < ?",
+            (now.isoformat(), now.isoformat()),
+        )
+        self._commit(conn)
+        return cursor.rowcount
+
+    @_locked
+    def list_receipt_flags(self, include_dismissed: bool = False) -> List[Dict]:
+        """Receipts that expired unjudged, newest first."""
+        conn = self._get_conn()
+        statuses = ("expired", "dismissed") if include_dismissed else ("expired",)
+        marks = ", ".join("?" for _ in statuses)
+        rows = conn.execute(
+            f"SELECT {self._RECEIPT_COLUMNS} FROM recall_receipts "
+            f"WHERE status IN ({marks}) ORDER BY expires_at DESC", statuses,
+        ).fetchall()
+        return [self._receipt_row(r) for r in rows]
+
+    @_locked
+    def dismiss_receipt_flag(self, recall_id: str) -> bool:
+        """A person has seen an expired-unjudged flag. Kept, marked dismissed."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "UPDATE recall_receipts SET status = 'dismissed' "
+            "WHERE recall_id = ? AND status = 'expired'", (recall_id,),
+        )
+        self._commit(conn)
+        return cursor.rowcount == 1
+
+    @_locked
+    def use_judgment_counts(self) -> Dict[str, int]:
+        """Totals over the whole ledger: judged, used, unused, applied, and
+        apply_unknown (a separate bucket, not part of applied)."""
+        conn = self._get_conn()
+        judged, used, applied, unknown = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(used), 0), COALESCE(SUM(applied = 1), 0), "
+            "COALESCE(SUM(applied = 2), 0) FROM use_judgments"
+        ).fetchone()
+        return {
+            "judged": int(judged),
+            "used": int(used),
+            "unused": int(judged) - int(used),
+            "applied": int(applied),
+            # claimed for apply and never finished (in progress, or the
+            # process died): mark_used may have run. Not counted as applied.
+            "apply_unknown": int(unknown),
+        }
 
     @_locked
     def find_context_node_by_ingest_key(
@@ -1493,6 +1938,21 @@ class GraphStore:
                 "DELETE FROM edges WHERE source_node_id = ? OR target_node_id = ?",
                 (node_id, node_id),
             )
+            # Usage judgments keep the memory's own words (shared_terms), so
+            # they go with it — right-to-forget runs through here, and its
+            # promise is that the content is actually gone.
+            conn.execute("DELETE FROM use_judgments WHERE node_id = ?", (node_id,))
+            # Receipts hold only ids, but a forgotten node's id should not
+            # linger in an open receipt or a flag either.
+            for recall_id, raw in conn.execute(
+                "SELECT recall_id, node_ids FROM recall_receipts "
+                "WHERE node_ids LIKE ?", (f'%"{node_id}"%',),
+            ).fetchall():
+                remaining = [n for n in json.loads(raw or "[]") if n != node_id]
+                conn.execute(
+                    "UPDATE recall_receipts SET node_ids = ? WHERE recall_id = ?",
+                    (json.dumps(remaining), recall_id),
+                )
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
             self._discard_pending_stmt(conn, node_id)
@@ -2128,6 +2588,10 @@ class GraphStore:
                 # when the semantic index is rebuilt wholesale below.
                 conn.execute("DELETE FROM edges")
                 conn.execute("DELETE FROM nodes")
+                # Same promise as delete_node: judgments carry the removed
+                # memories' own words, receipts their ids.
+                conn.execute("DELETE FROM use_judgments")
+                conn.execute("UPDATE recall_receipts SET node_ids = '[]'")
                 self._discard_pending_stmt(conn)
             for node in new_nodes:
                 self.add_node(node)  # rides this transaction; audit included

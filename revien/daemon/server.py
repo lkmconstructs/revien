@@ -3,6 +3,7 @@ Revien REST API Server — FastAPI application exposing all Revien endpoints.
 Runs as local daemon on port 7437 or as hosted service.
 """
 
+import asyncio
 import time
 import os
 from contextlib import asynccontextmanager
@@ -16,6 +17,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from revien import __version__, pairing
+from revien.daemon.heartbeat import (
+    DAEMON_FEATURES, HEARTBEAT_INTERVAL, clear_heartbeat, write_heartbeat)
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -92,6 +95,21 @@ class RecallRequest(BaseModel):
     # origin_runtime values (e.g. "claude-code", or ["claude-code", "codex"]).
     # None (default): no filtering, response byte-identical.
     source: Optional[Union[str, List[str]]] = None
+    # Usage signal (N1): issue a receipt for this recall. The response gains
+    # recall_id + receipt_expires_at; hand recall_id back with the answer to
+    # POST /v1/usage/observe within 24h, or it is flagged. False (default):
+    # response byte-identical.
+    receipt: bool = False
+    # Who is recalling, recorded on the receipt (e.g. "langchain", "api").
+    runtime: Optional[str] = None
+
+
+class ObserveRequest(BaseModel):
+    recall_id: str
+    answer: str
+    # The prompt the recall served, if the client has it: its words are
+    # discounted as evidence, same as the query's.
+    prompt: str = ""
 
 
 class NodeUpdateRequest(BaseModel):
@@ -151,6 +169,10 @@ class HealthResponse(BaseModel):
     edge_count: int
     uptime_seconds: float
     version: str
+    # What this daemon can do (revien/daemon/heartbeat.py:DAEMON_FEATURES).
+    # A daemon from before fencing has no such field, which is how
+    # `revien sync reset` recognises it. Names only: no path, no id.
+    features: List[str] = []
 
 
 class SyncResponse(BaseModel):
@@ -323,6 +345,16 @@ def _mcp_http_enabled() -> bool:
 
 # ── App Factory ───────────────────────────────────────────
 
+async def _heartbeat_loop(store) -> None:
+    """Write the daemon heartbeat now and every HEARTBEAT_INTERVAL seconds."""
+    while True:
+        try:
+            write_heartbeat(store)
+        except Exception:  # noqa: BLE001 - never take the daemon down
+            pass
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -372,6 +404,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         scheduler = getattr(app.state, "scheduler", None)
         if scheduler is not None and not scheduler.is_running:
             scheduler.start()
+        # A daemon (the app has a scheduler) says so in the database it
+        # serves, so an operation that depends on fencing can tell. Refreshed
+        # while it runs, removed on a clean exit. Best effort: a failure here
+        # never stops the daemon.
+        beat_task = None
+        if scheduler is not None:
+            beat_task = asyncio.ensure_future(_heartbeat_loop(store))
         # The MCP session manager needs a running task group for the life of
         # the app. Mounted sub-app lifespans don't run under Starlette, so it
         # is wired here. No-op when MCP is off.
@@ -391,6 +430,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # the db file handle when a TestClient exits: without it, the
             # connection create_app opened lived until GC and Windows
             # refused the temp-db unlink (WinError 32).
+            if beat_task is not None:
+                beat_task.cancel()
+                clear_heartbeat(store)
             scheduler = getattr(app.state, "scheduler", None)
             if scheduler is not None:
                 scheduler.stop()
@@ -501,8 +543,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/recall ───────────────────────────────
 
     @app.post("/v1/recall")
-    async def recall(request: RecallRequest):
+    async def recall(request: RecallRequest, http_request: Request):
         """Query memory. Returns ranked nodes by three-factor score."""
+        if request.receipt:
+            # A receipt writes a row (and can become a flag), so it takes the
+            # same gate as other writes; plain recall stays ungated.
+            require_mutation_auth(
+                http_request.client.host if http_request.client else "",
+                http_request.headers.get("authorization", ""),
+            )
         if request.format not in ("json", "toon"):
             raise HTTPException(400, f"Invalid format (json|toon expected): {request.format}")
         # Shared validation core — blank query, out-of-range top_n (reject,
@@ -570,6 +619,32 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             # this query. Always present, possibly [].
             "skill_proposals": response.skill_proposals,
         }
+        from revien.usage.observer import usage_mode
+
+        if request.receipt and usage_mode() == "off":
+            # REVIEN_USAGE=off: nothing will judge it, so a receipt would only
+            # expire into a false flag.
+            payload["recall_id"] = None
+            payload["receipt_expires_at"] = None
+            payload["receipt_note"] = ("no receipt issued: the usage signal is "
+                                       "off (REVIEN_USAGE=off)")
+        elif request.receipt and not response.results:
+            # Nothing was recalled, so nothing could be used: a receipt would
+            # only expire into a meaningless flag.
+            payload["recall_id"] = None
+            payload["receipt_expires_at"] = None
+            payload["receipt_note"] = ("no receipt issued: the recall "
+                                       "returned no results")
+        elif request.receipt:
+            from revien.usage import UsageObserver
+
+            issued = UsageObserver(store, mode="shadow").issue_receipt(
+                query=response.query,
+                node_ids=[r.node_id for r in response.results],
+                runtime=(request.runtime or "api").strip() or "api",
+            )
+            payload["recall_id"] = issued.recall_id
+            payload["receipt_expires_at"] = issued.expires_at.isoformat()
         if request.format == "toon":
             # Same payload, TOON wire format (LEG P2). text/toon is the
             # spec's provisional media type. The json path above is
@@ -845,6 +920,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             edge_count=store.count_edges(),
             uptime_seconds=round(time.time() - start_time, 2),
             version=__version__,
+            features=list(DAEMON_FEATURES),
         )
 
     # ── POST /v1/sync ─────────────────────────────────
@@ -892,6 +968,33 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, f"Node not found: {request.node_id}")
         engine.mark_used(request.node_id, request.query)
         return {"status": "marked", "node_id": request.node_id}
+
+    # ── POST /v1/usage/observe ─────────────────────────
+
+    @app.post("/v1/usage/observe", dependencies=[_mutation_auth])
+    async def usage_observe(request: ObserveRequest):
+        """Hand back the answer a receipted recall served. Judges each memory
+        on the receipt (both signals must agree) and returns how each was
+        handled. Shadow records only; REVIEN_USAGE=apply counts uses."""
+        from revien.usage import ReceiptError, UsageObserver
+
+        try:
+            result = UsageObserver(
+                store, engine=engine, semantic=semantic,
+            ).observe_answer(request.recall_id, request.answer, request.prompt)
+        except ReceiptError as e:
+            status = {"unknown": 404, "expired": 410, "already_redeemed": 409,
+                      "already_closed": 409, "empty_answer": 400}.get(e.code, 400)
+            raise HTTPException(status, {"code": e.code, "detail": str(e)})
+        return result.model_dump(mode="json")
+
+    # ── GET /v1/usage/flags ────────────────────────────
+
+    @app.get("/v1/usage/flags", dependencies=[_mutation_auth])
+    async def usage_flags(include_dismissed: bool = Query(False)):
+        """Recalls whose receipt expired unjudged. Kept until dismissed."""
+        store.expire_recall_receipts()
+        return {"flags": store.list_receipt_flags(include_dismissed)}
 
     # ── GET /v1/training/stats ─────────────────────────
 

@@ -1039,6 +1039,11 @@ def status(db: Optional[str]):
             "ONNX Runtime telemetry: "
             + ("disabled" if ort_telemetry_state() else "not applicable")
         )
+        store.expire_recall_receipts()
+        flags = len(store.list_receipt_flags())
+        if flags:
+            click.echo(f"Usage flags: {flags} recall(s) expired unjudged "
+                       "(revien usage flags)")
     finally:
         store.close()
 
@@ -1578,6 +1583,493 @@ def skills_decline(node_id: str, db: Optional[str]):
         click.echo(f"Declined ({declines}x) and invalidated: {node.label}")
     else:
         click.echo(f"Declined ({declines}x): {node.label}")
+
+
+@main.group()
+def sync():
+    """Control adapter sync positions."""
+    pass
+
+
+# Columns a Revien database must have in the tables it always creates. A
+# table of the same name with other columns means a foreign database.
+# The complete column sets of the oldest real Revien database (commit
+# 7757085, 0.3.0) for nodes, edges and audit_log; later versions only add
+# columns and tables. sync_cursors appeared later, so it is checked only when
+# present. A file missing any of these is not a Revien database.
+_REVIEN_TABLE_COLUMNS = {
+    "nodes": {
+        "node_id", "node_type", "label", "content", "source_id", "created_at",
+        "last_accessed", "access_count", "metadata", "source_type",
+        "confidence", "pinned", "confidence_set_at", "confidence_set_by",
+        "source_context", "last_referenced", "invalidated_at",
+        "source_modality", "answerable_by_text", "vision_processed",
+        "recorded_at", "event_time_start", "event_time_end",
+        "event_time_granularity", "event_time_confidence", "event_time_text",
+        "valid_from", "valid_until",
+    },
+    "edges": {
+        "edge_id", "edge_type", "source_node_id", "target_node_id", "weight",
+        "created_at", "metadata", "confidence", "confidence_set_at",
+        "confidence_set_by", "source_context",
+    },
+    "audit_log": {"id", "node_id", "op", "actor", "ts", "before_json",
+                  "after_json"},
+    "sync_cursors": {"adapter_name", "cursor", "updated_at"},
+}
+_REVIEN_REQUIRED_TABLES = {"nodes", "edges", "audit_log"}
+
+
+def _readonly_uri(p: Path) -> str:
+    """SQLite URI for a read that changes nothing on disk. A WAL-mode file
+    opened plain read-only still CREATES -wal/-shm sidecars, so when no -wal
+    file exists the file is opened immutable (no locks, no sidecars; with no
+    -wal file the main file holds everything). When a -wal file exists (an
+    open or crashed WAL database) it is opened read-only instead, because
+    recent data lives in the WAL and immutable would not see it."""
+    import urllib.parse
+    resolved = p.resolve()
+    quoted = urllib.parse.quote(str(resolved))
+    wal = Path(str(resolved) + "-wal")
+    if wal.exists():
+        return "file:" + quoted + "?mode=ro"
+    return "file:" + quoted + "?mode=ro&immutable=1"
+
+
+def _sqlite_problem(db_path: str) -> Optional[str]:
+    """One-line reason this path cannot be a Revien database, else None.
+    Checked BEFORE opening a GraphStore, which would write a full schema into
+    an empty or foreign file.
+
+    A SQLite header alone is not enough (any app's database has one), so the
+    file is opened READ-ONLY (see ``_readonly_uri``: it cannot be written and
+    creates no journal, -wal or -shm file, even for a WAL-mode database) and
+    its own catalog is read: it must hold the
+    ``nodes``, ``edges`` and ``audit_log`` tables every Revien version has,
+    each with every column the oldest real version has. ``sync_cursors``,
+    added later, is checked only when present."""
+    import sqlite3
+
+    p = Path(db_path)
+    if not p.exists():
+        return "No Revien database found. Run 'revien start' first."
+    if p.is_dir():
+        return f"{db_path} is a directory, not a Revien database."
+    try:
+        with open(p, "rb") as f:
+            head = f.read(16)
+    except OSError as e:
+        return f"Cannot read {db_path}: {e.strerror or e}"
+    if not head:
+        return f"{db_path} is empty, not a Revien database."
+    if head != b"SQLite format 3\x00":
+        return f"{db_path} is not a SQLite database."
+    uri = _readonly_uri(p)
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not _REVIEN_REQUIRED_TABLES <= tables:
+                return (f"{db_path} is a SQLite database but not a Revien "
+                        "database (no nodes/edges/audit_log tables). "
+                        "Not touching it.")
+            for table, wanted in _REVIEN_TABLE_COLUMNS.items():
+                if table not in tables:
+                    continue
+                have = {r[1] for r in conn.execute(
+                    f"PRAGMA table_info({table})")}
+                if not wanted <= have:
+                    return (f"{db_path} has a '{table}' table that is not "
+                            "Revien's, so it is not a Revien database. "
+                            "Not touching it.")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        return f"Cannot read {db_path}: {e}"
+    except sqlite3.DatabaseError:
+        return f"{db_path} is not a SQLite database."
+    return None
+
+
+@sync.command(name="reset")
+@click.argument("adapter_name")
+@click.option("--db", default=None, help="Database path")
+@click.option("--orphaned", is_flag=True,
+              help="Reset a saved sync position whose adapter is no longer in "
+                   "your config (only works when a saved position exists)")
+@click.option("--daemon-url", default="http://127.0.0.1:7437",
+              help="Where to look for a running daemon (loopback addresses "
+                   "only; default http://127.0.0.1:7437)")
+def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
+               daemon_url: str):
+    """Clear a connected adapter's sync position so its next sync re-reads
+    its full history (for example 'revien sync reset claude-code').
+
+    Only adapters that tag every item with a stable key (claude-code, codex)
+    can be reset: their sessions are refreshed in place, not duplicated, so
+    the reset is safe to repeat. Other adapters would ingest everything again
+    as new nodes, so they are refused. Nothing is deleted from the graph.
+    A sync already running in a current daemon when you reset cannot undo
+    the reset: its newer position is discarded. A daemon started before
+    this protection existed cannot do that, so the reset is refused while
+    one is running ("restart required"): it checks the daemon heartbeats in
+    the database and asks the daemon at --daemon-url for /v1/health. No
+    daemon answering means nothing to restart. The new position is used at
+    the next sync (default every 6 hours).
+
+    --orphaned resets a saved position whose adapter was removed from your
+    config. Its type cannot be checked, so the reset is allowed only because
+    a saved position exists."""
+    import sqlite3
+
+    from revien.adapters import (
+        _ADAPTER_CLASSES, adapter_type_rereads_idempotently)
+    from revien.graph.store import GraphStore
+
+    if adapter_name.startswith("usage:"):
+        click.echo(f"'{adapter_name}' is the usage observer's position, not an "
+                   "adapter. To rescan, run 'revien usage scan --full'.")
+        raise SystemExit(1)
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    problem = _sqlite_problem(db_path)
+    if problem:
+        click.echo(problem)
+        raise SystemExit(1)
+
+    adapters = config.get("adapters") or {}
+    connected = list(adapters.keys())
+    entry = adapters.get(adapter_name)
+    connected_txt = ", ".join(sorted(connected)) or "none"
+
+    # Everything that can be decided from the config and a read-only look at
+    # the database is decided BEFORE a GraphStore is opened: opening one
+    # migrates (writes to) the database, and a mistyped name must not do that.
+    if entry is None:
+        if not orphaned:
+            if _has_sync_row(db_path, adapter_name):
+                click.echo(
+                    f"'{adapter_name}' has a saved sync position but is not a "
+                    "connected adapter in your config, so its type cannot be "
+                    "checked and it is not reset. Connected adapters: "
+                    f"{connected_txt}. Connect it again ('revien connect'), "
+                    "use one of those names, or re-run with --orphaned to "
+                    "reset the saved position anyway.")
+            else:
+                click.echo(f"No connected adapter named '{adapter_name}'. "
+                           f"Connected adapters: {connected_txt}.")
+            raise SystemExit(1)
+        if not _has_sync_row(db_path, adapter_name):
+            click.echo(f"No saved sync position for '{adapter_name}', so "
+                       "--orphaned has nothing to reset. Connected adapters: "
+                       f"{connected_txt}. Nothing was changed.")
+            raise SystemExit(1)
+    else:
+        if orphaned:
+            click.echo(f"'{adapter_name}' is a connected adapter, so "
+                       "--orphaned does not apply. Run the command without it.")
+            raise SystemExit(1)
+        atype = entry.get("type", "") if isinstance(entry, dict) else None
+        if not isinstance(atype, str) or atype not in _ADAPTER_CLASSES:
+            click.echo(
+                f"Cannot reset '{adapter_name}': its config entry has "
+                + ("no usable 'type'" if not atype or not isinstance(atype, str)
+                   else f"unknown type '{atype}'")
+                + " (known types: " + ", ".join(sorted(_ADAPTER_CLASSES))
+                + "). Fix the entry in the config file. Nothing was changed.")
+            raise SystemExit(1)
+        if not adapter_type_rereads_idempotently(atype):
+            click.echo(
+                f"Refusing to reset '{adapter_name}': its items carry no stable "
+                "key, so a full re-read would add everything again as new "
+                "nodes instead of refreshing them. Only claude-code and codex "
+                "adapters can be reset.")
+            raise SystemExit(1)
+
+    # A reset is only safe against a daemon that fences its sync positions.
+    # Decided before anything is written (and before a GraphStore migrates).
+    old = _old_daemon_problem(db_path, daemon_url)
+    if old:
+        click.echo(old)
+        click.echo("Nothing was changed.")
+        raise SystemExit(1)
+
+    try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        had_position = store.reset_sync_cursor(adapter_name)
+    except sqlite3.Error as e:
+        click.echo(f"Database error: {e}")
+        raise SystemExit(1)
+    finally:
+        store.close()
+
+    if had_position is None:
+        click.echo(f"'{adapter_name}' has no saved sync position, so its next "
+                   "sync already reads its full history. Nothing to reset.")
+        return
+    if not had_position:
+        click.echo(f"'{adapter_name}' was already reset; its next sync reads "
+                   "its full history. The reset was recorded again.")
+    else:
+        click.echo(f"Cleared the sync position for '{adapter_name}'.")
+    if orphaned:
+        click.echo("Its adapter type is unknown (it is not in your config). If "
+                   "you connect it again as anything other than claude-code or "
+                   "codex, its first sync adds everything as new nodes.")
+    click.echo("It takes effect at the next sync (default every 6 hours), "
+               "which re-reads the full history. Already captured sessions "
+               "are refreshed in place, not duplicated. Nothing was deleted.")
+    click.echo("A sync that is running right now in a current daemon cannot "
+               "undo this reset: when it finishes, its position is "
+               "discarded. If the daemon is not running, start it with "
+               "'revien start'.")
+
+
+def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
+    """Why an operation that depends on sync-reset fencing must not run now,
+    else None. Two independent sources:
+
+    * the heartbeats current daemons write into THIS database: a live one that
+      lacks the feature refuses;
+    * ONE loopback health check (revien/loopback_probe.py, the single pinned
+      module that may open a connection): an answer without a features list
+      is a daemon from before fencing. Whether it serves this database cannot
+      be told from its answer, so it refuses either way.
+
+    No heartbeat and no answer: no daemon is running, nothing to restart."""
+    from revien.daemon.heartbeat import RESET_REQUIRES, live_heartbeats_readonly
+    from revien.loopback_probe import probe_daemon
+
+    need = set(RESET_REQUIRES)
+    restart = ("Restart required: stop that daemon ('Ctrl+C' in its "
+               "terminal), start it again with 'revien start', then run this "
+               "command again.")
+    for beat in live_heartbeats_readonly(_readonly_uri(Path(db_path))):
+        if not need <= set(beat["features"]):
+            return ("A daemon (pid " + str(beat["pid"]) + ") is serving this "
+                    "database but does not protect a reset from a sync that "
+                    "is running. " + restart)
+    health = probe_daemon(daemon_url)
+    if health is None:
+        return None
+    if "rejected" in health:
+        return (f"--daemon-url {daemon_url!r} was not used ({health['rejected']}). "
+                "Only http://127.0.0.1:PORT (any 127.x.x.x), http://[::1]:PORT "
+                "or http://localhost:PORT can be checked, so the reset cannot "
+                "tell whether a daemon from before sync-reset protection is "
+                "running. Use a loopback --daemon-url.")
+    ver = health.get("version") or "unknown"
+    if health["features"] is None:
+        return (f"A Revien daemon answering at {daemon_url} (version {ver}) was "
+                "started before sync-reset protection existed. A sync it is "
+                "running would write its old position back and undo the "
+                "reset, and it cannot read a reset position. The answer does "
+                "not say which database it serves, so this is refused either "
+                "way. " + restart)
+    if not need <= set(health["features"]):
+        return (f"The daemon answering at {daemon_url} (version {ver}) does "
+                "not report sync-reset protection. " + restart)
+    return None
+
+
+def _has_sync_row(db_path: str, name: str) -> bool:
+    """True if sync_cursors holds a row for ``name``. Read-only (see
+    _readonly_uri): creates no files."""
+    import sqlite3
+
+    uri = _readonly_uri(Path(db_path))
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sync_cursors WHERE adapter_name = ?",
+                (name,)).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+@main.group()
+def usage():
+    """Did recalled memory actually get used? Judges each revien_recall in
+    your Claude Code sessions against the answer that followed it. Records
+    only (shadow) unless REVIEN_USAGE=apply."""
+    pass
+
+
+@usage.command(name="scan")
+@click.option("--db", default=None, help="Database path")
+@click.option("--path", "session_dir", default=None, type=click.Path(),
+              help="Claude Code projects directory (default: the connected "
+                   "adapter's, else auto-detect)")
+@click.option("--mode", type=click.Choice(["shadow", "apply"]), default=None,
+              help="Override REVIEN_USAGE for this run")
+@click.option("--full", is_flag=True,
+              help="Rescan every session, not only those changed since the "
+                   "last scan (safe: judged pairs are skipped)")
+@click.option("--json-output", is_flag=True, help="Output the report as JSON")
+def usage_scan(db: Optional[str], session_dir: Optional[str], mode: Optional[str],
+               full: bool, json_output: bool):
+    """Judge recall episodes in Claude Code sessions."""
+    import json as _json
+    from revien.adapters.claude_code import ClaudeCodeAdapter
+    from revien.graph.store import GraphStore
+    from revien.retrieval.engine import RetrievalEngine
+    from revien.semantic.index import SemanticIndex
+    from revien.usage import UsageObserver
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+    if session_dir is None:
+        connected = (config.get("adapters") or {}).get("claude-code") or {}
+        session_dir = connected.get("session_dir")
+    adapter = ClaudeCodeAdapter(session_dir=session_dir)
+
+    store = GraphStore(db_path=db_path)
+    try:
+        semantic = SemanticIndex(store)
+        engine = RetrievalEngine(store, semantic=semantic)
+        report = UsageObserver(
+            store, engine=engine, semantic=semantic, mode=mode,
+        ).run_claude_code(adapter, full=full)
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(_json.dumps(report.model_dump(), indent=2))
+        return
+    click.echo(f"\nUsage scan ({report.mode}): {report.files_scanned} session "
+               f"file(s), {report.episodes} recall episode(s)\n")
+    click.echo(f"  judged    : {report.judged} new ({report.used} used, "
+               f"{report.unused} not used)")
+    click.echo(f"  abstained : {report.abstained}")
+    click.echo(f"  skipped   : {report.already_judged} already judged, "
+               f"{report.missing} no longer in the graph")
+    if report.mode == "apply":
+        click.echo(f"  applied   : {report.applied} use(s) counted")
+    else:
+        click.echo("  applied   : 0 (shadow records only; REVIEN_USAGE=apply "
+                   "or --mode apply to count uses)")
+    click.echo("  semantic  : " + ("active" if report.semantic_active else
+               "OFF - no similarity signal, so the rule abstains"))
+    click.echo()
+
+
+@usage.command(name="list")
+@click.option("--db", default=None, help="Database path")
+@click.option("--limit", default=20, show_default=True, help="Rows to show")
+@click.option("--filter", "which", type=click.Choice(["all", "used", "unused"]),
+              default="all", show_default=True, help="Which judgments to show")
+@click.option("--json-output", is_flag=True, help="Output rows as JSON")
+def usage_list(db: Optional[str], limit: int, which: str, json_output: bool):
+    """Show recent usage judgments with the evidence behind each."""
+    import json as _json
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        used = {"all": None, "used": True, "unused": False}[which]
+        rows = store.list_use_judgments(limit=limit, used=used)
+        counts = store.use_judgment_counts()
+        for row in rows:
+            node = store.get_node(row["node_id"])
+            row["label"] = node.label if node is not None else "(node no longer exists)"
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(_json.dumps({"counts": counts, "judgments": rows}, indent=2))
+        return
+    click.echo(f"\n{counts['judged']} judgment(s): {counts['used']} used, "
+               f"{counts['unused']} not used, {counts['applied']} applied"
+               + (f", {counts['apply_unknown']} apply unknown (in progress, "
+                  "or interrupted: mark_used may have run)"
+                  if counts["apply_unknown"] else "") + "\n")
+    for row in rows:
+        similarity = ("-" if row["similarity"] is None
+                      else f"{row['similarity']:.2f}")
+        verdict = "USED  " if row["used"] else "unused"
+        mark = "  [apply unknown]" if row["apply_state"] == "unknown" else ""
+        click.echo(f"  {verdict} sim={similarity} terms={len(row['shared_terms'])} "
+                   f"[{row['mode']}] {row['label'][:60]}{mark}")
+        if row["shared_terms"]:
+            click.echo(f"         shared: {', '.join(row['shared_terms'][:8])}")
+        click.echo(f"         query : {row['query'][:70]}")
+        if row["reason"]:
+            click.echo(f"         reason: {row['reason'][:70]}")
+    click.echo()
+
+
+@usage.command(name="flags")
+@click.option("--db", default=None, help="Database path")
+@click.option("--dismiss", "dismiss_id", default=None,
+              help="Mark one flag (by recall_id) as seen. Kept, not deleted.")
+@click.option("--all", "include_dismissed", is_flag=True,
+              help="Also show flags already dismissed")
+@click.option("--json-output", is_flag=True, help="Output flags as JSON")
+def usage_flags(db: Optional[str], dismiss_id: Optional[str],
+                include_dismissed: bool, json_output: bool):
+    """Recalls whose receipt expired before their answer was judged."""
+    import json as _json
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    if not Path(db_path).exists():
+        click.echo("No Revien database found. Run 'revien start' first.")
+        return
+
+    store = GraphStore(db_path=db_path)
+    try:
+        store.expire_recall_receipts()
+        if dismiss_id:
+            if store.dismiss_receipt_flag(dismiss_id):
+                click.echo(f"Dismissed {dismiss_id} (kept in the record).")
+            else:
+                click.echo(f"No open flag {dismiss_id}.")
+                sys.exit(1)
+            return
+        flags = store.list_receipt_flags(include_dismissed)
+        for flag in flags:
+            flag["labels"] = []
+            for node_id in flag["node_ids"]:
+                node = store.get_node(node_id)
+                flag["labels"].append(node.label if node is not None
+                                      else "(node no longer exists)")
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(_json.dumps({"flags": flags}, indent=2))
+        return
+    if not flags:
+        click.echo("No usage flags: every receipted recall was judged in time.")
+        return
+    click.echo(f"\n{len(flags)} recall(s) expired unjudged:\n")
+    for flag in flags:
+        status = " (dismissed)" if flag["status"] == "dismissed" else ""
+        click.echo(f"  {flag['recall_id']}{status}  runtime={flag['runtime']}  "
+                   f"expired {flag['expires_at'][:19]}")
+        click.echo(f"         query : {flag['query'][:70]}")
+        for label in flag["labels"][:8]:
+            click.echo(f"         memory: {label[:66]}")
+    click.echo()
 
 
 if __name__ == "__main__":

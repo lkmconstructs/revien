@@ -82,7 +82,9 @@ class RevienDaemon:
             # scheduler so `connect` -> `start` actually syncs. Malformed or
             # unknown entries are logged and skipped, never fatal.
             from revien.adapters import build_adapter_from_config
+            from revien.adapters.claude_code import ClaudeCodeAdapter
 
+            claude_adapter = None  # the usage observer below reads its sessions
             for name, entry in self.adapters.items():
                 adapter = build_adapter_from_config(entry)
                 if adapter is None:
@@ -92,6 +94,8 @@ class RevienDaemon:
                     )
                     continue
                 self._scheduler.register_adapter(name, adapter)
+                if isinstance(adapter, ClaudeCodeAdapter):
+                    claude_adapter = adapter
             if self._scheduler.list_adapters():
                 logger.info(
                     f"Live adapters: {', '.join(self._scheduler.list_adapters())} "
@@ -138,6 +142,40 @@ class RevienDaemon:
 
                     self._scheduler.add_interval_job(
                         "dream_consolidation", _dream, hours=interval,
+                    )
+
+            # Usage observer (N1) — STRICTLY OPT-IN, same gate as dream mode:
+            # unset env means it never runs unattended (`revien usage scan`
+            # is the manual path). Needs a connected Claude Code adapter. The
+            # mode is read from REVIEN_USAGE on every pass, default shadow.
+            usage_hours = os.environ.get("REVIEN_USAGE_INTERVAL_HOURS", "").strip()
+            if usage_hours:
+                try:
+                    usage_interval = float(usage_hours)
+                except ValueError:
+                    logger.warning(
+                        "REVIEN_USAGE_INTERVAL_HOURS=%r is not a number; "
+                        "usage observer NOT scheduled", usage_hours)
+                    usage_interval = 0.0
+                if usage_interval > 0 and claude_adapter is None:
+                    logger.warning(
+                        "REVIEN_USAGE_INTERVAL_HOURS is set but no Claude Code "
+                        "adapter is connected; usage observer NOT scheduled")
+                elif usage_interval > 0:
+                    from revien.usage import UsageObserver
+
+                    usage_state = self._app.state
+
+                    def _usage() -> None:
+                        observer = UsageObserver(
+                            usage_state.store, engine=usage_state.engine,
+                            semantic=usage_state.semantic,
+                        )
+                        report = observer.run_claude_code(claude_adapter)
+                        logger.info("usage pass: %s", report.model_dump())
+
+                    self._scheduler.add_interval_job(
+                        "usage_observer", _usage, hours=usage_interval,
                     )
 
             # Start uvicorn (blocking)

@@ -1146,3 +1146,19 @@ class SemanticIndex:
         except Exception as e:  # noqa: BLE001
             self._safe_disable(e)
             return []
+
+    def embed_texts(self, texts: Sequence[str]) -> Optional[List[List[float]]]:
+        """Embed arbitrary texts with the configured embedder, without touching
+        the vector table. One vector per input, in order. None when the layer
+        is disabled or on any runtime error (self-disabling, like search()).
+        Consumer: the usage observer, which compares a recalled memory with
+        the answer that followed it."""
+        if not self.is_enabled:
+            return None
+        if not texts:
+            return []
+        try:
+            return self._get_embedder().embed(list(texts))
+        except Exception as e:  # noqa: BLE001
+            self._safe_disable(e)
+            return None
