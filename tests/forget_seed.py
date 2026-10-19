@@ -45,6 +45,10 @@ class Seeded:
     extra: Dict = field(default_factory=dict)
     # Where a non-context node carries the secret, for single-node forgets.
     node_with_secret: Optional[str] = None
+    # Repeat the same capture against the same database (a sync after a
+    # cursor reset, a second import of the same export, ...). None for paths
+    # that cannot be repeated.
+    recapture: Optional[Callable[[], None]] = None
 
 
 def run_async(coro):
@@ -82,6 +86,16 @@ def node_holding(db: str, secret: str, not_type=NodeType.CONTEXT) -> Optional[st
     return None
 
 
+def _resync(db: str, name: str, adapter) -> None:
+    """A sync that reads the whole history again (the cursor is cleared)."""
+    store = GraphStore(db_path=db)
+    try:
+        store.delete_sync_cursor(name)
+    finally:
+        store.close()
+    _sync(db, name, adapter)
+
+
 def _sync(db: str, name: str, adapter) -> None:
     from revien.daemon.scheduler import SyncScheduler
     from revien.ingestion.pipeline import IngestionPipeline
@@ -103,7 +117,15 @@ def seed_pipeline(tmp: Path, secret: str) -> Seeded:
     out = IngestionPipeline(store).ingest(IngestionInput(
         source_id="app-notes", content=sentence(secret)))
     store.close()
-    return Seeded("pipeline", db, secret, [out.context_node_id], stable=False)
+
+    def again():
+        st = GraphStore(db_path=db)
+        IngestionPipeline(st).ingest(IngestionInput(
+            source_id="app-notes", content=sentence(secret)))
+        st.close()
+
+    return Seeded("pipeline", db, secret, [out.context_node_id], stable=False,
+                  recapture=again)
 
 
 def seed_rest(tmp: Path, secret: str) -> Seeded:
@@ -129,7 +151,15 @@ def seed_mcp(tmp: Path, secret: str) -> Seeded:
         ctx = json.loads(content[0].text)["context_node_id"]
     finally:
         close_mcp_server(server)
-    return Seeded("mcp", db, secret, [ctx], stable=False)
+    def again():
+        srv = build_mcp_server(db_path=db)
+        try:
+            asyncio.run(srv.call_tool("revien_store", {
+                "content": sentence(secret), "source_id": "mcp"}))
+        finally:
+            close_mcp_server(srv)
+
+    return Seeded("mcp", db, secret, [ctx], stable=False, recapture=again)
 
 
 def seed_cli(tmp: Path, secret: str) -> Seeded:
@@ -255,9 +285,11 @@ def seed_claude_code(tmp: Path, secret: str) -> Seeded:
     db = str(tmp / "claude.db")
     root = tmp / "claude"
     path = write_claude_session(root, secret, session_id="uuid-claude-1")
-    _sync(db, "claude-code", ClaudeCodeAdapter(session_dir=str(root / "projects")))
+    adapter = ClaudeCodeAdapter(session_dir=str(root / "projects"))
+    _sync(db, "claude-code", adapter)
     return Seeded("claude_code", db, secret, context_ids(db), source_file=path,
-                  file_backed=True, extra={"root": root})
+                  file_backed=True, extra={"root": root},
+                  recapture=lambda: _resync(db, "claude-code", adapter))
 
 
 def seed_codex(tmp: Path, secret: str) -> Seeded:
@@ -278,9 +310,11 @@ def seed_codex(tmp: Path, secret: str) -> Seeded:
                         "content": [{"type": kind, "text": text}]}}))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     _age(path)
-    _sync(db, "codex", CodexAdapter(session_dir=str(tmp / "codex" / "sessions")))
+    adapter = CodexAdapter(session_dir=str(tmp / "codex" / "sessions"))
+    _sync(db, "codex", adapter)
     return Seeded("codex", db, secret, context_ids(db), source_file=path,
-                  file_backed=True)
+                  file_backed=True,
+                  recapture=lambda: _resync(db, "codex", adapter))
 
 
 def seed_file_watcher(tmp: Path, secret: str) -> Seeded:
@@ -291,9 +325,11 @@ def seed_file_watcher(tmp: Path, secret: str) -> Seeded:
     path = d / "notes.md"
     path.write_text(f"Meeting notes. {sentence(secret)}\n", encoding="utf-8")
     _age(path)
-    _sync(db, "files", FileWatcherAdapter(watch_dir=str(d)))
+    adapter = FileWatcherAdapter(watch_dir=str(d))
+    _sync(db, "files", adapter)
     return Seeded("file_watcher", db, secret, context_ids(db), source_file=path,
-                  file_backed=True)
+                  file_backed=True,
+                  recapture=lambda: _resync(db, "files", adapter))
 
 
 def seed_obsidian(tmp: Path, secret: str) -> Seeded:
@@ -306,9 +342,11 @@ def seed_obsidian(tmp: Path, secret: str) -> Seeded:
                     f"We decided to use {secret} for the demo.\n",
                     encoding="utf-8")
     _age(path)
-    _sync(db, "vault", ObsidianVaultAdapter(vault_dir=str(vault)))
+    adapter = ObsidianVaultAdapter(vault_dir=str(vault))
+    _sync(db, "vault", adapter)
     return Seeded("obsidian", db, secret, context_ids(db), source_file=path,
-                  file_backed=True)
+                  file_backed=True,
+                  recapture=lambda: _resync(db, "vault", adapter))
 
 
 # ── permanent units (no file) ─────────────────────────────────────────
@@ -338,11 +376,14 @@ def seed_chatgpt_import(tmp: Path, secret: str) -> Seeded:
     db = str(tmp / "chatgpt.db")
     export = tmp / "conversations.json"
     _chatgpt_export(export, secret)
-    store = GraphStore(db_path=db)
-    run_import(chatgpt.iter_units(str(export)), IngestionPipeline(store))
-    store.close()
+    def again():
+        st = GraphStore(db_path=db)
+        run_import(chatgpt.iter_units(str(export)), IngestionPipeline(st))
+        st.close()
+
+    again()
     return Seeded("chatgpt", db, secret, context_ids(db), file_backed=False,
-                  extra={"export": export})
+                  extra={"export": export}, recapture=again)
 
 
 def seed_claude_import(tmp: Path, secret: str) -> Seeded:
@@ -361,11 +402,14 @@ def seed_claude_import(tmp: Path, secret: str) -> Seeded:
              "text": f"Noted. We decided to use {secret} as the codename.",
              "content": [{"type": "text", "text": f"Noted. We decided to use {secret} as the codename."}]}]}]),
         encoding="utf-8")
-    store = GraphStore(db_path=db)
-    run_import(claude.iter_units(str(export)), IngestionPipeline(store))
-    store.close()
+    def again():
+        st = GraphStore(db_path=db)
+        run_import(claude.iter_units(str(export)), IngestionPipeline(st))
+        st.close()
+
+    again()
     return Seeded("claude_import", db, secret, context_ids(db),
-                  extra={"export": export})
+                  extra={"export": export}, recapture=again)
 
 
 def seed_readwise_import(tmp: Path, secret: str) -> Seeded:
@@ -378,11 +422,14 @@ def seed_readwise_import(tmp: Path, secret: str) -> Seeded:
         "Highlight,Book Title,Book Author,Amazon Book ID,Note,Color,Tags,Location Type,Location,Highlighted at,Document tags\n"
         f"\"My safe code is {secret}. We decided to use {secret}.\",Safe Book,Some Author,,,,,page,12,2026-07-01 10:00:00,\n",
         encoding="utf-8")
-    store = GraphStore(db_path=db)
-    run_import(readwise.iter_units(str(export)), IngestionPipeline(store))
-    store.close()
+    def again():
+        st = GraphStore(db_path=db)
+        run_import(readwise.iter_units(str(export)), IngestionPipeline(st))
+        st.close()
+
+    again()
     return Seeded("readwise", db, secret, context_ids(db),
-                  extra={"export": export})
+                  extra={"export": export}, recapture=again)
 
 
 def seed_openai_adapter(tmp: Path, secret: str) -> Seeded:
@@ -392,10 +439,13 @@ def seed_openai_adapter(tmp: Path, secret: str) -> Seeded:
     _chatgpt_export(export, secret)
     conv = json.loads(export.read_text())[0]
     export.write_text(json.dumps(conv), encoding="utf-8")
-    with OpenAIAdapter(graph_path=db) as a:
-        a.ingest_conversation(str(export))
+    def again():
+        with OpenAIAdapter(graph_path=db) as a:
+            a.ingest_conversation(str(export))
+
+    again()
     return Seeded("openai_adapter", db, secret, context_ids(db),
-                  extra={"export": export})
+                  extra={"export": export}, recapture=again)
 
 
 def seed_import_graph(tmp: Path, secret: str) -> Seeded:
@@ -423,11 +473,17 @@ def seed_skill(tmp: Path, secret: str) -> Seeded:
     path.write_text(
         "---\nname: deploy\ndescription: Deploy the thing\ntriggers: [deploy]\n---\n"
         f"Use the code {secret} to unlock the release.\n", encoding="utf-8")
+    def again():
+        st = GraphStore(db_path=db)
+        ingest_roots(st, paths=[str(root)])
+        st.close()
+
+    again()
     store = GraphStore(db_path=db)
-    ingest_roots(store, paths=[str(root)])
     ids = [n.node_id for n in store.list_nodes(node_type=NodeType.SKILL, limit=10)]
     store.close()
-    return Seeded("skill", db, secret, ids, source_file=path, file_backed=True)
+    return Seeded("skill", db, secret, ids, source_file=path, file_backed=True,
+                  recapture=again)
 
 
 def seed_vault_reconcile(tmp: Path, secret: str) -> Seeded:

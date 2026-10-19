@@ -482,7 +482,11 @@ class ForgetEngine:
         problems = self._purge_vectors(gone + changed_ids + cut_ids)
         training = self._scrub_training(gone, strings)
         if self.clustering is not None:
+            # The detector keeps community labels in memory. A graph too small
+            # to cluster returns before it rebuilds, so drop them first.
             try:
+                self.clustering._communities.clear()
+                self.clustering._node_to_community.clear()
                 self.clustering.run()
             except Exception:  # noqa: BLE001 - never fail a forget on this
                 pass

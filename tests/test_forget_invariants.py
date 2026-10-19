@@ -37,7 +37,9 @@ def _forget(seeded, planted=None, cascade=True):
 def test_secret_is_gone_from_every_surface_after_a_forget(path, tmp_path, monkeypatch):
     """Invariant 1."""
     if path == "langchain":
-        pytest.importorskip("langchain_core")
+        from revien.adapters.langchain_adapter import LANGCHAIN_AVAILABLE
+        if not LANGCHAIN_AVAILABLE:
+            pytest.skip("langchain-core is not installed")
     seeded = fs.seed(path, tmp_path, monkeypatch)
     secret = seeded.secret
     handle_ids = list(seeded.ctx_ids) or [seeded.node_with_secret]
@@ -146,3 +148,24 @@ def test_no_api_surface_shows_the_secret_after_a_forget(path, tmp_path, monkeypa
             r = client.post("/v1/recall", json={
                 "query": "safe code codename", "format": fmt, "include_context": True})
             assert seeded.secret not in r.text, fmt
+
+
+def test_community_labels_held_in_memory_do_not_keep_a_forgotten_label(tmp_path):
+    """/v1/communities reads labels the community detector keeps in memory."""
+    db = str(tmp_path / "comm.db")
+    secret = fs.new_secret()
+    with TestClient(create_app(db_path=db)) as client:
+        ids = []
+        for i in range(4):
+            text = (f"User: We decided to use postgres for service{i}. "
+                    f"Our team lead Alice Smith owns service{i}.")
+            if i == 0:
+                text += f' The vault codename is "{secret}".'
+            r = client.post("/v1/ingest", json={"source_id": f"feed-{i}", "content": text})
+            ids.append(r.json()["context_node_id"])
+        client.post("/v1/cluster")
+        assert secret in client.get("/v1/communities").text   # the test sees it first
+        r = client.post(f"/v1/nodes/{ids[0]}/forget", json={"cascade": True})
+        assert r.status_code == 200, r.text
+        assert secret not in client.get("/v1/communities").text
+        assert secret not in client.get("/v1/graph").text
