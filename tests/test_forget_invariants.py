@@ -60,6 +60,21 @@ def test_secret_is_gone_from_every_surface_after_a_forget(path, tmp_path, monkey
     result, open_store = _forget(seeded, planted, keep_open=True)
     assert result["status"] == "forgotten", result
 
+    if path == "import_graph":
+        # A graph file carries no record of who wrote a node, so every node it
+        # brings is unproven (spec §3): kept and LISTED, untouched. What still
+        # holds the secret must be exactly what the response lists.
+        open_store.close()
+        s2 = GraphStore(db_path=seeded.db)
+        try:
+            holding = {n.node_id for n in s2.list_nodes(limit=1000)
+                       if secret in n.label + n.content}
+        finally:
+            s2.close()
+        assert holding and holding <= set(result["unproven"]), (holding, result["unproven"])
+        assert result["scope"] == "forgotten from Revien"
+        return
+
     # every table, decoded (JSON escapes non-ASCII and line breaks)
     conn = sqlite3.connect(seeded.db)
     try:
@@ -186,4 +201,19 @@ def test_a_trained_model_on_disk_is_named_not_hidden(tmp_path, monkeypatch):
     seeded = fs.seed("pipeline", tmp_path, monkeypatch)
     result = _forget(seeded)
     assert [l["kind"] for l in result["leftovers"]] == ["neural_model"]
+    assert result["scope"] == "forgotten from Revien"
+    assert result["model_stale"] is True
+    assert "POST /v1/training/run" in result["leftovers"][0]["note"]
+    assert "does not retrain on a schedule" in result["leftovers"][0]["note"]
+
+
+def test_gone_everywhere_is_said_only_when_it_is_true(tmp_path, monkeypatch):
+    seeded = fs.seed("pipeline", tmp_path, monkeypatch)
+    result = _forget(seeded)
+    assert result["leftovers"] == [] and result["remaining"] == {}
     assert result["scope"] == "gone everywhere"
+    assert result["message"].startswith("Gone everywhere.")
+    seeded = fs.seed("claude_code", tmp_path / "b", monkeypatch) if (tmp_path / "b").mkdir() is None else None
+    result = _forget(seeded)
+    assert result["leftovers"] and result["scope"] == "forgotten from Revien"
+    assert result["message"].startswith("Forgotten from Revien.")

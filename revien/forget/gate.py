@@ -110,7 +110,7 @@ def register(store, unit: UnitRef) -> None:
 
 def check(store, unit: UnitRef, content: str) -> Optional[Block]:
     """The first suppression record that forbids this capture, or None."""
-    records = store.list_suppressions("active")
+    records = store.list_suppressions("active", include_wording=True)
     if not records:
         return None
     fp = fingerprint(content) if content and content.strip() else None
@@ -123,6 +123,12 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
         by_fp = fp is not None and (
             fp in rec["content_fps"] or fp in rec["wording_fps"])
         if not (by_unit or by_key or by_fp):
+            continue
+        if rec["kind"] == "wording":
+            # A standing denylist entry, not a suppressed source: it blocks a
+            # capture only when the whole text is a forgotten text.
+            if by_fp:
+                return Block(rec, "the same text was forgotten")
             continue
         if rec["kind"] == "permanent":
             return Block(rec, "no file behind it, so suppressed for good")
@@ -144,29 +150,106 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
     return None
 
 
-def strip_forgotten(store, unit: UnitRef, content: str):
-    """After the gate lets a capture through, leave out the sentences a forget
-    removed from the SAME source.
-
-    A file that changed is new evidence (the gate lifted for it), but the
-    sentences the user forgot are still in it and have an identical keyed
-    fingerprint: "text with an identical fingerprint is never recaptured".
-    Scoped to the records that match this capture's unit or file, and to
-    sentences of at least ``scrub.MIN_SENTENCE`` characters, so a common
-    "Noted." is never touched. Returns (content, how many were left out)."""
-    from revien.forget import scrub
-
-    records = [r for r in store.list_suppressions("active") if r.get("sentence_fps")]
-    if not records or not content:
-        return content, 0
+def _known(store, unit: UnitRef):
+    """(global fingerprints, fingerprints scoped to this capture's source)."""
+    records = [r for r in store.list_suppressions("active", include_wording=True)
+               if r.get("sentence_fps") or r.get("short_fps")]
     verified = unit.path if (unit.path and is_real_file(unit.path)) else None
     keys = set(identity_keys(verified)) if verified else set()
-    known = set()
+    global_fps, scoped = set(), set()
     for rec in records:
+        global_fps |= set(rec["sentence_fps"])
         file_level = rec["unit_id"].startswith(FILE_LEVEL)
         if (unit.stable and rec["unit_id"] == unit.unit_id) or (
                 file_level and keys & set(rec["path_keys"])):
-            known |= set(rec["sentence_fps"])
-    if not known:
+            scoped |= set(rec["short_fps"])
+    return global_fps, scoped
+
+
+def strip_forgotten(store, unit: UnitRef, content: str):
+    """Leave forgotten sentences out of a capture. THE STANDING DENYLIST.
+
+    Forget is a rule, not a one-time subtraction: every sentence a forget cut
+    or removed (at least ``scrub.MIN_SENTENCE`` characters) is on a keyed,
+    content-free list, and a sentence with an identical fingerprint is left out
+    of ANY later capture, from any source (a copy of the file at a new path
+    with a line appended, another adapter, the API). Shorter fragments (down
+    to ``scrub.MIN_SHORT``) cannot be matched safely across sources, so they
+    are left out only of the source they were forgotten from, by its identity
+    (unit or file) together with their keyed fingerprint. Returns (content,
+    how many sentences were left out)."""
+    from revien.forget import scrub
+
+    if not content:
         return content, 0
-    return scrub.strip_sentences(content, lambda key: fingerprint(key) in known)
+    global_fps, scoped = _known(store, unit)
+    if not global_fps and not scoped:
+        return content, 0
+
+    def forgotten(key: str) -> bool:
+        fp = fingerprint(key)
+        if len(key) >= scrub.MIN_SENTENCE:
+            return fp in global_fps or fp in scoped
+        return fp in scoped
+
+    return scrub.strip_sentences(content, forgotten, min_len=scrub.MIN_SHORT)
+
+
+def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=()):
+    """The last word, said inside one write transaction.
+
+    A capture checks the gate before it extracts, and again before it writes,
+    but a forget can still land between that check and the commit (it can come
+    from another process, another connection). So after a capture has written,
+    this runs under BEGIN IMMEDIATE, which makes it take turns with a forget's
+    own write transaction: either the forget's denylist is visible here and
+    the capture is undone, or the forget has not committed yet and its removal
+    pass, which runs after the denylist is committed, finds what was written.
+    Either order, a forgotten sentence cannot stay. Returns the Block when the
+    whole capture was undone, else None. Nodes whose words were cut are
+    re-queued for embedding."""
+    from revien.forget import scrub
+
+    with store.transaction(immediate=True) as conn:
+        block = check(store, unit, content)
+        if block is not None:
+            for nid in new_ids:
+                store.delete_node(nid)
+            for nid in merged_ids:
+                store.delete_provenance(nid, [unit.owner])
+            return block
+        records = store.list_suppressions("active", include_wording=True)
+        if not records:
+            return None
+        global_fps, scoped = _known(store, unit)
+
+        def forgotten(key: str) -> bool:
+            fp = fingerprint(key)
+            if len(key) >= scrub.MIN_SENTENCE:
+                return fp in global_fps or fp in scoped
+            return fp in scoped
+
+        for nid in list(new_ids):
+            row = conn.execute(
+                "SELECT node_type, label, content FROM nodes WHERE node_id = ?",
+                (nid,)).fetchone()
+            if row is None:
+                continue
+            ntype, label, text = row
+            if ntype in ("context", "skill"):
+                new_text, n = scrub.strip_sentences(text, forgotten, min_len=scrub.MIN_SHORT)
+                if n:
+                    new_label, _ = scrub.strip_sentences(label, forgotten, min_len=scrub.MIN_SHORT)
+                    if not new_label.strip():
+                        first = next(iter(scrub.iter_sentences(new_text)), None)
+                        new_label = (first[2] if first else "[removed]")[:200]
+                    conn.execute(
+                        "UPDATE nodes SET content = ?, label = ? WHERE node_id = ?",
+                        (new_text, new_label[:200], nid))
+                    store._enqueue_embed_stmt(conn, nid)
+            elif text and len(scrub.sentence_key(text)) >= scrub.MIN_SHORT \
+                    and forgotten(scrub.sentence_key(text)):
+                store.delete_node(nid)
+    return None
+
+

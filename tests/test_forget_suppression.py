@@ -83,8 +83,19 @@ def test_shared_channels_are_eligible_for_recapture_and_say_so(path, tmp_path, m
     assert "eligible for recapture because the source supplied no stable item identity" in res["message"] \
         or "eligible for recapture because the source supplied no stable item identity" in res["blast_radius"]
     assert not has_secret(seeded)
+    # nothing can suppress the SOURCE, but the forgotten sentences are on the
+    # denylist: the same capture comes back without them
+    assert "denylist" in res["not_suppressed"][0]
     seeded.recapture()
-    assert has_secret(seeded)            # honest: nothing could stop it
+    texts = " ".join(n.content for n in _all_nodes(seeded.db))
+    assert f"my safe code is {seeded.secret}" not in texts
+    # a different statement about the same thing is not stopped
+    s2 = GraphStore(db_path=seeded.db)
+    from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
+    out = IngestionPipeline(s2).ingest(IngestionInput(
+        source_id="mcp", content=f"Please remember the vault {seeded.secret} too."))
+    s2.close()
+    assert out.suppressed is False and has_secret(seeded)
 
 
 class TestFileBackedUnitsLiftOnlyWhenTheFileChanges:
@@ -391,7 +402,7 @@ class TestPermanentUnits:
         try:
             assert store.list_suppressions("active") == []
             ops = [a for a in store.get_all_audit() if a["op"] == "restore"]
-            assert len(ops) == 1 and ops[0]["actor"] == "override:import"
+            assert len(ops) == 2 and {o["actor"] for o in ops} == {"override:import"}
         finally:
             store.close()
 

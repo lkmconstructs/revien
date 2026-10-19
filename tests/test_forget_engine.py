@@ -338,6 +338,6 @@ class TestUnprovenOwnership:
         assert store.get_node(ctx.node_id) is None
         assert store.get_node(fact.node_id) is not None            # kept, not deleted
         assert store.get_node(other.node_id) is not None
-        assert fact.node_id in res["unproven"]
+        assert fact.node_id in res["cut_back"] and fact.node_id not in res["unproven"]
         kept = store.get_node(fact.node_id)
         assert "ZEBRA77" not in kept.label + kept.content           # but scrubbed

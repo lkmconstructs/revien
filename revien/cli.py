@@ -1772,8 +1772,9 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
 
     Once you have forgotten something, a reset needs --yes: the full re-read
     shows every source to Revien again. Sources a forget suppressed stay out
-    until their file changes, but a source that changed since is captured
-    again, including any forgotten wording it still contains."""
+    until their file changes, and a source that changed since is captured
+    again minus the sentences that were forgotten (they stay on a keyed
+    denylist, whatever the source)."""
     import sqlite3
 
     from revien.adapters import (
@@ -1849,8 +1850,9 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
             f"This database has {forgets} forget record(s). A reset makes the "
             "next sync re-read every source in full. Sources a forget "
             "suppressed stay out until their file changes; a source that "
-            "has changed since is captured again, including any forgotten "
-            "wording it still contains. Re-run with --yes to reset anyway. "
+            "has changed since is captured again, minus the sentences that "
+            "were forgotten (kept out by their keyed fingerprint, from any "
+            "source). Re-run with --yes to reset anyway. "
             "Nothing was changed.")
         raise SystemExit(1)
 
@@ -2018,6 +2020,10 @@ def _has_sync_row(db_path: str, name: str) -> bool:
 @click.option("--cascade", is_flag=True,
               help="On a context node: forget the whole unit (session, "
                    "conversation, file) and everything only it wrote")
+@click.option("--everywhere", is_flag=True,
+              help="Also remove the wording from every other unit that holds "
+                   "it. Without it, a forget is per source and the response "
+                   "names the other units that still hold the wording")
 @click.option("--db", default=None, help="Database path")
 @click.option("--yes", "yes", is_flag=True, help="Do not ask before forgetting")
 @click.option("--preview", is_flag=True,
@@ -2026,7 +2032,7 @@ def _has_sync_row(db_path: str, name: str) -> bool:
               help="Where to look for a running daemon (loopback addresses "
                    "only; default http://127.0.0.1:7437)")
 @click.option("--json-output", is_flag=True, help="Output the result as JSON")
-def forget(node_id: str, cascade: bool, db: Optional[str], yes: bool,
+def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes: bool,
            preview: bool, daemon_url: str, json_output: bool):
     """Forget a node: privacy, not housekeeping.
 
@@ -2068,7 +2074,8 @@ def forget(node_id: str, cascade: bool, db: Optional[str], yes: bool,
         raise SystemExit(1)
     try:
         ops = GraphOperations(store)
-        plan = ops._forget_engine().forget(node_id, cascade=cascade, dry_run=True)
+        plan = ops._forget_engine().forget(
+            node_id, cascade=cascade, dry_run=True, everywhere=everywhere)
         status = plan.get("status")
         if status in ("not_found", "skipped"):
             click.echo(f"No node {node_id} to forget.")
@@ -2096,7 +2103,8 @@ def forget(node_id: str, cascade: bool, db: Optional[str], yes: bool,
             if not click.confirm("Forget this?"):
                 click.echo("Nothing was changed.")
                 raise SystemExit(1)
-        result = ops.forget_node(node_id, cascade=cascade, actor="cli:forget")
+        result = ops.forget_node(node_id, cascade=cascade, actor="cli:forget",
+                                 everywhere=everywhere)
     finally:
         store.close()
 

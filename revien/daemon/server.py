@@ -1157,10 +1157,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── GET /v1/nodes/{id}/forget/preview ──────────────
     @app.get("/v1/nodes/{node_id}/forget/preview")
-    async def forget_preview(node_id: str, cascade: bool = Query(False)):
+    async def forget_preview(node_id: str, cascade: bool = Query(False),
+                             everywhere: bool = Query(False)):
         """What a forget WOULD do (nodes removed, cut back, kept; units
         suppressed). Writes nothing."""
-        preview = ops._forget_engine().forget(node_id, cascade=cascade, dry_run=True)
+        preview = ops._forget_engine().forget(
+            node_id, cascade=cascade, dry_run=True, everywhere=everywhere)
         if preview.get("status") in ("not_found", "skipped"):
             raise HTTPException(404, f"Node not found: {node_id}")
         preview["exists"] = True
@@ -1169,6 +1171,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # ── POST /v1/nodes/{id}/forget ─────────────────────
     class ForgetRequest(BaseModel):
         cascade: bool = False
+        # Also remove the wording from every other unit that holds it (the
+        # default forgets it from this node's source only and names the rest).
+        everywhere: bool = False
         # Accepted for older clients and never stored: the verb is recorded
         # by this route, not by free text a caller sends.
         reason: str = ""
@@ -1198,7 +1203,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "forgotten source again. Restart required: stop it, "
                     "start it again with 'revien start', then forget again. "
                     "Nothing was changed.")})
-        result = ops.forget_node(node_id, cascade=req.cascade, actor="api:forget")
+        result = ops.forget_node(node_id, cascade=req.cascade, actor="api:forget",
+                                 everywhere=req.everywhere)
         status = result.get("status")
         if status == "not_found":
             raise HTTPException(404, f"Node not found: {node_id}")

@@ -62,7 +62,9 @@ class ForgetStoreMixin:
 
         -- Suppression records. Content-free: identities, keyed fingerprints
         -- (HMAC under the key in the Revien home) and times. kind 'file':
-        -- suppressed until the file changes. kind 'permanent': no file
+        -- suppressed until the file changes. kind 'wording': no source is
+        -- suppressed, only the forgotten sentences (a standing denylist).
+        -- kind 'permanent': no file
         -- behind it, suppressed for good. status 'lifted' keeps the row as
         -- the record that a restore happened.
         CREATE TABLE IF NOT EXISTS suppressions (
@@ -74,6 +76,7 @@ class ForgetStoreMixin:
             content_fps TEXT NOT NULL DEFAULT '[]',
             wording_fps TEXT NOT NULL DEFAULT '[]',
             sentence_fps TEXT NOT NULL DEFAULT '[]',
+            short_fps TEXT NOT NULL DEFAULT '[]',
             file_fp TEXT,
             created_at TEXT NOT NULL,
             actor TEXT NOT NULL DEFAULT '',
@@ -303,11 +306,12 @@ class ForgetStoreMixin:
             "file_fp": r[7], "created_at": r[8], "actor": r[9],
             "status": r[10], "lifted_at": r[11], "lifted_by": r[12],
             "sentence_fps": json.loads(r[13] or "[]"),
+            "short_fps": json.loads(r[14] or "[]"),
         }
 
     _SUPPRESSION_COLS = (
         "id, unit_id, kind, path, path_keys, content_fps, wording_fps, "
-        "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps")
+        "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps, short_fps")
 
     @_locked
     def add_suppression(
@@ -315,11 +319,13 @@ class ForgetStoreMixin:
         path_keys: List[str], content_fps: List[str],
         wording_fps: List[str], file_fp: Optional[str], actor: str,
         sentence_fps: Optional[List[str]] = None,
+        short_fps: Optional[List[str]] = None,
     ) -> int:
         """Write (or extend) the active record for a unit. A second forget of
         the same unit merges its fingerprints into the one record."""
-        if kind not in ("file", "permanent"):
-            raise ValueError(f"suppression kind must be file or permanent, got {kind!r}")
+        if kind not in ("file", "permanent", "wording"):
+            raise ValueError(
+                f"suppression kind must be file, permanent or wording, got {kind!r}")
         conn = self._get_conn()
         row = conn.execute(
             f"SELECT {self._SUPPRESSION_COLS} FROM suppressions "
@@ -329,37 +335,47 @@ class ForgetStoreMixin:
             conn.execute(
                 "UPDATE suppressions SET kind = ?, path = COALESCE(?, path), "
                 "path_keys = ?, content_fps = ?, wording_fps = ?, "
-                "sentence_fps = ?, file_fp = COALESCE(?, file_fp) WHERE id = ?",
+                "sentence_fps = ?, short_fps = ?, "
+                "file_fp = COALESCE(?, file_fp) WHERE id = ?",
                 (kind, path,
                  json.dumps(sorted(set(cur["path_keys"]) | set(path_keys))),
                  json.dumps(sorted(set(cur["content_fps"]) | set(content_fps))),
                  json.dumps(sorted(set(cur["wording_fps"]) | set(wording_fps))),
                  json.dumps(sorted(set(cur["sentence_fps"]) | set(sentence_fps or []))),
+                 json.dumps(sorted(set(cur["short_fps"]) | set(short_fps or []))),
                  file_fp, cur["id"]))
             self._commit(conn)
             return cur["id"]
         cur = conn.execute(
             "INSERT INTO suppressions (unit_id, kind, path, path_keys, "
-            "content_fps, wording_fps, sentence_fps, file_fp, created_at, actor) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "content_fps, wording_fps, sentence_fps, short_fps, file_fp, "
+            "created_at, actor) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (unit_id, kind, path, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(content_fps))),
              json.dumps(sorted(set(wording_fps))),
-             json.dumps(sorted(set(sentence_fps or []))), file_fp, _now(), actor))
+             json.dumps(sorted(set(sentence_fps or []))),
+             json.dumps(sorted(set(short_fps or []))), file_fp, _now(), actor))
         self._commit(conn)
         return cur.lastrowid
 
     @_locked
-    def list_suppressions(self, status: Optional[str] = "active") -> List[Dict]:
+    def list_suppressions(self, status: Optional[str] = "active",
+                          include_wording: bool = False) -> List[Dict]:
+        """Suppression records. The standing-denylist entries (kind
+        'wording') are left out unless asked for: they are not sources, and
+        a restore reaches them through the units they cover."""
         conn = self._get_conn()
-        if status is None:
-            rows = conn.execute(
-                f"SELECT {self._SUPPRESSION_COLS} FROM suppressions ORDER BY id")
-        else:
-            rows = conn.execute(
-                f"SELECT {self._SUPPRESSION_COLS} FROM suppressions "
-                "WHERE status = ? ORDER BY id", (status,))
-        return [self._row_to_suppression(r) for r in rows.fetchall()]
+        sql = f"SELECT {self._SUPPRESSION_COLS} FROM suppressions"
+        where, params = [], []
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if not include_wording:
+            where.append("kind != 'wording'")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        rows = conn.execute(sql + " ORDER BY id", params).fetchall()
+        return [self._row_to_suppression(r) for r in rows]
 
     @_locked
     def count_suppressions(self, status: str = "active") -> int:

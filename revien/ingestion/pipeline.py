@@ -688,6 +688,20 @@ class IngestionPipeline:
                     input_data.content,
                 )
 
+        # 3a4. Last word under BEGIN IMMEDIATE: a forget that committed its
+        #      denylist after the checks above is honoured here (any order).
+        _undone = _gate.enforce_after_write(
+            self.store, unit, input_data.content,
+            [nid for nid, _l, _c in newly_created],
+            [v for v in id_map.values()
+             if v not in {nid for nid, _l, _c in newly_created}])
+        if _undone is not None:
+            return self._suppressed_output(_undone, fenced_spans)
+        newly_created = [
+            (n.node_id, n.label, n.content)
+            for n in (self.store.get_node(nid) for nid, _l, _c in newly_created)
+            if n is not None]
+
         # 3b. Semantic indexing (opt-in). Embed the newly-created content nodes
         # so keyword-less queries can retrieve them. No-op when the layer is
         # disabled; index_nodes self-disables on any failure rather than
@@ -1027,6 +1041,17 @@ class IngestionPipeline:
 
             # 3c. Known-entity mention linking over the new content.
             edges_created += self._link_known_mentions(ctx_id, input_data.content)
+
+        # Last word under BEGIN IMMEDIATE (see ingest(), 3a4).
+        _undone = _gate.enforce_after_write(
+            self.store, unit, input_data.content,
+            [nid for nid, _l, _c in newly_created] + [ctx_id])
+        if _undone is not None:
+            return self._suppressed_output(_undone, fenced_spans)
+        newly_created = [
+            (n.node_id, n.label, n.content)
+            for n in (self.store.get_node(nid) for nid, _l, _c in newly_created)
+            if n is not None]
 
         # Post-commit: semantic indexing for the NEW extracted nodes (the
         # refreshed context node re-embeds via the store's content listener).

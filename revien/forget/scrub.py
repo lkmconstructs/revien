@@ -36,10 +36,19 @@ def clean_strings(strings: Iterable[str]) -> List[str]:
     return out
 
 
+def _bounded(s: str) -> str:
+    """A regex for ``s`` as whole words: a word character at either end must
+    not touch another word character, so 'API' never matches inside 'rapid'
+    or 'Therapists'. Unicode-aware (\\w covers letters of every script)."""
+    pre = r"(?<!\w)" if re.match(r"\w", s[:1]) else ""
+    post = r"(?!\w)" if re.match(r"\w", s[-1:]) else ""
+    return pre + re.escape(s) + post
+
+
 def _pattern(strings: List[str]):
     if not strings:
         return None
-    return re.compile("|".join(re.escape(s) for s in strings), re.IGNORECASE)
+    return re.compile("|".join(_bounded(s) for s in strings), re.IGNORECASE)
 
 
 _TERMINATORS = ".!?"
@@ -99,7 +108,8 @@ def _remove_spans(text: str, spans) -> str:
     return "".join(out)
 
 
-MIN_SENTENCE = 20   # shorter sentences ("Noted.") are never fingerprinted
+MIN_SENTENCE = 20   # shorter sentences ("Noted.") are not on the global denylist
+MIN_SHORT = 8       # ...they can be kept out of their own source, by identity
 
 
 def iter_sentences(text: str):
@@ -137,13 +147,14 @@ def sentence_key(sentence: str) -> str:
     return " ".join(_nfc(sentence).split())
 
 
-def strip_sentences(text: str, is_forgotten) -> Tuple[str, int]:
-    """Remove every sentence for which ``is_forgotten(sentence_key)`` is true.
-    Returns (text without them, how many)."""
+def strip_sentences(text: str, is_forgotten, min_len: int = MIN_SENTENCE) -> Tuple[str, int]:
+    """Remove every sentence for which ``is_forgotten(sentence_key)`` is true
+    (sentences shorter than ``min_len`` are never asked about). Returns
+    (text without them, how many)."""
     spans = []
     for l, r, body in iter_sentences(text):
         key = sentence_key(body)
-        if len(key) >= MIN_SENTENCE and is_forgotten(key):
+        if len(key) >= min_len and is_forgotten(key):
             spans.append([l, r])
     if not spans:
         return text, 0
@@ -262,7 +273,14 @@ def contains(text: str, strings: List[str]) -> bool:
 _SKIP_PREFIXES = ("sqlite_", "vec_nodes_")
 
 
-def find_residue(conn: sqlite3.Connection, strings: List[str]) -> Dict[str, int]:
+# Tables that hold identities, fingerprints and positions, never content.
+NOT_CONTENT_TABLES = frozenset({
+    "node_provenance", "capture_units", "suppressions", "store_meta",
+    "sync_cursors", "distill_manifest"})
+
+
+def find_residue(conn: sqlite3.Connection, strings: List[str],
+                 ignore=frozenset()) -> Dict[str, int]:
     """{table: rows} where any forgotten string still appears in a text
     column. Reads the whole database; run once per forget."""
     pat = _pattern(strings)
@@ -273,7 +291,7 @@ def find_residue(conn: sqlite3.Connection, strings: List[str]) -> Dict[str, int]
         "SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE "
         "'CREATE VIRTUAL%'")]
     for table in tables:
-        if table.startswith(_SKIP_PREFIXES) or table == "vec_nodes":
+        if table.startswith(_SKIP_PREFIXES) or table == "vec_nodes" or table in ignore:
             continue
         try:
             cur = conn.execute(f'SELECT * FROM "{table}"')

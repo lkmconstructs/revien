@@ -28,11 +28,21 @@ def _audit_lift(store, record: Dict, actor: str, via: str) -> None:
                "via": via})
 
 
+def _lift_linked_denylist(store, record: Dict, actor: str, via: str) -> None:
+    """Lifting a source also lifts the forgotten-sentence denylist that was
+    written with it: restoring a file means the user wants it back."""
+    for w in store.list_suppressions("active", include_wording=True):
+        if w["kind"] == "wording" and f"unit:{record['unit_id']}" in w["path_keys"]:
+            if store.lift_suppression(w["id"], actor):
+                _audit_lift(store, w, actor, via)
+
+
 def lift_for_override(store, record: Dict) -> bool:
     """A re-import with the explicit override: lift and audit."""
     ok = store.lift_suppression(record["id"], "override:import")
     if ok:
         _audit_lift(store, record, "override:import", "override")
+        _lift_linked_denylist(store, record, "override:import", "override")
     return ok
 
 
@@ -132,6 +142,7 @@ def restore(store, arg: str, actor: str = "cli:restore",
                    if r["id"] == item["id"])
         if store.lift_suppression(rec["id"], actor):
             _audit_lift(store, rec, actor, plan["mode"])
+            _lift_linked_denylist(store, rec, actor, plan["mode"])
             lifted.append(item)
     plan["lifted"] = lifted
     plan["status"] = "restored" if lifted else "none"

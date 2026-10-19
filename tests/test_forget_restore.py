@@ -92,7 +92,8 @@ class TestRestore:
         s = GraphStore(db_path=db)
         try:
             rows = [a for a in s.get_all_audit() if a["op"] == "restore"]
-            assert len(rows) == 1 and rows[0]["actor"] == "cli:restore"
+            # the source, and the forgotten-sentence denylist written with it
+            assert len(rows) == 2 and {r["actor"] for r in rows} == {"cli:restore"}
             assert "ALPHAWORD" not in json.dumps(rows) and "BRAVOWORD" not in json.dumps(rows)
             lifted = s.list_suppressions("lifted")
             assert len(lifted) == 1 and lifted[0]["lifted_by"] == "cli:restore"

@@ -364,10 +364,12 @@ class GraphOperations:
     def forget_node(
         self, node_id: str, cascade: bool = False, reason: str = "",
         construct_id: str = "", actor: str = "api:forget",
+        everywhere: bool = False,
     ) -> Dict:
         """The forget verb. ``reason`` and ``construct_id`` are accepted for
         compatibility and deliberately not stored. See ForgetEngine."""
-        return self._forget_engine().forget(node_id, cascade=cascade, actor=actor)
+        return self._forget_engine().forget(
+            node_id, cascade=cascade, actor=actor, everywhere=everywhere)
 
     def delete_node(self, node_id: str, actor: str = "api:delete",
                     op: str = "delete") -> bool:

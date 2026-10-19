@@ -802,10 +802,12 @@ class GraphStore(ForgetStoreMixin):
     # ── Transactions ──────────────────────────────────────
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, immediate: bool = False):
         """Everything inside lands in ONE commit; any failure rolls back ALL
         of it. Holds the store lock for the whole span, so no other thread can
         interleave (or commit) mid-transaction on the shared connection.
+
+        ``immediate=True`` opens it with BEGIN IMMEDIATE (see below).
 
         Nests: an inner transaction() rides the outer one — per-method commits
         (_commit) are no-ops until the outermost level commits. Listener fires
@@ -831,6 +833,13 @@ class GraphStore(ForgetStoreMixin):
                 return
             self._txn_depth = 1
             try:
+                if immediate:
+                    # Take SQLite's write lock NOW. Two connections (a daemon
+                    # and a CLI forget) then take turns for the whole span, so
+                    # a check made inside it cannot be overtaken by a write
+                    # from the other one.
+                    conn.commit()
+                    conn.execute("BEGIN IMMEDIATE")
                 yield conn
                 conn.commit()
             except BaseException:
