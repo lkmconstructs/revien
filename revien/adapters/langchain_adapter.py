@@ -24,6 +24,7 @@ Usage:
     chain = ConversationChain(llm=llm, memory=memory)
 """
 
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -219,6 +220,10 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
             if self.session_scope:
                 metadata["session_id"] = self.session_scope
 
+            # The question and the answer are one captured exchange: one
+            # group id, so a forget of either covers both.
+            capture_id = f"capture:{uuid.uuid4()}"
+
             # Create input node
             input_ingestion = IngestionInput(
                 source_id=self.session_scope or "langchain",
@@ -230,6 +235,7 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                 origin_runtime="langchain",
                 origin_source="live",
                 session_key=self.session_scope,
+                capture_id=capture_id,
             )
 
             input_result = self._ingestion_pipeline.ingest(input_ingestion)
@@ -246,6 +252,7 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                 origin_runtime="langchain",
                 origin_source="live",
                 session_key=self.session_scope,
+                capture_id=capture_id,
             )
 
             output_result = self._ingestion_pipeline.ingest(output_ingestion)
@@ -276,6 +283,8 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
             return
 
         try:
+            from revien.graph.operations import GraphOperations
+            ops = GraphOperations(self._store)
             # Batch deletion to avoid loading entire graph into memory
             batch_size = 100
             while True:
@@ -285,7 +294,10 @@ class RevienMemory(BaseMemory if LANGCHAIN_AVAILABLE else _MissingLangChainStub)
                     break
                 deleted = 0
                 for node in batch:
-                    if self._store.delete_node(node.node_id):
+                    # clear() is the DELETE verb (docs/FORGET_SPEC.md §1): it
+                    # leaves a content-free delete audit entry and no
+                    # suppression record. It never means "forget".
+                    if ops.delete_node(node.node_id, actor="langchain:clear"):
                         deleted += 1
                 if not deleted:
                     break  # nothing deletable left — never spin

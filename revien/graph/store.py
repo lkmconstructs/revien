@@ -280,13 +280,16 @@ class GraphStore(ForgetStoreMixin):
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
-            CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence);
-            CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence);
             CREATE INDEX IF NOT EXISTS idx_audit_node ON audit_log(node_id);
             CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
             CREATE INDEX IF NOT EXISTS idx_candidates_unresolved
                 ON supersession_candidates(resolved_at);
         """)
+        # idx_nodes_confidence / idx_edges_confidence are NOT created here
+        # either: a database from before the confidence layer (v0.2.x) has no
+        # confidence column, and CREATE INDEX on it failed the whole open
+        # ("no such column: confidence"). _migrate_add_confidence_columns
+        # creates both after the ALTERs, for fresh and legacy databases alike.
         # idx_nodes_origin_* are NOT created here: on a legacy DB whose
         # "nodes" table predates the origin columns, CREATE TABLE IF NOT
         # EXISTS is a no-op (the table already exists) but CREATE INDEX ...

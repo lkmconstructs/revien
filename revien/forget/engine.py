@@ -175,8 +175,12 @@ class ForgetEngine:
                 n = store.get_node(nid)
                 if n is not None:
                     unproven[nid] = n
-        if not plan.units or not proven:
-            for n in self._legacy_carriers(primary):
+        if True:
+            # Unproven nodes that carry the forgotten wording word for word
+            # are scrubbed too (kept, never deleted). When the target has no
+            # proven owner, parts of its text count as well.
+            reverse_min = 6 if (not plan.units or not proven) else 12
+            for n in self._legacy_carriers(primary, reverse_min):
                 if n.node_id not in remove and n.node_id != target.node_id \
                         and n.node_id not in cut_back:
                     unproven[n.node_id] = n
@@ -191,6 +195,14 @@ class ForgetEngine:
                     and any(_word_in(n.label.strip(), w) for w in primary
                             if len(n.label.strip()) >= _MIN_LABEL_CUT):
                 strings.append(n.label)
+        folded_primary = [w.casefold() for w in primary]
+        for n in unproven.values():
+            # An unproven node whose own words are part of the forgotten
+            # wording: cut those words from it.
+            for text in (n.label, n.content):
+                t = (text or "").strip()
+                if len(t) >= 6 and any(t.casefold() in w for w in folded_primary):
+                    strings.append(t)
         if holder or unit_cascade:
             # The unit's own words: handled by removal, not by cutting.
             strings = [s for s in strings if s != target.content] \
@@ -256,24 +268,35 @@ class ForgetEngine:
                 "SELECT node_id FROM node_provenance WHERE unit_id = ?",
                 ("unproven:" + unit_id,))]
 
-    def _legacy_carriers(self, primary: List[str]) -> List[Node]:
-        """Nodes with no proven owner whose text contains the forgotten
-        wording word for word. They are scrubbed and kept, never deleted."""
+    def _legacy_carriers(self, primary: List[str], reverse_min: int = 6) -> List[Node]:
+        """Nodes with no proven owner whose text is the forgotten wording or
+        part of it, word for word: they contain it, or a stretch of at least
+        six characters of theirs is inside it. They are scrubbed and kept,
+        never deleted."""
         out: Dict[str, Node] = {}
         conn = self.store._get_conn()
+        folded = [w.casefold() for w in primary]
         with self.store._lock:
-            for w in primary:
-                for (nid,) in conn.execute(
-                        "SELECT n.node_id FROM nodes n WHERE "
-                        "instr(lower(n.label || char(10) || n.content), ?) > 0 "
-                        "AND NOT EXISTS (SELECT 1 FROM node_provenance p WHERE "
-                        "p.node_id = n.node_id AND substr(p.unit_id,1,9) != "
-                        "'unproven:')", (w.lower(),)):
-                    if is_tombstone(nid) or nid in out:
-                        continue
-                    n = self.store.get_node(nid)
-                    if n is not None:
-                        out[nid] = n
+            rows = conn.execute(
+                "SELECT n.node_id, n.label, n.content FROM nodes n WHERE NOT "
+                "EXISTS (SELECT 1 FROM node_provenance p WHERE p.node_id = "
+                "n.node_id AND substr(p.unit_id, 1, 9) != 'unproven:')"
+            ).fetchall()
+        for nid, label, content in rows:
+            if is_tombstone(nid):
+                continue
+            texts = [(label or "").strip().casefold(),
+                     (content or "").strip().casefold()]
+            hit = False
+            for w in folded:
+                if any(w and w in t for t in texts) or any(
+                        len(t) >= reverse_min and t in w for t in texts):
+                    hit = True
+                    break
+            if hit:
+                n = self.store.get_node(nid)
+                if n is not None:
+                    out[nid] = n
         return list(out.values())
 
     # ── the verb ──────────────────────────────────────────
@@ -746,8 +769,15 @@ class ForgetEngine:
                 wording_cut, suppressed, not_suppressed, scrubbed_unproven,
                 manifest_notes, problems, training, storage, residue) -> Dict:
         target = plan.target
-        kept_nodes = [{"node_id": k["node"].node_id, "by": k["by"]}
-                      for k in plan.keep_vouched]
+        kept_nodes = []
+        for k in plan.keep_vouched:
+            n = self.store.get_node(k["node"].node_id)
+            # Only a kept node that STILL carries the forgotten words is a
+            # leftover worth naming; a shared entity that never held them is
+            # just a node another unit also wrote.
+            if n is not None and scrub.contains(
+                    (n.label or "") + "\n" + (n.content or ""), plan.strings):
+                kept_nodes.append({"node_id": n.node_id, "by": k["by"]})
         leftovers = self._leftovers(
             plan, None, manifest_notes, problems, training, storage, residue,
             kept_nodes)
@@ -788,8 +818,8 @@ class ForgetEngine:
 
     def _blast_radius(self, plan, suppressed, not_suppressed, removed) -> str:
         n = len(removed)
-        noun = "node" if n == 1 else "nodes"
-        parts = [f"This forgets {n} {noun}"]
+        count = "one node" if n == 1 else f"{n} nodes"
+        parts = [f"This forgets {count}"]
         if suppressed:
             names = ", ".join(describe(s["unit_id"]) for s in suppressed)
             parts.append(f"and suppresses future imports from {names}")

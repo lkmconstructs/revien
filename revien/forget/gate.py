@@ -89,6 +89,9 @@ def unit_for_input(input_data, origin) -> UnitRef:
         return UnitRef(ikey, ikey[len("skill:"):])
     if ikey:
         return UnitRef(item_unit(ikey), None)
+    group = getattr(input_data, "capture_id", None)
+    if isinstance(group, str) and group.startswith(CAPTURE_PREFIX):
+        return UnitRef(None, path, synthetic=group)
     return UnitRef(None, path)
 
 

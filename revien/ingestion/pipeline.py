@@ -174,6 +174,11 @@ class IngestionInput:
     # suppression record(s) that would block this unit, audited, and ingests.
     # Only the CLI import commands set it; the REST and MCP faces never do.
     override_suppression: bool = False
+    # Several ingests that are ONE capture (a LangChain save_context writes the
+    # question and the answer separately) share a "capture:<uuid>" id, so a
+    # forget of either covers both. It names no stable source: it only groups
+    # what one call wrote. Anything not starting "capture:" is ignored.
+    capture_id: Optional[str] = None
 
     def __post_init__(self):
         if self.timestamp_source not in TIMESTAMP_SOURCES:
