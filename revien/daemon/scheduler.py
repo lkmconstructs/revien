@@ -134,6 +134,7 @@ class SyncScheduler:
         # Ingest each piece of content
         ingested = 0
         skipped = 0
+        suppressed = 0
         for item in new_content:
             # timestamp was previously dropped here — every synced item
             # ingested with recorded_at=None, so temporal resolution and
@@ -176,7 +177,12 @@ class SyncScheduler:
             # without this the cursor never advances and the adapter re-fetches
             # and re-fails the same item on every sync, forever.
             try:
-                self.pipeline.ingest(input_data)
+                out = self.pipeline.ingest(input_data)
+                if getattr(out, "suppressed", False):
+                    # A forget said this must not come back: not captured,
+                    # and not counted as ingested.
+                    suppressed += 1
+                    continue
                 ingested += 1
             except ValueError as exc:
                 skipped += 1
@@ -193,6 +199,8 @@ class SyncScheduler:
         result = {"status": "ok", "adapter": name, "items_ingested": ingested}
         if skipped:
             result["items_skipped"] = skipped
+        if suppressed:
+            result["items_suppressed"] = suppressed
         return result
 
     @staticmethod

@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from revien.graph.schema import Edge, Node, NodeType
 from revien.graph.store import GraphStore
+from revien.graph.normalize import normalize_text
 from revien.graph.operations import GraphOperations
 
 if TYPE_CHECKING:  # import for typing only — dedup must not require the layer
@@ -88,14 +89,28 @@ class Deduplicator:
             "REVIEN_SEMANTIC_DEDUP_NEGATION_GUARD", default=True
         )
 
+    def _vouch(self, existing: Node, candidate: Node, unit_id: Optional[str]) -> None:
+        """The candidate's unit merged into ``existing``: it vouches for the
+        node's name, and for its wording only if its own wording is the same
+        (docs/FORGET_SPEC.md §3, §5)."""
+        if unit_id is None:
+            return
+        same_words = normalize_text(candidate.content) == normalize_text(existing.content)
+        self.store.record_provenance(
+            existing.node_id, unit_id, label_ok=True, wording_ok=same_words)
+
     def deduplicate_node(
-        self, candidate: Node, allow_semantic: bool = True
+        self, candidate: Node, allow_semantic: bool = True,
+        unit_id: Optional[str] = None,
     ) -> Tuple[Node, bool]:
         """
         Check if a semantically equivalent node exists.
 
         Args:
             candidate: The node the extractor proposes to create.
+            unit_id: The unit writing this candidate. A new node is recorded
+                as written by it (name and wording); a merge records that it
+                vouched for the existing node (see ``_vouch``).
             allow_semantic: Gate for the semantic layer of THIS call — the
                 capture path passes False (semantic dedup means embedding the
                 candidate inline, and defer_embed exists precisely so capture
@@ -107,8 +122,9 @@ class Deduplicator:
             access_count) and is_new=False.
         """
         # Context nodes are never deduplicated — each session is unique
+        owner = (unit_id, 1, 1) if unit_id is not None else None
         if candidate.node_type == NodeType.CONTEXT:
-            stored = self.store.add_node(candidate)
+            stored = self.store.add_node(candidate, owner=owner)
             return stored, True
 
         # 1. Exact label match (NORMALIZED, same type). Precision guard: a
@@ -127,12 +143,14 @@ class Deduplicator:
                     after_node=existing,
                 )
             self.ops.touch_node(existing.node_id)
+            self._vouch(existing, candidate, unit_id)
             return existing, False
 
         # 2. Fuzzy match (Levenshtein < 3), same type
         existing = self._find_fuzzy_match(candidate)
         if existing:
             self.ops.touch_node(existing.node_id)
+            self._vouch(existing, candidate, unit_id)
             return existing, False
 
         # 3. Semantic match (OPT-IN): paraphrases of the same claim
@@ -158,10 +176,11 @@ class Deduplicator:
                     after_node=existing,
                 )
                 self.ops.touch_node(existing.node_id)
+                self._vouch(existing, candidate, unit_id)
                 return existing, False
 
         # 4. No match — create new node
-        stored = self.store.add_node(candidate)
+        stored = self.store.add_node(candidate, owner=owner)
         return stored, True
 
     def deduplicate_nodes(

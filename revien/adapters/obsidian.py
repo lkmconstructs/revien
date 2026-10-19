@@ -158,10 +158,11 @@ class ObsidianVaultAdapter(RevienAdapter):
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            items.extend(self._note_to_items(rel, text, path.stat().st_mtime))
+            items.extend(self._note_to_items(rel, text, path.stat().st_mtime, path))
         return items
 
-    def _note_to_items(self, rel_path: Path, text: str, mtime: float) -> List[Dict]:
+    def _note_to_items(self, rel_path: Path, text: str, mtime: float,
+                       file_path: Optional[Path] = None) -> List[Dict]:
         note_title = rel_path.stem
         fm, body = _parse_frontmatter(text)
         # Distill-out exclusion: notes Revien itself wrote (revien: derived)
@@ -197,6 +198,8 @@ class ObsidianVaultAdapter(RevienAdapter):
                 "metadata": {
                     "adapter": "obsidian",
                     "vault": str(self.vault_dir),
+                    "path": str(file_path if file_path is not None
+                                else self.vault_dir / rel_path),
                     "note": rel_path.as_posix(),
                     "heading": heading,
                     "tags": tags,

@@ -282,7 +282,7 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                 session_key=session_key,
             )
         )
-        return {
+        out = {
             "context_node_id": result.context_node_id,
             "nodes_created": result.nodes_created,
             "nodes_deduplicated": result.nodes_deduplicated,
@@ -290,6 +290,11 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             "total_nodes_in_graph": result.total_nodes_in_graph,
             "total_edges_in_graph": result.total_edges_in_graph,
         }
+        if result.suppressed:
+            # The forget gate refused it; say so rather than look stored.
+            out["suppressed"] = True
+            out["suppression_note"] = result.suppression_note
+        return out
 
     return server
 
