@@ -778,6 +778,13 @@ class ForgetEngine:
                 "kind": "other_units", "node_id": k["node_id"],
                 "note": "another live unit vouched for this node's wording, "
                         "so it was kept", "by": k["by"]})
+        models = Path(os.path.expanduser("~")) / ".revien" / "models"
+        if models.is_dir() and any(models.iterdir()):
+            left.append({
+                "kind": "neural_model", "path": str(models),
+                "note": "the trained scoring model was fitted on queries and "
+                        "labels from retrieval signals and may still hold "
+                        "words from them; retrain it to drop them"})
         if problems:
             left.append({"kind": "vectors", "note": problems})
         for p in training.get("problems", []):

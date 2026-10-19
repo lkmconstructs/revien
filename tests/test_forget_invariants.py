@@ -177,3 +177,13 @@ def test_community_labels_held_in_memory_do_not_keep_a_forgotten_label(tmp_path)
         assert r.status_code == 200, r.text
         assert secret not in client.get("/v1/communities").text
         assert secret not in client.get("/v1/graph").text
+
+
+def test_a_trained_model_on_disk_is_named_not_hidden(tmp_path, monkeypatch):
+    models = Path.home() / ".revien" / "models"
+    models.mkdir(parents=True)
+    (models / "vectorizer.pkl").write_bytes(b"model")
+    seeded = fs.seed("pipeline", tmp_path, monkeypatch)
+    result = _forget(seeded)
+    assert [l["kind"] for l in result["leftovers"]] == ["neural_model"]
+    assert result["scope"] == "gone everywhere"
