@@ -73,6 +73,7 @@ class ForgetStoreMixin:
             path_keys TEXT NOT NULL DEFAULT '[]',
             content_fps TEXT NOT NULL DEFAULT '[]',
             wording_fps TEXT NOT NULL DEFAULT '[]',
+            sentence_fps TEXT NOT NULL DEFAULT '[]',
             file_fp TEXT,
             created_at TEXT NOT NULL,
             actor TEXT NOT NULL DEFAULT '',
@@ -301,17 +302,19 @@ class ForgetStoreMixin:
             "wording_fps": json.loads(r[6] or "[]"),
             "file_fp": r[7], "created_at": r[8], "actor": r[9],
             "status": r[10], "lifted_at": r[11], "lifted_by": r[12],
+            "sentence_fps": json.loads(r[13] or "[]"),
         }
 
     _SUPPRESSION_COLS = (
         "id, unit_id, kind, path, path_keys, content_fps, wording_fps, "
-        "file_fp, created_at, actor, status, lifted_at, lifted_by")
+        "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps")
 
     @_locked
     def add_suppression(
         self, unit_id: str, kind: str, path: Optional[str],
         path_keys: List[str], content_fps: List[str],
         wording_fps: List[str], file_fp: Optional[str], actor: str,
+        sentence_fps: Optional[List[str]] = None,
     ) -> int:
         """Write (or extend) the active record for a unit. A second forget of
         the same unit merges its fingerprints into the one record."""
@@ -326,21 +329,23 @@ class ForgetStoreMixin:
             conn.execute(
                 "UPDATE suppressions SET kind = ?, path = COALESCE(?, path), "
                 "path_keys = ?, content_fps = ?, wording_fps = ?, "
-                "file_fp = COALESCE(?, file_fp) WHERE id = ?",
+                "sentence_fps = ?, file_fp = COALESCE(?, file_fp) WHERE id = ?",
                 (kind, path,
                  json.dumps(sorted(set(cur["path_keys"]) | set(path_keys))),
                  json.dumps(sorted(set(cur["content_fps"]) | set(content_fps))),
                  json.dumps(sorted(set(cur["wording_fps"]) | set(wording_fps))),
+                 json.dumps(sorted(set(cur["sentence_fps"]) | set(sentence_fps or []))),
                  file_fp, cur["id"]))
             self._commit(conn)
             return cur["id"]
         cur = conn.execute(
             "INSERT INTO suppressions (unit_id, kind, path, path_keys, "
-            "content_fps, wording_fps, file_fp, created_at, actor) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "content_fps, wording_fps, sentence_fps, file_fp, created_at, actor) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (unit_id, kind, path, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(content_fps))),
-             json.dumps(sorted(set(wording_fps))), file_fp, _now(), actor))
+             json.dumps(sorted(set(wording_fps))),
+             json.dumps(sorted(set(sentence_fps or []))), file_fp, _now(), actor))
         self._commit(conn)
         return cur.lastrowid
 

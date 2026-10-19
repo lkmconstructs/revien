@@ -21,16 +21,21 @@ from tests import forget_surfaces as surf
 ALL = [p for p in fs.ALL_PATHS]
 
 
-def _forget(seeded, planted=None, cascade=True):
+def _forget(seeded, planted=None, cascade=True, keep_open=False):
     store = GraphStore(db_path=seeded.db)
     try:
         ops = GraphOperations(store)
         if planted:
             ops.training_dbs = (planted["training_db"],)
         handle = seeded.ctx_ids[0] if seeded.ctx_ids else seeded.node_with_secret
-        return ops.forget_node(handle, cascade=cascade)
-    finally:
+        result = ops.forget_node(handle, cascade=cascade)
+    except BaseException:
         store.close()
+        raise
+    if keep_open:
+        return result, store
+    store.close()
+    return result
 
 
 @pytest.mark.parametrize("path", ALL)
@@ -50,7 +55,9 @@ def test_secret_is_gone_from_every_surface_after_a_forget(path, tmp_path, monkey
     assert secret.encode() in b"".join(before.values())
 
     planted = surf.plant(seeded.db, secret, tmp_path, handle_ids)
-    result = _forget(seeded, planted)
+    # the store stays open while the raw files are read: a file that is only
+    # clean because closing the connection checkpointed it proves nothing
+    result, open_store = _forget(seeded, planted, keep_open=True)
     assert result["status"] == "forgotten", result
 
     # every table, decoded (JSON escapes non-ASCII and line breaks)
@@ -64,6 +71,7 @@ def test_secret_is_gone_from_every_surface_after_a_forget(path, tmp_path, monkey
     # the raw file, the WAL and the freelist
     for name, blob in surf.raw_bytes(seeded.db).items():
         assert secret.encode() not in blob, f"{path}: secret in raw {name}"
+    open_store.close()
 
     # vec_nodes and training.db
     conn = sqlite3.connect(seeded.db)

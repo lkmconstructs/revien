@@ -313,13 +313,26 @@ class TestFencingAndSyncReset:
         assert nodes(seeded.db) == []
 
 
-def test_secure_delete_is_on_for_every_connection(tmp_path):
-    """docs/FORGET_SPEC.md §4: freed pages are overwritten, not left behind."""
+def test_secure_delete_is_switched_on_for_every_connection(tmp_path, monkeypatch):
+    """docs/FORGET_SPEC.md §4: freed pages are overwritten, not left behind.
+    Some SQLite builds default it on, so the test reads what Revien asks for."""
+    import sqlite3
+    asked = []
+
+    class Recording(sqlite3.Connection):
+        def execute(self, sql, *a, **kw):
+            asked.append(" ".join(str(sql).split()).lower())
+            return super().execute(sql, *a, **kw)
+
+    real = sqlite3.connect
+    monkeypatch.setattr("revien.graph.store.sqlite3.connect",
+                        lambda *a, **kw: real(*a, factory=Recording, **kw))
     s = GraphStore(db_path=str(tmp_path / "sd.db"))
     try:
-        assert s._get_conn().execute("PRAGMA secure_delete").fetchone()[0] in (1, 2)
+        s.count_nodes()
     finally:
         s.close()
+    assert "pragma secure_delete = on" in asked
 
 
 def test_forget_reports_what_it_did_to_the_storage(tmp_path, monkeypatch):

@@ -142,3 +142,31 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
         # A vault section: its own text decides, not the whole note.
         continue
     return None
+
+
+def strip_forgotten(store, unit: UnitRef, content: str):
+    """After the gate lets a capture through, leave out the sentences a forget
+    removed from the SAME source.
+
+    A file that changed is new evidence (the gate lifted for it), but the
+    sentences the user forgot are still in it and have an identical keyed
+    fingerprint: "text with an identical fingerprint is never recaptured".
+    Scoped to the records that match this capture's unit or file, and to
+    sentences of at least ``scrub.MIN_SENTENCE`` characters, so a common
+    "Noted." is never touched. Returns (content, how many were left out)."""
+    from revien.forget import scrub
+
+    records = [r for r in store.list_suppressions("active") if r.get("sentence_fps")]
+    if not records or not content:
+        return content, 0
+    verified = unit.path if (unit.path and is_real_file(unit.path)) else None
+    keys = set(identity_keys(verified)) if verified else set()
+    known = set()
+    for rec in records:
+        file_level = rec["unit_id"].startswith(FILE_LEVEL)
+        if (unit.stable and rec["unit_id"] == unit.unit_id) or (
+                file_level and keys & set(rec["path_keys"])):
+            known |= set(rec["sentence_fps"])
+    if not known:
+        return content, 0
+    return scrub.strip_sentences(content, lambda key: fingerprint(key) in known)

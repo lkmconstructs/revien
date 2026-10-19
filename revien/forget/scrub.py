@@ -99,6 +99,57 @@ def _remove_spans(text: str, spans) -> str:
     return "".join(out)
 
 
+MIN_SENTENCE = 20   # shorter sentences ("Noted.") are never fingerprinted
+
+
+def iter_sentences(text: str):
+    """(start, end, sentence) for each sentence of ``text``, in order. A
+    sentence is a stretch of one line ending at '.', '!' or '?' followed by
+    whitespace (or at the end of the line). A leading speaker label ("User:")
+    is not part of the sentence text, so the same words fingerprint the same
+    whether or not a transcript labels them."""
+    pos = 0
+    for line in text.split("\n"):
+        line_start = pos
+        pos += len(line) + 1
+        i, n = 0, len(line)
+        while i < n:
+            j = i
+            while j < n:
+                if line[j] in _TERMINATORS and (j + 1 >= n or line[j + 1].isspace()):
+                    j += 1
+                    break
+                j += 1
+            raw = line[i:j]
+            body = raw.strip()
+            m = _SPEAKER.match(body)
+            if m:
+                body = body[m.end():]
+            if body:
+                yield line_start + i, line_start + j, body
+            i = j
+            while i < n and line[i].isspace():
+                i += 1
+
+
+def sentence_key(sentence: str) -> str:
+    """What gets fingerprinted for a sentence: NFC, whitespace collapsed."""
+    return " ".join(_nfc(sentence).split())
+
+
+def strip_sentences(text: str, is_forgotten) -> Tuple[str, int]:
+    """Remove every sentence for which ``is_forgotten(sentence_key)`` is true.
+    Returns (text without them, how many)."""
+    spans = []
+    for l, r, body in iter_sentences(text):
+        key = sentence_key(body)
+        if len(key) >= MIN_SENTENCE and is_forgotten(key):
+            spans.append([l, r])
+    if not spans:
+        return text, 0
+    return _remove_spans(text, [tuple(x) for x in spans]), len(spans)
+
+
 def cut_text(text: str, strings: List[str], sentences: bool = True) -> Tuple[str, int]:
     """(text with the forgotten wording cut out, number of occurrences).
 
@@ -170,6 +221,36 @@ def _iter_strings(value: Any):
     elif isinstance(value, dict):
         for x in value.values():
             yield from _iter_strings(x)
+
+
+_WORD = re.compile(r"\w+", re.UNICODE)
+MIN_TOKEN = 5
+
+
+def tokens_of(text: str) -> set:
+    return {w for w in _WORD.findall(_nfc(text or "").casefold()) if len(w) >= MIN_TOKEN}
+
+
+def distinctive_tokens(conn: sqlite3.Connection, strings: List[str]) -> List[str]:
+    """Words of the forgotten text that no surviving node contains.
+
+    Recall echoes (a query typed before the forget, a candidate's reason) quote
+    pieces of what was said, not whole sentences. A word that only the
+    forgotten text had is what identifies such an echo; a word the rest of the
+    graph still uses ("postgres") identifies nothing, so it is left alone. Call
+    this AFTER the forgotten nodes are gone."""
+    forgotten = set()
+    for s in strings:
+        forgotten |= tokens_of(s)
+    if not forgotten:
+        return []
+    alive = set()
+    for label, content, meta in conn.execute(
+            "SELECT label, content, metadata FROM nodes"):
+        alive |= tokens_of(f"{label}\n{content}\n{meta or ''}")
+        if not (forgotten - alive):
+            return []
+    return sorted(forgotten - alive, key=len, reverse=True)
 
 
 def contains(text: str, strings: List[str]) -> bool:

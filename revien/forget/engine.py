@@ -69,6 +69,9 @@ class Plan:
     unproven: List[Node] = field(default_factory=list)      # kept, scrubbed
     holders: List[Node] = field(default_factory=list)       # wording cut out
     strings: List[str] = field(default_factory=list)
+    # Everything the forgotten text said, whole: where the words that only it
+    # had are taken from (see scrub.distinctive_tokens).
+    token_sources: List[str] = field(default_factory=list)
     refusal: Optional[Dict] = None
 
 
@@ -207,6 +210,9 @@ class ForgetEngine:
             strings = [s for s in strings if s != target.content] \
                 if unit_cascade else strings
         plan.strings = scrub.clean_strings(strings)
+        plan.token_sources = [target.label, target.content] + [
+            t for n in list(remove.values()) + list(cut_back.values())
+            for t in (n.label, n.content)]
 
         # Where the wording is cut: the forgotten units' stored conversation.
         holders: Dict[str, Node] = {}
@@ -354,16 +360,28 @@ class ForgetEngine:
                 real = real_path(path)
                 keys = sorted(set(keys) | set(identity_keys(path)))
             texts = []
+            sentences = []
             for nid in self._members(unit_id):
                 n = store.get_node(nid)
                 if n is not None and is_holder(n):
                     texts.append(n.content)
+                    # a whole-unit forget leaves every sentence of its record
+                    # out of later captures of the same source; a node-level
+                    # forget leaves out the sentences that hold its wording
+                    for _l, _r, body in scrub.iter_sentences(n.content):
+                        key = scrub.sentence_key(body)
+                        if plan.cascade or scrub.contains(key, plan.strings) or any(
+                                len(key) >= scrub.MIN_SENTENCE
+                                and key.casefold() in w.casefold() for w in plan.strings):
+                            sentences.append(key)
             specs.append({
                 "unit_id": unit_id, "stable": True,
                 "kind": "file" if file_backed else "permanent",
                 "path": real or path, "path_keys": keys,
                 "content_fps": fingerprints(texts),
                 "wording_fps": fingerprints(wording),
+                "sentence_fps": fingerprints(
+                    k for k in sentences if len(k) >= scrub.MIN_SENTENCE),
                 "file_fp": (file_fingerprint(real)
                             if (real and file_level) else None),
             })
@@ -409,7 +427,8 @@ class ForgetEngine:
                 sid = store.add_suppression(
                     spec["unit_id"], spec["kind"], spec["path"],
                     spec["path_keys"], spec["content_fps"],
-                    spec["wording_fps"], spec["file_fp"], actor)
+                    spec["wording_fps"], spec["file_fp"], actor,
+                    sentence_fps=spec["sentence_fps"])
                 store.record_audit(
                     f"suppression:{sid}", "suppress", actor=actor,
                     after={"unit_id": spec["unit_id"], "kind": spec["kind"],
@@ -423,11 +442,6 @@ class ForgetEngine:
             affected = set(remove_ids + cut_ids + changed_ids)
             episodes = self._episodes_for(conn, affected)
             receipt_ids = self._receipts_for(conn, affected)
-
-            # 3. Audit: snapshots of the removed nodes are dropped, and the
-            #    forgotten wording is cut from every other row's snapshot.
-            stats["audit_rows_scrubbed"] = self._scrub_audit(
-                conn, set(remove_ids), strings)
 
             # 4. Lineage: surviving children of a removed node point at a
             #    content-free marker, as before.
@@ -472,10 +486,18 @@ class ForgetEngine:
                 if store.delete_node(nid):
                     removed_done.append(nid)
 
-            # 8. Everything else that quotes them.
-            q = self._scrub_queries(conn, episodes, receipt_ids, strings)
+            # 8. Everything else that quotes them. The words only the
+            #    forgotten text had identify an echo of it (a query typed
+            #    before the forget, a candidate's reason), so they are cut
+            #    along with the sentences. Computed now the nodes are gone.
+            echo = scrub.distinctive_tokens(conn, plan.token_sources)
+            all_strings = scrub.clean_strings(list(strings) + echo)
+            stats["audit_rows_scrubbed"] = self._scrub_audit(
+                conn, set(remove_ids), all_strings)
+            q = self._scrub_queries(conn, episodes, receipt_ids, all_strings)
             stats.update(q)
-            stats["candidates_scrubbed"] = self._scrub_candidates(conn, strings)
+            stats["candidates_scrubbed"] = self._scrub_candidates(conn, all_strings)
+        strings = all_strings
         # ── committed ──
 
         gone = removed_done

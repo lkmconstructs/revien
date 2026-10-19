@@ -300,6 +300,21 @@ class TestRefusal:
 
 
 class TestUnprovenOwnership:
+    def test_a_legacy_node_a_unit_later_merged_into_is_still_unproven(self, store):
+        """A node from before provenance has unknown owners. A unit that
+        merges into it later is one of them, not the only one: forgetting that
+        unit must not delete it."""
+        legacy = store.add_node(Node(node_type=NodeType.FACT, label="shared fact",
+                                     content="we deploy on fridays"))
+        store.record_provenance(legacy.node_id, "unproven:", False, False)
+        a_ctx = store.add_node(Node(node_type=NodeType.CONTEXT, label="a", content="A: we deploy on fridays"),
+                               owner=("session:claude-code:A", 1, 1))
+        store.record_provenance(legacy.node_id, "session:claude-code:A", True, False)
+        res = GraphOperations(store).forget_node(a_ctx.node_id, cascade=True)
+        assert store.get_node(legacy.node_id) is not None
+        assert legacy.node_id in res["unproven"] or not res["forgotten"].count(legacy.node_id)
+        assert legacy.node_id not in res["forgotten"]
+
     def test_legacy_nodes_are_kept_listed_and_cut_back(self, store, tmp_path):
         """Nodes from before provenance: the forgotten unit's likely nodes are
         kept and listed, never deleted on a guess."""

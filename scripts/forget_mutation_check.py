@@ -32,15 +32,15 @@ LOG = "tests/test_forget_changelog.py"
 # (name, invariant, file, old, new, [pytest targets])
 M = [
     ("audit-snapshots-not-scrubbed", 1, "revien/forget/engine.py",
-     "        stats[\"audit_rows_scrubbed\"] = self._scrub_audit(\n                conn, set(remove_ids), strings)",
-     "        stats[\"audit_rows_scrubbed\"] = 0",
+     "            stats[\"audit_rows_scrubbed\"] = self._scrub_audit(\n                conn, set(remove_ids), all_strings)",
+     "            stats[\"audit_rows_scrubbed\"] = 0",
      [INV + " -k pipeline", ENG + " -k Unicode"]),
     ("usage-queries-not-cleared", 1, "revien/forget/engine.py",
-     "            q = self._scrub_queries(conn, episodes, receipt_ids, strings)",
+     "            q = self._scrub_queries(conn, episodes, receipt_ids, all_strings)",
      "            q = {}",
      [INV + " -k pipeline"]),
     ("candidates-not-scrubbed", 1, "revien/forget/engine.py",
-     "            stats[\"candidates_scrubbed\"] = self._scrub_candidates(conn, strings)",
+     "            stats[\"candidates_scrubbed\"] = self._scrub_candidates(conn, all_strings)",
      "            stats[\"candidates_scrubbed\"] = 0",
      [INV + " -k pipeline"]),
     ("vectors-not-purged", 1, "revien/forget/engine.py",
@@ -99,6 +99,10 @@ M = [
      "            if current is None or current == rec[\"file_fp\"]:",
      "            if current is None:",
      [SUP + " -k 'unchanged or timestamp'"]),
+    ("forgotten-sentences-come-back-when-the-file-grows", 3, "revien/ingestion/pipeline.py",
+     "            input_data.content, _left_out = _gate.strip_forgotten(\n                self.store, unit, input_data.content)",
+     "            _left_out = 0",
+     [SUP + " -k 'growing or new_evidence'"]),
     ("pipeline-skips-the-gate", 3, "revien/ingestion/pipeline.py",
      "        blocked = self._gate_check(input_data, unit)\n        if blocked is not None:\n            return self._suppressed_output(blocked, fenced_spans)\n\n        # 0b.",
      "        # 0b.",
@@ -108,8 +112,8 @@ M = [
      "        block = None",
      [SUP + " -k openai", COV + " -k openai"]),
     ("graph-import-skips-the-gate", 3, "revien/graph/store.py",
-     "            if (forget_gate.check(self, ref, node.content) is not None",
-     "            if (False and forget_gate.check(self, ref, node.content) is not None",
+     "            if (forget_gate.check(self, ref, node.content) is not None\n                    or forget_gate.check(\n                        self, forget_gate.UnitRef(None), node.label) is not None):",
+     "            if False:",
      [SUP + " -k graph_import", COV + " -k import_graph"]),
     ("skills-skip-the-gate", 3, "revien/skills/ingest.py",
      "        if forget_gate.check(store, unit, fresh.content) is not None:",
@@ -155,9 +159,17 @@ M = [
      "    if forgets and not yes:",
      "    if False:",
      [VERBS + " -k needs_yes"]),
-    ("late-forget-written-over", 8, "revien/ingestion/pipeline.py",
+    ("late-forget-written-over-fresh", 8, "revien/ingestion/pipeline.py",
      "        with self.store._capture_lock:\n            blocked = self._gate_check(input_data, unit)\n            if blocked is not None:\n                return self._suppressed_output(blocked, fenced_spans)\n            _gate.register(self.store, unit)",
      "        with self.store._capture_lock:\n            _gate.register(self.store, unit)",
+     [SUP + " -k 'Mid and fresh'"]),
+    ("late-forget-written-over-refresh", 8, "revien/ingestion/pipeline.py",
+     "        with self.store._capture_lock, self.store.transaction():\n            blocked = self._gate_check(input_data, unit)\n            if blocked is not None:\n                return self._suppressed_output(blocked, fenced_spans)\n            _gate.register(self.store, unit)",
+     "        with self.store._capture_lock, self.store.transaction():\n            _gate.register(self.store, unit)",
+     [SUP + " -k 'Mid and keyed'"]),
+    ("scheduler-counts-suppressed-as-ingested", 8, "revien/daemon/scheduler.py",
+     "                if getattr(out, \"suppressed\", False):",
+     "                if False:",
      [VERBS + " -k started_before"]),
     ("restore-bare-name-fans-out", 7, "revien/forget/restore.py",
      "    cands = [r for r in records if base and (",
@@ -186,7 +198,7 @@ M = [
     ("fingerprint-is-a-plain-hash", 3, "revien/forget/keys.py",
      "    return hmac.new(key, normalize_text(text), hashlib.sha256).hexdigest()",
      "    return hashlib.sha256(normalize_text(text)).hexdigest()",
-     [SUP + " -k content_free"]),
+     [SUP + " -k ContentFree"]),
     ("counts-do-not-match-the-database", 5, "revien/forget/engine.py",
      "            \"removed_nodes\": len(removed),",
      "            \"removed_nodes\": len(removed) + 1,",
@@ -223,6 +235,8 @@ def run(name, inv, rel, old, new, targets, root):
             cmd = [sys.executable, "-m", "pytest", *shlex.split(t), "-q", "-x",
                    "-p", "no:cacheprovider", "--basetemp", str(work / "bt")]
             res = subprocess.run(cmd, cwd=work, capture_output=True, text=True)
+            if res.returncode == 5:
+                return "NO-TESTS", f"{t} collected nothing"
             if res.returncode != 0:
                 failed.append(t)
         return ("CAUGHT" if failed else "SURVIVED"), ", ".join(failed)

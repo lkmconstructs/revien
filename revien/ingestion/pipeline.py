@@ -404,6 +404,17 @@ class IngestionPipeline:
         blocked = self._gate_check(input_data, unit)
         if blocked is not None:
             return self._suppressed_output(blocked, fenced_spans)
+        # A source that changed since a forget is new evidence, but the
+        # sentences that were forgotten from it stay out (same keyed
+        # fingerprint). Mutates the content like the fence does, so the
+        # ingest hash and the extraction both see what will be stored.
+        if not input_data.override_suppression:
+            input_data.content, _left_out = _gate.strip_forgotten(
+                self.store, unit, input_data.content)
+            if _left_out and not input_data.content.strip():
+                return self._suppressed_output(_gate.Block(
+                    {"unit_id": unit.unit_id or "(shared channel)"},
+                    "everything in it was forgotten"), fenced_spans)
 
         # 0b. Stable ingestion key (repair leg R3). With a key, look for the
         #     context node a previous ingest of this same unit stamped:

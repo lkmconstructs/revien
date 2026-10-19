@@ -51,6 +51,21 @@ def plant(db: str, secret: str, tmp: Path, node_ids: List[str]) -> Dict:
             store.add_candidate(target, others[0], "candidate",
                                 reason=f"conflicts with {secret}",
                                 trace=json.dumps({"claim": secret}))
+        # two bystanders nobody forgets, with a candidate and a judgment of
+        # their own that quote the secret (a recall where it was typed)
+        from revien.graph.schema import Node, NodeType
+        b1 = store.add_node(Node(node_type=NodeType.FACT, label="bystander one", content="plain words one"))
+        b2 = store.add_node(Node(node_type=NodeType.FACT, label="bystander two", content="plain words two"))
+        store.add_candidate(b1.node_id, b2.node_id, "candidate",
+                            reason=f"asked about {secret}", trace=json.dumps({"q": secret}))
+        store.record_use_judgment(
+            episode_key="sess#tool-2", node_id=b1.node_id, used=False,
+            reason="r", shared_terms=["plain"], similarity=0.2,
+            query=f"remind me of {secret}", mode="shadow", applied=False)
+        store.add_recall_receipt(
+            recall_id="rcpt-2", runtime="claude-code",
+            query=f"find {secret} please", node_ids=[b1.node_id],
+            issued_at=now, expires_at=now + timedelta(hours=24))
         store.replace_distill_manifest("Some Note", [{
             "entity_id": target, "anchor_node_id": target,
             "current_node_id": target,
