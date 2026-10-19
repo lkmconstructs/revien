@@ -41,6 +41,21 @@ def _disable_rerank_by_default(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """A forget writes a key under the Revien home and scrubs training.db
+    under the user's home. No test may touch the real ones: every test gets a
+    throwaway home."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("REVIEN_HOME", str(home / ".revien"))
+    from revien.forget import keys
+    keys._cache.clear()
+    yield
+    keys._cache.clear()
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",

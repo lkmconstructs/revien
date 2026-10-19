@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from .forget_store import ForgetStoreMixin
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
@@ -44,7 +45,7 @@ def _locked(method):
     return wrapper
 
 
-class GraphStore:
+class GraphStore(ForgetStoreMixin):
     """SQLite-backed graph store. Thread-safe: one shared connection
     (check_same_thread=False) serialized by a reentrant lock."""
 
@@ -58,6 +59,9 @@ class GraphStore:
         self._closed = False
         # Serializes ALL access to the shared connection (see _locked).
         self._lock = threading.RLock()
+        # Held by a capture's write section and by a forget, so a forget and
+        # an ingest of the same unit never interleave inside one process.
+        self._capture_lock = threading.RLock()
         # transaction() nesting depth. >0 means per-method commits are
         # deferred to the outermost transaction's single commit.
         self._txn_depth = 0
@@ -308,6 +312,9 @@ class GraphStore:
         self._migrate_backfill_recorded_at_source(conn)
         # Usage layer (user_version 5): ALL of its DDL lives in one guard.
         self._migrate_add_usage_layer(conn)
+        # Forget layer (user_version 6): ownership, unit registry,
+        # suppression records. Its DDL lives in graph/forget_store.py.
+        self._migrate_add_forget_layer(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -770,6 +777,9 @@ class GraphStore:
             )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
+            # Freed pages are overwritten with zeros, so deleted text does
+            # not linger in the file (docs/FORGET_SPEC.md §4).
+            self._conn.execute("PRAGMA secure_delete = ON")
         return self._conn
 
     @_locked
@@ -963,13 +973,24 @@ class GraphStore:
     # ── Node CRUD ─────────────────────────────────────────
 
     @_locked
-    def add_node(self, node: Node) -> Node:
+    def add_node(self, node: Node, owner: Optional[tuple] = None) -> Node:
+        """Insert a node (and its audit row) in one commit.
+
+        ``owner`` is ``(unit_id, label_ok, wording_ok)``: the writer's record
+        of who wrote this node, stored in the same commit as the node
+        (docs/FORGET_SPEC.md §3). A writer with no unit passes nothing and
+        the node has no ownership row, i.e. it is never removed by a
+        cascade."""
         self._check_validity_window(node.valid_from, node.valid_until)
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.
         with self.transaction() as conn:
             self._add_node_stmt(conn, node)
             self._enqueue_embed_stmt(conn, node.node_id)
+            if owner is not None:
+                unit_id, label_ok, wording_ok = owner
+                self._record_provenance_stmt(
+                    conn, node.node_id, unit_id, label_ok, wording_ok)
             # Provenance hook: record node creation. Inside the transaction an
             # audit failure rolls the insert back — provenance is required.
             self._record_node_audit(
@@ -1956,6 +1977,19 @@ class GraphStore:
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
             self._discard_pending_stmt(conn, node_id)
+            # Everything else that points at the node by id goes with it:
+            # ownership, queue entries naming it, the distill manifest rows
+            # that render it. None of them can outlive the node it describes.
+            conn.execute(
+                "DELETE FROM node_provenance WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "DELETE FROM supersession_candidates "
+                "WHERE existing_node_id = ? OR new_node_id = ?",
+                (node_id, node_id))
+            conn.execute(
+                "DELETE FROM distill_manifest WHERE anchor_node_id = ? "
+                "OR current_node_id = ? OR entity_id = ?",
+                (node_id, node_id, node_id))
         if deleted:
             self._fire_delete(node_id)
             if successor is not None:
@@ -2575,6 +2609,35 @@ class GraphStore:
         else:
             new_nodes, new_edges = list(graph.nodes), list(graph.edges)
 
+        # ── Suppression gate (docs/FORGET_SPEC.md §6) ──
+        # An imported node whose unit, or whose words, a forget suppressed is
+        # not brought back. Its edges go with it.
+        from revien.forget import gate as forget_gate
+        owners: dict = {}
+        kept_nodes = []
+        dropped_ids = set()
+        for node in new_nodes:
+            unit_id, label_ok, wording_ok, likely = self.ownership_for_fields(
+                node.node_type.value, node.origin_runtime, node.session_key,
+                node.source_id, node.metadata)
+            md = node.metadata if isinstance(node.metadata, dict) else {}
+            path = md.get("path") if isinstance(md.get("path"), str) else None
+            ref = forget_gate.UnitRef(likely, path)
+            if (forget_gate.check(self, ref, node.content) is not None
+                    or forget_gate.check(
+                        self, forget_gate.UnitRef(None), node.label) is not None):
+                dropped_ids.add(node.node_id)
+                continue
+            owners[node.node_id] = (unit_id, label_ok, wording_ok)
+            kept_nodes.append(node)
+        new_nodes = kept_nodes
+        kept_edges = [e for e in new_edges
+                      if e.source_node_id not in dropped_ids
+                      and e.target_node_id not in dropped_ids]
+        result["skipped_suppressed"] = len(dropped_ids)
+        result["skipped_suppressed_edges"] = len(new_edges) - len(kept_edges)
+        new_edges = kept_edges
+
         # ── One transaction: wipe (replace only) + inserts + their audits ──
         with self.transaction():
             if mode == "replace":
@@ -2592,9 +2655,14 @@ class GraphStore:
                 # memories' own words, receipts their ids.
                 conn.execute("DELETE FROM use_judgments")
                 conn.execute("UPDATE recall_receipts SET node_ids = '[]'")
+                conn.execute("DELETE FROM node_provenance")
                 self._discard_pending_stmt(conn)
             for node in new_nodes:
-                self.add_node(node)  # rides this transaction; audit included
+                # rides this transaction; audit included. The graph file
+                # carries no record of who wrote a node, so ownership is
+                # proven only where an ingest key proves it (see
+                # ownership_for_fields); the rest is marked unproven.
+                self.add_node(node, owner=owners[node.node_id])
                 result["nodes_added"] += 1
             for edge in new_edges:
                 self.add_edge(edge)  # rides this transaction
