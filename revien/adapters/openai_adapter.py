@@ -390,6 +390,12 @@ class OpenAIAdapter:
 
             # Handle empty or null content
             content = "".join(str(p) for p in content_parts if p) or ""
+            # Sentences a forget removed stay out (the standing denylist).
+            if content.strip():
+                content, _left_out = forget_gate.strip_forgotten(
+                    self.store, unit, content)
+                if _left_out and not content.strip():
+                    continue
             if not content.strip():
                 content = f"[Empty message from {author_role}]"
 

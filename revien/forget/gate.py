@@ -215,6 +215,9 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
         if block is not None:
             for nid in new_ids:
                 store.delete_node(nid)
+                # A capture that is undone leaves no trace: the creation
+                # rows quote what was just refused.
+                conn.execute("DELETE FROM audit_log WHERE node_id = ?", (nid,))
             for nid in merged_ids:
                 store.delete_provenance(nid, [unit.owner])
             return block
@@ -250,6 +253,7 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
             elif text and len(scrub.sentence_key(text)) >= scrub.MIN_SHORT \
                     and forgotten(scrub.sentence_key(text)):
                 store.delete_node(nid)
+                conn.execute("DELETE FROM audit_log WHERE node_id = ?", (nid,))
     return None
 
 

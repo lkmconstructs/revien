@@ -2640,6 +2640,15 @@ class GraphStore(ForgetStoreMixin):
                         self, forget_gate.UnitRef(None), node.label) is not None):
                 dropped_ids.add(node.node_id)
                 continue
+            # The standing denylist: forgotten sentences are left out of an
+            # imported node; a node that was only a forgotten sentence is not
+            # imported.
+            cleaned, left_out = forget_gate.strip_forgotten(self, ref, node.content)
+            if left_out:
+                if node.node_type.value not in ("context", "skill") or not cleaned.strip():
+                    dropped_ids.add(node.node_id)
+                    continue
+                node.content = cleaned
             owners[node.node_id] = (unit_id, label_ok, wording_ok)
             kept_nodes.append(node)
         new_nodes = kept_nodes

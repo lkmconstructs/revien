@@ -539,6 +539,8 @@ class VaultReconciler:
         unit = forget_gate.UnitRef(None)
         if forget_gate.check(self.store, unit, text) is not None:
             return None
+        if forget_gate.strip_forgotten(self.store, unit, text)[1]:
+            return None
         node = self.store.add_node(Node(
             node_type=node_type,
             label=text[:80],

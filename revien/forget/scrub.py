@@ -242,7 +242,8 @@ def tokens_of(text: str) -> set:
     return {w for w in _WORD.findall(_nfc(text or "").casefold()) if len(w) >= MIN_TOKEN}
 
 
-def distinctive_tokens(conn: sqlite3.Connection, strings: List[str]) -> List[str]:
+def distinctive_tokens(conn: sqlite3.Connection, strings: List[str],
+                       skip_side_fields=frozenset()) -> List[str]:
     """Words of the forgotten text that no surviving node contains.
 
     Recall echoes (a query typed before the forget, a candidate's reason) quote
@@ -256,9 +257,12 @@ def distinctive_tokens(conn: sqlite3.Connection, strings: List[str]) -> List[str
     if not forgotten:
         return []
     alive = set()
-    for label, content, meta in conn.execute(
-            "SELECT label, content, metadata FROM nodes"):
-        alive |= tokens_of(f"{label}\n{content}\n{meta or ''}")
+    for nid, label, content, meta in conn.execute(
+            "SELECT node_id, label, content, metadata FROM nodes"):
+        # The side fields of a node being cut are about to be cut with these
+        # very words, so they cannot vouch for a word staying.
+        side = "" if nid in skip_side_fields else (meta or "")
+        alive |= tokens_of(f"{label}\n{content}\n{side}")
         if not (forgotten - alive):
             return []
     return sorted(forgotten - alive, key=len, reverse=True)

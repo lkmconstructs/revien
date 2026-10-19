@@ -202,6 +202,8 @@ def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, projec
         if forget_gate.check(store, unit, fresh.content) is not None:
             return None, False, 0
         forget_gate.register(store, unit)
+        fresh.content, _left_out = forget_gate.strip_forgotten(
+            store, unit, fresh.content)
         existing = store.find_context_node_by_ingest_key(ikey, node_type=NodeType.SKILL)
 
         if existing is None:

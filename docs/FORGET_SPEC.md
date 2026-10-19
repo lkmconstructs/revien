@@ -24,7 +24,10 @@ Sources: owner rulings (Lissa, with Ash's reads, 2026-10-16), and the findings o
 2. **The forgotten wording inside the stored conversation.** The exact sentence is cut out of the session's context node: its label, its content, the audit snapshots, the vector and the search index.
    - If the wording cannot be found verbatim (for example, the model paraphrased it), the forget is **refused**, with a message naming the context node. The user can then forget the whole conversation. Revien never claims a removal it could not do.
 3. **Shared nodes whose wording only the forgotten unit supplied** are cut back to their label (§5).
-4. **Session cascade:** forgetting a context node with `cascade` forgets the whole unit (§3) and everything only it wrote.
+4. **Matching is by whole words, and the cut is a sentence.** The wording is matched case-insensitively on word boundaries (Unicode-aware), so forgetting the entity "API" never touches "rapid" or "capital". Only the sentence that holds the wording is cut; the rest of the node stays.
+5. **A forget removes the wording from the unit it was forgotten from, and nowhere else by default.** Other units that hold the same wording are not changed; the response names every one of them. `forget --everywhere` (CLI, REST) removes the wording from every unit that holds it, with the same word-bounded matching and sentence cut. There is no MCP forget surface.
+6. **Nodes whose owner is not proven are never changed** by another unit's forget (§3). They are kept and listed.
+7. **Session cascade:** forgetting a context node with `cascade` forgets the whole unit (§3) and everything only it wrote.
 
 Every response states exactly what was removed, cut back and kept, with counts that match the database. Single-node forgets also name the blast radius: "This forgets one node and suppresses future imports from session X."
 
@@ -33,6 +36,7 @@ Every response states exactly what was removed, cut back and kept, with counts t
 - A **unit** is one source item with a stable identity: a Claude Code or Codex session (its UUID; sub-agent files that carry the parent's `sessionId` belong to it), an OpenAI conversation, a watched file (by real path), a vault section, or a skill.
 - **Ownership is recorded when something is written**, in `node_provenance(node_id, unit_id, label_ok, wording_ok)`, by every writer that creates a node or merges into one. Nothing is inferred later from edges or text matching.
 - **Upgrade rule:** when an existing database is backfilled, ownership that cannot be proven is **not guessed**. A node with unproven ownership is kept, marked unproven, and listed when a forget touches its likely unit. **Revien never deletes on a guess.**
+- Hand-added nodes, nodes outside any unit and another unit's context node are never removed or rewritten by a forget; unproven nodes are only listed.
 - Hand-added nodes and nodes outside any unit are never removed by a cascade.
 - Labels are compared with Unicode-aware normalization, so "Jörg" and "Jürg" stay distinct.
 
@@ -47,18 +51,24 @@ Allowed leftovers, each named in the response when it applies:
 - the user's own source files (the session `.jsonl` on disk);
 - exports written to disk before the forget;
 - distilled Obsidian notes, until the user runs `revien distill-vault`. Revien never rewrites the vault on its own; automatic re-distill stays parked. A forget that leaves a distilled note behind must say so explicitly, naming the note and the manual command that removes the fact. Until that runs, the operation is reported as "forgotten from Revien", never "gone everywhere". The keyed fingerprint (§6) stops the unchanged note from being re-imported in the meantime;
-- the echo of a query the user types after the forget.
+- the echo of a query the user types after the forget;
+- other units that still hold the wording (plain forget is per source; `--everywhere` removes them), named in the response;
+- the trained ranking model, which cannot unlearn: it is marked stale and stays so until it is retrained (nothing retrains it automatically; `POST /v1/training/run`). `revien watch` snapshots are part of the raw store and are scrubbed; one that cannot be opened is named.
+
+"Gone everywhere" is printed only when there are no leftovers and nothing remains; otherwise the response says "Forgotten from Revien" and lists them.
 
 ## 5. Shared nodes
 
 - If another live unit vouched for the **name and the wording**, the node stays as is, and ownership moves to that unit.
 - If another live unit vouched for the **name only**, the node is **cut back to its label**. The forgotten wording is scrubbed per §4, and the cut is logged (node id, time; no content) so the description can be regenerated from surviving units on a later index pass. A regenerated description is clean by construction.
 - If no live unit vouches for it, it is removed with the forgotten unit.
+- A cut-back applies only to a shared node that is not a context node and whose wording is unproven; the cut is the sentence, never the whole node unless nothing else is left.
 - Old databases: descriptions saved before provenance existed are treated as unproven wording and are cut back, and logged, the first time a forget touches them. This is a privacy fix, not data loss.
 
 ## 6. Coming back: suppression
 
 - A forget writes a **content-free** suppression record bound to the unit's stable identity.
+- **Forget is a standing rule.** Every forgotten sentence (20 characters or more) goes on a persistent denylist of HMAC fingerprints (the same key as above, content-free). It is checked on every capture path, for every source, inside the write transaction, so a capture that raced the forget, a copy of the file at a new path with a line appended, or another adapter cannot write the wording back. Fragments under 20 characters cannot be matched safely across sources; they are kept out by unit or source identity plus the node's key, and the response says so. Where a unit has no stable identity the response says so and it is listed under Known limits.
 - **File-backed units** (watched files, vault sections, session files) are suppressed **until the file changes**. The record also stores a **keyed fingerprint** of the forgotten content: an HMAC with a secret key kept only in the user's Revien home, so a short secret cannot be recovered by guessing. Text with an identical fingerprint is never recaptured, even if the file's timestamp moves. New or changed content is new evidence and may be captured.
 - **Units with no file behind them** (OpenAI imports, manual entries) are suppressed **for good**.
 - **Shared channels** (`mcp`, `hermes`, `ollama_*`, `langchain`, `api:<feed>`) cannot be suppressed without blocking the whole channel. Forgetting from them **deletes now**, and the response says the content is "eligible for recapture because the source supplied no stable item identity". Stable per-item ids are **required follow-up work**.
@@ -75,7 +85,7 @@ Allowed leftovers, each named in the response when it applies:
 
 - `revien sync reset <adapter>` works only for adapters whose re-read is provably duplicate-free; others are refused. `--orphaned` is allowed only where a saved sync position exists. When explicit forgets exist, `--yes` is required.
 - **Generation fencing:** a reset cannot be undone by a sync that started before it (compare-and-set on the cursor generation).
-- **Old daemons are detected and refused, not just documented.** A daemon running pre-upgrade code ignores suppression and fencing, so the upgraded CLI and API must refuse operations that depend on them, with a clear "restart required" error. Proposed design, for owner approval:
+- **Old daemons are detected and refused, not just documented.** A daemon running pre-upgrade code ignores suppression and fencing, so the upgraded CLI and API must refuse operations that depend on them, with a clear "restart required" error. Design approved by the owner and built:
   - A current daemon writes a heartbeat (code features, process id, time) into the database. Reading it needs no network.
   - Pre-upgrade daemons write no heartbeat, so they are detected through one pinned, loopback-only health check (`/v1/health` on the local machine; an answer without the feature list means old code). Talking to Revien's own daemon on loopback is not egress. The egress gate pins that one module by hash and also forbids every other file from importing it or reaching into it, which closes the re-export evasion found in round 7.
   - Either detection, a stale-code heartbeat or an old health answer, refuses the operation with the restart-required error. No daemon answering means proceed.

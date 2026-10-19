@@ -602,8 +602,15 @@ class ForgetEngine:
             # Everything else that quotes them. The words only the forgotten
             # text had identify an echo of it (a query typed before the
             # forget, a candidate's reason). Whole words only.
-            echo = scrub.distinctive_tokens(conn, plan.token_sources)
+            echo = scrub.distinctive_tokens(conn, plan.token_sources,
+                                            set(holder_ids + cut_ids))
             all_strings = scrub.clean_strings(list(strings) + echo)
+            # The side fields of the nodes that were cut (when it was said,
+            # where it came from, caller metadata) quote single words, not
+            # whole sentences, so they are cut with the words only the
+            # forgotten text had.
+            for nid in holder_ids + cut_ids:
+                self._cut_aux(conn, nid, all_strings)
             stats["audit_rows_scrubbed"] = self._scrub_audit(
                 conn, set(remove_ids), set(changed_ids), all_strings)
             q = self._scrub_queries(conn, episodes, receipt_ids, all_strings)
@@ -777,6 +784,23 @@ class ForgetEngine:
              json.dumps(meta), node_id))
         self.store._enqueue_embed_stmt(conn, node_id)
         return {"cuts": cuts, "changed": True}
+
+    def _cut_aux(self, conn, node_id: str, strings: List[str]) -> None:
+        """Cut event_time_text, source_context and metadata only."""
+        row = conn.execute(
+            "SELECT event_time_text, source_context, metadata FROM nodes "
+            "WHERE node_id = ?", (node_id,)).fetchone()
+        if row is None:
+            return
+        ett, sctx, meta = row
+        n_ett, a = scrub.cut_text(ett or "", strings)
+        n_sctx, b = scrub.cut_text(sctx or "", strings)
+        n_meta, c = scrub.cut_json_text(meta or "{}", strings)
+        if a or b or c:
+            conn.execute(
+                "UPDATE nodes SET event_time_text = ?, source_context = ?, "
+                "metadata = ? WHERE node_id = ?",
+                (n_ett, n_sctx, n_meta, node_id))
 
     def _scrub_queries(self, conn, episodes, receipt_ids, strings) -> Dict:
         out = {"judgments_removed": 0, "judgments_queries_cleared": 0,
