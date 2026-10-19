@@ -1,6 +1,6 @@
 # Forget, delete and cleanup: specification
 
-Status: **draft for owner approval.** §4 (vault), §8 and §10 are updated with the owner's 2026-10-16 confirmations; only §8's daemon-detection design still awaits approval. No further code is built against these rules until this document is approved. Code is then built once against it, and verified against the invariants in §9.
+Status: **approved by the owner.** §8's old-daemon detection design is also approved, and it is already built on `main` (the first PR). Code is built once against this document and verified against the invariants in §9.
 
 Sources: owner rulings (Lissa, with Ash's reads, 2026-10-16), and the findings of seven independent verification rounds on branch `claude/project-mnemosyne-2eevt2`.
 
@@ -93,7 +93,7 @@ Allowed leftovers, each named in the response when it applies:
 
 ## 10. Out of scope here, tracked separately
 
-- The `list_nodes` crash on databases created by v0.3.0 and 7757085 (seen at 7420060 and 2f1dfb5; its status on `main` is unconfirmed). It is investigated on its own and fixed in its own PR. **But if it breaks the supported upgrade path for this redesign, it is a release blocker for the forget work.**
+- The `list_nodes` crash on databases created by v0.3.0 and 7757085. **Resolved:** it does not reproduce on `main` and is not an upgrade blocker (verified for PR #5).
 - Stable per-item identity for shared channels.
 - Automatic re-distill of the vault on forget.
 - **Confirmed split:** the usage signal, receipts and the Claude Code adapter fix ship first, as their own PR, with a smaller blast radius and independent review. Forget follows as a separate PR built against this spec.
