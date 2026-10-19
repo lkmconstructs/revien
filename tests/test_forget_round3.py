@@ -146,6 +146,26 @@ class TestOriginScope:
             s.close()
         assert seeded.secret not in blob
 
+    def test_a_sub_agent_file_carrying_the_parents_session_id_stays_forgotten(self, tmp_path, monkeypatch):
+        seeded = fs.seed("claude_code", tmp_path, monkeypatch)
+        s = GraphStore(db_path=seeded.db)
+        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
+        s.close()
+        sub = seeded.source_file.parent / "subagents" / "agent-7.jsonl"
+        sub.parent.mkdir(exist_ok=True)
+        sub.write_text("".join(json.dumps({
+            "type": "user", "sessionId": "uuid-claude-1", "timestamp": "2026-07-01T10:05:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": f"Sub-agent remark number {i} about the quarterly budget review."}]}}) + "\n"
+            for i in range(4)))
+        fs._age(sub)
+        seeded.recapture()
+        s = GraphStore(db_path=seeded.db)
+        try:
+            blob = " ".join(n.label + n.content for n in s.list_nodes(limit=200))
+        finally:
+            s.close()
+        assert "quarterly budget review" not in blob      # it is the forgotten session's, whatever the file is called
+
     def test_a_codex_rollout_has_no_internal_id_so_a_renamed_copy_is_recognised_by_content(self, tmp_path, monkeypatch):
         seeded = fs.seed("codex", tmp_path, monkeypatch)
         s = GraphStore(db_path=seeded.db)

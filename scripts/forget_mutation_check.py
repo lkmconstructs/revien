@@ -332,7 +332,7 @@ M = [
     ('session-id-travels-no-more', 3, 'revien/forget/gate.py',
      '            session = sid_override.strip()',
      '            pass',
-     ["tests/test_forget_round3.py -k 'renamed_claude_code_session'"]),
+     ["tests/test_forget_round3.py -k 'renamed_claude_code_session or sub_agent_file'"]),
     ('plain-forget-reaches-other-units', 2, 'revien/forget/engine.py',
      '        if everywhere and not holder:',
      '        if not holder:',

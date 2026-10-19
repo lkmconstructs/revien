@@ -62,6 +62,7 @@ Allowed leftovers, each named in the response when it applies:
 - If another live unit vouched for the **name and the wording**, the node stays as is, and ownership moves to that unit.
 - If another live unit vouched for the **name only**, the node is **cut back to its label**. The forgotten wording is scrubbed per §4, and the cut is logged (node id, time; no content) so the description can be regenerated from surviving units on a later index pass. A regenerated description is clean by construction.
 - If no live unit vouches for it, it is removed with the forgotten unit.
+- `forget --everywhere` never cuts a shared node back to its label: it cuts the exact targeted sentence out of it in place (§2.5).
 - A cut-back applies only to a shared node that is not a context node and whose wording is unproven; the cut is the sentence, never the whole node unless nothing else is left.
 - Old databases: descriptions saved before provenance existed are treated as unproven wording and are cut back, and logged, the first time a forget touches them. This is a privacy fix, not data loss.
 
