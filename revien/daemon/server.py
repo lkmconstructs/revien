@@ -64,6 +64,11 @@ class IngestResponse(BaseModel):
     edges_created: int
     total_nodes_in_graph: int
     total_edges_in_graph: int
+    # True when the suppression gate refused the capture (a forget said it
+    # must not come back); nothing was written. A capture that arrives
+    # through a shared channel has no stable identity the gate can protect.
+    suppressed: bool = False
+    suppression_note: str = ""
 
 
 class ConsolidateRequest(BaseModel):
@@ -478,6 +483,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     app.state.engine = engine
     app.state.clustering = clustering
     app.state.semantic = semantic
+    # What a forget needs beyond the store: the vectors to drop, the
+    # training database to scrub, the community labels to rebuild.
+    ops.semantic = semantic
+    ops.clustering = clustering
+    ops.training_dbs = (engine.training_loop.db_path,)
 
     # ── POST /v1/ingest ───────────────────────────────
 
@@ -538,6 +548,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             edges_created=result.edges_created,
             total_nodes_in_graph=result.total_nodes_in_graph,
             total_edges_in_graph=result.total_edges_in_graph,
+            suppressed=result.suppressed,
+            suppression_note=result.suppression_note,
         )
 
     # ── POST /v1/recall ───────────────────────────────
@@ -754,8 +766,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.delete("/v1/nodes/{node_id}", dependencies=[_mutation_auth])
     async def delete_node(node_id: str):
-        """Delete a node and its edges. Permanent."""
-        deleted = store.delete_node(node_id)
+        """The DELETE verb: remove the node and its edges now. Permanent.
+        Leaves a content-free delete audit entry and NO suppression record;
+        the content can be captured again if its source still holds it. To
+        keep it from coming back, use POST /v1/nodes/{id}/forget."""
+        deleted = ops.delete_node(node_id, actor="api:delete")
         if not deleted:
             raise HTTPException(404, f"Node not found: {node_id}")
         return {"status": "deleted", "node_id": node_id}
@@ -1142,16 +1157,20 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── GET /v1/nodes/{id}/forget/preview ──────────────
     @app.get("/v1/nodes/{node_id}/forget/preview")
-    async def forget_preview(node_id: str):
-        """Show what a cascade forget WOULD remove (count + ids) — never blind."""
-        preview = ops.forget_preview(node_id)
-        if not preview.get("exists", False):
+    async def forget_preview(node_id: str, cascade: bool = Query(False)):
+        """What a forget WOULD do (nodes removed, cut back, kept; units
+        suppressed). Writes nothing."""
+        preview = ops._forget_engine().forget(node_id, cascade=cascade, dry_run=True)
+        if preview.get("status") in ("not_found", "skipped"):
             raise HTTPException(404, f"Node not found: {node_id}")
+        preview["exists"] = True
         return preview
 
     # ── POST /v1/nodes/{id}/forget ─────────────────────
     class ForgetRequest(BaseModel):
         cascade: bool = False
+        # Accepted for older clients and never stored: the verb is recorded
+        # by this route, not by free text a caller sends.
         reason: str = ""
         construct_id: str = ""
 
@@ -1159,19 +1178,32 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def forget_node_endpoint(
         node_id: str, request: Optional[ForgetRequest] = None
     ):
-        """Right-to-forget: HARD-delete the node's content (privacy).
+        """The FORGET verb: privacy. Removes the node, cuts the forgotten
+        wording out of the session's stored conversation, scrubs every copy,
+        and suppresses the source so it does not come back. The response says
+        exactly what was removed, cut back and kept, and what is left behind
+        (docs/FORGET_SPEC.md). cascade=True on a context node forgets the
+        whole unit and everything only it wrote. A daemon from before the
+        suppression gate on the same database makes this refuse."""
+        from revien.daemon.heartbeat import FORGET_REQUIRES, daemons_lacking
 
-        Distinct from invalidate (which retains). Writes a content-free tombstone
-        audit entry and re-points children's lineage to a tombstone marker.
-        cascade=True forgets the whole DERIVED_FROM subtree.
-        """
         req = request or ForgetRequest()
-        result = ops.forget_node(
-            node_id, cascade=req.cascade, reason=req.reason,
-            construct_id=req.construct_id,
-        )
-        if result.get("status") == "not_found":
+        old = daemons_lacking(store, FORGET_REQUIRES, exclude_pid=os.getpid())
+        if old:
+            raise HTTPException(409, detail={
+                "status": "refused", "reason": "restart_required",
+                "message": (
+                    f"A daemon (pid {old[0]['pid']}) is serving this database "
+                    "from before forget protection. It would capture the "
+                    "forgotten source again. Restart required: stop it, "
+                    "start it again with 'revien start', then forget again. "
+                    "Nothing was changed.")})
+        result = ops.forget_node(node_id, cascade=req.cascade, actor="api:forget")
+        status = result.get("status")
+        if status == "not_found":
             raise HTTPException(404, f"Node not found: {node_id}")
+        if status == "refused":
+            raise HTTPException(409, detail=result)
         return result
 
     # ── GET /v1/export ─────────────────────────────────

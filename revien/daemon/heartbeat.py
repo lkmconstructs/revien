@@ -21,10 +21,17 @@ from typing import Dict, List, Optional
 
 # What this build's daemon can do. "sync_reset_fence": its scheduler persists
 # a sync position only if no reset happened meanwhile (sync_cursors.generation).
-DAEMON_FEATURES = ("sync_reset_fence", "usage_receipts")
+# "forget_suppression": every capture it makes goes through the suppression
+# gate, so a forgotten unit does not come back through it.
+DAEMON_FEATURES = ("sync_reset_fence", "usage_receipts", "forget_suppression")
 
 # Features `revien sync reset` needs a daemon on the database to have.
 RESET_REQUIRES = ("sync_reset_fence",)
+
+# Features `revien forget` needs: a daemon without the gate would capture the
+# forgotten source again, and one without the fence could undo a reset made
+# because of it.
+FORGET_REQUIRES = ("sync_reset_fence", "forget_suppression")
 
 HEARTBEAT_PREFIX = "daemon_heartbeat:"
 HEARTBEAT_INTERVAL = 10.0   # seconds between refreshes
@@ -106,3 +113,13 @@ def live_heartbeats_readonly(readonly_uri: str,
     except sqlite3.Error:
         return []
     return _parse(rows, now or datetime.now(timezone.utc))
+
+
+def daemons_lacking(store, need, exclude_pid: Optional[int] = None,
+                    now: Optional[datetime] = None) -> List[dict]:
+    """Live heartbeats (other than ``exclude_pid``) from daemons that do not
+    report every feature in ``need``. A daemon refusing for its own sake
+    passes its own pid so it does not refuse itself."""
+    need = set(need)
+    return [b for b in live_heartbeats(store, now)
+            if b["pid"] != exclude_pid and not need <= set(b["features"])]

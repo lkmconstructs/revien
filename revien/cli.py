@@ -787,6 +787,9 @@ def ingest(content: str, source: str, db: Optional[str]):
             timestamp=datetime.now(timezone.utc),
             timestamp_source="capture",
         ))
+        if result.suppressed:
+            click.echo("Not ingested: " + result.suppression_note)
+            return
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
                    f"{result.total_edges_in_graph} edges")
@@ -842,7 +845,7 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
 
         items = asyncio.run(adapter.fetch_new_content(since))
         pipeline = IngestionPipeline(store)
-        nodes = edges = 0
+        nodes = edges = suppressed = 0
         for item in items:
             ts = None
             try:
@@ -861,6 +864,9 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
                 links=item.get("links", []),
                 curated=True,
             ))
+            if out.suppressed:
+                suppressed += 1
+                continue
             nodes += out.nodes_created
             edges += out.edges_created
     finally:
@@ -872,6 +878,9 @@ def sync_vault(vault: Optional[str], db: Optional[str], folder: str, full: bool)
         notes = len({i["metadata"]["note"] for i in items})
         click.echo(f"Vault sync: {notes} notes -> {len(items)} chunks, "
                    f"{nodes} nodes, {edges} edges (curated).")
+        if suppressed:
+            click.echo(f"{suppressed} chunk(s) were not ingested: a forget "
+                       "suppressed them. 'revien restore' lifts that.")
     elif not (rec["corrected"] or rec["added"] or rec["forgotten"]):
         click.echo("Vault is up to date — nothing to reconcile or ingest.")
 
@@ -1107,12 +1116,26 @@ def export(file: Optional[str], output: Optional[str], db: Optional[str]):
 
         if target:
             Path(target).write_text(json_str, encoding="utf-8")
+            # A file on disk is a copy a later forget cannot reach; remember
+            # that one was written so the forget response can name it.
+            _note_export(store)
             click.echo(f"Exported {len(graph.nodes)} nodes, "
                        f"{len(graph.edges)} edges to {target}")
         else:
             click.echo(json_str)
     finally:
         store.close()
+
+
+def _note_export(store) -> None:
+    """Record that an export was written to disk (count and time, no path)."""
+    try:
+        prev = json.loads(store.get_meta("exports_written") or "{}")
+        store.set_meta("exports_written", json.dumps({
+            "count": int(prev.get("count", 0)) + 1,
+            "last": datetime.now(timezone.utc).isoformat()}))
+    except Exception:  # noqa: BLE001 - a note must never fail an export
+        pass
 
 
 @main.command(name="import")
@@ -1200,7 +1223,8 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
 
 
 def _run_export_import(runtime: str, file: str, db: Optional[str],
-                        dry_run: bool, limit: Optional[int]) -> None:
+                        dry_run: bool, limit: Optional[int],
+                        override: bool = False) -> None:
     """Shared body for import-chatgpt / import-claude / import-readwise:
     resolve the store/pipeline the same way `ingest` does (cli.py's own
     ingest command, above), stream units from the right importer module,
@@ -1240,6 +1264,7 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
                 report = run_import(
                     units, pipeline, dry_run=False,
                     progress=lambda _unit: bar.update(1),
+                    override_suppression=override,
                 )
         finally:
             store.close()
@@ -1248,7 +1273,12 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
         f"seen={report.units_seen} ingested={report.units_ingested} "
         f"unchanged={report.units_unchanged} denied={report.units_denied} "
         f"empty={report.units_skipped_empty} errors={len(report.errors)}"
+        + (f" suppressed={report.units_suppressed}" if report.units_suppressed else "")
     )
+    if report.units_suppressed:
+        click.echo(f"{report.units_suppressed} unit(s) were not imported: a "
+                   "forget suppressed them. Re-run with --override-suppressed "
+                   "to import them anyway, or use 'revien restore'.")
     if not dry_run:
         click.echo(
             f"nodes_created={report.nodes_created} "
@@ -1271,15 +1301,19 @@ def _run_export_import(runtime: str, file: str, db: Optional[str],
 @click.option("--db", default=None, help="Database path")
 @click.option("--dry-run", is_flag=True,
               help="Parse and report counts; write nothing")
+@click.option("--override-suppressed", is_flag=True,
+              help="Import units a forget suppressed (lifts those "
+                   "suppressions; audited)")
 @click.option("--limit", default=None, type=int,
               help="Only process the first N conversations")
-def import_chatgpt(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+def import_chatgpt(file: str, db: Optional[str], dry_run: bool, limit: Optional[int],
+                  override_suppressed: bool):
     """Import a ChatGPT export (conversations.json, or the .zip you
     downloaded straight from ChatGPT's Settings -> Data controls -> Export)
     through the ingestion pipeline: one unit per conversation, on the
     thread actually shown (edited-away branches are not ingested).
     Idempotent — re-running an unchanged export is a no-op."""
-    _run_export_import("chatgpt", file, db, dry_run, limit)
+    _run_export_import("chatgpt", file, db, dry_run, limit, override_suppressed)
 
 
 @main.command(name="import-claude")
@@ -1287,14 +1321,18 @@ def import_chatgpt(file: str, db: Optional[str], dry_run: bool, limit: Optional[
 @click.option("--db", default=None, help="Database path")
 @click.option("--dry-run", is_flag=True,
               help="Parse and report counts; write nothing")
+@click.option("--override-suppressed", is_flag=True,
+              help="Import units a forget suppressed (lifts those "
+                   "suppressions; audited)")
 @click.option("--limit", default=None, type=int,
               help="Only process the first N conversations")
-def import_claude(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+def import_claude(file: str, db: Optional[str], dry_run: bool, limit: Optional[int],
+                  override_suppressed: bool):
     """Import a Claude.ai export (conversations.json, or the .zip from
     Claude.ai's Settings -> Account -> Export data) through the ingestion
     pipeline: one unit per conversation. Idempotent — re-running an
     unchanged export is a no-op."""
-    _run_export_import("claude", file, db, dry_run, limit)
+    _run_export_import("claude", file, db, dry_run, limit, override_suppressed)
 
 
 @main.command(name="import-readwise")
@@ -1302,13 +1340,17 @@ def import_claude(file: str, db: Optional[str], dry_run: bool, limit: Optional[i
 @click.option("--db", default=None, help="Database path")
 @click.option("--dry-run", is_flag=True,
               help="Parse and report counts; write nothing")
+@click.option("--override-suppressed", is_flag=True,
+              help="Import units a forget suppressed (lifts those "
+                   "suppressions; audited)")
 @click.option("--limit", default=None, type=int,
               help="Only process the first N highlights")
-def import_readwise(file: str, db: Optional[str], dry_run: bool, limit: Optional[int]):
+def import_readwise(file: str, db: Optional[str], dry_run: bool, limit: Optional[int],
+                  override_suppressed: bool):
     """Import a Readwise highlights CSV export through the ingestion
     pipeline: one unit per highlight, linked to its book by an entity
     edge. Idempotent — re-running an unchanged export is a no-op."""
-    _run_export_import("readwise", file, db, dry_run, limit)
+    _run_export_import("readwise", file, db, dry_run, limit, override_suppressed)
 
 
 @main.command()
@@ -1407,6 +1449,9 @@ def skills_ingest(paths: Tuple[str, ...], include_global: bool, db: Optional[str
         f"{summary['refreshed']} refreshed, {summary['edges']} entity/topic "
         f"edge(s) linked."
     )
+    if summary.get("suppressed"):
+        click.echo(f"{summary['suppressed']} skill(s) were not ingested: a "
+                   "forget suppressed them until their file changes.")
 
 
 @skills.command(name="list")
@@ -1701,8 +1746,11 @@ def _sqlite_problem(db_path: str) -> Optional[str]:
 @click.option("--daemon-url", default="http://127.0.0.1:7437",
               help="Where to look for a running daemon (loopback addresses "
                    "only; default http://127.0.0.1:7437)")
+@click.option("--yes", "yes", is_flag=True,
+              help="Reset even though you have forgotten something: required "
+                   "once this database has an explicit forget in it")
 def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
-               daemon_url: str):
+               daemon_url: str, yes: bool):
     """Clear a connected adapter's sync position so its next sync re-reads
     its full history (for example 'revien sync reset claude-code').
 
@@ -1720,7 +1768,12 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
 
     --orphaned resets a saved position whose adapter was removed from your
     config. Its type cannot be checked, so the reset is allowed only because
-    a saved position exists."""
+    a saved position exists.
+
+    Once you have forgotten something, a reset needs --yes: the full re-read
+    shows every source to Revien again. Sources a forget suppressed stay out
+    until their file changes, but a source that changed since is captured
+    again, including any forgotten wording it still contains."""
     import sqlite3
 
     from revien.adapters import (
@@ -1788,6 +1841,19 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
                 "adapters can be reset.")
             raise SystemExit(1)
 
+    # A reset re-reads every source. With an explicit forget in the database
+    # that is not a routine step: say what it does and make the user mean it.
+    forgets = _forget_count(db_path)
+    if forgets and not yes:
+        click.echo(
+            f"This database has {forgets} forget record(s). A reset makes the "
+            "next sync re-read every source in full. Sources a forget "
+            "suppressed stay out until their file changes; a source that "
+            "has changed since is captured again, including any forgotten "
+            "wording it still contains. Re-run with --yes to reset anyway. "
+            "Nothing was changed.")
+        raise SystemExit(1)
+
     # A reset is only safe against a daemon that fences its sync positions.
     # Decided before anything is written (and before a GraphStore migrates).
     old = _old_daemon_problem(db_path, daemon_url)
@@ -1831,9 +1897,10 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
                "'revien start'.")
 
 
-def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
-    """Why an operation that depends on sync-reset fencing must not run now,
-    else None. Two independent sources:
+def _old_daemon_problem(db_path: str, daemon_url: str,
+                        need_features=None, what: str = "reset") -> Optional[str]:
+    """Why an operation that depends on a daemon feature (sync-reset fencing,
+    or the forget gate) must not run now, else None. Two independent sources:
 
     * the heartbeats current daemons write into THIS database: a live one that
       lacks the feature refuses;
@@ -1842,16 +1909,26 @@ def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
       is a daemon from before fencing. Whether it serves this database cannot
       be told from its answer, so it refuses either way.
 
-    No heartbeat and no answer: no daemon is running, nothing to restart."""
+    No heartbeat and no answer: no daemon is running, nothing to restart.
+
+    ``what`` is "reset" (sync reset) or "forget"; it only changes the wording."""
     from revien.daemon.heartbeat import RESET_REQUIRES, live_heartbeats_readonly
     from revien.loopback_probe import probe_daemon
 
-    need = set(RESET_REQUIRES)
+    need = set(RESET_REQUIRES if need_features is None else need_features)
+    forgetting = what == "forget"
+    again = "forget again" if forgetting else "run this command again"
     restart = ("Restart required: stop that daemon ('Ctrl+C' in its "
-               "terminal), start it again with 'revien start', then run this "
-               "command again.")
+               "terminal), start it again with 'revien start', then "
+               + again + ".")
+    protects = ("capture a forgotten source again" if forgetting
+                else "protect a reset from a sync that is running")
     for beat in live_heartbeats_readonly(_readonly_uri(Path(db_path))):
         if not need <= set(beat["features"]):
+            if forgetting:
+                return ("A daemon (pid " + str(beat["pid"]) + ") is serving "
+                        "this database from before forget protection: it "
+                        "would " + protects + ". " + restart)
             return ("A daemon (pid " + str(beat["pid"]) + ") is serving this "
                     "database but does not protect a reset from a sync that "
                     "is running. " + restart)
@@ -1859,6 +1936,13 @@ def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
     if health is None:
         return None
     if "rejected" in health:
+        if forgetting:
+            return (f"--daemon-url {daemon_url!r} was not used "
+                    f"({health['rejected']}). Only http://127.0.0.1:PORT (any "
+                    "127.x.x.x), http://[::1]:PORT or http://localhost:PORT "
+                    "can be checked, so the forget cannot tell whether a "
+                    "daemon from before forget protection is running. Use a "
+                    "loopback --daemon-url.")
         return (f"--daemon-url {daemon_url!r} was not used ({health['rejected']}). "
                 "Only http://127.0.0.1:PORT (any 127.x.x.x), http://[::1]:PORT "
                 "or http://localhost:PORT can be checked, so the reset cannot "
@@ -1866,6 +1950,12 @@ def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
                 "running. Use a loopback --daemon-url.")
     ver = health.get("version") or "unknown"
     if health["features"] is None:
+        if forgetting:
+            return (f"A Revien daemon answering at {daemon_url} (version "
+                    f"{ver}) was started before forget protection existed. It "
+                    "would capture the forgotten source again. The answer "
+                    "does not say which database it serves, so this is "
+                    "refused either way. " + restart)
         return (f"A Revien daemon answering at {daemon_url} (version {ver}) was "
                 "started before sync-reset protection existed. A sync it is "
                 "running would write its old position back and undo the "
@@ -1873,9 +1963,36 @@ def _old_daemon_problem(db_path: str, daemon_url: str) -> Optional[str]:
                 "not say which database it serves, so this is refused either "
                 "way. " + restart)
     if not need <= set(health["features"]):
+        if forgetting:
+            return (f"The daemon answering at {daemon_url} (version {ver}) "
+                    "does not report forget protection. " + restart)
         return (f"The daemon answering at {daemon_url} (version {ver}) does "
                 "not report sync-reset protection. " + restart)
     return None
+
+
+def _forget_count(db_path: str) -> int:
+    """How many explicit forgets this database holds: suppression records
+    plus forget audit entries. Read-only (see _readonly_uri): creates no
+    files and does not migrate."""
+    import sqlite3
+
+    uri = _readonly_uri(Path(db_path))
+    total = 0
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            for sql in ("SELECT COUNT(*) FROM suppressions",
+                        "SELECT COUNT(*) FROM audit_log WHERE op = 'forget'"):
+                try:
+                    total += conn.execute(sql).fetchone()[0]
+                except sqlite3.Error:
+                    pass
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    return total
 
 
 def _has_sync_row(db_path: str, name: str) -> bool:
@@ -1894,6 +2011,170 @@ def _has_sync_row(db_path: str, name: str) -> bool:
             conn.close()
     except sqlite3.Error:
         return False
+
+
+@main.command()
+@click.argument("node_id")
+@click.option("--cascade", is_flag=True,
+              help="On a context node: forget the whole unit (session, "
+                   "conversation, file) and everything only it wrote")
+@click.option("--db", default=None, help="Database path")
+@click.option("--yes", "yes", is_flag=True, help="Do not ask before forgetting")
+@click.option("--preview", is_flag=True,
+              help="Show what would be forgotten and change nothing")
+@click.option("--daemon-url", default="http://127.0.0.1:7437",
+              help="Where to look for a running daemon (loopback addresses "
+                   "only; default http://127.0.0.1:7437)")
+@click.option("--json-output", is_flag=True, help="Output the result as JSON")
+def forget(node_id: str, cascade: bool, db: Optional[str], yes: bool,
+           preview: bool, daemon_url: str, json_output: bool):
+    """Forget a node: privacy, not housekeeping.
+
+    Removes the node, cuts the forgotten wording out of the conversation it
+    came from, scrubs every copy Revien keeps (audit history, recall records,
+    vectors, training data, the database file and its write-ahead log), and
+    stops the source bringing it back until that source changes. The result
+    says exactly what was removed, cut back and kept, and what is left that
+    Revien cannot reach (your own source file, exports, distilled notes).
+
+    To only remove a node and let it be captured again, use the delete
+    endpoint instead. A running daemon from before forget protection makes
+    this refuse; restart it first."""
+    import sqlite3
+
+    from revien.graph.operations import GraphOperations
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    problem = _sqlite_problem(db_path)
+    if problem:
+        click.echo(problem)
+        raise SystemExit(1)
+
+    from revien.daemon.heartbeat import FORGET_REQUIRES
+
+    old = _old_daemon_problem(db_path, daemon_url,
+                              need_features=FORGET_REQUIRES, what="forget")
+    if old:
+        click.echo(old)
+        click.echo("Nothing was changed.")
+        raise SystemExit(1)
+
+    try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        ops = GraphOperations(store)
+        plan = ops._forget_engine().forget(node_id, cascade=cascade, dry_run=True)
+        status = plan.get("status")
+        if status in ("not_found", "skipped"):
+            click.echo(f"No node {node_id} to forget.")
+            raise SystemExit(1)
+        if status == "refused":
+            click.echo(plan["message"])
+            raise SystemExit(1)
+        if preview:
+            if json_output:
+                click.echo(json.dumps(plan, indent=2))
+            else:
+                click.echo(plan["blast_radius"])
+                click.echo(f"  would remove  : {len(plan['would_remove'])} node(s)")
+                click.echo(f"  would cut back: {len(plan['would_cut_back'])} shared node(s)")
+                click.echo(f"  would keep    : {len(plan['would_keep'])} (another unit vouches)")
+                click.echo(f"  unproven      : {len(plan['unproven'])} kept and listed")
+                for u in plan["not_suppressed"]:
+                    click.echo(f"  note: {u['note']}")
+            return
+        if not yes:
+            click.echo(plan["blast_radius"])
+            click.echo(f"  {len(plan['would_remove'])} node(s) removed, "
+                       f"{len(plan['would_cut_back'])} cut back, "
+                       f"{len(plan['would_keep'])} kept.")
+            if not click.confirm("Forget this?"):
+                click.echo("Nothing was changed.")
+                raise SystemExit(1)
+        result = ops.forget_node(node_id, cascade=cascade, actor="cli:forget")
+    finally:
+        store.close()
+
+    if json_output:
+        click.echo(json.dumps(result, indent=2))
+        return
+    if result["status"] == "refused":
+        click.echo(result["message"])
+        raise SystemExit(1)
+    click.echo(result["message"])
+    click.echo(f"  removed {result['removed_nodes']} node(s); the graph went "
+               f"from {result['nodes_before']} to {result['nodes_after']} nodes "
+               f"and {result['edges_before']} to {result['edges_after']} edges.")
+    for u in result["not_suppressed"]:
+        click.echo(f"  {u['note']}")
+
+
+@main.command()
+@click.argument("target", required=False)
+@click.option("--db", default=None, help="Database path")
+@click.option("--list", "list_only", is_flag=True,
+              help="List the active suppressions and change nothing")
+@click.option("--yes", "yes", is_flag=True,
+              help="For a pattern: lift what it lists without asking")
+def restore(target: Optional[str], db: Optional[str], list_only: bool, yes: bool):
+    """Let a forgotten source be captured again.
+
+    'revien restore /path/to/file' lifts the suppression of that ONE file. A
+    bare name never lifts several paths. To lift several, give an explicit
+    pattern, for example: revien restore 'projA/**'. It lists everything it
+    would lift and asks before lifting. Every restore is audited."""
+    import sqlite3
+
+    from revien.forget.restore import plan_restore, restore as do_restore
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    problem = _sqlite_problem(db_path)
+    if problem:
+        click.echo(problem)
+        raise SystemExit(1)
+    try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        if list_only or not target:
+            rows = store.list_suppressions("active")
+            if not rows:
+                click.echo("No active suppressions.")
+                return
+            click.echo(f"{len(rows)} active suppression(s):")
+            for r in rows:
+                where = r["path"] or r["unit_id"]
+                lasts = ("until the file changes" if r["kind"] == "file"
+                         else "for good")
+                click.echo(f"  #{r['id']} {where} ({lasts}), since {r['created_at'][:19]}")
+            return
+        plan = plan_restore(store, target)
+        if plan["status"] in ("error", "none", "ambiguous"):
+            click.echo(plan["message"])
+            for c in plan.get("candidates", []):
+                click.echo(f"  #{c['id']} {c['path'] or c['unit_id']}")
+            raise SystemExit(1)
+        click.echo(f"Will lift {len(plan['lifts'])} suppression(s):")
+        for item in plan["lifts"]:
+            click.echo(f"  #{item['id']} {item['path'] or item['unit_id']}")
+        if plan["mode"] == "bulk" and not yes:
+            if not click.confirm("Lift all of these?"):
+                click.echo("Nothing was changed.")
+                raise SystemExit(1)
+        done = do_restore(store, target, actor="cli:restore", confirmed=True)
+    finally:
+        store.close()
+    click.echo(f"Restored {len(done.get('lifted', []))} suppression(s). Their "
+               "sources can be captured again at the next sync.")
 
 
 @main.group()

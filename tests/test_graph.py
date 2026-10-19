@@ -615,16 +615,31 @@ class TestRetentionArchive:
 class TestRetentionExpire:
     """expire HARD-deletes stale unpinned nodes (+content-free tombstone audit)."""
 
-    def test_stale_hard_deleted_with_tombstone(self, store, ops):
+    def test_user_sweep_is_the_delete_verb(self, store, ops):
+        """A sweep a person asked for is DELETE (docs/FORGET_SPEC.md §1): a
+        content-free `delete` audit entry, the verb recorded by the code
+        path (not a caller string), and no suppression record."""
         stale = _aged(store, "stale", 200)
         r = ops.apply_retention(mode="expire", days=90)
         assert r["expired"] == 1
         assert store.get_node(stale.node_id) is None       # HARD deleted
-        forget_entries = [a for a in store.get_node_audit(stale.node_id)
-                          if a["op"] == "forget"]
-        assert len(forget_entries) == 1
-        assert forget_entries[0]["before"] is None          # no forgotten content
-        assert forget_entries[0]["after"]["reason"] == "retention_expire"
+        entries = [a for a in store.get_node_audit(stale.node_id)
+                   if a["op"] == "delete"]
+        assert len(entries) == 1
+        assert entries[0]["before"] is None                 # no deleted content
+        assert entries[0]["actor"] == "api:retention_sweep"
+        assert "STALE" not in str(entries[0])
+        assert not any(a["op"] == "forget"
+                       for a in store.get_node_audit(stale.node_id))
+        assert store.list_suppressions(None) == []
+
+    def test_scheduled_cleanup_is_its_own_verb(self, store, ops):
+        stale = _aged(store, "stale", 200)
+        r = ops.run_scheduled_cleanup(mode="expire", days=90)
+        assert r["expired"] == 1
+        ops_seen = [a["op"] for a in store.get_node_audit(stale.node_id)]
+        assert "cleanup" in ops_seen and "delete" not in ops_seen
+        assert store.list_suppressions(None) == []
 
     def test_pinned_and_fresh_survive_expire(self, store, ops):
         pinned = _aged(store, "pin", 200, pinned=True)
@@ -664,19 +679,23 @@ class TestForget:
         assert tomb is not None and tomb.pinned and tomb.content == ""
         assert tomb.node_type == NodeType.CONTEXT           # excluded from recall
 
-    def test_forget_preview_lists_subtree(self, store, ops):
+    def test_forget_preview_says_what_would_happen(self, store, ops):
         a, b, c = self._chain(store, ops)
         prev = ops.forget_preview(a.node_id)
-        assert prev["exists"] and prev["count"] == 3
-        assert set(prev["node_ids"]) == {a.node_id, b.node_id, c.node_id}
+        assert prev["exists"] and prev["status"] == "preview"
+        assert prev["would_remove"] == [a.node_id]
+        assert store.get_node(a.node_id) is not None        # nothing written
 
-    def test_forget_cascade_removes_chain(self, store, ops):
+    def test_cascade_never_removes_nodes_outside_a_unit(self, store, ops):
+        """Hand-added nodes (no recorded owner) are never removed by a
+        cascade (docs/FORGET_SPEC.md §3), even when derived from the target."""
         a, b, c = self._chain(store, ops)
-        res = ops.forget_node(a.node_id, cascade=True, reason="gdpr")
-        assert res["count"] == 3
+        res = ops.forget_node(a.node_id, cascade=True)
+        assert res["count"] == 1
         assert store.get_node(a.node_id) is None
-        assert store.get_node(b.node_id) is None
-        assert store.get_node(c.node_id) is None
+        assert store.get_node(b.node_id) is not None
+        assert store.get_node(c.node_id) is not None
+        assert "cascade" in res["cascade_note"]
 
     def test_forget_missing_node(self, store, ops):
         assert ops.forget_node("nope")["status"] == "not_found"
