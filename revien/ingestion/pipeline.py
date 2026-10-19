@@ -1062,7 +1062,7 @@ class IngestionPipeline:
         # Last word under BEGIN IMMEDIATE (see ingest(), 3a4).
         _undone = _gate.enforce_after_write(
             self.store, unit, input_data.content,
-            [nid for nid, _l, _c in newly_created] + [ctx_id])
+            [nid for nid, _l, _c in newly_created], existing_ids=[ctx_id])
         if _undone is not None:
             return self._suppressed_output(_undone, fenced_spans)
         newly_created = [

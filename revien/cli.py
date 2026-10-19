@@ -2021,9 +2021,12 @@ def _has_sync_row(db_path: str, name: str) -> bool:
               help="On a context node: forget the whole unit (session, "
                    "conversation, file) and everything only it wrote")
 @click.option("--everywhere", is_flag=True,
-              help="Also remove the wording from every other unit that holds "
-                   "it. Without it, a forget is per source and the response "
-                   "names the other units that still hold the wording")
+              help="Also cut the exact forgotten wording (this node's own "
+                   "content) out of every other node that holds it, in place "
+                   "(nothing is deleted or suppressed), and keep it out of "
+                   "every source. Without it, a forget is per source and the "
+                   "response names the other sources that still hold the "
+                   "wording")
 @click.option("--db", default=None, help="Database path")
 @click.option("--yes", "yes", is_flag=True, help="Do not ask before forgetting")
 @click.option("--preview", is_flag=True,
@@ -2039,9 +2042,10 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
     Removes the node, cuts the forgotten wording out of the conversation it
     came from, scrubs every copy Revien keeps (audit history, recall records,
     vectors, training data, the database file and its write-ahead log), and
-    stops the source bringing it back until that source changes. The result
-    says exactly what was removed, cut back and kept, and what is left that
-    Revien cannot reach (your own source file, exports, distilled notes).
+    stops the source (and a copy of it) bringing it back until that source
+    changes. The result says exactly what was removed, cut back and kept,
+    what is left that Revien cannot reach (your own source file, exports,
+    distilled notes), and which way back it does and does not close.
 
     To only remove a node and let it be captured again, use the delete
     endpoint instead. A running daemon from before forget protection makes
@@ -2094,6 +2098,13 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
                 click.echo(f"  unproven      : {len(plan['unproven'])} kept and listed")
                 for u in plan["not_suppressed"]:
                     click.echo(f"  note: {u['note']}")
+                if plan.get("would_cut_in_place"):
+                    click.echo(f"  would cut in place: {len(plan['would_cut_in_place'])} "
+                               "node(s) of other sources")
+                click.echo("  would stop coming back: "
+                           + " | ".join(plan["reentry"]["stops"]))
+                click.echo("  would not stop: "
+                           + " | ".join(plan["reentry"]["does_not_stop"]))
             return
         if not yes:
             click.echo(plan["blast_radius"])

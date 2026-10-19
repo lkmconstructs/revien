@@ -347,8 +347,9 @@ class TestGoneEverywhereIsTrue:
             c = sqlite3.connect(path)
             try:
                 assert c.execute("SELECT query FROM recall_receipts WHERE recall_id = 'rcpt-plain'").fetchone()[0] == ""
-                assert c.execute("SELECT count(*) FROM use_judgments WHERE query != ''").fetchone()[0] == \
-                    c.execute("SELECT count(*) FROM use_judgments WHERE query != '' AND episode_key != 'sess#plain' AND episode_key != 'sess#tool-1'").fetchone()[0]
+                assert c.execute(
+                    "SELECT count(*) FROM use_judgments WHERE episode_key = 'sess#plain' AND query != ''"
+                ).fetchone()[0] == 0
                 assert vec_rows(c) == 0
                 assert scrub.find_residue(c, [seeded.secret]) == {}
             finally:
@@ -549,23 +550,33 @@ class TestModelRetrain:
         assert "Neural ranking is off, so nothing retrains it: run POST /v1/training/run" in left["note"]
 
     def test_the_daemon_retrains_after_a_forget_only_when_neural_ranking_is_on(self, tmp_path, monkeypatch):
+        """Through the daemon's own engine, so the model it holds in memory is
+        reloaded too (not only the file on disk)."""
         from revien.neural.training import TrainingLoop
         from fastapi.testclient import TestClient
         from revien.daemon.server import create_app
-        ran = []
-        monkeypatch.setattr(TrainingLoop, "train", lambda self: ran.append(1) or True)
+        trained = []
+        monkeypatch.setattr(TrainingLoop, "_neural_available", lambda self: True)
+        monkeypatch.setattr("revien.neural.scorer_model.NeuralScorer.train",
+                            lambda self, data: trained.append(len(data)) or True)
         for flag, expect in (("1", True), ("0", False)):
             monkeypatch.setenv("REVIEN_NEURAL", flag)
             db = str(tmp_path / f"d{flag}.db")
             s = GraphStore(db_path=db)
             c = ctx(s, "User: remember the gate code ZQXRETRAIN1.")
             s.close()
-            ran.clear()
-            with TestClient(create_app(db_path=db)) as client:
+            trained.clear()
+            app = create_app(db_path=db)
+            with TestClient(app) as client:
+                engine = app.state.engine
+                self._signals(engine.training_loop, 120)
+                old = engine.neural_scorer
                 r = client.post(f"/v1/nodes/{c.node_id}/forget", json={"cascade": True})
-            body = r.json()
-            assert body["model"]["neural_ranking"] is expect
-            assert (len(ran) == 1) is expect and body["model"]["retrained"] is expect
+                body = r.json()
+                assert body["model"]["neural_ranking"] is expect
+                assert (len(trained) == 1) is expect and body["model"]["retrained"] is expect
+                assert (engine.neural_scorer is not old) is expect       # the live model was replaced
+                assert engine.training_loop.is_stale() is (not expect)
 
     def test_a_forget_from_the_cli_retrains_too_when_neural_ranking_is_on(self, store, monkeypatch):
         monkeypatch.setenv("REVIEN_NEURAL", "1")
@@ -612,7 +623,9 @@ class TestEveryPathDecidesUnderTheWriteLock:
         lock_log.clear()
         cap(pipe, "chatgpt:conversation:W", "User: First line of the conversation here.\nUser: A second, newer line follows.")
         s.close()
-        assert lock_log and lock_log[-1] is True      # the decision that counts is the one inside the transaction
+        # [before the work, inside the refresh transaction, enforce_after_write]:
+        # everything after the first look is made with the write lock held
+        assert len(lock_log) >= 3 and all(lock_log[1:])
 
     def test_the_append_path_undoes_inside_a_write_transaction(self, tmp_path, lock_log):
         s = GraphStore(db_path=str(tmp_path / "w2.db"))
@@ -778,6 +791,42 @@ class TestRaces:
                   "User: Plain first line of the conversation.\nUser: A later line arrives.")
         assert fired and out.suppressed is False and out.context_node_id
         assert s1.get_node(out.context_node_id) is not None
+        s1.close(); s2.close()
+
+    def test_a_refresh_of_a_suppressed_unit_changes_nothing(self, tmp_path):
+        """A forget lands while the refresh is being extracted (so the first
+        look found the unit free). The check inside the refresh transaction is
+        what keeps the unit's record exactly as the forget left it: not
+        updated with the new text, not deleted."""
+        db = str(tmp_path / "frozen.db")
+        s1 = GraphStore(db_path=db)
+        s2 = GraphStore(db_path=db)
+        pipe = IngestionPipeline(s1)
+        cap(pipe, "chatgpt:conversation:FZ",
+            "User: We decided to use ZQXFROZEN as the gate.\nUser: Another plain line stays here.")
+        target = [n for n in s1.list_nodes(node_type=NodeType.DECISION, limit=10) if "ZQXFROZEN" in n.content][0]
+
+        def state(store):
+            return {n.node_id: (n.label, n.content) for n in store.list_nodes(limit=100)}
+
+        left_by_the_forget = {}
+        real = pipe.extractor.extract
+        fired = []
+
+        def extract(*a, **kw):
+            out = real(*a, **kw)
+            if not fired:
+                fired.append(1)
+                res = GraphOperations(s2).forget_node(target.node_id)     # node level: the context is cut, kept
+                assert [x["unit_id"] for x in res["suppressed"]] == ["item:chatgpt:conversation:FZ"]
+                left_by_the_forget.update(state(s2))
+            return out
+
+        pipe.extractor.extract = extract
+        out = cap(pipe, "chatgpt:conversation:FZ",
+                  "User: We decided to use ZQXFROZEN as the gate.\nUser: Another plain line stays here.\nUser: A newer line.")
+        assert fired and out.suppressed is True
+        assert left_by_the_forget and state(s1) == left_by_the_forget
         s1.close(); s2.close()
 
     def test_a_forget_under_a_refresh_suppresses_it_cleanly(self, tmp_path):
@@ -1068,3 +1117,26 @@ class TestSpecAndChangelogAgree:
         assert "only the exact wording that was targeted" in spec
         assert "cuts only the exact wording that was targeted" in log
         assert "Every response" in spec or "Every response states" in spec
+
+
+class TestThePreviewSaysTheSame:
+    def test_cli_and_rest_previews_carry_the_scope(self, tmp_path):
+        from click.testing import CliRunner
+        from fastapi.testclient import TestClient
+
+        from revien.cli import main
+        from revien.daemon.server import create_app
+        db = str(tmp_path / "pv.db")
+        s = GraphStore(db_path=db)
+        pipe = IngestionPipeline(s)
+        cap(pipe, "chatgpt:conversation:B", f"User: {SHARED}\nUser: {BOIL}\nUser: {B_ONLY}")
+        fact = a_only_fact(s)
+        s.close()
+        out = CliRunner().invoke(main, ["forget", fact.node_id, "--db", db, "--preview", "--everywhere"])
+        assert out.exit_code == 0, out.output
+        assert "would stop coming back:" in out.output and "would not stop:" in out.output
+        assert "would cut in place:" in out.output
+        with TestClient(create_app(db_path=db)) as client:
+            r = client.get(f"/v1/nodes/{fact.node_id}/forget/preview", params={"everywhere": True})
+        body = r.json()
+        assert body["reentry"]["scope"] == "everywhere" and body["would_cut_in_place"]

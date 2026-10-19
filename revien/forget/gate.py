@@ -295,7 +295,8 @@ def strip_forgotten(store, unit: UnitRef, content: str,
         content, _forgotten_test(long_fps, short_fps), min_len=scrub.MIN_SHORT)
 
 
-def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=()):
+def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=(),
+                        existing_ids=()):
     """The last word, said inside one write transaction.
 
     A capture checks the gate before it extracts, and again before it writes,
@@ -307,7 +308,10 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
     pass, which runs after the denylist is committed, finds what was written.
     Either order, a forgotten sentence cannot stay. Returns the Block when the
     whole capture was undone, else None. Nodes whose words were cut are
-    re-queued for embedding."""
+    re-queued for embedding. ``existing_ids`` are records the capture
+    refreshed in place (a keyed context node): their forgotten sentences are
+    cut, but a record that was there before the capture is never deleted by
+    undoing it."""
     from revien.forget import scrub
 
     with store.transaction(immediate=True) as conn:
@@ -326,7 +330,8 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
             return None
         forgotten = _forgotten_test(long_fps, short_fps)
 
-        for nid in list(new_ids):
+        fresh = set(new_ids)
+        for nid in list(new_ids) + [i for i in existing_ids if i not in fresh]:
             row = conn.execute(
                 "SELECT node_type, label, content FROM nodes WHERE node_id = ?",
                 (nid,)).fetchone()
@@ -344,7 +349,8 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
                         "UPDATE nodes SET content = ?, label = ? WHERE node_id = ?",
                         (new_text, new_label[:200], nid))
                     store._enqueue_embed_stmt(conn, nid)
-            elif text and len(scrub.sentence_key(text)) >= scrub.MIN_SHORT \
+            elif nid in fresh and text \
+                    and len(scrub.sentence_key(text)) >= scrub.MIN_SHORT \
                     and forgotten(scrub.sentence_key(text)):
                 store.delete_node(nid)
                 conn.execute("DELETE FROM audit_log WHERE node_id = ?", (nid,))
