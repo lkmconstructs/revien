@@ -1351,6 +1351,10 @@ class RetrievalEngine:
             "scorer": self.neural_scorer.get_stats(),
         }
 
+    def last_train_failure(self) -> Optional[str]:
+        """Why the last training run produced no model, or None."""
+        return self.training_loop.last_failure
+
     def reload_scorer(self) -> None:
         """Load the model from disk again (after a retrain)."""
         self.neural_scorer = NeuralScorer(model_dir=self._model_dir)

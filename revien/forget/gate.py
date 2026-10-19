@@ -43,6 +43,10 @@ class UnitRef:
     unit_id: Optional[str]          # stable identity, or None (shared channel)
     path: Optional[str] = None      # the file it came from, as reported
     synthetic: str = field(default_factory=lambda: f"{CAPTURE_PREFIX}{uuid.uuid4()}")
+    #: An id read from inside the source that travels with a copy of it
+    #: (a Codex rollout's session id), as ``sid:<runtime>:<id>``. It is an
+    #: extra key for the unit, never its id.
+    sid: Optional[str] = None
 
     @property
     def stable(self) -> bool:
@@ -80,7 +84,12 @@ def unit_for_input(input_data, origin) -> UnitRef:
         if isinstance(sid_override, str) and sid_override.strip() \
                 and runtime == "claude-code":
             session = sid_override.strip()
-        return UnitRef(session_unit(runtime, session), path)
+        sid = None
+        if runtime == "codex":
+            inner = meta.get("session_id")
+            if isinstance(inner, str) and inner.strip():
+                sid = f"sid:codex:{inner.strip()}"
+        return UnitRef(session_unit(runtime, session), path, sid=sid)
     if runtime == "obsidian" and sid.startswith("vault:"):
         return UnitRef(sid, path)
     if runtime == "file" and path:
@@ -105,6 +114,8 @@ def register(store, unit: UnitRef) -> None:
     if unit.path and is_real_file(unit.path):
         path = real_path(unit.path)
         keys = identity_keys(unit.path)
+    if unit.sid:
+        keys = keys + [unit.sid]
     store.register_unit(unit.unit_id, path, keys)
 
 
@@ -180,8 +191,13 @@ def _origin_applies(rec: Dict, unit: UnitRef, keys: set, capture_fps) -> bool:
 
 
 def _capture_keys(unit: UnitRef) -> set:
+    """Every key that names where this capture comes from: its file (real
+    path, inode) and the id inside it, when it has one."""
     verified = unit.path if (unit.path and is_real_file(unit.path)) else None
-    return set(identity_keys(verified)) if verified else set()
+    keys = set(identity_keys(verified)) if verified else set()
+    if unit.sid:
+        keys.add(unit.sid)
+    return keys
 
 
 def known(store, unit: UnitRef, content: str, match_content: Optional[str] = None):
@@ -226,11 +242,12 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
     fp = fingerprint(content) if content and content.strip() else None
     verified = unit.path if (unit.path and is_real_file(unit.path)) else None
     keys = set(identity_keys(verified)) if verified else set()
+    named = keys | ({unit.sid} if unit.sid else set())
     capture_fps = None
     for rec in records:
         file_level = rec["unit_id"].startswith(FILE_LEVEL)
         by_unit = unit.stable and rec["unit_id"] == unit.unit_id
-        by_key = file_level and bool(keys & set(rec["path_keys"]))
+        by_key = file_level and bool(named & set(rec["path_keys"]))
         by_fp = fp is not None and (
             fp in rec["content_fps"] or fp in rec["wording_fps"])
         if rec["kind"] == "wording":
@@ -244,7 +261,7 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
                 return Block(rec, "the same text was forgotten")
             if capture_fps is None:
                 capture_fps = long_fingerprints(content)
-            if _origin_applies(rec, unit, keys, capture_fps):
+            if _origin_applies(rec, unit, named, capture_fps):
                 return Block(rec, "the same text was forgotten")
             continue
         if not (by_unit or by_key or by_fp):

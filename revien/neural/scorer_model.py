@@ -58,6 +58,8 @@ class NeuralScorer:
         self._weights = None
         self._bias = 0.0
         self._model_available = False
+        #: Why the last train() returned False (None when it did not).
+        self.last_error: Optional[str] = None
 
         # Without numpy there is nothing to load or run — stay disabled.
         if _NUMPY_AVAILABLE:
@@ -131,15 +133,18 @@ class NeuralScorer:
             True if training succeeded. Returns False (and logs) if the neural
             extra (numpy/sklearn) is not installed.
         """
+        self.last_error = None
         if not _NUMPY_AVAILABLE:
             logger.warning(
                 "numpy not installed. Neural training disabled "
                 "(install with: pip install revien[neural])."
             )
+            self.last_error = "numpy is not installed (pip install revien[neural])"
             return False
 
         if len(training_data) < 50:
             logger.info(f"Not enough training data: {len(training_data)}/50 minimum")
+            self.last_error = f"only {len(training_data)} examples, 50 are needed"
             return False
 
         try:
@@ -189,9 +194,11 @@ class NeuralScorer:
                 "sklearn not installed. Neural training disabled "
                 "(install with: pip install revien[neural])."
             )
+            self.last_error = "scikit-learn is not installed (pip install revien[neural])"
             return False
         except Exception as e:
             logger.error(f"Training failed: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
             return False
 
     def _save_model(self) -> None:

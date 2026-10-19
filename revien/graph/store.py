@@ -7,6 +7,7 @@ import functools
 import json
 import sqlite3
 import threading
+import time
 import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,6 +19,11 @@ from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
+
+
+class StoreBusy(sqlite3.OperationalError):
+    """Another connection held the write lock for the whole of a bounded
+    wait (see GraphStore.transaction)."""
 
 
 class ImportRefusedError(ValueError):
@@ -802,12 +808,14 @@ class GraphStore(ForgetStoreMixin):
     # ── Transactions ──────────────────────────────────────
 
     @contextmanager
-    def transaction(self, immediate: bool = False):
+    def transaction(self, immediate: bool = False, wait: float = 0.0):
         """Everything inside lands in ONE commit; any failure rolls back ALL
         of it. Holds the store lock for the whole span, so no other thread can
         interleave (or commit) mid-transaction on the shared connection.
 
         ``immediate=True`` opens it with BEGIN IMMEDIATE (see below).
+        ``wait``: seconds to keep trying (with backoff) after SQLite's own
+        busy timeout has run out, before raising StoreBusy.
 
         Nests: an inner transaction() rides the outer one — per-method commits
         (_commit) are no-ops until the outermost level commits. Listener fires
@@ -839,7 +847,22 @@ class GraphStore(ForgetStoreMixin):
                     # a check made inside it cannot be overtaken by a write
                     # from the other one.
                     conn.commit()
-                    conn.execute("BEGIN IMMEDIATE")
+                    deadline = time.monotonic() + max(0.0, wait)
+                    delay = 0.05
+                    while True:
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            break
+                        except sqlite3.OperationalError as e:
+                            if "locked" not in str(e).lower() \
+                                    and "busy" not in str(e).lower():
+                                raise
+                            if time.monotonic() >= deadline:
+                                if wait > 0:
+                                    raise StoreBusy(str(e)) from e
+                                raise
+                            time.sleep(delay)
+                            delay = min(delay * 2, 1.0)
                 yield conn
                 conn.commit()
             except BaseException:

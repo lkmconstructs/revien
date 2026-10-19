@@ -2122,7 +2122,7 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
     if json_output:
         click.echo(json.dumps(result, indent=2))
         return
-    if result["status"] == "refused":
+    if result["status"] in ("refused", "busy"):
         click.echo(result["message"])
         raise SystemExit(1)
     click.echo(result["message"])

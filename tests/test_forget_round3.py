@@ -166,18 +166,23 @@ class TestOriginScope:
             s.close()
         assert "quarterly budget review" not in blob      # it is the forgotten session's, whatever the file is called
 
-    def test_a_codex_rollout_has_no_internal_id_so_a_renamed_copy_is_recognised_by_content(self, tmp_path, monkeypatch):
+    def test_a_renamed_codex_rollout_keeps_its_session_id_and_stays_forgotten(self, tmp_path, monkeypatch):
         seeded = fs.seed("codex", tmp_path, monkeypatch)
         s = GraphStore(db_path=seeded.db)
         res = GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
         s.close()
         said = " ".join(res["reentry"]["stops"])
-        assert "file name" in said and "content" in said
-        copy = seeded.source_file.parent / "rollout-copy-renamed.jsonl"
-        copy.write_text(seeded.source_file.read_text() + json.dumps({
+        assert "session_meta" in said and "renamed or moved copy" in said
+        copy = seeded.source_file.parent / "rollout-renamed-elsewhere.jsonl"
+        # (so much new text that the copy rule cannot recognise it: only the
+        # id inside the file, which travels with the copy, can)
+        later = "".join(json.dumps({
             "timestamp": "2026-07-01T10:02:00Z", "type": "response_item",
             "payload": {"type": "message", "role": "user",
-                        "content": [{"type": "input_text", "text": "An unrelated later remark about parking."}]}}) + "\n")
+                        "content": [{"type": "input_text",
+                                     "text": f"Later remark number {i} about parking permits and the quarterly budget."}]}}) + "\n"
+            for i in range(8))
+        copy.write_text(seeded.source_file.read_text() + later)
         fs._age(copy)
         seeded.recapture()
         s = GraphStore(db_path=seeded.db)
@@ -185,8 +190,33 @@ class TestOriginScope:
             blob = " ".join(n.label + n.content for n in s.list_nodes(limit=200))
         finally:
             s.close()
-        assert seeded.secret not in blob
-        assert "parking" in blob
+        assert seeded.secret not in blob and "parking permits" not in blob
+
+    def test_a_different_codex_rollout_that_shares_sentences_is_untouched(self, tmp_path, monkeypatch):
+        seeded = fs.seed("codex", tmp_path, monkeypatch)
+        s = GraphStore(db_path=seeded.db)
+        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
+        s.close()
+        other = seeded.source_file.parent / "rollout-other-session.jsonl"
+        lines = [json.dumps({"timestamp": "2026-07-01T11:00:00Z", "type": "session_meta",
+                             "payload": {"id": "0197-codex-another", "cwd": "/work/proj-c"}})]
+        for role, kind, text in (
+                ("user", "input_text", f"remember that my safe code is {seeded.secret}."),
+                ("assistant", "output_text", "A long unrelated discussion about the quarterly budget."),
+                ("user", "input_text", "Please also review the parking permits for the new office."),
+                ("assistant", "output_text", "Understood, the parking permits review is on the agenda.")):
+            lines.append(json.dumps({"timestamp": "2026-07-01T11:00:01Z", "type": "response_item",
+                                     "payload": {"type": "message", "role": role,
+                                                 "content": [{"type": kind, "text": text}]}}))
+        other.write_text("\n".join(lines) + "\n")
+        fs._age(other)
+        seeded.recapture()
+        s = GraphStore(db_path=seeded.db)
+        try:
+            blob = " ".join(n.content for n in s.list_nodes(limit=200))
+        finally:
+            s.close()
+        assert f"my safe code is {seeded.secret}" in blob and "parking permits" in blob
 
     def test_the_copy_rule(self):
         sig = {f"s{i}" for i in range(10)}
@@ -372,6 +402,9 @@ class TestGoneEverywhereIsTrue:
                 ).fetchone()[0] == 0
                 assert vec_rows(c) == 0
                 assert scrub.find_residue(c, [seeded.secret]) == {}
+                # the receipts no longer name the nodes that were removed
+                listed = [json.loads(r[0]) for r in c.execute("SELECT node_ids FROM recall_receipts")]
+                assert all(planted["target"] not in ids_ for ids_ in listed)
             finally:
                 c.close()
 

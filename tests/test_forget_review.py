@@ -429,7 +429,9 @@ class TestEverywhere:
         assert survivor is not None and self.SENT not in survivor.content
         assert res["still_held_by"] == []
         assert {s["unit_id"] for s in res["suppressed"]} == {A}
-        assert {c["node_id"] for c in res["cut_in_place"]} == {b.node_id, fb.node_id}
+        # every node the exact-wording cut touched is listed, the origin's own too
+        assert {c["node_id"] for c in res["cut_in_place"]} == {a.node_id, b.node_id, fb.node_id}
+        assert {c["node_id"] for c in res["cut_in_place"] if c.get("origin")} == {a.node_id}
 
     def test_the_cli_and_rest_have_the_verb(self, tmp_path):
         out = CliRunner().invoke(main, ["forget", "--help"])

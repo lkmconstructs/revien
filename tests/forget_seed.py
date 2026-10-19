@@ -299,7 +299,7 @@ def seed_codex(tmp: Path, secret: str) -> Seeded:
     d.mkdir(parents=True)
     path = d / "rollout-2026-07-01T10-00-00-abc.jsonl"
     lines = [json.dumps({"timestamp": "2026-07-01T10:00:00Z", "type": "session_meta",
-                         "payload": {"cwd": "/work/proj-c"}})]
+                         "payload": {"id": "0197-codex-forgotten", "cwd": "/work/proj-c"}})]
     for role, kind, text in (
             ("user", "input_text", f"remember that my safe code is {secret}."),
             ("assistant", "output_text",

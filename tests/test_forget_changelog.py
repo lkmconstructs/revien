@@ -173,11 +173,14 @@ def test_the_known_limit_about_concurrent_forgets_is_the_true_one():
 def test_the_source_classes_named_are_the_ones_in_the_code():
     """(1) an id that travels with a copy, (2) path and inode, (3) content
     alone: the adapters and the gate say the same."""
-    src = (REPO / "revien" / "adapters" / "codex.py").read_text(encoding="utf-8")
-    assert '"session_key": jsonl_file.stem' in src and "session_id" not in src
+    codex = (REPO / "revien" / "adapters" / "codex.py").read_text(encoding="utf-8")
+    assert '"session_key": jsonl_file.stem' in codex            # the unit id stays the file name
+    assert 'meta_extra["session_id"] = session_id' in codex and '"session_meta"' in codex
     cc = (REPO / "revien" / "adapters" / "claude_code.py").read_text(encoding="utf-8")
     assert 'meta_extra["session_id"] = session_id' in cc and "sessionId" in cc
     gate_src = (REPO / "revien" / "forget" / "gate.py").read_text(encoding="utf-8")
-    assert 'runtime == "claude-code"' in gate_src         # only Claude Code's sessionId overrides the file name
+    assert 'runtime == "claude-code"' in gate_src         # only Claude Code's sessionId replaces the unit id
+    assert 'sid=sid' in gate_src and 'f"sid:codex:' in gate_src
     sec = forget_section()
-    assert "a Codex rollout file (its unit is the file name" in sec
+    assert "a Codex rollout by the `id` in its `session_meta` line" in sec
+    assert "a Codex rollout file (its unit is the file name" not in sec

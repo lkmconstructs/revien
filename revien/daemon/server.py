@@ -491,6 +491,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # With neural ranking on, a forget retrains the model from the scrubbed
     # signals; with it off nothing trains and the model stays marked stale.
     ops.retrain = engine.force_train if engine.neural_enabled else None
+    ops.retrain_reason = engine.last_train_failure if engine.neural_enabled else None
 
     # ── POST /v1/ingest ───────────────────────────────
 
@@ -1213,6 +1214,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(404, f"Node not found: {node_id}")
         if status == "refused":
             raise HTTPException(409, detail=result)
+        if status == "busy":
+            raise HTTPException(503, detail=result)
         return result
 
     # ── GET /v1/export ─────────────────────────────────

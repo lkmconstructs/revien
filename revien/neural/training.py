@@ -33,6 +33,8 @@ class TrainingLoop:
         self.model_dir = model_dir or str(Path.home() / ".revien" / "models")
         self._last_train_count = 0
         self._stale_attempted = -1
+        #: Why the last train() did not produce a model (None after a success).
+        self.last_failure: Optional[str] = None
         #: Called after a training run that wrote a new model, so a process
         #: holding the old one in memory can reload it.
         self.on_trained = None
@@ -253,12 +255,15 @@ class TrainingLoop:
         """
         Run training loop on accumulated signals.
         """
+        self.last_failure = None
         # Availability first — never export the signal table to no-op.
         if not self._neural_available():
             logger.info(
                 "sklearn/numpy not installed. Neural training disabled "
                 "(install with: pip install revien[neural])."
             )
+            self.last_failure = ("the neural extra (numpy, scikit-learn) is "
+                                 "not installed")
             return False
 
         count = self.get_signal_count()
@@ -268,6 +273,8 @@ class TrainingLoop:
                 f"Not enough signals for training: "
                 f"{count}/{self.INITIAL_THRESHOLD}"
             )
+            self.last_failure = (f"only {count} retrieval signals are left, "
+                                 f"{self.INITIAL_THRESHOLD} are needed")
             return False
 
         try:
@@ -278,6 +285,9 @@ class TrainingLoop:
             # Instantiate scorer and train
             scorer = NeuralScorer(model_dir=self.model_dir)
             success = scorer.train(training_data)
+            if not success:
+                self.last_failure = (scorer.last_error
+                                     or "training produced no model")
             
             if success:
                 self._last_train_count = count
@@ -294,6 +304,7 @@ class TrainingLoop:
             
         except Exception as e:
             logger.error(f"Training failed: {e}")
+            self.last_failure = f"{type(e).__name__}: {e}"
             return False
 
     def get_stats(self) -> Dict:
