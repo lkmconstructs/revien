@@ -537,30 +537,34 @@ class VaultReconciler:
         # any other. If it is text a forget suppressed, it stays out: the
         # keyed fingerprint stops the unchanged note being re-imported.
         unit = forget_gate.UnitRef(None)
-        if forget_gate.check(self.store, unit, text) is not None:
-            return None
-        if forget_gate.strip_forgotten(self.store, unit, text)[1]:
-            return None
-        node = self.store.add_node(Node(
-            node_type=node_type,
-            label=text[:80],
-            content=text,
-            source_type=SourceType.EXTRACTED,
-            confidence=1.0,
-            created_at=now,
-            last_accessed=now,
-            recorded_at=now,
-            metadata={"curated": True, "source": "vault_reconcile",
-                      "recorded_at_source": "capture"},
-        ), owner=(unit.owner, 1, 1))
-        # Attach to the note's entity so it renders on the entity's note and is
-        # reachable in the graph walk.
-        self.store.add_edge(Edge(
-            edge_type=EdgeType.RELATED_TO,
-            source_node_id=entity_id,
-            target_node_id=node.node_id,
-            weight=0.9,  # human-authored, high trust
-        ))
+        # Decided inside the write transaction, after the write lock is held
+        # (BEGIN IMMEDIATE), so a forget from another connection is either
+        # seen here or waits until this claim has landed.
+        with self.store.transaction(immediate=True):
+            if forget_gate.check(self.store, unit, text) is not None:
+                return None
+            if forget_gate.strip_forgotten(self.store, unit, text)[1]:
+                return None
+            node = self.store.add_node(Node(
+                node_type=node_type,
+                label=text[:80],
+                content=text,
+                source_type=SourceType.EXTRACTED,
+                confidence=1.0,
+                created_at=now,
+                last_accessed=now,
+                recorded_at=now,
+                metadata={"curated": True, "source": "vault_reconcile",
+                          "recorded_at_source": "capture"},
+            ), owner=(unit.owner, 1, 1))
+            # Attach to the note's entity so it renders on the entity's note
+            # and is reachable in the graph walk.
+            self.store.add_edge(Edge(
+                edge_type=EdgeType.RELATED_TO,
+                source_node_id=entity_id,
+                target_node_id=node.node_id,
+                weight=0.9,  # human-authored, high trust
+            ))
         # Index for semantic recall (add_node does not; the pipeline would, but
         # reconcile bypasses it). No-op without the semantic extra.
         if self.semantic.is_enabled:

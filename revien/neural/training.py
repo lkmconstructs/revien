@@ -32,6 +32,10 @@ class TrainingLoop:
         self.db_path = db_path or str(Path.home() / ".revien" / "training.db")
         self.model_dir = model_dir or str(Path.home() / ".revien" / "models")
         self._last_train_count = 0
+        self._stale_attempted = -1
+        #: Called after a training run that wrote a new model, so a process
+        #: holding the old one in memory can reload it.
+        self.on_trained = None
         self._ensure_db()
         self._load_train_state()
 
@@ -83,6 +87,37 @@ class TrainingLoop:
             "INSERT OR REPLACE INTO training_state (key, value) VALUES (?, ?)",
             ("last_train_count", str(self._last_train_count)),
         )
+        conn.commit()
+        conn.close()
+
+    # ── forgotten text ────────────────────────────────────
+    # A trained model cannot unlearn: it was fitted on queries and node labels.
+    # A forget marks it stale here (revien/forget/engine.py), and this is the
+    # reader: while the mark stands, a retrain is due as soon as there are
+    # enough signals, whatever the usual interval says, and a successful
+    # training run clears it.
+
+    def mark_stale(self, when: Optional[str] = None) -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO training_state (key, value) VALUES (?, ?)",
+            ("model_stale", when or datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+
+    def is_stale(self) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT value FROM training_state WHERE key = 'model_stale'"
+            ).fetchone()
+        finally:
+            conn.close()
+        return bool(row and row[0])
+
+    def _clear_stale(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM training_state WHERE key = 'model_stale'")
         conn.commit()
         conn.close()
 
@@ -144,7 +179,13 @@ class TrainingLoop:
     def is_ready_for_training(self) -> bool:
         """Check if enough new signals have accumulated for training."""
         count = self.get_signal_count()
-        
+
+        # A forget left the model stale: retrain as soon as there is enough
+        # data to train on at all.
+        if (self.is_stale() and count >= self.INITIAL_THRESHOLD
+                and count > self._stale_attempted):
+            return True
+
         # Initial training
         if self._last_train_count == 0 and count >= self.INITIAL_THRESHOLD:
             return True
@@ -203,6 +244,7 @@ class TrainingLoop:
             return False
         trained = self.train()
         if not trained:
+            self._stale_attempted = self.get_signal_count()
             self._last_train_count = self.get_signal_count()
             self._save_train_state()
         return trained
@@ -240,7 +282,13 @@ class TrainingLoop:
             if success:
                 self._last_train_count = count
                 self._save_train_state()
+                self._clear_stale()
                 logger.info(f"Training completed on {count} signals")
+                if self.on_trained is not None:
+                    try:
+                        self.on_trained()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"Could not reload the model: {e}")
             
             return success
             
@@ -268,4 +316,5 @@ class TrainingLoop:
                 else self.RETRAIN_INTERVAL - (count - self._last_train_count)
             ),
             "ready_for_training": self.is_ready_for_training(),
+            "model_stale": self.is_stale(),
         }

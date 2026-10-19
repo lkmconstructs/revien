@@ -404,7 +404,10 @@ def propose_skills(
     # guarantees, just batched into one disk sync at the end. A failure
     # partway rolls back the WHOLE batch, same all-or-nothing shape
     # import_graph already uses for its bulk writes.
-    with store.transaction():
+    # BEGIN IMMEDIATE: the suppression check below is made after the write
+    # lock is held, so a forget from another connection cannot slip between
+    # the check and the write.
+    with store.transaction(immediate=True):
         for pattern in patterns:
             if _pattern_suppressed(store, pattern):
                 # A step is wording a forget said must not come back

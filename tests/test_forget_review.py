@@ -424,9 +424,12 @@ class TestEverywhere:
         assert res["everywhere"] is True
         assert self.SENT not in store.get_node(b.node_id).content
         assert "Bravo only remark" in store.get_node(b.node_id).content   # the rest stays
-        assert store.get_node(fb.node_id) is None
+        # another source's node is cut in place, never deleted or suppressed
+        survivor = store.get_node(fb.node_id)
+        assert survivor is not None and self.SENT not in survivor.content
         assert res["still_held_by"] == []
-        assert {s["unit_id"] for s in res["suppressed"]} == {A, B}
+        assert {s["unit_id"] for s in res["suppressed"]} == {A}
+        assert {c["node_id"] for c in res["cut_in_place"]} == {b.node_id, fb.node_id}
 
     def test_the_cli_and_rest_have_the_verb(self, tmp_path):
         out = CliRunner().invoke(main, ["forget", "--help"])
@@ -451,13 +454,21 @@ class TestEverywhere:
 # ── ruling 3 and N1, N3 ───────────────────────────────────────────────
 
 class TestModelAndHonesty:
-    def test_the_model_is_marked_stale_on_every_forget(self, store):
+    def test_the_model_is_marked_stale_on_every_forget(self, store, tmp_path, monkeypatch):
+        from revien.neural.training import TrainingLoop
+        tdb = str(tmp_path / "training.db")
+        loop = TrainingLoop(db_path=tdb, model_dir=str(tmp_path / "models"))
+        assert loop.is_stale() is False
         c = ctx(store, "User: some words to forget here.")
-        res = GraphOperations(store).forget_node(c.node_id, cascade=True)
-        assert res["model_stale"] is True
-        assert store.get_meta("neural_model_stale")
+        ops = GraphOperations(store)
+        ops.training_dbs = (tdb,)
+        res = ops.forget_node(c.node_id, cascade=True)
+        assert res["model_stale"] is True and res["model"]["stale"] is True
+        assert loop.is_stale() is True       # the flag lives where the retrain path reads it
 
-    def test_there_is_no_scheduled_retrain(self):
+    def test_there_is_no_scheduled_retrain_job(self):
+        # (a retrain happens only on new retrieval signals, a stale mark, or a
+        # manual run: see tests/test_forget_round3.py)
         for rel in ("revien/daemon/scheduler.py", "revien/daemon/daemon.py", "revien/consolidate.py"):
             src = (REPO / rel).read_text(encoding="utf-8")
             assert "force_train" not in src and "training_loop.train" not in src

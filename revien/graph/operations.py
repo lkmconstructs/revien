@@ -345,6 +345,9 @@ class GraphOperations:
     clustering = None
     #: The semantic index whose vectors a forget must drop; set by the daemon.
     semantic = None
+    #: Retrains the ranking model after a forget; set by the daemon when
+    #: neural ranking is on. None: nothing retrains it automatically.
+    retrain = None
 
     def _forget_engine(self):
         from revien.forget.engine import ForgetEngine
@@ -352,8 +355,15 @@ class GraphOperations:
         default = os.path.join(os.path.expanduser("~"), ".revien", "training.db")
         if default not in dbs:
             dbs.append(default)
+        retrain = self.retrain
+        if retrain is None and os.environ.get("REVIEN_NEURAL", "0").strip().lower() \
+                in ("1", "true", "yes", "on"):
+            # a forget run from the CLI with neural ranking switched on
+            from revien.neural.training import TrainingLoop
+            retrain = TrainingLoop(db_path=default).train
         return ForgetEngine(self.store, semantic=self.semantic,
-                            training_dbs=dbs, clustering=self.clustering)
+                            training_dbs=dbs, clustering=self.clustering,
+                            retrain=retrain)
 
     def forget_preview(self, node_id: str) -> Dict:
         """What a forget WOULD do, so it is never blind. Writes nothing."""

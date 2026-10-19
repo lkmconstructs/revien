@@ -2621,46 +2621,59 @@ class GraphStore(ForgetStoreMixin):
         else:
             new_nodes, new_edges = list(graph.nodes), list(graph.edges)
 
-        # ── Suppression gate (docs/FORGET_SPEC.md §6) ──
-        # An imported node whose unit, or whose words, a forget suppressed is
-        # not brought back. Its edges go with it.
+        # ── One transaction: gate + wipe (replace only) + inserts + audits ──
+        # The suppression gate (docs/FORGET_SPEC.md §6) decides INSIDE the
+        # write transaction, after it has taken SQLite's write lock (BEGIN
+        # IMMEDIATE): a forget from another connection either committed
+        # before this point, and is seen here, or waits until this import
+        # has committed, and then removes what it wrote.
         from revien.forget import gate as forget_gate
+        from revien.forget import scrub as forget_scrub
         owners: dict = {}
-        kept_nodes = []
-        dropped_ids = set()
-        for node in new_nodes:
-            unit_id, label_ok, wording_ok, likely = self.ownership_for_fields(
-                node.node_type.value, node.origin_runtime, node.session_key,
-                node.source_id, node.metadata)
-            md = node.metadata if isinstance(node.metadata, dict) else {}
-            path = md.get("path") if isinstance(md.get("path"), str) else None
-            ref = forget_gate.UnitRef(likely, path)
-            if (forget_gate.check(self, ref, node.content) is not None
-                    or forget_gate.check(
-                        self, forget_gate.UnitRef(None), node.label) is not None):
-                dropped_ids.add(node.node_id)
-                continue
-            # The standing denylist: forgotten sentences are left out of an
-            # imported node; a node that was only a forgotten sentence is not
-            # imported.
-            cleaned, left_out = forget_gate.strip_forgotten(self, ref, node.content)
-            if left_out:
-                if node.node_type.value not in ("context", "skill") or not cleaned.strip():
+        with self.transaction(immediate=True):
+            kept_nodes = []
+            dropped_ids = set()
+            for node in new_nodes:
+                unit_id, label_ok, wording_ok, likely = self.ownership_for_fields(
+                    node.node_type.value, node.origin_runtime, node.session_key,
+                    node.source_id, node.metadata)
+                md = node.metadata if isinstance(node.metadata, dict) else {}
+                path = md.get("path") if isinstance(md.get("path"), str) else None
+                ref = forget_gate.UnitRef(likely, path)
+                # A node of a forgotten unit, or whose whole text was
+                # forgotten, is not brought back. Its label alone decides
+                # nothing: a label that equals a forgotten label must not
+                # cost the node its other sentences.
+                if forget_gate.check(self, ref, node.content) is not None:
                     dropped_ids.add(node.node_id)
                     continue
-                node.content = cleaned
-            owners[node.node_id] = (unit_id, label_ok, wording_ok)
-            kept_nodes.append(node)
-        new_nodes = kept_nodes
-        kept_edges = [e for e in new_edges
-                      if e.source_node_id not in dropped_ids
-                      and e.target_node_id not in dropped_ids]
-        result["skipped_suppressed"] = len(dropped_ids)
-        result["skipped_suppressed_edges"] = len(new_edges) - len(kept_edges)
-        new_edges = kept_edges
+                # The standing denylist: sentences forgotten from this origin
+                # (or a copy of it) are left out of an imported node; a node
+                # that was only a forgotten sentence is not imported.
+                cleaned, left_out = forget_gate.strip_forgotten(
+                    self, ref, node.content)
+                if left_out:
+                    if node.node_type.value not in ("context", "skill") \
+                            or not cleaned.strip():
+                        dropped_ids.add(node.node_id)
+                        continue
+                    node.content = cleaned
+                new_label, label_out = forget_gate.strip_forgotten(
+                    self, ref, node.label, match_content=node.content + "\n" + node.label)
+                if label_out:
+                    first = next(iter(forget_scrub.iter_sentences(node.content)), None)
+                    node.label = (new_label.strip()
+                                  or (first[2] if first else "") or "[removed]")[:200]
+                owners[node.node_id] = (unit_id, label_ok, wording_ok)
+                kept_nodes.append(node)
+            new_nodes = kept_nodes
+            kept_edges = [e for e in new_edges
+                          if e.source_node_id not in dropped_ids
+                          and e.target_node_id not in dropped_ids]
+            result["skipped_suppressed"] = len(dropped_ids)
+            result["skipped_suppressed_edges"] = len(new_edges) - len(kept_edges)
+            new_edges = kept_edges
 
-        # ── One transaction: wipe (replace only) + inserts + their audits ──
-        with self.transaction():
             if mode == "replace":
                 removed_node_ids = [
                     r[0] for r in conn.execute("SELECT node_id FROM nodes").fetchall()

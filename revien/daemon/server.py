@@ -488,6 +488,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     ops.semantic = semantic
     ops.clustering = clustering
     ops.training_dbs = (engine.training_loop.db_path,)
+    # With neural ranking on, a forget retrains the model from the scrubbed
+    # signals; with it off nothing trains and the model stays marked stale.
+    ops.retrain = engine.force_train if engine.neural_enabled else None
 
     # ── POST /v1/ingest ───────────────────────────────
 

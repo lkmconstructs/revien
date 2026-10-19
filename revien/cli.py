@@ -2154,12 +2154,20 @@ def restore(target: Optional[str], db: Optional[str], list_only: bool, yes: bool
         raise SystemExit(1)
     try:
         if list_only or not target:
-            rows = store.list_suppressions("active")
+            from revien.forget.restore import liftable
+            rows = liftable(store)
             if not rows:
                 click.echo("No active suppressions.")
                 return
             click.echo(f"{len(rows)} active suppression(s):")
             for r in rows:
+                if r["kind"] == "wording":
+                    click.echo(
+                        f"  #{r['id']} {r['unit_id']} (the exact wording of "
+                        f"{len(r['sentence_fps'])} sentence(s) banned in every "
+                        f"source by forget --everywhere), since "
+                        f"{r['created_at'][:19]}")
+                    continue
                 where = r["path"] or r["unit_id"]
                 lasts = ("until the file changes" if r["kind"] == "file"
                          else "for good")

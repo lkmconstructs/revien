@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
-from revien.forget import scrub
+from revien.forget import gate, scrub
 from revien.forget.keys import file_fingerprint, fingerprints
 from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
 from revien.graph.units import (
@@ -34,6 +34,13 @@ TOMBSTONE_PREFIX = "tombstone:"
 VERB = "forget"
 RECAPTURE_NOTE = ("eligible for recapture because the source supplied no "
                   "stable item identity")
+
+# What "a copy of the forgotten source" means (revien/forget/gate.py).
+COPY_RULE = (
+    f"a copy is a capture that carries at least {int(gate.COPY_OF_ORIGIN * 100)}% "
+    f"of the forgotten source's own long sentences (and at least "
+    f"{gate.COPY_MIN_SHARED} of them), and those make up at least "
+    f"{int(gate.COPY_OF_CAPTURE * 100)}% of the capture's own")
 
 # Labels inside the forgotten sentence are cut from the unit's conversation
 # too, but only when long enough to be identifying wording.
@@ -70,6 +77,11 @@ class Plan:
     unproven: List[Node] = field(default_factory=list)      # kept, listed, untouched
     legacy_cut: List[Node] = field(default_factory=list)    # pre-provenance shared nodes, cut back (§5)
     everywhere: bool = False
+    # forget --everywhere: the EXACT wording that was targeted (the target
+    # node's own content, never a label, never a whole session's sentences),
+    # and the nodes of other sources it is cut out of, in place.
+    everywhere_strings: List[str] = field(default_factory=list)
+    everywhere_cut: List[Node] = field(default_factory=list)
     likely_unit: bool = False                               # unit known from the node's source key, ownership unproven
     holders: List[Node] = field(default_factory=list)       # wording cut out
     strings: List[str] = field(default_factory=list)
@@ -81,11 +93,14 @@ class Plan:
 
 class ForgetEngine:
     def __init__(self, store, semantic=None, training_dbs: Iterable[str] = (),
-                 clustering=None):
+                 clustering=None, retrain=None):
         self.store = store
         self.semantic = semantic
         self.training_dbs = [str(p) for p in training_dbs]
         self.clustering = clustering
+        #: Retrains the ranking model from the (scrubbed) retrieval signals;
+        #: set only when neural ranking is on. Returns True when it ran.
+        self.retrain = retrain
 
     # ── planning (read only) ──────────────────────────────
 
@@ -164,14 +179,10 @@ class ForgetEngine:
             if likely:
                 plan.units = [likely]
                 plan.likely_unit = True
-        if everywhere:
-            # Every unit that holds the wording, not only this node's source.
-            extra = set()
-            for n in self._nodes_containing(primary):
-                for r in store.get_provenance(n.node_id):
-                    if not is_unproven(r["unit_id"]):
-                        extra.add(r["unit_id"])
-            plan.units = sorted(set(plan.units) | extra)
+        if everywhere and not holder:
+            # Only the wording the user named: this node's own words. A whole
+            # session names no wording (its identity is what is banned).
+            plan.everywhere_strings = scrub.clean_strings([target.content])
         fset = set(plan.units)
 
         if cascade and not holder:
@@ -239,21 +250,6 @@ class ForgetEngine:
             if n.node_id not in remove and n.node_id != target.node_id \
                     and n.node_id not in cut_back and n.node_id not in legacy_cut:
                 unproven[n.node_id] = n
-        everywhere_holders: Dict[str, Node] = {}
-        if everywhere:
-            for n in self._nodes_containing(primary):
-                if n.node_id in remove or n.node_id == target.node_id \
-                        or n.node_id in cut_back:
-                    continue
-                if is_holder(n):
-                    everywhere_holders[n.node_id] = n
-                    unproven.pop(n.node_id, None)
-                elif n.node_id not in legacy_cut and not any(
-                        not is_unproven(r["unit_id"])
-                        for r in store.get_provenance(n.node_id)):
-                    unproven.pop(n.node_id, None)
-                    legacy_cut[n.node_id] = n
-
         # Every string that gets cut: the target's wording, the wording of
         # what is removed or cut back, and the labels of removed nodes that
         # are inside the forgotten sentence.
@@ -283,8 +279,19 @@ class ForgetEngine:
                 if scrub.contains(n.content, plan.strings) or \
                         scrub.contains(n.label, plan.strings):
                     holders[nid] = n
-        for nid, n in everywhere_holders.items():
-            holders.setdefault(nid, n)
+
+        # forget --everywhere: the targeted wording, cut in place from every
+        # other node that holds it. Never a deletion, never a cut-back to the
+        # label, never a suppression of the source it sits in.
+        everywhere_cut: Dict[str, Node] = {}
+        if plan.everywhere_strings:
+            handled = (set(remove) | set(cut_back) | set(holders)
+                       | set(legacy_cut) | {target.node_id})
+            for n in self._nodes_containing(plan.everywhere_strings):
+                if n.node_id in handled or is_tombstone(n.node_id):
+                    continue
+                everywhere_cut[n.node_id] = n
+                unproven.pop(n.node_id, None)
 
         # The wording must be found verbatim where the unit stored it.
         if (not holder and plan.units and had_holder
@@ -318,6 +325,7 @@ class ForgetEngine:
         plan.unproven = [n for n in unproven.values() if n.node_id not in holders]
         plan.legacy_cut = list(legacy_cut.values())
         plan.holders = list(holders.values())
+        plan.everywhere_cut = list(everywhere_cut.values())
         return plan
 
     def _unproven_nodes_for(self, unit_id: str) -> List[str]:
@@ -380,9 +388,9 @@ class ForgetEngine:
                         "forgotten": [], "count": 0, **plan.refusal}
             if dry_run:
                 return self._summary(plan, preview=True)
-            specs, wording = self._suppression_specs(plan)
+            specs, origin_spec, global_spec = self._suppression_specs(plan)
             suppressed, not_suppressed, fallback = self._record_denylist(
-                specs, wording, actor)
+                specs, origin_spec, global_spec, actor)
             plan = self.plan(node_id, cascade, everywhere)
             if plan.target is None:       # removed by a racing forget
                 return {"status": "not_found", "verb": VERB,
@@ -416,38 +424,74 @@ class ForgetEngine:
         return out
 
     @staticmethod
+    def _sentences_containing(text: str, strings: List[str]) -> List[str]:
+        """The sentences of ``text`` (long enough to be matched anywhere) that
+        hold one of ``strings`` as whole words."""
+        out = []
+        for _l, _r, body in scrub.iter_sentences(text or ""):
+            key = scrub.sentence_key(body)
+            if len(key) >= scrub.MIN_SENTENCE and scrub.contains(key, strings):
+                out.append(key)
+        return out
+
+    def _holder_texts(self, unit_id: str) -> List[str]:
+        out = []
+        for nid in self._members(unit_id):
+            n = self.store.get_node(nid)
+            if n is not None and is_holder(n):
+                out.append(n.content)
+        return out
+
+    def _forgotten_keys(self, plan: Plan) -> List[str]:
+        """Every sentence this forget takes out (before anything is cut): the
+        sentences of what is removed, the sentences that hold the wording in
+        the stored conversation, and, for a whole-unit forget, every sentence
+        of the unit's record."""
+        gone = plan.remove + plan.cut_back + plan.legacy_cut
+        keys: List[str] = []
+        for n in gone + [plan.target]:
+            keys += self._forgotten_sentences(n.content, plan, True)
+        for h in plan.holders:
+            keys += self._forgotten_sentences(h.content, plan, False)
+        for unit_id in plan.units:
+            for t in self._holder_texts(unit_id):
+                keys += self._forgotten_sentences(t, plan, plan.cascade)
+        return list(dict.fromkeys(keys))
+
+    @staticmethod
     def _split_fps(keys: Iterable[str]):
         long_fps = fingerprints(k for k in keys if len(k) >= scrub.MIN_SENTENCE)
         short_fps = fingerprints(k for k in keys if len(k) < scrub.MIN_SENTENCE)
         return long_fps, short_fps
 
     def _suppression_specs(self, plan: Plan):
-        """(one spec per stable forgotten unit, one standing-denylist spec),
-        built BEFORE anything is cut so the fingerprints are of the text as it
-        was."""
+        """(one spec per stable forgotten unit, the origin-bound denylist
+        entry, the global entry of a --everywhere or None), built BEFORE
+        anything is cut so the fingerprints are of the text as it was.
+
+        The origin-bound entry is what keeps the forgotten sentences out of
+        captures that come from the forgotten origin: it carries the unit ids
+        and file identities, and the signature (keyed fingerprints of the
+        origin's own sentences) by which a copy of it is recognised. The
+        global entry exists only for ``forget --everywhere`` and holds only
+        the sentences of the exact wording that was targeted."""
         store = self.store
         specs = []
         gone = plan.remove + plan.cut_back + plan.legacy_cut
         wording = [n.content for n in gone] + [n.label for n in gone] \
             + [plan.target.content, plan.target.label]
-        denylist_keys: List[str] = []
-        for n in gone + [plan.target]:
-            denylist_keys += self._forgotten_sentences(n.content, plan, True)
-        for h in plan.holders:
-            denylist_keys += self._forgotten_sentences(h.content, plan, False)
+        denylist_keys = self._forgotten_keys(plan)
+        signature_texts: List[str] = []
+        covered: List[str] = []
         for unit_id in plan.units:
-            holder_texts = []
-            for nid in self._members(unit_id):
-                n = store.get_node(nid)
-                if n is not None and is_holder(n):
-                    holder_texts.append(n.content)
+            holder_texts = self._holder_texts(unit_id)
+            signature_texts += holder_texts
             # a whole-unit forget leaves every sentence of its record out of
             # later captures; a node-level forget the sentences that hold its
             # wording
             keys = []
             for t in holder_texts:
                 keys += self._forgotten_sentences(t, plan, plan.cascade)
-            denylist_keys += keys
             if is_shared_channel(unit_id):
                 specs.append({"unit_id": unit_id, "stable": False})
                 continue
@@ -460,6 +504,7 @@ class ForgetEngine:
             if path and is_real_file(path):
                 real = real_path(path)
                 pkeys = sorted(set(pkeys) | set(identity_keys(path)))
+            covered += [f"unit:{unit_id}"] + pkeys
             long_fps, short_fps = self._split_fps(keys)
             specs.append({
                 "unit_id": unit_id, "stable": True,
@@ -471,22 +516,49 @@ class ForgetEngine:
                 "file_fp": (file_fingerprint(real)
                             if (real and file_level) else None),
             })
+        signature_texts += [h.content for h in plan.holders]
+        if is_holder(plan.target):
+            signature_texts.append(plan.target.content)
+        if not signature_texts:
+            signature_texts = [n.content for n in gone] + [plan.target.content]
+        signature = set()
+        for t in signature_texts:
+            signature |= gate.long_fingerprints(t)
         long_fps, short_fps = self._split_fps(denylist_keys)
-        wording_spec = {
+        origin_spec = {
             "unit_id": f"forget:{uuid.uuid4()}", "stable": False,
-            "kind": "wording", "path": None, "path_keys": [],
+            "kind": "wording", "path": None,
+            "path_keys": sorted(set(covered)),
             "content_fps": [], "wording_fps": fingerprints(wording),
             "sentence_fps": long_fps, "short_fps": short_fps, "file_fp": None,
+            "signature_fps": sorted(signature), "scope": "origin",
         }
-        return specs, wording_spec
+        global_spec = None
+        if plan.everywhere_strings:
+            texts = [plan.target.content] + [h.content for h in plan.holders] \
+                + [n.content for n in plan.everywhere_cut] \
+                + [n.content for n in gone]
+            sentences: List[str] = []
+            for t in texts:
+                sentences += self._sentences_containing(t, plan.everywhere_strings)
+            global_spec = {
+                "unit_id": f"forget:{uuid.uuid4()}", "stable": False,
+                "kind": "wording", "path": None, "path_keys": [],
+                "content_fps": [],
+                "wording_fps": fingerprints(plan.everywhere_strings),
+                "sentence_fps": fingerprints(dict.fromkeys(sentences)),
+                "short_fps": [], "file_fp": None,
+                "signature_fps": [], "scope": "global",
+            }
+        return specs, origin_spec, global_spec
 
-    def _record_denylist(self, specs, wording_spec, actor):
+    def _record_denylist(self, specs, origin_spec, global_spec, actor):
         """Phase 1: commit the suppression records and the standing denylist
         under BEGIN IMMEDIATE (visible to every other connection at once)."""
         store = self.store
         now = datetime.now(timezone.utc)
         suppressed, not_suppressed = [], []
-        short_total = len(wording_spec["short_fps"])
+        short_total = len(origin_spec["short_fps"])
         with store.transaction(immediate=True):
             for spec in specs:
                 if not spec["stable"]:
@@ -494,9 +566,11 @@ class ForgetEngine:
                         "unit_id": spec["unit_id"], "note": RECAPTURE_NOTE,
                         "denylist": "the source itself cannot be suppressed, "
                                     "but the forgotten sentences (at least "
-                                    f"{scrub.MIN_SENTENCE} characters) are on "
-                                    "the denylist and are left out of any "
-                                    "later capture from any source"})
+                                    f"{scrub.MIN_SENTENCE} characters) are kept "
+                                    "out of a later capture that is a copy of "
+                                    "it (at least half of its sentences); "
+                                    "another source's own copy of a sentence "
+                                    "is not touched"})
                     continue
                 short_total += len(spec["short_fps"])
                 sid = store.add_suppression(
@@ -509,13 +583,15 @@ class ForgetEngine:
                     after={"unit_id": spec["unit_id"], "kind": spec["kind"],
                            "verb": VERB}, ts=now)
                 suppressed.append({"unit_id": spec["unit_id"], "kind": spec["kind"]})
-            w = wording_spec
-            covered = [f"unit:{sp['unit_id']}" for sp in specs]
-            sid = store.add_suppression(
-                w["unit_id"], "wording", None, covered, [], w["wording_fps"], None,
-                actor, sentence_fps=w["sentence_fps"], short_fps=w["short_fps"])
-            store.record_audit(f"suppression:{sid}", "suppress", actor=actor,
-                               after={"kind": "wording", "verb": VERB}, ts=now)
+            for w in [origin_spec] + ([global_spec] if global_spec else []):
+                sid = store.add_suppression(
+                    w["unit_id"], "wording", None, w["path_keys"], [],
+                    w["wording_fps"], None, actor,
+                    sentence_fps=w["sentence_fps"], short_fps=w["short_fps"],
+                    signature_fps=w["signature_fps"], scope=w["scope"])
+                store.record_audit(f"suppression:{sid}", "suppress", actor=actor,
+                                   after={"kind": "wording", "scope": w["scope"],
+                                          "verb": VERB}, ts=now)
         fallback = None
         if short_total:
             fallback = {
@@ -539,8 +615,12 @@ class ForgetEngine:
         legacy_ids = [n.node_id for n in plan.legacy_cut]
         holder_ids = [n.node_id for n in plan.holders]
         keep_ids = [k["node"].node_id for k in plan.keep_vouched]
+        place_ids = [n.node_id for n in plan.everywhere_cut]
         forgotten_units = set(plan.units)
         changed_ids = list(dict.fromkeys(cut_ids + legacy_ids + holder_ids))
+        # what this forget takes out, read before anything is cut
+        forgotten_keys = self._forgotten_keys(plan)
+        identifying = self._identifying_tokens(plan, forgotten_keys)
 
         before = {"nodes": store.count_nodes(), "edges": store.count_edges()}
         manifest_notes = self._manifest_notes(remove_ids + cut_ids + legacy_ids)
@@ -552,13 +632,14 @@ class ForgetEngine:
             "wording_cuts": 0,
         }
         wording_cut: List[Dict] = []
+        cut_in_place: List[Dict] = []
         tombstones = 0
         removed_done: List[str] = []
 
         with store.transaction(immediate=True) as conn:
             # What the recall surfaces remember about these nodes, read
             # BEFORE the nodes go (deleting a node strips its id).
-            affected = set(remove_ids + cut_ids + changed_ids)
+            affected = set(remove_ids + cut_ids + changed_ids + place_ids)
             episodes = self._episodes_for(conn, affected)
             receipt_ids = self._receipts_for(conn, affected)
 
@@ -575,6 +656,21 @@ class ForgetEngine:
                                         "occurrences": info["cuts"]})
                     store.record_audit(nid, "forget_cut", actor=actor,
                                        after={"verb": VERB}, ts=now)
+            # forget --everywhere: the exact targeted wording, cut in place
+            # out of the nodes of other sources. The sentence goes; the rest
+            # of the node stays, and the node is never deleted, cut back to
+            # its label or suppressed.
+            for nid in place_ids:
+                info = self._cut_node(conn, nid, plan.everywhere_strings,
+                                      cut_back=False, keep_node=True)
+                if info["cuts"]:
+                    stats["wording_cuts"] += info["cuts"]
+                    cut_in_place.append({
+                        "node_id": nid, "occurrences": info["cuts"],
+                        "units": self._owners_of(nid)})
+                    store.record_audit(nid, "forget_cut", actor=actor,
+                                       after={"verb": VERB, "everywhere": True},
+                                       ts=now)
             # Shared nodes whose wording only the forgotten unit supplied, and
             # (spec §5) descriptions saved before provenance existed.
             for nid in cut_ids:
@@ -613,18 +709,24 @@ class ForgetEngine:
                 self._cut_aux(conn, nid, all_strings)
             stats["audit_rows_scrubbed"] = self._scrub_audit(
                 conn, set(remove_ids), set(changed_ids), all_strings)
+            if place_ids:
+                # Other sources' history is theirs: only the exact wording
+                # that was targeted is cut from it.
+                stats["audit_rows_scrubbed"] += self._scrub_audit(
+                    conn, set(), set(place_ids), plan.everywhere_strings)
             q = self._scrub_queries(conn, episodes, receipt_ids, all_strings)
             stats.update(q)
             stats["candidates_scrubbed"] = self._scrub_candidates(conn, all_strings)
-            store.set_meta("neural_model_stale", now.isoformat())
         strings = all_strings
         # ── committed ──
 
         gone = removed_done
-        problems = self._purge_vectors(gone + changed_ids)
+        problems = self._purge_vectors(gone + changed_ids + place_ids)
         training = self._scrub_training(gone, strings)
+        model = self._model_after_forget(now)
         snapshots = self._scrub_snapshots(
-            remove_ids, set(changed_ids), strings, episodes)
+            remove_ids, set(changed_ids), strings, episodes, receipt_ids,
+            place=(set(place_ids), plan.everywhere_strings))
         if self.clustering is not None:
             # The detector keeps community labels in memory. A graph too small
             # to cluster returns before it rebuilds, so drop them first.
@@ -636,15 +738,29 @@ class ForgetEngine:
                 pass
         storage = store.scrub_storage()
         after = {"nodes": store.count_nodes(), "edges": store.count_edges()}
+        # What is still in the database: the cut strings, and every sentence
+        # this forget took out, whole words only. Revien's own actor and op
+        # strings are not content.
+        witnesses = scrub.clean_strings(
+            list(strings) + sorted(identifying)
+            + [k for k in forgotten_keys if len(k) >= scrub.MIN_SENTENCE])
         with store._lock:
-            residue = scrub.find_residue(store._get_conn(), strings,
+            residue = scrub.find_residue(store._get_conn(), witnesses,
                                          ignore=scrub.NOT_CONTENT_TABLES)
-        held = self._held_elsewhere(plan)
+        held = self._held_elsewhere(plan, forgotten_keys, identifying)
 
         return self._finish(
             plan, before, after, tombstones, removed_done, stats, wording_cut,
             suppressed, not_suppressed, legacy_ids, manifest_notes,
-            problems, training, storage, residue, snapshots, held, fallback)
+            problems, training, storage, residue, snapshots, held, fallback,
+            cut_in_place, model)
+
+    def _owners_of(self, node_id: str) -> List[str]:
+        rows = self.store.get_provenance(node_id)
+        units = sorted({r["unit_id"] for r in rows if not is_unproven(r["unit_id"])})
+        if units:
+            return units
+        return ["(ownership unproven)" if rows else "(no recorded source)"]
 
     # ── execution helpers ─────────────────────────────────
 
@@ -741,7 +857,7 @@ class ForgetEngine:
         return made
 
     def _cut_node(self, conn, node_id: str, strings: List[str],
-                  cut_back: bool) -> Dict:
+                  cut_back: bool, keep_node: bool = False) -> Dict:
         """Cut the wording out of one node's stored text, with raw SQL so no
         audit snapshot of the old text is written. ``cut_back`` also reduces
         its description to its label (and clears an engine proposal's steps).
@@ -777,6 +893,9 @@ class ForgetEngine:
             return {"cuts": 0, "changed": False}
         if not new_label.strip():
             new_label = "[removed]"
+        if keep_node and not new_content.strip():
+            # the node was only the cut sentence: it stays, as a marker
+            new_content = "[removed]"
         conn.execute(
             "UPDATE nodes SET label = ?, content = ?, event_time_text = ?, "
             "source_context = ?, metadata = ? WHERE node_id = ?",
@@ -898,11 +1017,14 @@ class ForgetEngine:
 
     # ── reporting ─────────────────────────────────────────
 
-    def _scrub_snapshots(self, removed_ids, touched_ids, strings, episodes) -> Dict:
+    def _scrub_snapshots(self, removed_ids, touched_ids, strings, episodes,
+                         receipt_ids=frozenset(), place=(frozenset(), ())) -> Dict:
         """`revien watch` backups are copies of the raw store, so the forget
-        reaches them too: the removed nodes go, the cut ones are cut, the
-        echoes are cleared, and the file is rewritten. A snapshot that cannot
-        be opened is named, not skipped silently."""
+        reaches them too, with the same treatment as the live database: the
+        removed nodes go (and their vectors), the cut ones are cut, the
+        recall queries and receipts of the same recalls are cleared, and the
+        file is rewritten. A snapshot (or part of one) that cannot be opened
+        is named, not skipped silently."""
         import gzip
         import shutil
         import tempfile
@@ -921,20 +1043,31 @@ class ForgetEngine:
                         raw = Path(tmp) / "snap.db"
                         with gzip.open(f, "rb") as src, open(raw, "wb") as dst:
                             shutil.copyfileobj(src, dst)
-                        self._scrub_db_copy(raw, removed_ids, touched_ids, strings)
+                        partial = self._scrub_db_copy(
+                            raw, removed_ids, touched_ids, strings, episodes,
+                            receipt_ids, place)
                         packed = Path(tmp) / "snap.db.gz"
                         with open(raw, "rb") as src, gzip.open(packed, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                         shutil.copyfile(packed, f)
                 else:
-                    self._scrub_db_copy(f, removed_ids, touched_ids, strings)
+                    partial = self._scrub_db_copy(
+                        f, removed_ids, touched_ids, strings, episodes,
+                        receipt_ids, place)
                 out["scrubbed"] += 1
+                for note in partial:
+                    out["unreadable"].append(f"{name}: {note}")
             except Exception as e:  # noqa: BLE001
                 out["unreadable"].append(f"{name}: {e}")
         return out
 
-    @staticmethod
-    def _scrub_db_copy(path, removed_ids, touched_ids, strings) -> None:
+    def _scrub_db_copy(self, path, removed_ids, touched_ids, strings,
+                       episodes=frozenset(), receipt_ids=frozenset(),
+                       place=(frozenset(), ())) -> List[str]:
+        """Scrub one snapshot file in place. Returns notes about anything in
+        it that could not be scrubbed."""
+        place_ids, place_strings = place
+        notes: List[str] = []
         conn = sqlite3.connect(str(path))
         try:
             conn.execute("PRAGMA secure_delete = ON")
@@ -975,14 +1108,64 @@ class ForgetEngine:
                     conn.execute("UPDATE audit_log SET before_json=?, after_json=? WHERE id=?",
                                  (scrub.cut_json_text(bj, strings)[0] if bj else bj,
                                   scrub.cut_json_text(aj, strings)[0] if aj else aj, rid))
-            for table, col in (("use_judgments", "query"), ("recall_receipts", "query")):
-                try:
-                    for rid_col, text in conn.execute(
-                            f"SELECT rowid, {col} FROM {table}").fetchall():
-                        if scrub.contains(text or "", strings):
-                            conn.execute(f"UPDATE {table} SET {col} = '' WHERE rowid = ?", (rid_col,))
-                except sqlite3.OperationalError:
-                    pass
+            # nodes of other sources the exact targeted wording was cut from
+            for nid in place_ids:
+                row = conn.execute(
+                    "SELECT label, content, event_time_text, source_context, metadata "
+                    "FROM nodes WHERE node_id = ?", (nid,)).fetchone()
+                if row:
+                    new_content = scrub.cut_text(row[1], place_strings)[0]
+                    if not new_content.strip():
+                        new_content = "[removed]"
+                    new_label = scrub.cut_text(row[0], place_strings)[0] or "[removed]"
+                    cut = [new_label, new_content,
+                           scrub.cut_text(row[2] or "", place_strings)[0],
+                           scrub.cut_text(row[3] or "", place_strings)[0],
+                           scrub.cut_json_text(row[4] or "{}", place_strings)[0]]
+                    conn.execute(
+                        "UPDATE nodes SET label=?, content=?, event_time_text=?, "
+                        "source_context=?, metadata=? WHERE node_id=?", (*cut, nid))
+                for rid, bj, aj in conn.execute(
+                        "SELECT id, before_json, after_json FROM audit_log WHERE node_id = ?",
+                        (nid,)).fetchall():
+                    conn.execute("UPDATE audit_log SET before_json=?, after_json=? WHERE id=?",
+                                 (scrub.cut_json_text(bj, place_strings)[0] if bj else bj,
+                                  scrub.cut_json_text(aj, place_strings)[0] if aj else aj, rid))
+            # recall queries: the same ones the live database clears (the
+            # recalls that surfaced a forgotten node), and any that quote it
+            try:
+                for rid_col, ep, text, terms in conn.execute(
+                        "SELECT rowid, episode_key, query, shared_terms FROM use_judgments"
+                ).fetchall():
+                    nt = scrub.cut_json_text(terms or "[]", strings)[0]
+                    if ep in episodes or scrub.contains(text or "", strings):
+                        conn.execute(
+                            "UPDATE use_judgments SET query = '', shared_terms = ? "
+                            "WHERE rowid = ?", (nt, rid_col))
+                    elif nt != (terms or "[]"):
+                        conn.execute("UPDATE use_judgments SET shared_terms = ? "
+                                     "WHERE rowid = ?", (nt, rid_col))
+            except sqlite3.OperationalError:
+                pass
+            try:
+                for recall_id, text, raw in conn.execute(
+                        "SELECT recall_id, query, node_ids FROM recall_receipts"
+                ).fetchall():
+                    if recall_id in receipt_ids or scrub.contains(text or "", strings):
+                        conn.execute(
+                            "UPDATE recall_receipts SET query = '' WHERE recall_id = ?",
+                            (recall_id,))
+                    try:
+                        listed = json.loads(raw or "[]")
+                    except ValueError:
+                        continue
+                    kept = [i for i in listed if i not in removed_ids]
+                    if kept != listed:
+                        conn.execute(
+                            "UPDATE recall_receipts SET node_ids = ? WHERE recall_id = ?",
+                            (json.dumps(kept), recall_id))
+            except sqlite3.OperationalError:
+                pass
             try:
                 for cid, reason, trace in conn.execute(
                         "SELECT id, reason, trace FROM supersession_candidates").fetchall():
@@ -992,29 +1175,154 @@ class ForgetEngine:
                          scrub.cut_json_text(trace or "", strings)[0], cid))
             except sqlite3.OperationalError:
                 pass
+            # the vectors of the removed and the cut nodes
+            vec_ids = list(dict.fromkeys(
+                list(removed_ids) + list(touched_ids) + list(place_ids)))
+            has_vec = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'vec_nodes'"
+            ).fetchone() is not None
+            vec_ok = False
+            if has_vec:
+                try:
+                    self.store._load_vec_extension(conn)
+                    vec_ok = True
+                except Exception as e:  # noqa: BLE001
+                    if vec_ids:
+                        notes.append(
+                            "its vector index could not be opened to remove "
+                            f"the vectors of the forgotten nodes ({e})")
+            if vec_ok and vec_ids:
+                conn.executemany("DELETE FROM vec_nodes WHERE node_id = ?",
+                                 [(i,) for i in vec_ids])
             conn.commit()
-            conn.execute("VACUUM")
+            try:
+                conn.execute("VACUUM")
+            except sqlite3.OperationalError as e:
+                if not (has_vec and not vec_ok):
+                    notes.append(f"could not be rewritten ({e})")
         finally:
             conn.close()
+        return notes
 
-    def _held_elsewhere(self, plan: Plan) -> List[Dict]:
-        """Nodes that STILL carry the forgotten wording, whole words, and
-        whose they are: another unit that vouched for it, a node whose owner
-        is unproven, a hand-added node. Plain forget is per source, so these
-        are named, not touched; `forget --everywhere` is the verb that
-        reaches them."""
-        primary = scrub.clean_strings([plan.target.content, plan.target.label])
-        held = []
-        for n in self._nodes_containing(primary):
-            rows = self.store.get_provenance(n.node_id)
-            units = sorted({r["unit_id"] for r in rows if not is_unproven(r["unit_id"])})
-            if not units:
-                units = ["(ownership unproven)" if rows else "(no recorded source)"]
-            held.append({"node_id": n.node_id, "units": units})
-        return held
+    def _model_after_forget(self, now: datetime) -> Dict:
+        """The trained ranking model cannot unlearn a sentence: it was fitted
+        on queries and node labels. Mark it stale where it lives (the training
+        database, read by the retrain path) and, when neural ranking is on,
+        retrain it now from the scrubbed signals. Says what happened."""
+        marked = 0
+        for path in self.training_dbs:
+            if not os.path.exists(path):
+                continue
+            try:
+                conn = sqlite3.connect(path)
+                try:
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS training_state "
+                        "(key TEXT PRIMARY KEY, value TEXT)")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO training_state (key, value) "
+                        "VALUES ('model_stale', ?)", (now.isoformat(),))
+                    conn.commit()
+                    marked += 1
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                continue
+        retrained, note = False, ""
+        if self.retrain is not None:
+            try:
+                retrained = bool(self.retrain())
+            except Exception as e:  # noqa: BLE001 - never fail a forget on this
+                note = f"the retrain failed ({e})"
+            if not retrained and not note:
+                note = ("the retrain could not run: too few retrieval signals "
+                        "are left, or the neural extra is not installed")
+        return {"neural_ranking": self.retrain is not None,
+                "retrained": retrained, "stale": not retrained,
+                "marked": marked, "note": note}
+
+    #: A word counts as identifying the forgotten text when no more than this
+    #: many nodes use it (see _identifying_tokens).
+    IDENTIFYING_MAX_NODES = 8
+
+    def _identifying_tokens(self, plan: Plan, forgotten_keys: List[str]) -> Set[str]:
+        """Words of the forgotten text that point back at it: rare in the
+        graph (at most IDENTIFYING_MAX_NODES nodes use them) and used by no
+        node that another live unit vouches for. They are how Revien notices,
+        after the cut, a node it was not allowed to touch (its owner is not
+        proven) that still carries what only the forgotten text said. Read
+        before anything is cut."""
+        texts = [plan.target.content, plan.target.label] + list(forgotten_keys)
+        for n in plan.remove + plan.cut_back + plan.legacy_cut:
+            texts += [n.content, n.label]
+        candidates: Set[str] = set()
+        for t in texts:
+            candidates |= scrub.tokens_of(t)
+        if not candidates:
+            return set()
+        forgotten_units = set(plan.units)
+        conn = self.store._get_conn()
+        with self.store._lock:
+            proven_elsewhere = set()
+            for nid, unit in conn.execute(
+                    "SELECT node_id, unit_id FROM node_provenance"):
+                if not is_unproven(unit) and unit not in forgotten_units:
+                    proven_elsewhere.add(nid)
+            counts: Dict[str, int] = {}
+            used_elsewhere: Set[str] = set()
+            for nid, label, content in conn.execute(
+                    "SELECT node_id, label, content FROM nodes"):
+                if is_tombstone(nid):
+                    continue
+                for tok in scrub.tokens_of(f"{label}\n{content}") & candidates:
+                    counts[tok] = counts.get(tok, 0) + 1
+                    if nid in proven_elsewhere:
+                        used_elsewhere.add(tok)
+        return {t for t in candidates
+                if counts.get(t, 0) <= self.IDENTIFYING_MAX_NODES
+                and t not in used_elsewhere}
+
+    def _held_elsewhere(self, plan: Plan, forgotten_keys: List[str],
+                        identifying: Set[str] = frozenset()) -> List[Dict]:
+        """Nodes that STILL carry what this forget took out, whole words only,
+        and whose they are: another source that holds the same sentence, a
+        node whose owner is unproven, a hand-added node. Plain forget is per
+        source, so these are named, not touched; `forget --everywhere` is the
+        verb that cuts the exact wording out of them."""
+        witnesses = [k for k in forgotten_keys if len(k) >= scrub.MIN_SENTENCE]
+        if plan.target is not None and not is_holder(plan.target):
+            witnesses += scrub.clean_strings([plan.target.content])
+        witnesses += sorted(identifying)
+        pat = scrub.compile_strings(scrub.clean_strings(witnesses))
+        found: Dict[str, Node] = {}
+        if pat is not None:
+            conn = self.store._get_conn()
+            with self.store._lock:
+                rows = conn.execute(
+                    "SELECT node_id, label, content FROM nodes").fetchall()
+            for nid, label, content in rows:
+                if is_tombstone(nid):
+                    continue
+                if pat.search(scrub.nfc(f"{label}\n{content}")):
+                    found[nid] = None
+        # nodes kept and listed because their owner is unproven and what they
+        # say is part of the forgotten text (a fragment of a forgotten
+        # sentence, which a whole-sentence match would not see)
+        whole = list(forgotten_keys)
+        if plan.target is not None:
+            whole.append(plan.target.content)
+        for n in plan.unproven:
+            if self.store.get_node(n.node_id) is None:
+                continue
+            for text in (n.content, n.label):
+                t = (text or "").strip()
+                if len(t) >= 12 and any(scrub.contains(w, [t]) for w in whole):
+                    found.setdefault(n.node_id, None)
+                    break
+        return [{"node_id": nid, "units": self._owners_of(nid)} for nid in found]
 
     def _leftovers(self, plan, manifest_notes, problems, training, storage,
-                   snapshots, held) -> List[Dict]:
+                   snapshots, held, model) -> List[Dict]:
         store = self.store
         left: List[Dict] = []
         for unit_id in plan.units:
@@ -1040,25 +1348,32 @@ class ForgetEngine:
         for u in snapshots.get("unreadable", []):
             left.append({
                 "kind": "snapshots",
-                "note": f"a `revien watch` backup could not be opened to "
-                        f"scrub it and may still contain it ({u})"})
+                "note": f"a `revien watch` backup could not be fully scrubbed "
+                        f"and may still contain it ({u})"})
         for h in held:
-            left.append({
-                "kind": "other_units", "node_id": h["node_id"],
-                "units": h["units"],
-                "note": "this node still holds the wording and belongs to "
+            if h["units"] in (["(ownership unproven)"], ["(no recorded source)"]):
+                note = ("this node holds part of the forgotten text, or words "
+                        "only it used, and its owner is not proven, so Revien "
+                        "left it untouched; delete it by id if it is yours")
+            else:
+                note = ("this node still holds the wording and belongs to "
                         + ", ".join(h["units"]) + "; forget it there too, or "
-                        "use `forget --everywhere`"})
+                        "use `forget --everywhere`")
+            left.append({"kind": "other_units", "node_id": h["node_id"],
+                         "units": h["units"], "note": note})
         models = Path(os.path.expanduser("~")) / ".revien" / "models"
-        if models.is_dir() and any(models.iterdir()):
+        if model["stale"] and models.is_dir() and any(models.iterdir()):
             left.append({
                 "kind": "neural_model", "path": str(models),
                 "note": "the trained ranking model cannot unlearn and is "
-                        "marked stale. Revien does not retrain on a schedule: "
-                        "it retrains by itself only when enough new retrieval "
-                        "signals have been logged (with REVIEN_NEURAL on), or "
-                        "when you run POST /v1/training/run. Until then it may "
-                        "still hold words from the forgotten text"})
+                        "marked stale: it may still hold words from the "
+                        "forgotten text until it is retrained. "
+                        + ("Neural ranking is on, and " + model["note"] + ". "
+                           "It retries on its own as retrieval signals "
+                           "accumulate; to retrain now run POST /v1/training/run"
+                           if model["neural_ranking"] else
+                           "Neural ranking is off, so nothing retrains it: run "
+                           "POST /v1/training/run")})
         if problems:
             left.append({"kind": "vectors", "note": problems})
         for p in training.get("problems", []):
@@ -1071,13 +1386,82 @@ class ForgetEngine:
                         (storage.get("note") or "another connection is open")})
         return left
 
+    # ── what a forget does and does not stop coming back ──────
+
+    @staticmethod
+    def _identity_class(unit_id: str) -> Dict:
+        """How a unit is recognised when its text comes back, from the way the
+        code names it (revien/graph/units.py, revien/forget/gate.py)."""
+        if unit_id.startswith("session:claude-code:"):
+            return {"how": "by its sessionId when the file carries one (a "
+                           "renamed, moved or re-saved copy is the same "
+                           "session, and so is a sub-agent file with its "
+                           "sessionId); a file with no sessionId is known by "
+                           "its file name",
+                    "copy": "a copy under another name is recognised by its "
+                            "content"}
+        if unit_id.startswith("session:codex:"):
+            return {"how": "by the rollout's file name (Revien does not read "
+                           "an id from inside a Codex rollout)",
+                    "copy": "a copy under another name is recognised by its "
+                            "content only"}
+        if unit_id.startswith("item:"):
+            return {"how": "by the id its source gave it (a conversation or "
+                           "item id that travels with the export)",
+                    "copy": "a copy under another id is recognised by its "
+                            "content only"}
+        if unit_id.startswith(("file:", "skill:", "vault:")):
+            return {"how": "by its real path and inode",
+                    "copy": "a copy at another path is recognised by its "
+                            "content only"}
+        return {"how": "it has no identity of its own (a shared channel)",
+                "copy": "a later capture is recognised by its content only"}
+
+    def _reentry(self, plan: Plan, fallback) -> Dict:
+        stops: List[str] = []
+        not_stops: List[str] = []
+        units = plan.units or []
+        if units:
+            for u in units:
+                cls = self._identity_class(u)
+                stops.append(f"{describe(u)}: {cls['how']}; {cls['copy']} "
+                             f"({COPY_RULE})")
+        else:
+            stops.append("no source was recorded for it: only a later capture "
+                         "that carries the forgotten sentences is recognised")
+        if plan.everywhere:
+            if plan.everywhere_strings:
+                stops.append("the exact forgotten wording, in every source")
+            else:
+                stops.append("this source is banned everywhere by its "
+                             "identity; a whole-session forget names no "
+                             "wording, so no sentence of it is banned in "
+                             "other sources")
+        else:
+            not_stops.append("the same sentence arriving from another source "
+                             "(another session, file or channel): that source "
+                             "keeps its own copy, and still_held_by names it")
+        not_stops.append("a copy that was edited so far that it no longer "
+                         "meets that rule, or that carries no id of its own "
+                         "and is too short to recognise by content, can come "
+                         "back under a new name"
+                         + ("" if plan.everywhere else
+                            "; use `forget --everywhere` to ban the exact "
+                            "wording in every source"))
+        out = {"scope": "everywhere" if plan.everywhere else "this source",
+               "stops": stops, "does_not_stop": not_stops}
+        if fallback:
+            out["short_fragments"] = fallback["note"]
+        return out
+
     def _finish(self, plan, before, after, tombstones, removed, stats,
                 wording_cut, suppressed, not_suppressed, legacy_ids,
                 manifest_notes, problems, training, storage, residue,
-                snapshots, held, fallback) -> Dict:
+                snapshots, held, fallback, cut_in_place, model) -> Dict:
         target = plan.target
         leftovers = self._leftovers(
-            plan, manifest_notes, problems, training, storage, snapshots, held)
+            plan, manifest_notes, problems, training, storage, snapshots, held,
+            model)
         remaining = dict(residue)
         # "Gone everywhere" is printed only when it is true: nothing left in
         # Revien's own tables and nothing named as left behind.
@@ -1100,6 +1484,7 @@ class ForgetEngine:
             "unproven": [n.node_id for n in plan.unproven],
             "still_held_by": sorted({u for h in held for u in h["units"]}),
             "wording_cut": wording_cut,
+            "cut_in_place": cut_in_place,
             "suppressed": suppressed,
             "not_suppressed": not_suppressed,
             "blast_radius": radius,
@@ -1110,7 +1495,9 @@ class ForgetEngine:
             "remaining": remaining,
             "leftovers": leftovers,
             "scope": scope,
-            "model_stale": True,
+            "model": model,
+            "model_stale": model["stale"],
+            "reentry": self._reentry(plan, fallback),
         }
         if plan.likely_unit:
             result["identity_note"] = (
@@ -1152,6 +1539,17 @@ class ForgetEngine:
         for w in r["wording_cut"]:
             lines.append(f"Cut {w['occurrences']} occurrence(s) from context "
                          f"node {w['context_node_id']}.")
+        if r["cut_in_place"]:
+            lines.append(
+                f"--everywhere cut the exact wording out of {len(r['cut_in_place'])} "
+                "node(s) of other sources, in place (nothing deleted, "
+                "nothing suppressed): "
+                + "; ".join(f"{c['node_id']} ({', '.join(c['units'])})"
+                            for c in r["cut_in_place"]) + ".")
+        re_ = r["reentry"]
+        lines.append(f"Scope: {re_['scope']}. Stops coming back: "
+                     + " | ".join(re_["stops"]) + ". Does not stop: "
+                     + " | ".join(re_["does_not_stop"]) + ".")
         if r.get("fallback"):
             lines.append(r["fallback"]["note"])
         if r.get("identity_note"):
@@ -1185,7 +1583,9 @@ class ForgetEngine:
                            for k in plan.keep_vouched],
             "unproven": [n.node_id for n in plan.unproven],
             "would_cut_wording_from": [h.node_id for h in plan.holders],
+            "would_cut_in_place": [n.node_id for n in plan.everywhere_cut],
             "suppressed": sup, "not_suppressed": nosup,
+            "reentry": self._reentry(plan, None),
             "count": len(plan.remove), "forgotten": [],
             "blast_radius": self._blast_radius(
                 plan, sup, nosup, [n.node_id for n in plan.remove]).replace(

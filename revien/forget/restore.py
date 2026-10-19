@@ -46,9 +46,21 @@ def lift_for_override(store, record: Dict) -> bool:
     return ok
 
 
+def liftable(store) -> List[Dict]:
+    """What a restore can lift: every suppressed source, and the bans that a
+    ``forget --everywhere`` put on an exact wording in every source (those are
+    named ``forget:<id>``; the origin-bound denylist entries go with their
+    source and are not listed on their own)."""
+    return store.list_suppressions("active") + [
+        w for w in store.list_suppressions("active", include_wording=True)
+        if w["kind"] == "wording" and w.get("scope") == "global"]
+
+
 def _summarize(rec: Dict) -> Dict:
     return {"id": rec["id"], "unit_id": rec["unit_id"], "kind": rec["kind"],
-            "path": rec["path"], "created_at": rec["created_at"]}
+            "path": rec["path"], "created_at": rec["created_at"],
+            "scope": rec.get("scope", "origin"),
+            "sentences": len(rec.get("sentence_fps") or [])}
 
 
 def _match_one(records: List[Dict], arg: str) -> List[Dict]:
@@ -89,7 +101,7 @@ def _match_pattern(records: List[Dict], pattern: str) -> List[Dict]:
 
 def plan_restore(store, arg: str) -> Dict:
     """What ``restore`` would lift for this argument. Lifts nothing."""
-    records = store.list_suppressions("active")
+    records = liftable(store)
     if not arg or not arg.strip():
         return {"status": "error", "message": "Give a path to restore."}
     if is_pattern(arg):
@@ -138,8 +150,7 @@ def restore(store, arg: str, actor: str = "cli:restore",
         return plan
     lifted = []
     for item in plan["lifts"]:
-        rec = next(r for r in store.list_suppressions("active")
-                   if r["id"] == item["id"])
+        rec = next(r for r in liftable(store) if r["id"] == item["id"])
         if store.lift_suppression(rec["id"], actor):
             _audit_lift(store, rec, actor, plan["mode"])
             _lift_linked_denylist(store, rec, actor, plan["mode"])

@@ -204,7 +204,7 @@ def test_a_trained_model_on_disk_is_named_not_hidden(tmp_path, monkeypatch):
     assert result["scope"] == "forgotten from Revien"
     assert result["model_stale"] is True
     assert "POST /v1/training/run" in result["leftovers"][0]["note"]
-    assert "does not retrain on a schedule" in result["leftovers"][0]["note"]
+    assert "nothing retrains it" in result["leftovers"][0]["note"]
 
 
 def test_gone_everywhere_is_said_only_when_it_is_true(tmp_path, monkeypatch):

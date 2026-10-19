@@ -219,6 +219,11 @@ class IngestionOutput:
     suppression_note: str = ""
 
 
+class _ContextGone(Exception):
+    """The context node a keyed refresh was about to update is gone: a forget
+    (or a delete) from another connection removed it after it was read."""
+
+
 class IngestionPipeline:
     """
     Orchestrates the full ingestion flow:
@@ -473,11 +478,17 @@ class IngestionPipeline:
                         total_edges_in_graph=self.store.count_edges(),
                         fenced_spans=fenced_spans,
                     )
-                return self._refresh_keyed(
-                    input_data, ingest_key, content_hash, existing_ctx,
-                    fenced_spans=fenced_spans, unit=unit, origin=_origin,
-                    origin_declared=_origin_declared,
-                )
+                try:
+                    return self._refresh_keyed(
+                        input_data, ingest_key, content_hash, existing_ctx,
+                        fenced_spans=fenced_spans, unit=unit, origin=_origin,
+                        origin_declared=_origin_declared,
+                    )
+                except _ContextGone:
+                    # The record it would have refreshed was removed while
+                    # this capture waited for the write lock. Nothing was
+                    # written; capture it as new below (the gate decides).
+                    pass
 
         # 1. Extract nodes and edges
         extraction = self.extractor.extract(
@@ -881,10 +892,16 @@ class IngestionPipeline:
         edges_created = 0
         newly_created: List[tuple] = []
 
-        with self.store._capture_lock, self.store.transaction():
+        # BEGIN IMMEDIATE: the write lock is taken here, before the first
+        # statement. A deferred transaction would let a forget from another
+        # connection commit between the read of the context node and the
+        # first write, and the refresh would then fail on a foreign key.
+        with self.store._capture_lock, self.store.transaction(immediate=True):
             blocked = self._gate_check(input_data, unit)
             if blocked is not None:
                 return self._suppressed_output(blocked, fenced_spans)
+            if self.store.get_node(ctx_id) is None:
+                raise _ContextGone()
             _gate.register(self.store, unit)
             # The context node is found by the unit's own ingest key: proof
             # it is this unit's record, whatever it was marked before.

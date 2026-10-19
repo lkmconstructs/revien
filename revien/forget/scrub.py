@@ -70,6 +70,9 @@ def _sentence_span(text: str, start: int, end: int):
         left -= 1
     right = end
     n = len(text)
+    if end > start and text[end - 1] in _TERMINATORS and (end >= n or text[end].isspace()):
+        # the wording already ends its sentence: do not run on into the next
+        return left, right
     while right < n:
         ch = text[right]
         if ch == "\n":
@@ -102,6 +105,10 @@ def _remove_spans(text: str, spans) -> str:
         # the whole line was the sentence: take its line break too
         if not prefix.strip() and not text[r:line_end].strip():
             r = min(line_end + 1, len(text))
+        elif not prefix.strip():
+            # the sentence opened its line: the space before the next one goes
+            while r < len(text) and text[r] in " \t":
+                r += 1
         out.append(text[pos:l])
         pos = r
     out.append(text[pos:])
@@ -268,6 +275,15 @@ def distinctive_tokens(conn: sqlite3.Connection, strings: List[str],
     return sorted(forgotten - alive, key=len, reverse=True)
 
 
+def compile_strings(strings: List[str]):
+    """One compiled whole-word pattern for ``strings`` (None when empty)."""
+    return _pattern(strings)
+
+
+def nfc(text: str) -> str:
+    return _nfc(text)
+
+
 def contains(text: str, strings: List[str]) -> bool:
     pat = _pattern(strings)
     return bool(pat and text and pat.search(_nfc(text)))
@@ -281,6 +297,22 @@ _SKIP_PREFIXES = ("sqlite_", "vec_nodes_")
 NOT_CONTENT_TABLES = frozenset({
     "node_provenance", "capture_units", "suppressions", "store_meta",
     "sync_cursors", "distill_manifest"})
+
+
+# Columns Revien writes itself, never the user's words: the audit op and actor
+# ("forget", "api:forget", "cli:forget", a scheduler name). The one exception
+# is the actor of a merge entry, which records the merged candidate's label.
+_OWN_COLUMNS = {"audit_log": ("op", "actor")}
+_MERGE_OPS = ("normalized_merge", "semantic_merge")
+
+
+def _own_columns(table: str, cols: List[str]) -> set:
+    return {cols.index(c) for c in _OWN_COLUMNS.get(table, ()) if c in cols}
+
+
+def _is_content_cell(table: str, cols: List[str], row, i: int) -> bool:
+    return (table == "audit_log" and cols[i] == "actor"
+            and "op" in cols and row[cols.index("op")] in _MERGE_OPS)
 
 
 def find_residue(conn: sqlite3.Connection, strings: List[str],
@@ -301,9 +333,13 @@ def find_residue(conn: sqlite3.Connection, strings: List[str],
             cur = conn.execute(f'SELECT * FROM "{table}"')
         except sqlite3.Error:
             continue
+        cols = [d[0] for d in cur.description]
+        skip = _own_columns(table, cols)
         hits = 0
         for row in cur:
-            for v in row:
+            for i, v in enumerate(row):
+                if i in skip and not _is_content_cell(table, cols, row, i):
+                    continue
                 if isinstance(v, str) and any(pat.search(_nfc(s)) for s in _iter_strings(v)):
                     hits += 1
                     break

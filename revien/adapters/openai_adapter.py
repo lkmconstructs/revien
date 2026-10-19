@@ -291,6 +291,17 @@ class OpenAIAdapter:
     def _ingest_conversation_data(
         self, conv_data: Dict, source_prefix: str
     ) -> Dict[str, int]:
+        """One conversation is one write transaction, taken with BEGIN
+        IMMEDIATE: the suppression gate below decides after the write lock is
+        held, so a forget from another connection either committed first (and
+        is seen) or waits until this conversation has landed (and then
+        removes it). A failure rolls the whole conversation back."""
+        with self.store.transaction(immediate=True):
+            return self._ingest_conversation_in_txn(conv_data, source_prefix)
+
+    def _ingest_conversation_in_txn(
+        self, conv_data: Dict, source_prefix: str
+    ) -> Dict[str, int]:
         """
         Internal: Parse a conversation object and ingest all its messages.
 
@@ -324,7 +335,11 @@ class OpenAIAdapter:
             if self._is_valid_message_node(nd):
                 parts = (nd.get("message", {}).get("content", {}) or {}).get("parts", [])
                 texts.append("".join(str(p) for p in parts if p))
-        block = forget_gate.check(self.store, unit, "\n".join(texts))
+        whole = "\n".join(texts)
+        # What this conversation will store, as a copy of it would show: the
+        # root record it writes (its title) and every message.
+        record = f"OpenAI conversation: {conv_data.get('title', 'Untitled')}\n{whole}"
+        block = forget_gate.check(self.store, unit, whole)
         if block is not None:
             logger.info("conversation %s suppressed: %s", conv_id, block.reason)
             return {
@@ -392,8 +407,10 @@ class OpenAIAdapter:
             content = "".join(str(p) for p in content_parts if p) or ""
             # Sentences a forget removed stay out (the standing denylist).
             if content.strip():
+                # (a copy under another conversation id is recognised by the
+                # whole conversation, not by one message)
                 content, _left_out = forget_gate.strip_forgotten(
-                    self.store, unit, content)
+                    self.store, unit, content, match_content=record)
                 if _left_out and not content.strip():
                     continue
             if not content.strip():

@@ -67,6 +67,11 @@ class ForgetStoreMixin:
         -- kind 'permanent': no file
         -- behind it, suppressed for good. status 'lifted' keeps the row as
         -- the record that a restore happened.
+        -- scope 'origin': the sentences are kept out of captures that come
+        -- from the forgotten origin (its unit id, its file identity, or a
+        -- copy of it recognised by signature_fps, the keyed fingerprints of
+        -- the origin's own sentences). scope 'global': the exact wording a
+        -- forget --everywhere targeted, kept out of every source.
         CREATE TABLE IF NOT EXISTS suppressions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             unit_id TEXT NOT NULL,
@@ -77,6 +82,8 @@ class ForgetStoreMixin:
             wording_fps TEXT NOT NULL DEFAULT '[]',
             sentence_fps TEXT NOT NULL DEFAULT '[]',
             short_fps TEXT NOT NULL DEFAULT '[]',
+            signature_fps TEXT NOT NULL DEFAULT '[]',
+            scope TEXT NOT NULL DEFAULT 'origin',
             file_fp TEXT,
             created_at TEXT NOT NULL,
             actor TEXT NOT NULL DEFAULT '',
@@ -106,8 +113,10 @@ class ForgetStoreMixin:
                     "?" * len(self._FORGET_OBJECTS)), self._FORGET_OBJECTS)}
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version >= 6 and len(have) == len(self._FORGET_OBJECTS):
+                self._ensure_suppression_columns(conn)
                 return
             conn.executescript(self._FORGET_LAYER_DDL)
+            self._ensure_suppression_columns(conn)
             if version < 6:
                 self._backfill_provenance(conn)
                 conn.execute("PRAGMA user_version = 6")
@@ -117,6 +126,19 @@ class ForgetStoreMixin:
                 print(f"Migration note: {e}")
             else:
                 raise
+
+    @staticmethod
+    def _ensure_suppression_columns(conn: sqlite3.Connection) -> None:
+        """A suppressions table made before these columns existed gets them."""
+        have = {r[1] for r in conn.execute("PRAGMA table_info(suppressions)")}
+        for col, ddl in (
+                ("sentence_fps", "TEXT NOT NULL DEFAULT '[]'"),
+                ("short_fps", "TEXT NOT NULL DEFAULT '[]'"),
+                ("signature_fps", "TEXT NOT NULL DEFAULT '[]'"),
+                ("scope", "TEXT NOT NULL DEFAULT 'origin'")):
+            if col not in have:
+                conn.execute(f"ALTER TABLE suppressions ADD COLUMN {col} {ddl}")
+                conn.commit()
 
     @staticmethod
     def ownership_for_fields(node_type: str, runtime: Optional[str],
@@ -307,11 +329,14 @@ class ForgetStoreMixin:
             "status": r[10], "lifted_at": r[11], "lifted_by": r[12],
             "sentence_fps": json.loads(r[13] or "[]"),
             "short_fps": json.loads(r[14] or "[]"),
+            "signature_fps": json.loads(r[15] or "[]"),
+            "scope": r[16] or "origin",
         }
 
     _SUPPRESSION_COLS = (
         "id, unit_id, kind, path, path_keys, content_fps, wording_fps, "
-        "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps, short_fps")
+        "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps, short_fps, "
+        "signature_fps, scope")
 
     @_locked
     def add_suppression(
@@ -320,6 +345,8 @@ class ForgetStoreMixin:
         wording_fps: List[str], file_fp: Optional[str], actor: str,
         sentence_fps: Optional[List[str]] = None,
         short_fps: Optional[List[str]] = None,
+        signature_fps: Optional[List[str]] = None,
+        scope: str = "origin",
     ) -> int:
         """Write (or extend) the active record for a unit. A second forget of
         the same unit merges its fingerprints into the one record."""
@@ -335,7 +362,7 @@ class ForgetStoreMixin:
             conn.execute(
                 "UPDATE suppressions SET kind = ?, path = COALESCE(?, path), "
                 "path_keys = ?, content_fps = ?, wording_fps = ?, "
-                "sentence_fps = ?, short_fps = ?, "
+                "sentence_fps = ?, short_fps = ?, signature_fps = ?, "
                 "file_fp = COALESCE(?, file_fp) WHERE id = ?",
                 (kind, path,
                  json.dumps(sorted(set(cur["path_keys"]) | set(path_keys))),
@@ -343,18 +370,21 @@ class ForgetStoreMixin:
                  json.dumps(sorted(set(cur["wording_fps"]) | set(wording_fps))),
                  json.dumps(sorted(set(cur["sentence_fps"]) | set(sentence_fps or []))),
                  json.dumps(sorted(set(cur["short_fps"]) | set(short_fps or []))),
+                 json.dumps(sorted(set(cur["signature_fps"]) | set(signature_fps or []))),
                  file_fp, cur["id"]))
             self._commit(conn)
             return cur["id"]
         cur = conn.execute(
             "INSERT INTO suppressions (unit_id, kind, path, path_keys, "
-            "content_fps, wording_fps, sentence_fps, short_fps, file_fp, "
-            "created_at, actor) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "content_fps, wording_fps, sentence_fps, short_fps, signature_fps, "
+            "scope, file_fp, created_at, actor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (unit_id, kind, path, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(content_fps))),
              json.dumps(sorted(set(wording_fps))),
              json.dumps(sorted(set(sentence_fps or []))),
-             json.dumps(sorted(set(short_fps or []))), file_fp, _now(), actor))
+             json.dumps(sorted(set(short_fps or []))),
+             json.dumps(sorted(set(signature_fps or []))), scope,
+             file_fp, _now(), actor))
         self._commit(conn)
         return cur.lastrowid
 

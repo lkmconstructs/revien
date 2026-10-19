@@ -198,7 +198,10 @@ def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, projec
     fresh = build_skill_node(skill_md_path, scope, project_key, origin_runtime)
     ikey = fresh.metadata["ingest_key"]
     unit = forget_gate.UnitRef(ikey, str(skill_md_path))
-    with store._capture_lock:
+    # BEGIN IMMEDIATE: the gate decides after the write lock is held, so a
+    # forget from another connection either committed first (and is seen) or
+    # waits until this skill has landed (and then removes it).
+    with store._capture_lock, store.transaction(immediate=True):
         if forget_gate.check(store, unit, fresh.content) is not None:
             return None, False, 0
         forget_gate.register(store, unit)

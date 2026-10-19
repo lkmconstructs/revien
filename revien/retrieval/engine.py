@@ -362,6 +362,10 @@ class RetrievalEngine:
         )
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
+        # A retrain writes a new model to disk; this process keeps the one it
+        # loaded in memory, so it reloads after every run.
+        self._model_dir = model_dir
+        self.training_loop.on_trained = self.reload_scorer
 
         # Semantic/vector layer (SPINE — core deps as of the promote-to-spine
         # change). Constructs cleanly even when the deps are absent (source
@@ -1346,6 +1350,10 @@ class RetrievalEngine:
             "training": self.training_loop.get_stats(),
             "scorer": self.neural_scorer.get_stats(),
         }
+
+    def reload_scorer(self) -> None:
+        """Load the model from disk again (after a retrain)."""
+        self.neural_scorer = NeuralScorer(model_dir=self._model_dir)
 
     def force_train(self) -> bool:
         """Force training run regardless of threshold. For testing/manual triggers.
