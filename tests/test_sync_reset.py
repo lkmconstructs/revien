@@ -66,6 +66,10 @@ def _write_real_session(root, turns):
                 "message": {"role": role, "content": [{"type": "text", "text": text}]},
                 "timestamp": "2026-07-01T10:00:00Z",
             }) + "\n")
+    # Same-tick files are re-read on purpose; Windows' coarse clock widens the
+    # tick, so age the fixture and let "cursor moved on" test the cursor.
+    old = datetime.now(timezone.utc).timestamp() - 60
+    os.utime(path, (old, old))
     return path
 
 
