@@ -22,7 +22,7 @@ Sources: owner rulings (Lissa, with Ash's reads, 2026-10-16), and the findings o
 
 A forget names **one specific thing**. It does not name a conversation.
 
-1. **A conversation is refused.** Forgetting a context node (the stored text of a session, a conversation or a file), or a skill, is refused with: "To remove a whole conversation or file, use delete; to keep a specific detail out, forget that detail." Nothing changes. There is no `cascade`: the flag, the REST field and the operation argument do not exist.
+1. **A conversation is refused.** Forgetting a context node (the stored text of a session, a conversation or a file), or a skill, is refused with: "To remove a whole conversation or file, use delete; to keep a specific detail out, forget that detail." Nothing changes. There is no `cascade`: the CLI flag and the operation argument do not exist, and a REST request that still sends a `cascade` field is answered 400 (`cascade_removed`).
 2. **The forgotten node**, everywhere (§4).
 3. **The forgotten wording inside the stored conversation.** The wording of a node is what was said: a fact, decision or preference is its text; an entity or a topic is its **label** ("Brigitte Vandermeer"), never the content string Revien gives it ("Entity: Brigitte Vandermeer"). Every sentence of the source's stored conversation that holds the wording is cut out of the context node: its label, its content, the audit snapshots, the vector and the search index.
    - If the wording cannot be found verbatim in the stored conversation (for example, the model paraphrased it), the forget is **refused**, with a message naming the context node. To remove the whole conversation, use delete. Revien never claims a removal it could not do.
