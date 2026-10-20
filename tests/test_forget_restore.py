@@ -17,20 +17,26 @@ def two_watched_files(tmp_path, monkeypatch):
     """Two forgotten files with the SAME name in different folders."""
     from revien.adapters.file_watcher import FileWatcherAdapter
     db = str(tmp_path / "r.db")
+    texts = {"ALPHAWORD": "We decided to use ALPHAWORD for the gate.",
+             "BRAVOWORD": "We decided to migrate every BRAVOWORD server to Frankfurt."}
     for folder, word in (("projA", "ALPHAWORD"), ("projB", "BRAVOWORD")):
         d = tmp_path / "watched" / folder
         d.mkdir(parents=True)
         p = d / "notes.md"
-        p.write_text(f"Plan notes. We decided to use {word} for the gate.\n")
+        p.write_text(f"Plan notes. {texts[word]}\n")
         fs._age(p)
     fs._sync(db, "files", FileWatcherAdapter(watch_dir=str(tmp_path / "watched")))
     store = GraphStore(db_path=db)
     ops = GraphOperations(store)
     for n in store.list_nodes(limit=100):
-        if n.node_type.value == "context":
-            ops.forget_node(n.node_id, cascade=True)
+        if n.node_type.value == "decision":
+            ops.forget_node(n.node_id)
     store.close()
     return db, tmp_path / "watched"
+
+
+def sources(rec):
+    return " ".join(k for k in rec["path_keys"] if k.startswith("path:")).casefold()
 
 
 def active(db):
@@ -52,14 +58,14 @@ class TestRestore:
         r = run(db, str(root / "projA" / "notes.md"))
         assert r.exit_code == 0, r.output
         left = active(db)
-        assert len(left) == 1 and "projB" in left[0]["path"]
+        assert len(left) == 1 and "projb" in sources(left[0])
 
     def test_a_bare_name_never_fans_out(self, tmp_path, monkeypatch):
         db, root = two_watched_files(tmp_path, monkeypatch)
         r = run(db, "notes.md")
         assert r.exit_code == 1
         assert "name, not a path" in r.output
-        assert "projA" in r.output and "projB" in r.output       # candidates listed
+        assert "proja" in r.output.casefold() and "projb" in r.output.casefold()   # candidates listed
         assert len(active(db)) == 2                              # nothing lifted
 
     def test_a_pattern_lists_what_it_lifts_before_lifting(self, tmp_path, monkeypatch):
@@ -67,8 +73,8 @@ class TestRestore:
         # declined at the prompt: the list is shown, nothing is lifted
         r = run(db, "projA/**", input="n\n")
         assert r.exit_code == 1
-        assert "Will lift 1 suppression(s)" in r.output and "projA" in r.output
-        assert "projB" not in r.output
+        assert "Will lift 1 forget record(s)" in r.output and "proja" in r.output.casefold()
+        assert "projb" not in r.output.casefold()
         assert len(active(db)) == 2
         r = run(db, "projA/**", input="y\n")
         assert r.exit_code == 0, r.output
@@ -92,8 +98,7 @@ class TestRestore:
         s = GraphStore(db_path=db)
         try:
             rows = [a for a in s.get_all_audit() if a["op"] == "restore"]
-            # the source, and the forgotten-sentence denylist written with it
-            assert len(rows) == 2 and {r["actor"] for r in rows} == {"cli:restore"}
+            assert len(rows) == 1 and {r["actor"] for r in rows} == {"cli:restore"}
             assert "ALPHAWORD" not in json.dumps(rows) and "BRAVOWORD" not in json.dumps(rows)
             lifted = s.list_suppressions("lifted")
             assert len(lifted) == 1 and lifted[0]["lifted_by"] == "cli:restore"
@@ -115,15 +120,14 @@ class TestRestore:
     def test_list_and_nothing_to_restore(self, tmp_path, monkeypatch):
         db, root = two_watched_files(tmp_path, monkeypatch)
         r = run(db, "--list")
-        assert "2 active suppression(s)" in r.output and "until the file changes" in r.output
+        assert "2 active forget record(s)" in r.output and "kept out of" in r.output
         none = run(db, str(tmp_path / "never" / "forgotten.md"))
-        assert none.exit_code == 1 and "No active suppression" in none.output
+        assert none.exit_code == 1 and "No active forget record" in none.output
 
     def test_restore_by_unit_id(self, tmp_path, monkeypatch):
         seeded = fs.seed("chatgpt", tmp_path, monkeypatch)
-        s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
-        s.close()
+        fs.forget_all(seeded.db, seeded.secret)
+        assert active(seeded.db)
         r = run(seeded.db, "item:chatgpt:conversation:conv-1")
         assert r.exit_code == 0, r.output
         assert active(seeded.db) == []
@@ -142,3 +146,15 @@ class TestRestore:
             src = inspect.getsource(mod)
             assert "lift_suppression" not in src
             assert "override_suppression" not in src
+
+
+    def test_restore_by_the_id_of_the_record(self, tmp_path, monkeypatch):
+        seeded = fs.seed("pipeline", tmp_path, monkeypatch)
+        ops_store = GraphStore(db_path=seeded.db)
+        GraphOperations(ops_store).forget_node(fs.holders(seeded.db, seeded.secret)[0], everywhere=True)
+        ops_store.close()
+        rec = [r for r in active(seeded.db) if r["scope"] == "global"][0]
+        assert rec["unit_id"].startswith("forget:")
+        r = run(seeded.db, rec["unit_id"])
+        assert r.exit_code == 0, r.output
+        assert not [x for x in active(seeded.db) if x["scope"] == "global"]

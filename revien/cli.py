@@ -791,8 +791,6 @@ def ingest(content: str, source: str, db: Optional[str]):
             click.echo("Not ingested: " + result.suppression_note)
             return
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
-        if getattr(result, "left_out_note", ""):
-            click.echo(result.left_out_note)
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
                    f"{result.total_edges_in_graph} edges")
     finally:
@@ -1453,7 +1451,8 @@ def skills_ingest(paths: Tuple[str, ...], include_global: bool, db: Optional[str
     )
     if summary.get("suppressed"):
         click.echo(f"{summary['suppressed']} skill(s) were not ingested: a "
-                   "forget suppressed them until their file changes.")
+                   "forget --everywhere banned their exact text. "
+                   "'revien restore' lifts that.")
 
 
 @skills.command(name="list")
@@ -1773,10 +1772,10 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
     a saved position exists.
 
     Once you have forgotten something, a reset needs --yes: the full re-read
-    shows every source to Revien again. Sources a forget suppressed stay out
-    until their file changes, and a source that changed since is captured
-    again minus the sentences that were forgotten (they stay on a keyed
-    denylist, whatever the source)."""
+    shows every source to Revien again. A source that was re-read is captured
+    again minus the sentences that held what was forgotten from it (they stay
+    on a keyed denylist, bound to that source's identity; with --everywhere,
+    whatever the source)."""
     import sqlite3
 
     from revien.adapters import (
@@ -1850,11 +1849,11 @@ def sync_reset(adapter_name: str, db: Optional[str], orphaned: bool,
     if forgets and not yes:
         click.echo(
             f"This database has {forgets} forget record(s). A reset makes the "
-            "next sync re-read every source in full. Sources a forget "
-            "suppressed stay out until their file changes; a source that "
-            "has changed since is captured again, minus the sentences that "
-            "were forgotten (kept out by their keyed fingerprint, from any "
-            "source). Re-run with --yes to reset anyway. "
+            "next sync re-read every source in full. Each source is captured "
+            "again minus the sentences that held what was forgotten from it "
+            "(kept out by their keyed fingerprint, bound to that source's "
+            "identity; from any source for a forget --everywhere). Re-run "
+            "with --yes to reset anyway. "
             "Nothing was changed.")
         raise SystemExit(1)
 
@@ -2019,16 +2018,12 @@ def _has_sync_row(db_path: str, name: str) -> bool:
 
 @main.command()
 @click.argument("node_id")
-@click.option("--cascade", is_flag=True,
-              help="On a context node: forget the whole unit (session, "
-                   "conversation, file) and everything only it wrote")
 @click.option("--everywhere", is_flag=True,
               help="Also cut the exact forgotten wording (this node's own "
-                   "content) out of every other node that holds it, in place "
-                   "(nothing is deleted or suppressed), and keep it out of "
-                   "every source. Without it, a forget is per source and the "
-                   "response names the other sources that still hold the "
-                   "wording")
+                   "wording) out of every other node that holds it, in place "
+                   "(nothing is deleted), and keep it out of every source. "
+                   "Without it, a forget is per source and the response names "
+                   "the other sources that still hold the wording")
 @click.option("--db", default=None, help="Database path")
 @click.option("--yes", "yes", is_flag=True, help="Do not ask before forgetting")
 @click.option("--preview", is_flag=True,
@@ -2037,20 +2032,24 @@ def _has_sync_row(db_path: str, name: str) -> bool:
               help="Where to look for a running daemon (loopback addresses "
                    "only; default http://127.0.0.1:7437)")
 @click.option("--json-output", is_flag=True, help="Output the result as JSON")
-def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes: bool,
+def forget(node_id: str, everywhere: bool, db: Optional[str], yes: bool,
            preview: bool, daemon_url: str, json_output: bool):
-    """Forget a node: privacy, not housekeeping.
+    """Forget one specific thing: a fact, an entity, a decision or a
+    preference. Privacy, not housekeeping.
 
-    Removes the node, cuts the forgotten wording out of the conversation it
-    came from, scrubs every copy Revien keeps (audit history, recall records,
-    vectors, training data, the database file and its write-ahead log), and
-    stops the source (and a copy of it) bringing it back until that source
-    changes. The result says exactly what was removed, cut back and kept,
-    what is left that Revien cannot reach (your own source file, exports,
-    distilled notes), and which way back it does and does not close.
+    Removes the node, cuts its wording out of the conversation it came from,
+    scrubs every copy Revien keeps (audit history, recall records, vectors,
+    training data, the database file and its write-ahead log), and keeps that
+    wording out of later captures of the same source (named by its id, or its
+    real path or inode). A copy of the source under a different identity is
+    not recognised; --everywhere keeps the wording out of every source. The
+    result says exactly what was removed, cut back and kept, what is left that
+    Revien cannot reach (your own source file, exports, distilled notes), and
+    which way back it does and does not close.
 
-    To only remove a node and let it be captured again, use the delete
-    endpoint instead. A running daemon from before forget protection makes
+    A whole conversation is not one thing to forget: to remove it, use
+    delete. To only remove a node and let it be captured again, use the
+    delete endpoint. A running daemon from before forget protection makes
     this refuse; restart it first."""
     import sqlite3
 
@@ -2081,7 +2080,7 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
     try:
         ops = GraphOperations(store)
         plan = ops._forget_engine().forget(
-            node_id, cascade=cascade, dry_run=True, everywhere=everywhere)
+            node_id, dry_run=True, everywhere=everywhere)
         status = plan.get("status")
         if status in ("not_found", "skipped"):
             click.echo(f"No node {node_id} to forget.")
@@ -2098,7 +2097,7 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
                 click.echo(f"  would cut back: {len(plan['would_cut_back'])} shared node(s)")
                 click.echo(f"  would keep    : {len(plan['would_keep'])} (another unit vouches)")
                 click.echo(f"  unproven      : {len(plan['unproven'])} kept and listed")
-                for u in plan["not_suppressed"]:
+                for u in plan["not_bound"]:
                     click.echo(f"  note: {u['note']}")
                 if plan.get("would_cut_in_place"):
                     click.echo(f"  would cut in place: {len(plan['would_cut_in_place'])} "
@@ -2116,7 +2115,7 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
             if not click.confirm("Forget this?"):
                 click.echo("Nothing was changed.")
                 raise SystemExit(1)
-        result = ops.forget_node(node_id, cascade=cascade, actor="cli:forget",
+        result = ops.forget_node(node_id, actor="cli:forget",
                                  everywhere=everywhere)
     finally:
         store.close()
@@ -2131,7 +2130,7 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
     click.echo(f"  removed {result['removed_nodes']} node(s); the graph went "
                f"from {result['nodes_before']} to {result['nodes_after']} nodes "
                f"and {result['edges_before']} to {result['edges_after']} edges.")
-    for u in result["not_suppressed"]:
+    for u in result["not_bound"]:
         click.echo(f"  {u['note']}")
 
 
@@ -2139,16 +2138,18 @@ def forget(node_id: str, cascade: bool, everywhere: bool, db: Optional[str], yes
 @click.argument("target", required=False)
 @click.option("--db", default=None, help="Database path")
 @click.option("--list", "list_only", is_flag=True,
-              help="List the active suppressions and change nothing")
+              help="List the active forget records and change nothing")
 @click.option("--yes", "yes", is_flag=True,
               help="For a pattern: lift what it lists without asking")
 def restore(target: Optional[str], db: Optional[str], list_only: bool, yes: bool):
-    """Let a forgotten source be captured again.
+    """Let forgotten wording be captured again.
 
-    'revien restore /path/to/file' lifts the suppression of that ONE file. A
-    bare name never lifts several paths. To lift several, give an explicit
-    pattern, for example: revien restore 'projA/**'. It lists everything it
-    would lift and asks before lifting. Every restore is audited."""
+    'revien restore /path/to/file' lifts the forget records bound to that ONE
+    file; 'revien restore forget:<id>' lifts one record by its id. A bare name
+    never lifts several paths. To lift several, give an explicit pattern, for
+    example: revien restore 'projA/**'. It lists everything it would lift and
+    asks before lifting. Every restore is audited. It does not bring a removed
+    node back."""
     import sqlite3
 
     from revien.forget.restore import plan_restore, restore as do_restore
@@ -2170,31 +2171,35 @@ def restore(target: Optional[str], db: Optional[str], list_only: bool, yes: bool
             from revien.forget.restore import liftable
             rows = liftable(store)
             if not rows:
-                click.echo("No active suppressions.")
+                click.echo("No active forget records.")
                 return
-            click.echo(f"{len(rows)} active suppression(s):")
+            click.echo(f"{len(rows)} active forget record(s):")
             for r in rows:
-                if r["kind"] == "wording":
+                if r["scope"] == "global":
                     click.echo(
-                        f"  #{r['id']} {r['unit_id']} (the exact wording of "
-                        f"{len(r['sentence_fps'])} sentence(s) banned in every "
-                        f"source by forget --everywhere), since "
+                        f"  #{r['id']} {r['unit_id']} (an exact wording kept "
+                        f"out of every source by forget --everywhere), since "
                         f"{r['created_at'][:19]}")
                     continue
-                where = r["path"] or r["unit_id"]
-                lasts = ("until the file changes" if r["kind"] == "file"
-                         else "for good")
-                click.echo(f"  #{r['id']} {where} ({lasts}), since {r['created_at'][:19]}")
+                where = ", ".join(sorted(
+                    k[len("unit:"):] for k in r["path_keys"]
+                    if k.startswith("unit:"))) or r["unit_id"]
+                click.echo(
+                    f"  #{r['id']} {r['unit_id']} ({len(r['sentence_fps'])} "
+                    f"sentence(s) kept out of {where}), since "
+                    f"{r['created_at'][:19]}")
             return
         plan = plan_restore(store, target)
         if plan["status"] in ("error", "none", "ambiguous"):
             click.echo(plan["message"])
             for c in plan.get("candidates", []):
-                click.echo(f"  #{c['id']} {c['path'] or c['unit_id']}")
+                click.echo(f"  #{c['id']} {c['unit_id']} "
+                           f"({', '.join(c['sources']) or 'every source'})")
             raise SystemExit(1)
-        click.echo(f"Will lift {len(plan['lifts'])} suppression(s):")
+        click.echo(f"Will lift {len(plan['lifts'])} forget record(s):")
         for item in plan["lifts"]:
-            click.echo(f"  #{item['id']} {item['path'] or item['unit_id']}")
+            click.echo(f"  #{item['id']} {item['unit_id']} "
+                       f"({', '.join(item['sources']) or 'every source'})")
         if plan["mode"] == "bulk" and not yes:
             if not click.confirm("Lift all of these?"):
                 click.echo("Nothing was changed.")
@@ -2202,8 +2207,8 @@ def restore(target: Optional[str], db: Optional[str], list_only: bool, yes: bool
         done = do_restore(store, target, actor="cli:restore", confirmed=True)
     finally:
         store.close()
-    click.echo(f"Restored {len(done.get('lifted', []))} suppression(s). Their "
-               "sources can be captured again at the next sync.")
+    click.echo(f"Restored {len(done.get('lifted', []))} forget record(s). The "
+               "wording can be captured again at the next sync.")
 
 
 @main.group()

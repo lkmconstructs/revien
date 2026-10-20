@@ -90,7 +90,10 @@ def node_likely_unit(
     if origin_runtime in ("claude-code", "codex") and session_key:
         return session_unit(origin_runtime, session_key)
     src = source_id or ""
-    if src.startswith("openai:conversation:"):
+    if src.startswith(("openai:conversation:", "chatgpt:conversation:",
+                       "claude:conversation:", "readwise:")):
+        # an importer's source id is its ingest key: the conversation or
+        # highlight id from the export
         return item_unit(src)
     if src.startswith("vault:"):
         return src

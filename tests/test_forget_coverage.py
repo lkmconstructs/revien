@@ -59,7 +59,7 @@ def test_every_owned_writer_asks_the_gate():
 
 
 def test_the_pipeline_asks_the_gate_before_it_extracts_anything():
-    src = inspect.getsource(IngestionPipeline._ingest)
+    src = inspect.getsource(IngestionPipeline.ingest)
     assert src.index("_gate_check") < src.index("self.extractor.extract")
     assert src.index("_gate_check") < src.index("find_context_node_by_ingest_key")
 

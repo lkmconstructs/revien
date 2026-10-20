@@ -1,18 +1,23 @@
-"""Restore: lift a suppression (docs/FORGET_SPEC.md §7).
+"""Restore: lift a forget record (docs/FORGET_SPEC.md §7).
 
-``revien restore <path>`` lifts the suppression of ONE file. A bare name never
-fans out across paths: if it names more than one suppression it is refused and
-the candidates are listed. Lifting several at once needs an explicit pattern
+A forget leaves a record of the sentences that held the forgotten wording,
+bound to the source it was forgotten from (or, for ``forget --everywhere``, to
+no source). ``revien restore <path>`` lifts the records bound to ONE file;
+``revien restore forget:<id>`` lifts one record by its id; ``revien restore
+<unit id>`` lifts the records bound to that unit. A bare name never fans out
+across paths: if it names more than one record it is refused and the
+candidates are listed. Lifting several at once needs an explicit pattern
 (``revien restore 'projA/**'``), and what it would lift is listed first. Every
 lift is audited. Only an explicit restore, or a re-import with the explicit
-override flag, ever lifts a suppression.
+override flag, ever lifts a record. Lifting a record lets the wording be
+captured again; it does not bring a removed node back.
 """
 
 import fnmatch
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from revien.graph.units import identity_keys, path_unit_key, real_path
+from revien.graph.units import identity_keys, path_unit_key
 
 _WILD = set("*?[")
 
@@ -24,17 +29,8 @@ def is_pattern(arg: str) -> bool:
 def _audit_lift(store, record: Dict, actor: str, via: str) -> None:
     store.record_audit(
         f"suppression:{record['id']}", "restore", actor=actor,
-        after={"unit_id": record["unit_id"], "kind": record["kind"],
+        after={"unit_id": record["unit_id"], "scope": record["scope"],
                "via": via})
-
-
-def _lift_linked_denylist(store, record: Dict, actor: str, via: str) -> None:
-    """Lifting a source also lifts the forgotten-sentence denylist that was
-    written with it: restoring a file means the user wants it back."""
-    for w in store.list_suppressions("active", include_wording=True):
-        if w["kind"] == "wording" and f"unit:{record['unit_id']}" in w["path_keys"]:
-            if store.lift_suppression(w["id"], actor):
-                _audit_lift(store, w, actor, via)
 
 
 def lift_for_override(store, record: Dict) -> bool:
@@ -42,45 +38,41 @@ def lift_for_override(store, record: Dict) -> bool:
     ok = store.lift_suppression(record["id"], "override:import")
     if ok:
         _audit_lift(store, record, "override:import", "override")
-        _lift_linked_denylist(store, record, "override:import", "override")
     return ok
 
 
 def liftable(store) -> List[Dict]:
-    """What a restore can lift: every suppressed source, and the bans that a
-    ``forget --everywhere`` put on an exact wording in every source (those are
-    named ``forget:<id>``; the origin-bound denylist entries go with their
-    source and are not listed on their own)."""
-    return store.list_suppressions("active") + [
-        w for w in store.list_suppressions("active", include_wording=True)
-        if w["kind"] == "wording" and w.get("scope") == "global"]
+    """What a restore can lift: every active forget record."""
+    return store.list_suppressions("active")
+
+
+def _sources(rec: Dict) -> List[str]:
+    return sorted(k[len("unit:"):] for k in rec["path_keys"]
+                  if k.startswith("unit:"))
 
 
 def _summarize(rec: Dict) -> Dict:
-    return {"id": rec["id"], "unit_id": rec["unit_id"], "kind": rec["kind"],
-            "path": rec["path"], "created_at": rec["created_at"],
-            "scope": rec.get("scope", "origin"),
+    return {"id": rec["id"], "unit_id": rec["unit_id"],
+            "scope": rec["scope"], "sources": _sources(rec),
+            "created_at": rec["created_at"],
             "sentences": len(rec.get("sentence_fps") or [])}
 
 
 def _match_one(records: List[Dict], arg: str) -> List[Dict]:
-    """Records that name exactly this file or unit. Never a name search
-    across paths."""
+    """Records bound to exactly this file or unit, or named by this id.
+    Never a name search across paths."""
     found: Dict[int, Dict] = {}
-    exists = os.path.exists(arg)
-    if exists:
+    if os.path.exists(arg):
         keys = set(identity_keys(arg))
-        unit_ids = {"file:" + path_unit_key(arg), "skill:" + real_path(arg)}
+        unit_ids = {"file:" + path_unit_key(arg)}
         for rec in records:
-            if rec["unit_id"] in unit_ids or keys & set(rec["path_keys"]):
+            if keys & set(rec["path_keys"]) or any(
+                    f"unit:{u}" in rec["path_keys"] for u in unit_ids):
                 found[rec["id"]] = rec
         if found:
             return list(found.values())
     for rec in records:
-        if rec["unit_id"] == arg:
-            found[rec["id"]] = rec
-        elif rec["path"] and os.path.normcase(rec["path"]).casefold() == \
-                path_unit_key(arg):
+        if rec["unit_id"] == arg or f"unit:{arg}" in rec["path_keys"]:
             found[rec["id"]] = rec
     return list(found.values())
 
@@ -89,9 +81,10 @@ def _match_pattern(records: List[Dict], pattern: str) -> List[Dict]:
     pat = pattern.replace("\\", "/").casefold()
     out = []
     for rec in records:
-        candidates = [rec["unit_id"].casefold()]
-        if rec["path"]:
-            candidates.append(rec["path"].replace("\\", "/").casefold())
+        candidates = [rec["unit_id"].casefold()] + [
+            u.replace("\\", "/").casefold() for u in _sources(rec)]
+        candidates += [k[len("path:"):].replace("\\", "/").casefold()
+                       for k in rec["path_keys"] if k.startswith("path:")]
         for c in candidates:
             if fnmatch.fnmatchcase(c, pat) or fnmatch.fnmatchcase(c, "*/" + pat):
                 out.append(rec)
@@ -119,7 +112,7 @@ def plan_restore(store, arg: str) -> Dict:
         if len(hits) > 1 and not os.path.exists(arg):
             return {"status": "ambiguous", "mode": "single",
                     "candidates": [_summarize(r) for r in hits],
-                    "message": f"'{arg}' names {len(hits)} suppressions. "
+                    "message": f"'{arg}' names {len(hits)} forget records. "
                                "Restore one by its full path, or lift several "
                                "with an explicit pattern."}
         return {"status": "ok", "mode": "single",
@@ -127,15 +120,15 @@ def plan_restore(store, arg: str) -> Dict:
     # A bare name: list candidates, never lift them.
     base = os.path.basename(arg).casefold()
     cands = [r for r in records if base and (
-        (r["path"] and os.path.basename(r["path"]).casefold() == base)
-        or r["unit_id"].casefold().endswith(base))]
+        r["unit_id"].casefold().endswith(base)
+        or any(u.casefold().endswith(base) for u in _sources(r)))]
     if cands:
         return {"status": "ambiguous", "mode": "single",
                 "candidates": [_summarize(r) for r in cands],
                 "message": f"'{arg}' is a name, not a path. Restore by full "
                            "path so only that file is lifted."}
     return {"status": "none", "mode": "single", "lifts": [],
-            "message": f"No active suppression matches '{arg}'."}
+            "message": f"No active forget record matches '{arg}'."}
 
 
 def restore(store, arg: str, actor: str = "cli:restore",
@@ -153,7 +146,6 @@ def restore(store, arg: str, actor: str = "cli:restore",
         rec = next(r for r in liftable(store) if r["id"] == item["id"])
         if store.lift_suppression(rec["id"], actor):
             _audit_lift(store, rec, actor, plan["mode"])
-            _lift_linked_denylist(store, rec, actor, plan["mode"])
             lifted.append(item)
     plan["lifted"] = lifted
     plan["status"] = "restored" if lifted else "none"

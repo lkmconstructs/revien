@@ -18,17 +18,19 @@ from revien.graph.store import GraphStore
 from tests import forget_seed as fs
 from tests import forget_surfaces as surf
 
-ALL = [p for p in fs.ALL_PATHS]
+# A skill is a file: forget refuses it (delete removes it), so it has no node
+# to forget; see test_forget_narrow.py.
+ALL = [p for p in fs.ALL_PATHS if p != "skill"]
 
 
-def _forget(seeded, planted=None, cascade=True, keep_open=False):
+def _forget(seeded, planted=None, keep_open=False):
+    """Forget, one node at a time, every node that holds the secret."""
     store = GraphStore(db_path=seeded.db)
     try:
         ops = GraphOperations(store)
         if planted:
             ops.training_dbs = (planted["training_db"],)
-        handle = seeded.ctx_ids[0] if seeded.ctx_ids else seeded.node_with_secret
-        result = ops.forget_node(handle, cascade=cascade)
+        result = fs.forget_all(seeded.db, seeded.secret, ops=ops)
     except BaseException:
         store.close()
         raise
@@ -47,8 +49,8 @@ def test_secret_is_gone_from_every_surface_after_a_forget(path, tmp_path, monkey
             pytest.skip("langchain-core is not installed")
     seeded = fs.seed(path, tmp_path, monkeypatch)
     secret = seeded.secret
-    handle_ids = list(seeded.ctx_ids) or [seeded.node_with_secret]
-    assert handle_ids[0], f"{path}: the capture produced nothing to forget"
+    handle_ids = fs.holders(seeded.db, secret)
+    assert handle_ids, f"{path}: the capture produced nothing to forget"
 
     # the secret really is in the store, and in the raw file, before
     before = surf.raw_bytes(seeded.db)
@@ -131,15 +133,12 @@ def test_secret_is_gone_from_every_surface_after_a_forget(path, tmp_path, monkey
             l["path"].casefold() for l in result["leftovers"]
             if l["kind"] == "source_file"]
     if seeded.stable:
-        assert result["suppressed"], result
-    elif path == "import_graph":
-        # a graph file carries no record of who wrote a node: ownership is
-        # unproven, so nothing can be suppressed, and the response says so
-        assert not result["suppressed"]
-        assert "suppresses nothing" in result["blast_radius"]
+        assert result["bound_to"], result
     else:
-        assert not result["suppressed"]
-        assert "eligible for recapture because the source supplied no stable item identity" in json.dumps(result)
+        # a shared channel has no identity of its own: nothing is bound, and
+        # the response says so
+        assert not result["bound_to"]
+        assert "shared channel" in json.dumps(result)
     # a distilled note rendered the node (planted), so this is "forgotten
     # from Revien", never "gone everywhere", and it names the manual step
     notes = [l for l in result["leftovers"] if l["kind"] == "vault_note"]
@@ -188,8 +187,15 @@ def test_community_labels_held_in_memory_do_not_keep_a_forgotten_label(tmp_path)
             ids.append(r.json()["context_node_id"])
         client.post("/v1/cluster")
         assert secret in client.get("/v1/communities").text   # the test sees it first
-        r = client.post(f"/v1/nodes/{ids[0]}/forget", json={"cascade": True})
-        assert r.status_code == 200, r.text
+        nodes = client.get("/v1/nodes").json()
+        nodes = nodes["nodes"] if isinstance(nodes, dict) else nodes
+        forgotten = 0
+        for n in nodes:
+            if n["node_type"] != "context" and secret in (n["label"] + n["content"]):
+                r = client.post(f"/v1/nodes/{n['node_id']}/forget", json={})
+                assert r.status_code == 200, r.text
+                forgotten += 1
+        assert forgotten
         assert secret not in client.get("/v1/communities").text
         assert secret not in client.get("/v1/graph").text
 

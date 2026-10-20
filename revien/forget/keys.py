@@ -104,16 +104,3 @@ def fingerprints(texts: Iterable[str]) -> list:
             seen.add(fp)
             out.append(fp)
     return out
-
-
-def file_fingerprint(path: str) -> Optional[str]:
-    """HMAC over the file's bytes, or None when it cannot be read."""
-    key = load_key(create=True)
-    mac = hmac.new(key, b"file:", hashlib.sha256)
-    try:
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                mac.update(chunk)
-    except OSError:
-        return None
-    return mac.hexdigest()

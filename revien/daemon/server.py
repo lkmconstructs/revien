@@ -69,8 +69,6 @@ class IngestResponse(BaseModel):
     # through a shared channel has no stable identity the gate can protect.
     suppressed: bool = False
     suppression_note: str = ""
-    left_out: Optional[dict] = None
-    left_out_note: str = ""
 
 
 class ConsolidateRequest(BaseModel):
@@ -556,8 +554,6 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             total_edges_in_graph=result.total_edges_in_graph,
             suppressed=result.suppressed,
             suppression_note=result.suppression_note,
-            left_out=result.left_out,
-            left_out_note=result.left_out_note,
         )
 
     # ── POST /v1/recall ───────────────────────────────
@@ -1165,12 +1161,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── GET /v1/nodes/{id}/forget/preview ──────────────
     @app.get("/v1/nodes/{node_id}/forget/preview")
-    async def forget_preview(node_id: str, cascade: bool = Query(False),
-                             everywhere: bool = Query(False)):
-        """What a forget WOULD do (nodes removed, cut back, kept; units
-        suppressed). Writes nothing."""
+    async def forget_preview(node_id: str, everywhere: bool = Query(False)):
+        """What a forget WOULD do (nodes removed, cut back, kept; the sources
+        the wording is kept out of). Writes nothing."""
         preview = ops._forget_engine().forget(
-            node_id, cascade=cascade, dry_run=True, everywhere=everywhere)
+            node_id, dry_run=True, everywhere=everywhere)
         if preview.get("status") in ("not_found", "skipped"):
             raise HTTPException(404, f"Node not found: {node_id}")
         preview["exists"] = True
@@ -1178,7 +1173,6 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── POST /v1/nodes/{id}/forget ─────────────────────
     class ForgetRequest(BaseModel):
-        cascade: bool = False
         # Also remove the wording from every other unit that holds it (the
         # default forgets it from this node's source only and names the rest).
         everywhere: bool = False
@@ -1191,13 +1185,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def forget_node_endpoint(
         node_id: str, request: Optional[ForgetRequest] = None
     ):
-        """The FORGET verb: privacy. Removes the node, cuts the forgotten
-        wording out of the session's stored conversation, scrubs every copy,
-        and suppresses the source so it does not come back. The response says
-        exactly what was removed, cut back and kept, and what is left behind
-        (docs/FORGET_SPEC.md). cascade=True on a context node forgets the
-        whole unit and everything only it wrote. A daemon from before the
-        suppression gate on the same database makes this refuse."""
+        """The FORGET verb: privacy, for one specific thing (a fact, an
+        entity, a decision, a preference). Removes the node, cuts its wording
+        out of the stored conversation of the source it came from, scrubs
+        every copy, and keeps that wording out of later captures of that
+        source. The response says exactly what was removed, cut back and kept,
+        what it does and does not stop coming back, and what is left behind
+        (docs/FORGET_SPEC.md). A context node is refused: remove a whole
+        conversation with delete. A daemon from before the forget gate on the
+        same database makes this refuse."""
         from revien.daemon.heartbeat import FORGET_REQUIRES, daemons_lacking
 
         req = request or ForgetRequest()
@@ -1211,7 +1207,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "forgotten source again. Restart required: stop it, "
                     "start it again with 'revien start', then forget again. "
                     "Nothing was changed.")})
-        result = ops.forget_node(node_id, cascade=req.cascade, actor="api:forget",
+        result = ops.forget_node(node_id, actor="api:forget",
                                  everywhere=req.everywhere)
         status = result.get("status")
         if status == "not_found":

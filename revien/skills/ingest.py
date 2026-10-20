@@ -190,9 +190,9 @@ def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, projec
     by ingest_key: an unchanged path refreshes label/content/metadata on the
     existing node in place rather than duplicating it.
 
-    A skill that was forgotten is suppressed until its file changes
-    (docs/FORGET_SPEC.md §6): the gate refuses it and this returns
-    ``(None, False, 0)`` with nothing written."""
+    A skill file whose exact text a ``forget --everywhere`` banned is refused
+    by the gate (docs/FORGET_SPEC.md §6) and this returns ``(None, False, 0)``
+    with nothing written; sentences that were forgotten are left out of it."""
     from revien.forget import gate as forget_gate
 
     fresh = build_skill_node(skill_md_path, scope, project_key, origin_runtime)

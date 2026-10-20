@@ -326,9 +326,9 @@ class OpenAIAdapter:
                 "skipped_messages": 0,
             }
 
-        # Suppression gate (docs/FORGET_SPEC.md §6): a conversation that was
-        # forgotten has no file behind it and is suppressed for good, by its
-        # id. The text is checked too, so a copy under another id stays out.
+        # Denylist (docs/FORGET_SPEC.md §6): sentences forgotten from this
+        # conversation (named by its id) are left out of it below, and a
+        # conversation that is exactly a wording banned everywhere is refused.
         unit = forget_gate.UnitRef(item_unit(source_id))
         texts = []
         for nd in (conv_data.get("mapping") or {}).values():
@@ -336,9 +336,6 @@ class OpenAIAdapter:
                 parts = (nd.get("message", {}).get("content", {}) or {}).get("parts", [])
                 texts.append("".join(str(p) for p in parts if p))
         whole = "\n".join(texts)
-        # What this conversation will store, as a copy of it would show: the
-        # root record it writes (its title) and every message.
-        record = f"OpenAI conversation: {conv_data.get('title', 'Untitled')}\n{whole}"
         block = forget_gate.check(self.store, unit, whole)
         if block is not None:
             logger.info("conversation %s suppressed: %s", conv_id, block.reason)
@@ -407,10 +404,8 @@ class OpenAIAdapter:
             content = "".join(str(p) for p in content_parts if p) or ""
             # Sentences a forget removed stay out (the standing denylist).
             if content.strip():
-                # (a copy under another conversation id is recognised by the
-                # whole conversation, not by one message)
                 content, _left_out = forget_gate.strip_forgotten(
-                    self.store, unit, content, match_content=record)
+                    self.store, unit, content)
                 if _left_out and not content.strip():
                     continue
             if not content.strip():

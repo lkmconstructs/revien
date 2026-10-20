@@ -82,6 +82,7 @@ class TestWordBoundedMatching:
     def test_the_audit_query_and_training_scrubs_are_word_bounded_too(self, store, tmp_path):
         from revien.neural.training import TrainingLoop
         c = ctx(store, "User: The tomato code is ZQXTOM77XYZ now.")
+        fact = node(store, NodeType.FACT, "tomato code", "The tomato code is ZQXTOM77XYZ now.")
         store.record_use_judgment(
             episode_key="e#1", node_id=c.node_id, used=True, reason="r", shared_terms=[],
             similarity=0.1, query="best tomatoes for a salad", mode="shadow", applied=False)
@@ -97,7 +98,7 @@ class TestWordBoundedMatching:
             "best tomatoes for a salad", [{"node_id": "x", "label": "salad", "node_type": "fact", "score": 1}])
         ops = GraphOperations(store)
         ops.training_dbs = (tdb,)
-        ops.forget_node(c.node_id, cascade=True)
+        ops.forget_node(fact.node_id)
         queries = {r[0] for r in store._get_conn().execute("SELECT query FROM use_judgments")}
         assert "best tomatoes for a salad" in queries          # unrelated row survives
         assert "what is the tomato code" not in queries        # the echo goes
@@ -143,7 +144,8 @@ class TestUnprovenIsLeftAlone:
         a = ctx(store, "User: legacy things here.", unit="session:claude-code:old")
         legacy = store.add_node(Node(node_type=NodeType.FACT, label="legacy", content="legacy description text"))
         store.record_provenance(legacy.node_id, "unproven:session:claude-code:old", False, False)
-        res = GraphOperations(store).forget_node(a.node_id, cascade=True)
+        target = node(store, NodeType.FACT, "legacy things", "legacy things here.", unit="session:claude-code:old")
+        res = GraphOperations(store).forget_node(target.node_id)
         assert legacy.node_id in res["cut_back"]
         assert legacy.node_id not in res["unproven"]
         assert "kept and listed" not in res["message"].split(legacy.node_id)[0] or True
@@ -213,7 +215,7 @@ class TestSnapshotsAreScrubbed:
         from revien.watch import snapshot_db
         db = str(tmp_path / "s.db")
         s = GraphStore(db_path=db)
-        run_pipeline(s, f"User: My safe code is {secret}. We decided to use {secret} as the codename.")
+        run_pipeline(s, f"User: The gate is blue. We decided to use {secret} as the codename.")
         out = tmp_path / "s.db.snapshots"
         plain = snapshot_db(db, use_gzip=False, out_dir=out)
         packed = snapshot_db(db, use_gzip=True, out_dir=out)
@@ -223,12 +225,11 @@ class TestSnapshotsAreScrubbed:
         secret = fs.new_secret()
         db, s, plain, packed = self._snap(tmp_path, secret)
         assert secret.encode() in plain.read_bytes()
-        ctxid = [n.node_id for n in s.list_nodes(node_type=NodeType.CONTEXT, limit=5)][0]
-        res = GraphOperations(s).forget_node(ctxid, cascade=True)
+        res = fs.forget_all(db, secret, ops=GraphOperations(s))
         s.close()
         assert secret.encode() not in plain.read_bytes()
         assert secret.encode() not in gzip.decompress(packed.read_bytes())
-        assert res["snapshots"]["scrubbed"] == 2
+        assert res["snapshots"]["scrubbed"] >= 2
         assert "snapshots" not in {l["kind"] for l in res["leftovers"]}
         c = sqlite3.connect(plain)
         try:
@@ -240,8 +241,7 @@ class TestSnapshotsAreScrubbed:
         secret = fs.new_secret()
         db, s, plain, packed = self._snap(tmp_path, secret)
         (plain.parent / "broken.db").write_bytes(b"not a database at all")
-        ctxid = [n.node_id for n in s.list_nodes(node_type=NodeType.CONTEXT, limit=5)][0]
-        res = GraphOperations(s).forget_node(ctxid, cascade=True)
+        res = fs.forget_all(db, secret, ops=GraphOperations(s))
         s.close()
         named = [l for l in res["leftovers"] if l["kind"] == "snapshots"]
         assert len(named) == 1 and "broken.db" in named[0]["note"]
@@ -251,7 +251,7 @@ class TestSnapshotsAreScrubbed:
 # ── ruling 1: a standing rule, any order ─────────────────────────────
 
 class TestStandingDenylist:
-    TEXT = ("User: My vault code is ZQXVAULT99 for the main safe.\n"
+    TEXT = ("User: The vault is in the main safe.\n"
             "User: We decided to use ZQXVAULT99 as the project codename.")
 
     def _file_unit(self, tmp_path, text):
@@ -271,7 +271,9 @@ class TestStandingDenylist:
         db = str(tmp_path / "race.db")
         f = self._file_unit(tmp_path, self.TEXT)
         s1 = GraphStore(db_path=db)
-        first = self._capture(s1, f, self.TEXT)
+        self._capture(s1, f, self.TEXT)
+        target = [n for n in s1.list_nodes(node_type=NodeType.DECISION, limit=10)
+                  if "ZQXVAULT99" in n.content][0]
         s2 = GraphStore(db_path=db)
         pipe = IngestionPipeline(s1)
         real = pipe.dedup.deduplicate_node
@@ -281,7 +283,7 @@ class TestStandingDenylist:
             if not fired:
                 fired.append(1)
                 # after the second gate check, another process forgets
-                GraphOperations(s2).forget_node(first.context_node_id, cascade=True)
+                GraphOperations(s2).forget_node(target.node_id)
             return real(candidate, *a, **kw)
 
         pipe.dedup.deduplicate_node = slow_dedup
@@ -295,11 +297,11 @@ class TestStandingDenylist:
             assert scrub.find_residue(conn, ["ZQXVAULT99"], ignore=scrub.NOT_CONTENT_TABLES) == {}
         finally:
             conn.close()
-        assert out.suppressed is True
+        assert out.suppressed is False
 
-    def test_a_sentence_forgotten_mid_capture_is_cut_from_what_was_written(self, tmp_path):
-        """A capture from a source with no stable identity (so no unit-level
-        record): only the standing denylist can keep the sentence out."""
+    def test_a_capture_with_another_identity_lands_as_written_even_mid_forget(self, tmp_path):
+        """A capture from a source with no stable identity is not the origin
+        the wording was forgotten from: it lands as written."""
         db = str(tmp_path / "race2.db")
         s1 = GraphStore(db_path=db)
         run_pipeline(s1, self.TEXT)
@@ -322,14 +324,14 @@ class TestStandingDenylist:
         texts = " ".join(n.content for n in s1.list_nodes(limit=100))
         s1.close(); s2.close()
         assert fired
-        assert "We decided to use ZQXVAULT99 as the project codename" not in texts
+        assert "We decided to use ZQXVAULT99 as the project codename" in texts
         assert "harmless new remark" in texts
 
-    def test_a_copy_of_the_forgotten_file_at_a_new_path_with_a_line_appended(self, tmp_path, monkeypatch):
+    def test_a_copy_of_the_forgotten_file_at_a_new_path_lands_and_the_response_said_so(self, tmp_path, monkeypatch):
         seeded = fs.seed("file_watcher", tmp_path, monkeypatch)
-        s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
-        s.close()
+        res = fs.forget_all(seeded.db, seeded.secret)
+        assert "different identity" in res["message"]
+        assert "use --everywhere" in res["message"]
         from revien.adapters.file_watcher import FileWatcherAdapter
         copy_dir = tmp_path / "elsewhere"
         copy_dir.mkdir()
@@ -343,7 +345,7 @@ class TestStandingDenylist:
         texts = " ".join(n.content for n in s.list_nodes(limit=100))
         s.close()
         assert "next quarter planning" in texts
-        assert seeded.secret not in texts
+        assert seeded.secret in texts      # not recognised: a different path and inode
 
     def test_a_short_fragment_is_kept_out_by_source_identity_and_the_response_says_so(self, tmp_path):
         from revien.graph.units import path_unit_key, identity_keys, real_path
@@ -428,7 +430,7 @@ class TestEverywhere:
         survivor = store.get_node(fb.node_id)
         assert survivor is not None and self.SENT not in survivor.content
         assert res["still_held_by"] == []
-        assert {s["unit_id"] for s in res["suppressed"]} == {A}
+        assert {s["unit_id"] for s in res["bound_to"]} == {A}
         # every node the exact-wording cut touched is listed, the origin's own too
         assert {c["node_id"] for c in res["cut_in_place"]} == {a.node_id, b.node_id, fb.node_id}
         assert {c["node_id"] for c in res["cut_in_place"] if c.get("origin")} == {a.node_id}
@@ -461,10 +463,11 @@ class TestModelAndHonesty:
         tdb = str(tmp_path / "training.db")
         loop = TrainingLoop(db_path=tdb, model_dir=str(tmp_path / "models"))
         assert loop.is_stale() is False
-        c = ctx(store, "User: some words to forget here.")
+        ctx(store, "User: some words to forget here.")
+        f = node(store, NodeType.FACT, "words", "some words to forget here.")
         ops = GraphOperations(store)
         ops.training_dbs = (tdb,)
-        res = ops.forget_node(c.node_id, cascade=True)
+        res = ops.forget_node(f.node_id)
         assert res["model_stale"] is True and res["model"]["stale"] is True
         assert loop.is_stale() is True       # the flag lives where the retrain path reads it
 
@@ -477,8 +480,9 @@ class TestModelAndHonesty:
 
     def test_exports_are_worded_as_may_still_contain_it(self, store):
         store.set_meta("exports_written", json.dumps({"count": 1}))
-        c = ctx(store, "User: some words to forget here.")
-        res = GraphOperations(store).forget_node(c.node_id, cascade=True)
+        ctx(store, "User: some words to forget here.")
+        f = node(store, NodeType.FACT, "words", "some words to forget here.")
+        res = GraphOperations(store).forget_node(f.node_id)
         (e,) = [l for l in res["leftovers"] if l["kind"] == "exports"]
         assert "may still contain it" in e["note"]
 
@@ -493,26 +497,30 @@ class TestModelAndHonesty:
         db = str(tmp_path / "id.db")
         fs._sync(db, "files", FileWatcherAdapter(watch_dir=str(d)))
         s = GraphStore(db_path=db)
-        res = GraphOperations(s).forget_node(fs.context_ids(db)[0], cascade=True)
+        res = fs.forget_all(db, word, ops=GraphOperations(s))
         s.close()
+        assert res["status"] == "forgotten"
         assert not ({"suppressions", "node_provenance", "capture_units"} & set(res["remaining"]))
 
-    def test_an_unproven_session_is_suppressed_by_its_known_identity(self, tmp_path):
+    def test_an_unproven_node_binds_its_wording_to_the_source_it_names(self, tmp_path):
         """N1: ownership of the node is unproven (it predates provenance), but
-        its source key names the session, so the session is suppressed."""
+        its source key names the session, so the wording is kept out of it."""
         from tests.test_forget_upgrade import made_by
         path = made_by("v0.3.0-tag-7bf8738", tmp_path)
         s = GraphStore(db_path=path)
         fact = [n for n in s.list_nodes(limit=10) if n.node_type == NodeType.FACT and "PostgreSQL" in n.content][0]
+        forgotten_text = fact.content
         res = GraphOperations(s).forget_node(fact.node_id)
-        assert res["suppressed"] and res["suppressed"][0]["unit_id"] == "session:claude-code:sess-1"
+        assert res["bound_to"] and res["bound_to"][0]["unit_id"] == "session:claude-code:sess-1"
         assert "unproven" in res["identity_note"]
         out = IngestionPipeline(s).ingest(IngestionInput(
             source_id="claude-code:proj-x:sess-1", ingest_key="claude-code:proj-x:sess-1",
             origin_runtime="claude-code", session_key="sess-1",
-            content="User: hello\nAssistant: hi"))
+            content=f"User: hello there friend\nUser: {forgotten_text}"))
+        texts = " ".join(n.content for n in s.list_nodes(limit=100))
         s.close()
-        assert out.suppressed is True
+        assert out.suppressed is False
+        assert "hello there friend" in texts and forgotten_text not in texts
 
     def test_spec_marks_the_old_daemon_design_approved_and_built(self):
         spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")

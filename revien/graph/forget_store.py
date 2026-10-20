@@ -37,8 +37,8 @@ class ForgetStoreMixin:
         -- every writer. label_ok: the unit vouched for the node's name.
         -- wording_ok: the unit vouched for its wording. A unit_id starting
         -- 'unproven:' marks a node whose ownership could not be proven (it
-        -- predates this table): it is kept, listed, and never deleted by a
-        -- cascade. Nothing here is ever inferred from edges or text.
+        -- predates this table): it is kept, listed, and never deleted on a
+        -- guess. Nothing here is ever inferred from edges or text.
         CREATE TABLE IF NOT EXISTS node_provenance (
             node_id TEXT NOT NULL,
             unit_id TEXT NOT NULL,
@@ -60,34 +60,24 @@ class ForgetStoreMixin:
             last_seen TEXT NOT NULL
         );
 
-        -- Suppression records. Content-free: identities, keyed fingerprints
-        -- (HMAC under the key in the Revien home) and times. kind 'file':
-        -- suppressed until the file changes. kind 'wording': no source is
-        -- suppressed, only the forgotten sentences (a standing denylist).
-        -- kind 'permanent': no file
-        -- behind it, suppressed for good. status 'lifted' keeps the row as
-        -- the record that a restore happened.
-        -- scope 'origin': the sentences are kept out of captures that come
-        -- from the forgotten origin (its unit id, its file identity, or a
-        -- copy of it recognised by signature_fps, the keyed fingerprints of
-        -- the origin's own sentences; held_fps: of those, the ones that held
-        -- what was forgotten, the only ones a copy recognised by content alone
-        -- loses). scope 'global': the exact wording a
-        -- forget --everywhere targeted, kept out of every source.
+        -- Forget records (the standing denylist). Content-free: identities,
+        -- keyed fingerprints (HMAC under the key in the Revien home) and
+        -- times. unit_id is the record's own id, 'forget:<uuid>'. scope
+        -- 'origin': the sentences that held the forgotten wording are kept
+        -- out of captures that come from the origin it was forgotten from,
+        -- named by path_keys (its unit id, its file's real path or inode, the
+        -- id inside it). scope 'global': the exact wording a forget
+        -- --everywhere targeted, kept out of every source. status 'lifted'
+        -- keeps the row as the record that a restore happened.
         CREATE TABLE IF NOT EXISTS suppressions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             unit_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            path TEXT,
             path_keys TEXT NOT NULL DEFAULT '[]',
-            content_fps TEXT NOT NULL DEFAULT '[]',
             wording_fps TEXT NOT NULL DEFAULT '[]',
             sentence_fps TEXT NOT NULL DEFAULT '[]',
             short_fps TEXT NOT NULL DEFAULT '[]',
-            signature_fps TEXT NOT NULL DEFAULT '[]',
-            held_fps TEXT NOT NULL DEFAULT '[]',
+            window_fps TEXT NOT NULL DEFAULT '[]',
             scope TEXT NOT NULL DEFAULT 'origin',
-            file_fp TEXT,
             created_at TEXT NOT NULL,
             actor TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'active',
@@ -116,10 +106,8 @@ class ForgetStoreMixin:
                     "?" * len(self._FORGET_OBJECTS)), self._FORGET_OBJECTS)}
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version >= 6 and len(have) == len(self._FORGET_OBJECTS):
-                self._ensure_suppression_columns(conn)
                 return
             conn.executescript(self._FORGET_LAYER_DDL)
-            self._ensure_suppression_columns(conn)
             if version < 6:
                 self._backfill_provenance(conn)
                 conn.execute("PRAGMA user_version = 6")
@@ -129,20 +117,6 @@ class ForgetStoreMixin:
                 print(f"Migration note: {e}")
             else:
                 raise
-
-    @staticmethod
-    def _ensure_suppression_columns(conn: sqlite3.Connection) -> None:
-        """A suppressions table made before these columns existed gets them."""
-        have = {r[1] for r in conn.execute("PRAGMA table_info(suppressions)")}
-        for col, ddl in (
-                ("sentence_fps", "TEXT NOT NULL DEFAULT '[]'"),
-                ("short_fps", "TEXT NOT NULL DEFAULT '[]'"),
-                ("signature_fps", "TEXT NOT NULL DEFAULT '[]'"),
-                ("held_fps", "TEXT NOT NULL DEFAULT '[]'"),
-                ("scope", "TEXT NOT NULL DEFAULT 'origin'")):
-            if col not in have:
-                conn.execute(f"ALTER TABLE suppressions ADD COLUMN {col} {ddl}")
-                conn.commit()
 
     @staticmethod
     def ownership_for_fields(node_type: str, runtime: Optional[str],
@@ -325,103 +299,55 @@ class ForgetStoreMixin:
     @staticmethod
     def _row_to_suppression(r) -> Dict:
         return {
-            "id": r[0], "unit_id": r[1], "kind": r[2], "path": r[3],
-            "path_keys": json.loads(r[4] or "[]"),
-            "content_fps": json.loads(r[5] or "[]"),
-            "wording_fps": json.loads(r[6] or "[]"),
-            "file_fp": r[7], "created_at": r[8], "actor": r[9],
+            "id": r[0], "unit_id": r[1],
+            "path_keys": json.loads(r[2] or "[]"),
+            "wording_fps": json.loads(r[3] or "[]"),
+            "sentence_fps": json.loads(r[4] or "[]"),
+            "short_fps": json.loads(r[5] or "[]"),
+            "window_fps": json.loads(r[6] or "[]"),
+            "scope": r[7] or "origin", "created_at": r[8], "actor": r[9],
             "status": r[10], "lifted_at": r[11], "lifted_by": r[12],
-            "sentence_fps": json.loads(r[13] or "[]"),
-            "short_fps": json.loads(r[14] or "[]"),
-            "signature_fps": json.loads(r[15] or "[]"),
-            "scope": r[16] or "origin",
-            "held_fps": json.loads(r[17] or "[]"),
         }
 
     _SUPPRESSION_COLS = (
-        "id, unit_id, kind, path, path_keys, content_fps, wording_fps, "
-        "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps, short_fps, "
-        "signature_fps, scope, held_fps")
+        "id, unit_id, path_keys, wording_fps, sentence_fps, short_fps, "
+        "window_fps, scope, created_at, actor, status, lifted_at, lifted_by")
 
     @_locked
     def add_suppression(
-        self, unit_id: str, kind: str, path: Optional[str],
-        path_keys: List[str], content_fps: List[str],
-        wording_fps: List[str], file_fp: Optional[str], actor: str,
-        sentence_fps: Optional[List[str]] = None,
-        short_fps: Optional[List[str]] = None,
-        signature_fps: Optional[List[str]] = None,
-        scope: str = "origin",
-        held_fps: Optional[List[str]] = None,
+        self, unit_id: str, path_keys: List[str], wording_fps: List[str],
+        sentence_fps: List[str], short_fps: List[str], actor: str,
+        scope: str = "origin", window_fps: Optional[List[str]] = None,
     ) -> int:
-        """Write (or extend) the active record for a unit. A second forget of
-        the same unit merges its fingerprints into the one record."""
-        if kind not in ("file", "permanent", "wording"):
-            raise ValueError(
-                f"suppression kind must be file, permanent or wording, got {kind!r}")
+        """Write one forget record: the keyed fingerprints of the sentences
+        that held the forgotten wording, and the identities (path_keys) of
+        the origin they are kept out of, or none for scope 'global'."""
+        if scope not in ("origin", "global"):
+            raise ValueError(f"forget scope must be origin or global, got {scope!r}")
         conn = self._get_conn()
-        row = conn.execute(
-            f"SELECT {self._SUPPRESSION_COLS} FROM suppressions "
-            "WHERE unit_id = ? AND status = 'active'", (unit_id,)).fetchone()
-        if row is not None:
-            cur = self._row_to_suppression(row)
-            conn.execute(
-                "UPDATE suppressions SET kind = ?, path = COALESCE(?, path), "
-                "path_keys = ?, content_fps = ?, wording_fps = ?, "
-                "sentence_fps = ?, short_fps = ?, signature_fps = ?, "
-                "held_fps = ?, file_fp = COALESCE(?, file_fp) WHERE id = ?",
-                (kind, path,
-                 json.dumps(sorted(set(cur["path_keys"]) | set(path_keys))),
-                 json.dumps(sorted(set(cur["content_fps"]) | set(content_fps))),
-                 json.dumps(sorted(set(cur["wording_fps"]) | set(wording_fps))),
-                 json.dumps(sorted(set(cur["sentence_fps"]) | set(sentence_fps or []))),
-                 json.dumps(sorted(set(cur["short_fps"]) | set(short_fps or []))),
-                 json.dumps(sorted(set(cur["signature_fps"]) | set(signature_fps or []))),
-                 json.dumps(sorted(set(cur["held_fps"]) | set(held_fps or []))),
-                 file_fp, cur["id"]))
-            self._commit(conn)
-            return cur["id"]
         cur = conn.execute(
-            "INSERT INTO suppressions (unit_id, kind, path, path_keys, "
-            "content_fps, wording_fps, sentence_fps, short_fps, signature_fps, "
-            "scope, held_fps, file_fp, created_at, actor) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (unit_id, kind, path, json.dumps(sorted(set(path_keys))),
-             json.dumps(sorted(set(content_fps))),
+            "INSERT INTO suppressions (unit_id, path_keys, wording_fps, "
+            "sentence_fps, short_fps, window_fps, scope, created_at, actor) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (unit_id, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(wording_fps))),
-             json.dumps(sorted(set(sentence_fps or []))),
-             json.dumps(sorted(set(short_fps or []))),
-             json.dumps(sorted(set(signature_fps or []))), scope,
-             json.dumps(sorted(set(held_fps or []))),
-             file_fp, _now(), actor))
+             json.dumps(sorted(set(sentence_fps))),
+             json.dumps(sorted(set(short_fps))),
+             json.dumps(sorted(set(window_fps or []))), scope, _now(), actor))
         self._commit(conn)
         return cur.lastrowid
 
     @_locked
-    def list_suppressions(self, status: Optional[str] = "active",
-                          include_wording: bool = False) -> List[Dict]:
-        """Suppression records. The standing-denylist entries (kind
-        'wording') are left out unless asked for: they are not sources, and
-        a restore reaches them through the units they cover."""
+    def list_suppressions(self, status: Optional[str] = "active") -> List[Dict]:
+        """The forget records, oldest first."""
         conn = self._get_conn()
         sql = f"SELECT {self._SUPPRESSION_COLS} FROM suppressions"
-        where, params = [], []
+        params = []
         if status is not None:
-            where.append("status = ?")
+            sql += " WHERE status = ?"
             params.append(status)
-        if not include_wording:
-            where.append("kind != 'wording'")
-        if where:
-            sql += " WHERE " + " AND ".join(where)
         rows = conn.execute(sql + " ORDER BY id", params).fetchall()
         return [self._row_to_suppression(r) for r in rows]
-
-    @_locked
-    def count_suppressions(self, status: str = "active") -> int:
-        conn = self._get_conn()
-        return conn.execute(
-            "SELECT COUNT(*) FROM suppressions WHERE status = ?",
-            (status,)).fetchone()[0]
 
     @_locked
     def lift_suppression(self, suppression_id: int, by: str) -> bool:

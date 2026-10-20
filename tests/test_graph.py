@@ -650,7 +650,7 @@ class TestRetentionExpire:
 
 
 class TestForget:
-    """Right-to-forget: hard-delete content, tombstone, lineage re-point, cascade."""
+    """Right-to-forget: hard-delete content, tombstone, lineage re-point."""
 
     def _chain(self, store, ops):
         # A <- B <- C  (B derived_from A; C derived_from B)
@@ -686,16 +686,15 @@ class TestForget:
         assert prev["would_remove"] == [a.node_id]
         assert store.get_node(a.node_id) is not None        # nothing written
 
-    def test_cascade_never_removes_nodes_outside_a_unit(self, store, ops):
-        """Hand-added nodes (no recorded owner) are never removed by a
-        cascade (docs/FORGET_SPEC.md §3), even when derived from the target."""
+    def test_forget_never_removes_nodes_derived_from_the_target(self, store, ops):
+        """Hand-added nodes (no recorded owner) are never removed by a forget
+        (docs/FORGET_SPEC.md §3), even when derived from the target."""
         a, b, c = self._chain(store, ops)
-        res = ops.forget_node(a.node_id, cascade=True)
+        res = ops.forget_node(a.node_id)
         assert res["count"] == 1
         assert store.get_node(a.node_id) is None
         assert store.get_node(b.node_id) is not None
         assert store.get_node(c.node_id) is not None
-        assert "cascade" in res["cascade_note"]
 
     def test_forget_missing_node(self, store, ops):
         assert ops.forget_node("nope")["status"] == "not_found"

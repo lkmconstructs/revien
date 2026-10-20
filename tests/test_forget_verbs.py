@@ -30,6 +30,11 @@ def ops_of(db, op):
         s.close()
 
 
+def target(seeded):
+    """The node a user would forget to take the secret out."""
+    return fs.holders(seeded.db, seeded.secret)[0]
+
+
 def nodes(db):
     s = GraphStore(db_path=db)
     try:
@@ -130,10 +135,10 @@ class TestSweepsAndCleanup:
     def test_only_forget_writes_a_suppression_record(self, tmp_path, monkeypatch):
         seeded = fs.seed("claude_code", tmp_path, monkeypatch)
         with TestClient(create_app(db_path=seeded.db)) as client:
-            r = client.post(f"/v1/nodes/{seeded.ctx_ids[0]}/forget", json={"cascade": True})
+            r = client.post(f"/v1/nodes/{target(seeded)}/forget", json={})
             assert r.status_code == 200, r.text
             body = r.json()
-        assert body["verb"] == "forget" and body["suppressed"]
+        assert body["verb"] == "forget" and body["bound_to"]
         s = GraphStore(db_path=seeded.db)
         try:
             assert len(s.list_suppressions("active")) == 1
@@ -156,8 +161,14 @@ class TestSweepsAndCleanup:
             assert r.status_code == 409
             detail = r.json()["detail"]
             assert detail["status"] == "refused" and ctx.node_id in detail["message"]
-            prev = client.get(f"/v1/nodes/{ctx.node_id}/forget/preview?cascade=true")
-            assert prev.status_code == 200 and prev.json()["status"] == "preview"
+            # a conversation is removed with delete, not forget
+            whole = "To remove a whole conversation, use delete; to keep a specific detail out, forget that detail."
+            r = client.post(f"/v1/nodes/{ctx.node_id}/forget", json={})
+            assert r.status_code == 409 and r.json()["detail"]["message"] == whole
+            prev = client.get(f"/v1/nodes/{ctx.node_id}/forget/preview")
+            assert prev.status_code == 200 and prev.json()["status"] == "refused"
+            assert prev.json()["message"] == whole
+            assert client.delete(f"/v1/nodes/{ctx.node_id}").status_code == 200
 
 
 @pytest.mark.real_probe
@@ -170,7 +181,7 @@ class TestForgetRefusesWhileAnOldDaemonMayBeRunning:
 
     def _forget(self, seeded, *extra):
         return CliRunner().invoke(main, [
-            "forget", seeded.ctx_ids[0], "--cascade", "--yes", "--db", seeded.db, *extra])
+            "forget", target(seeded), "--yes", "--db", seeded.db, *extra])
 
     def test_a_daemon_without_a_features_list_is_refused(self, tmp_path, monkeypatch):
         seeded = self._setup(tmp_path, monkeypatch)
@@ -215,8 +226,8 @@ class TestForgetRefusesWhileAnOldDaemonMayBeRunning:
         seeded = self._setup(tmp_path, monkeypatch)
         r = self._forget(seeded, "--daemon-url", f"http://127.0.0.1:{free_port()}")
         assert r.exit_code == 0, r.output
-        assert "suppresses future imports" in r.output
-        assert nodes(seeded.db) == []
+        assert "keeps its wording out of later captures" in r.output
+        assert [n.node_type.value for n in nodes(seeded.db)] == ["context"]
 
     def test_a_current_daemon_is_not_a_reason_to_refuse(self, tmp_path, monkeypatch):
         seeded = self._setup(tmp_path, monkeypatch)
@@ -235,7 +246,7 @@ class TestForgetRefusesWhileAnOldDaemonMayBeRunning:
             "time": datetime.now(timezone.utc).isoformat()}))
         s.close()
         with TestClient(create_app(db_path=seeded.db)) as client:
-            r = client.post(f"/v1/nodes/{seeded.ctx_ids[0]}/forget", json={"cascade": True})
+            r = client.post(f"/v1/nodes/{target(seeded)}/forget", json={})
             assert r.status_code == 409
             assert r.json()["detail"]["reason"] == "restart_required"
         assert len(nodes(seeded.db)) == 3
@@ -247,9 +258,9 @@ class TestForgetRefusesWhileAnOldDaemonMayBeRunning:
 
 
 class TestFencingAndSyncReset:
-    def test_a_sync_that_started_before_the_forget_cannot_write_the_unit_back(self, tmp_path, monkeypatch):
+    def test_a_sync_that_started_before_the_forget_cannot_write_the_wording_back(self, tmp_path, monkeypatch):
         """The forget lands between a sync's fetch and its write: the gate is
-        asked at write time, so the unit does not come back."""
+        asked at write time, so the wording does not come back."""
         from revien.adapters.claude_code import ClaudeCodeAdapter
         from revien.daemon.scheduler import SyncScheduler
         from revien.ingestion.pipeline import IngestionPipeline
@@ -264,15 +275,44 @@ class TestFencingAndSyncReset:
 
             async def fetch_then_forget(since):
                 items = await real_fetch(since)          # the sync has its items
-                GraphOperations(store).forget_node(seeded.ctx_ids[0], cascade=True)
+                GraphOperations(store).forget_node(target(seeded))
                 return items                             # ...and writes them now
 
             adapter.fetch_new_content = fetch_then_forget
             result = fs.run_async(sched.sync_one("claude-code"))
-            assert result["items_ingested"] == 0 and result["items_suppressed"] == 1
-            assert store.count_nodes() == 0
+            assert result["items_ingested"] == 1 and not result.get("items_suppressed")
+            assert all(seeded.secret not in n.label + n.content
+                       for n in store.list_nodes(limit=100))
+            assert store.count_nodes() >= 1
         finally:
             store.close()
+
+    def test_a_sync_counts_a_capture_refused_whole_as_suppressed_not_ingested(self, tmp_path, monkeypatch):
+        """Only a capture that IS wording banned by forget --everywhere is
+        refused whole; the scheduler says so."""
+        from revien.daemon.scheduler import SyncScheduler
+        from revien.ingestion.pipeline import IngestionPipeline
+        seeded = fs.seed("claude_code", tmp_path, monkeypatch)
+        wording = fs.decision_text(seeded.db, seeded.secret)
+        s = GraphStore(db_path=seeded.db)
+        GraphOperations(s).forget_node(target(seeded), everywhere=True)
+
+        class Feed:
+            async def fetch_new_content(self, since):
+                return [{"content": wording, "source_id": "feed-1"},
+                        {"content": "A plain remark about lunch plans.", "source_id": "feed-2"}]
+
+            async def health_check(self):
+                return True
+
+        try:
+            sched = SyncScheduler(IngestionPipeline(s))
+            sched.register_adapter("feed", Feed())
+            result = fs.run_async(sched.sync_one("feed"))
+        finally:
+            s.close()
+        assert result["items_suppressed"] == 1 and result["items_ingested"] == 1
+        assert all(seeded.secret not in n.label + n.content for n in nodes(seeded.db))
 
     def _cfg(self, monkeypatch, db):
         monkeypatch.setattr("revien.cli._load_config", lambda: {
@@ -287,7 +327,7 @@ class TestFencingAndSyncReset:
                                        "--daemon-url", f"http://127.0.0.1:{free_port()}"])
         assert ok.exit_code == 0, ok.output
         s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
+        GraphOperations(s).forget_node(target(seeded))
         s.close()
         before = GraphStore(db_path=seeded.db)
         gen = before.get_sync_state("claude-code")
@@ -303,14 +343,15 @@ class TestFencingAndSyncReset:
                                          "--daemon-url", f"http://127.0.0.1:{free_port()}"])
         assert done.exit_code == 0, done.output
 
-    def test_a_reset_then_a_full_reread_still_keeps_the_unit_out(self, tmp_path, monkeypatch):
+    def test_a_reset_then_a_full_reread_still_keeps_the_wording_out(self, tmp_path, monkeypatch):
         seeded = fs.seed("claude_code", tmp_path, monkeypatch)
         s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
+        GraphOperations(s).forget_node(target(seeded))
         s.reset_sync_cursor("claude-code")
         s.close()
         seeded.recapture()
-        assert nodes(seeded.db) == []
+        assert nodes(seeded.db)
+        assert all(seeded.secret not in n.label + n.content for n in nodes(seeded.db))
 
 
 def test_secure_delete_is_switched_on_for_every_connection(tmp_path, monkeypatch):
@@ -339,7 +380,7 @@ def test_forget_reports_what_it_did_to_the_storage(tmp_path, monkeypatch):
     seeded = fs.seed("pipeline", tmp_path, monkeypatch)
     s = GraphStore(db_path=seeded.db)
     try:
-        res = GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
+        res = GraphOperations(s).forget_node(target(seeded))
     finally:
         s.close()
     assert res["storage"]["secure_delete"] is True

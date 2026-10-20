@@ -81,16 +81,6 @@ class TestOriginScope:
         text = contexts(store)[(UB,)]
         assert SHARED in text and BOIL in text and "Newer B line" in text
 
-    def test_a_cascade_of_a_leaves_bs_own_sentences_and_boilerplate(self, store):
-        pipe, a, b = two_sessions(store)
-        res = GraphOperations(store).forget_node(a.context_node_id, cascade=True)
-        assert res["status"] == "forgotten"
-        assert UB in res["still_held_by"]
-        b_grows(pipe)
-        text = contexts(store)[(UB,)]
-        assert SHARED in text and BOIL in text and B_ONLY in text
-        assert (UA,) not in contexts(store)
-
     def test_on_an_upgraded_database_b_keeps_its_copy_too(self, tmp_path):
         db = str(tmp_path / "up.db")
         s = GraphStore(db_path=db)
@@ -113,7 +103,7 @@ class TestOriginScope:
             fact = [n for n in s.list_nodes(node_type=NodeType.FACT, limit=10)
                     if "ZQXPG" in n.content][0]
             res = GraphOperations(s).forget_node(fact.node_id)
-            assert [x["unit_id"] for x in res["suppressed"]] == ["session:claude-code:sA"]
+            assert [x["unit_id"] for x in res["bound_to"]] == ["session:claude-code:sA"]
             IngestionPipeline(s).ingest(IngestionInput(
                 source_id="claude-code:proj:sB", ingest_key="claude-code:proj:sB",
                 origin_runtime="claude-code", session_key="sB", project_key="proj",
@@ -126,12 +116,10 @@ class TestOriginScope:
 
     def test_a_renamed_claude_code_session_keeps_its_session_id_and_stays_forgotten(self, tmp_path, monkeypatch):
         seeded = fs.seed("claude_code", tmp_path, monkeypatch)
-        s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
-        s.close()
+        fs.forget_all(seeded.db, seeded.secret)
         copy = seeded.source_file.parent / "renamed-copy.jsonl"
-        # (so much new text that the copy rule cannot recognise it: only the
-        # sessionId inside the file, which travels with the copy, can)
+        # (only the sessionId inside the file, which travels with the copy,
+        # says whose it is)
         later = "".join(json.dumps({
             "type": "user", "sessionId": "uuid-claude-1", "timestamp": "2026-07-01T10:01:00Z",
             "message": {"role": "user", "content": [{"type": "text", "text": f"Later remark number {i} about parking permits and the quarterly budget."}]}}) + "\n"
@@ -148,15 +136,15 @@ class TestOriginScope:
 
     def test_a_sub_agent_file_carrying_the_parents_session_id_stays_forgotten(self, tmp_path, monkeypatch):
         seeded = fs.seed("claude_code", tmp_path, monkeypatch)
-        s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
-        s.close()
+        wording = fs.decision_text(seeded.db, seeded.secret)
+        fs.forget_all(seeded.db, seeded.secret)
         sub = seeded.source_file.parent / "subagents" / "agent-7.jsonl"
         sub.parent.mkdir(exist_ok=True)
         sub.write_text("".join(json.dumps({
             "type": "user", "sessionId": "uuid-claude-1", "timestamp": "2026-07-01T10:05:00Z",
-            "message": {"role": "user", "content": [{"type": "text", "text": f"Sub-agent remark number {i} about the quarterly budget review."}]}}) + "\n"
-            for i in range(4)))
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]}}) + "\n"
+            for text in [f"Sub-agent remark number {i} about the quarterly budget review."
+                         for i in range(4)] + [wording]))
         fs._age(sub)
         seeded.recapture()
         s = GraphStore(db_path=seeded.db)
@@ -164,18 +152,19 @@ class TestOriginScope:
             blob = " ".join(n.label + n.content for n in s.list_nodes(limit=200))
         finally:
             s.close()
-        assert "quarterly budget review" not in blob      # it is the forgotten session's, whatever the file is called
+        # it is the forgotten session's, whatever the file is called: the
+        # wording stays out of it, the rest of it is captured
+        assert seeded.secret not in blob
+        assert "quarterly budget review" in blob
 
     def test_a_renamed_codex_rollout_keeps_its_session_id_and_stays_forgotten(self, tmp_path, monkeypatch):
         seeded = fs.seed("codex", tmp_path, monkeypatch)
-        s = GraphStore(db_path=seeded.db)
-        res = GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
-        s.close()
+        res = fs.forget_all(seeded.db, seeded.secret)
         said = " ".join(res["reentry"]["stops"])
         assert "session_meta" in said and "renamed or moved copy" in said
         copy = seeded.source_file.parent / "rollout-renamed-elsewhere.jsonl"
-        # (so much new text that the copy rule cannot recognise it: only the
-        # id inside the file, which travels with the copy, can)
+        # (only the id inside the file, which travels with the copy, says
+        # whose it is)
         later = "".join(json.dumps({
             "timestamp": "2026-07-01T10:02:00Z", "type": "response_item",
             "payload": {"type": "message", "role": "user",
@@ -190,13 +179,11 @@ class TestOriginScope:
             blob = " ".join(n.label + n.content for n in s.list_nodes(limit=200))
         finally:
             s.close()
-        assert seeded.secret not in blob and "parking permits" not in blob
+        assert seeded.secret not in blob and "parking permits" in blob
 
     def test_a_different_codex_rollout_that_shares_sentences_is_untouched(self, tmp_path, monkeypatch):
         seeded = fs.seed("codex", tmp_path, monkeypatch)
-        s = GraphStore(db_path=seeded.db)
-        GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
-        s.close()
+        fs.forget_all(seeded.db, seeded.secret)
         other = seeded.source_file.parent / "rollout-other-session.jsonl"
         lines = [json.dumps({"timestamp": "2026-07-01T11:00:00Z", "type": "session_meta",
                              "payload": {"id": "0197-codex-another", "cwd": "/work/proj-c"}})]
@@ -218,16 +205,6 @@ class TestOriginScope:
             s.close()
         assert f"my safe code is {seeded.secret}" in blob and "parking permits" in blob
 
-    def test_the_copy_rule(self):
-        sig = {f"s{i}" for i in range(10)}
-        assert gate.is_copy_of(sig, sig | {"new1", "new2"})            # a copy with lines appended
-        assert gate.is_copy_of(sig, {f"s{i}" for i in range(9)})       # 90% of it, an edit or two
-        assert not gate.is_copy_of(sig, {"s0", "s1", "s2", "x", "y"})  # shares three
-        assert not gate.is_copy_of(sig, sig | {f"n{i}" for i in range(12)})  # buried in a much longer source
-        assert not gate.is_copy_of({"only"}, {"only", "x"})            # one sentence is never enough
-        assert not gate.is_copy_of({"a", "b", "c"}, {"a", "b", "z", "y"})  # two of three: boilerplate, not a copy
-        assert gate.is_copy_of({"a", "b"}, {"a", "b", "z"})            # a short file copied whole, one line added
-
     def test_every_response_says_what_stops_coming_back_and_what_does_not(self, store):
         fact = a_only_fact(store)
         res = GraphOperations(store).forget_node(fact.node_id)
@@ -235,7 +212,8 @@ class TestOriginScope:
         assert re_["scope"] == "this source"
         assert any("id its source gave it" in s for s in re_["stops"])
         joined = " ".join(re_["does_not_stop"])
-        assert "another source" in joined and "forget --everywhere" in joined
+        assert "another source" in joined and "--everywhere" in joined
+        assert "different identity" in joined
         assert "Scope: this source." in res["message"] and "Does not stop:" in res["message"]
         node = store.add_node(Node(node_type=NodeType.FACT, label="x", content="Some other fact to forget now."),
                               owner=(UB, 1, 1))
@@ -247,20 +225,6 @@ class TestOriginScope:
 # ── --everywhere: the exact wording, never a deletion, never a guess ──────
 
 class TestEverywhereDoesNotOverreach:
-    def test_a_cascade_with_everywhere_does_not_touch_bs_context_or_suppress_b(self, store):
-        pipe, a, b = two_sessions(store)
-        before = contexts(store)[(UB,)]
-        res = GraphOperations(store).forget_node(a.context_node_id, cascade=True, everywhere=True)
-        assert [x["unit_id"] for x in res["suppressed"]] == [UA]
-        assert res["cut_in_place"] == []
-        assert contexts(store)[(UB,)] == before
-        assert B_ONLY in contexts(store)[(UB,)]
-        assert "names no wording" in " ".join(res["reentry"]["stops"])
-        # B is not suppressed: its next capture lands, nothing of it is stripped
-        b_grows(pipe)
-        text = contexts(store)[(UB,)]
-        assert SHARED in text and BOIL in text and "Newer B line" in text
-
     def test_a_derived_node_with_everywhere_cuts_the_sentence_in_place_and_lists_every_touch(self, store):
         pipe = IngestionPipeline(store)
         cap(pipe, "chatgpt:conversation:B", f"User: {SHARED}\nUser: {BOIL}\nUser: {B_ONLY}")
@@ -269,8 +233,8 @@ class TestEverywhereDoesNotOverreach:
                                    content=f"{SHARED} Also the hand-written reminder about tulips."))
         res = GraphOperations(store).forget_node(fact.node_id, everywhere=True)
         assert res["status"] == "forgotten"
-        # nothing of another source was deleted or suppressed
-        assert [x["unit_id"] for x in res["suppressed"]] == [UA]
+        # nothing of another source was deleted
+        assert [x["unit_id"] for x in res["bound_to"]] == [UA]
         survivor = store.get_node(hand.node_id)
         assert survivor is not None
         assert survivor.content == "Also the hand-written reminder about tulips."   # not cut back to its label
@@ -310,8 +274,8 @@ class TestEverywhereDoesNotOverreach:
             fact = [n for n in s.list_nodes(node_type=NodeType.FACT, limit=10)
                     if "ZQXPG" in n.content][0]
             res = GraphOperations(s).forget_node(fact.node_id, everywhere=True)
-            assert [x["unit_id"] for x in res["suppressed"]] == ["session:claude-code:sA"]
-            assert not any(r["unit_id"] == "session:claude-code:sB" and r["kind"] != "wording"
+            assert [x["unit_id"] for x in res["bound_to"]] == ["session:claude-code:sA"]
+            assert not any("unit:session:claude-code:sB" in r["path_keys"]
                            for r in s.list_suppressions("active"))
             ctx = [n for n in s.list_nodes(node_type=NodeType.CONTEXT, limit=10)
                    if "sB" in str(s.get_provenance(n.node_id))][0]
@@ -334,8 +298,8 @@ class TestGoneEverywhereIsTrue:
         db = str(tmp_path / "dst.db")
         s = GraphStore(db_path=db)
         s.import_graph(graph, mode="merge")
-        ctx_node = s.list_nodes(node_type=NodeType.CONTEXT, limit=5)[0]
-        res = GraphOperations(s).forget_node(ctx_node.node_id, cascade=True)
+        target = [n for n in s.list_nodes(node_type=NodeType.DECISION, limit=5) if secret in n.content][0]
+        res = GraphOperations(s).forget_node(target.node_id)
         still = s.get_node(action.node_id)
         s.close()
         assert still is not None and secret in still.content      # untouched: its owner is not proven
@@ -350,7 +314,7 @@ class TestGoneEverywhereIsTrue:
         from revien.watch import snapshot_db
         from tests import forget_surfaces as surf
         seeded = fs.seed("pipeline", tmp_path, monkeypatch)
-        ids = list(seeded.ctx_ids) + [seeded.node_with_secret]
+        ids = fs.holders(seeded.db, seeded.secret)
         planted = surf.plant(seeded.db, seeded.secret, tmp_path, ids)
         s = GraphStore(db_path=seeded.db)
         from datetime import datetime, timedelta, timezone
@@ -384,7 +348,7 @@ class TestGoneEverywhereIsTrue:
         s = GraphStore(db_path=seeded.db)
         ops = GraphOperations(s)
         ops.training_dbs = (planted["training_db"],)
-        res = ops.forget_node(seeded.ctx_ids[0], cascade=True)
+        res = fs.forget_all(seeded.db, seeded.secret, ops=ops)
         s.close()
         assert res["snapshots"]["unreadable"] == [] and res["snapshots"]["scrubbed"] == 2
 
@@ -418,7 +382,7 @@ class TestGoneEverywhereIsTrue:
         src.close()
         s = GraphStore(db_path=str(tmp_path / "gdst.db"))
         s.import_graph(graph, mode="merge")
-        res = GraphOperations(s).forget_node(d.node_id)
+        res = GraphOperations(s).forget_node(d.node_id, everywhere=True)
         assert res["status"] == "forgotten"
         s.delete_node(k.node_id)                       # (so that the same file can come in again)
         out = s.import_graph(graph, mode="merge")
@@ -449,34 +413,6 @@ def node(store, ntype, label, content, unit=UA, **kw):
 
 
 # ── the reason names what changes, by unit type ───────────────────────────
-
-class TestSuppressionReasonFitsTheUnit:
-    @pytest.mark.parametrize("unit_id,noun", [
-        ("session:claude-code:abc", "session file"),
-        ("session:codex:abc", "session file"),
-        ("vault:Notes/a.md#top", "note"),
-        ("skill:/x/SKILL.md", "skill file"),
-        ("file:/x/notes.md", "file"),
-    ])
-    def test_no_evidence_reason(self, store, unit_id, noun):
-        store.add_suppression(unit_id, "file", "/nowhere/else.md", ["path:/nowhere/else.md"],
-                              [], [], "fp", "test")
-        block = gate.check(store, gate.UnitRef(unit_id, None), "some text")
-        assert block is not None
-        assert block.reason == f"no evidence the {noun} changed"
-
-    def test_unchanged_reason_for_a_session(self, store, tmp_path):
-        from revien.forget.keys import file_fingerprint
-        from revien.graph.units import identity_keys, real_path
-        f = tmp_path / "s.jsonl"
-        f.write_text("x")
-        store.add_suppression("session:claude-code:abc", "file", real_path(str(f)),
-                              identity_keys(str(f)), [], [], file_fingerprint(real_path(str(f))), "test")
-        block = gate.check(store, gate.UnitRef("session:claude-code:abc", str(f)), "x")
-        assert block.reason == "the session file has not changed"
-
-
-# ── the trained ranking model: stale mark, a reader, a retrain ────────────
 
 class TestModelRetrain:
     @staticmethod
@@ -548,8 +484,8 @@ class TestModelRetrain:
 
     def test_a_forget_retrains_from_the_scrubbed_signals_when_neural_ranking_is_on(self, store, tmp_path):
         loop = self._loop(tmp_path)
-        c = ctx(store, "User: remember the gate code ZQXRETRAIN7.\nUser: another plain line stays here.")
-        n = node(store, NodeType.FACT, "gate", "the gate code is ZQXRETRAIN7.")
+        ctx(store, "User: remember the gate code ZQXRETRAIN7.\nUser: another plain line stays here.")
+        n = node(store, NodeType.FACT, "gate", "remember the gate code ZQXRETRAIN7.")
         conn = sqlite3.connect(loop.db_path)
         conn.execute("INSERT INTO retrieval_signals (query, node_id, node_label, node_type, score, was_used, timestamp) "
                      "VALUES ('where is ZQXRETRAIN7', ?, 'gate', 'fact', 0.5, 1, 't')", (n.node_id,))
@@ -567,7 +503,7 @@ class TestModelRetrain:
         ops = GraphOperations(store)
         ops.training_dbs = (loop.db_path,)
         ops.retrain = retrain
-        res = ops.forget_node(c.node_id, cascade=True)
+        res = ops.forget_node(n.node_id)
         assert seen["rows_at_retrain"] == 0                # the retrain saw the scrubbed signals
         assert res["model"]["retrained"] is True and res["model_stale"] is False
         assert not [l for l in res["leftovers"] if l["kind"] == "neural_model"]
@@ -578,11 +514,12 @@ class TestModelRetrain:
         models = Path.home() / ".revien" / "models"
         models.mkdir(parents=True, exist_ok=True)
         (models / "vectorizer.pkl").write_bytes(b"model")
-        c = ctx(store, "User: remember the gate code ZQXRETRAIN8.")
+        ctx(store, "User: remember the gate code ZQXRETRAIN8.")
+        n = node(store, NodeType.FACT, "gate", "remember the gate code ZQXRETRAIN8.")
         ops = GraphOperations(store)
         ops.training_dbs = (loop.db_path,)
         ops.retrain = lambda: False
-        res = ops.forget_node(c.node_id, cascade=True)
+        res = ops.forget_node(n.node_id)
         assert res["model_stale"] is True and res["model"]["neural_ranking"] is True
         (left,) = [l for l in res["leftovers"] if l["kind"] == "neural_model"]
         assert "could not run" in left["note"] and "POST /v1/training/run" in left["note"]
@@ -593,10 +530,11 @@ class TestModelRetrain:
         models = Path.home() / ".revien" / "models"
         models.mkdir(parents=True, exist_ok=True)
         (models / "vectorizer.pkl").write_bytes(b"model")
-        c = ctx(store, "User: remember the gate code ZQXRETRAIN9.")
+        ctx(store, "User: remember the gate code ZQXRETRAIN9.")
+        n = node(store, NodeType.FACT, "gate", "remember the gate code ZQXRETRAIN9.")
         ops = GraphOperations(store)
         ops.training_dbs = (loop.db_path,)
-        res = ops.forget_node(c.node_id, cascade=True)
+        res = ops.forget_node(n.node_id)
         assert res["model"] == {"neural_ranking": False, "retrained": False, "stale": True,
                                 "marked": 1, "note": ""}
         (left,) = [l for l in res["leftovers"] if l["kind"] == "neural_model"]
@@ -616,7 +554,8 @@ class TestModelRetrain:
             monkeypatch.setenv("REVIEN_NEURAL", flag)
             db = str(tmp_path / f"d{flag}.db")
             s = GraphStore(db_path=db)
-            c = ctx(s, "User: remember the gate code ZQXRETRAIN1.")
+            ctx(s, "User: remember the gate code ZQXRETRAIN1.")
+            c = node(s, NodeType.FACT, "gate", "remember the gate code ZQXRETRAIN1.")
             s.close()
             trained.clear()
             app = create_app(db_path=db)
@@ -624,7 +563,7 @@ class TestModelRetrain:
                 engine = app.state.engine
                 self._signals(engine.training_loop, 120)
                 old = engine.neural_scorer
-                r = client.post(f"/v1/nodes/{c.node_id}/forget", json={"cascade": True})
+                r = client.post(f"/v1/nodes/{c.node_id}/forget", json={})
                 body = r.json()
                 assert body["model"]["neural_ranking"] is expect
                 assert (len(trained) == 1) is expect and body["model"]["retrained"] is expect
@@ -846,11 +785,11 @@ class TestRaces:
         assert s1.get_node(out.context_node_id) is not None
         s1.close(); s2.close()
 
-    def test_a_refresh_of_a_suppressed_unit_changes_nothing(self, tmp_path):
+    def test_a_refresh_after_a_forget_lands_without_the_forgotten_sentence(self, tmp_path):
         """A forget lands while the refresh is being extracted (so the first
-        look found the unit free). The check inside the refresh transaction is
-        what keeps the unit's record exactly as the forget left it: not
-        updated with the new text, not deleted."""
+        look found nothing to leave out). The check inside the refresh
+        transaction leaves the forgotten sentence out of the record and keeps
+        the new text."""
         db = str(tmp_path / "frozen.db")
         s1 = GraphStore(db_path=db)
         s2 = GraphStore(db_path=db)
@@ -871,38 +810,17 @@ class TestRaces:
             if not fired:
                 fired.append(1)
                 res = GraphOperations(s2).forget_node(target.node_id)     # node level: the context is cut, kept
-                assert [x["unit_id"] for x in res["suppressed"]] == ["item:chatgpt:conversation:FZ"]
+                assert [x["unit_id"] for x in res["bound_to"]] == ["item:chatgpt:conversation:FZ"]
                 left_by_the_forget.update(state(s2))
             return out
 
         pipe.extractor.extract = extract
         out = cap(pipe, "chatgpt:conversation:FZ",
                   "User: We decided to use ZQXFROZEN as the gate.\nUser: Another plain line stays here.\nUser: A newer line.")
-        assert fired and out.suppressed is True
-        assert left_by_the_forget and state(s1) == left_by_the_forget
-        s1.close(); s2.close()
-
-    def test_a_forget_under_a_refresh_suppresses_it_cleanly(self, tmp_path):
-        db = str(tmp_path / "gone2.db")
-        s1 = GraphStore(db_path=db)
-        s2 = GraphStore(db_path=db)
-        pipe = IngestionPipeline(s1)
-        first = cap(pipe, "chatgpt:conversation:G2", "User: Plain first line of the conversation.")
-        real = pipe.extractor.extract
-        fired = []
-
-        def extract(*a, **kw):
-            out = real(*a, **kw)
-            if not fired:
-                fired.append(1)
-                GraphOperations(s2).forget_node(first.context_node_id, cascade=True)
-            return out
-
-        pipe.extractor.extract = extract
-        out = cap(pipe, "chatgpt:conversation:G2",
-                  "User: Plain first line of the conversation.\nUser: A later line arrives.")
-        assert fired and out.suppressed is True
-        assert s1.list_nodes(node_type=NodeType.CONTEXT, limit=10) == []
+        assert fired and out.suppressed is False
+        assert left_by_the_forget
+        blob = " ".join(c for _l, c in state(s1).values())
+        assert "ZQXFROZEN" not in blob and "A newer line." in blob
         s1.close(); s2.close()
 
     def test_an_adapter_sync_does_not_abort_when_one_item_hits_a_foreign_key_error(self):
@@ -968,67 +886,72 @@ def _conversation(conv_id, secret, extra=()):
 
 
 class TestOpenAIAdapterPaths:
-    def test_a_forgotten_conversation_is_refused_by_its_id(self, tmp_path):
+    def _ingest(self, db, export):
         from revien.adapters.openai_adapter import OpenAIAdapter
-        db = str(tmp_path / "oa1.db")
-        secret = fs.new_secret()
+        with OpenAIAdapter(graph_path=db) as a:
+            return a.ingest_conversation(str(export))
+
+    def _forgotten(self, tmp_path, name, secret):
+        db = str(tmp_path / f"{name}.db")
         export = tmp_path / "c1.json"
         export.write_text(json.dumps(_conversation("conv-1", secret)))
-        with OpenAIAdapter(graph_path=db) as a:
-            a.ingest_conversation(str(export))
-        s = GraphStore(db_path=db)
-        ctxs = [n.node_id for n in s.list_nodes(node_type=NodeType.CONTEXT, limit=10)]
-        GraphOperations(s).forget_node(ctxs[0], cascade=True)
-        s.close()
-        with OpenAIAdapter(graph_path=db) as a:
-            out = a.ingest_conversation(str(export))
-        assert out.get("suppressed") is True and out["node_count"] == 0
-        s = GraphStore(db_path=db)
-        assert s.list_nodes(limit=50) == []
-        s.close()
+        self._ingest(db, export)
+        res = fs.forget_all(db, secret)
+        assert res["status"] == "forgotten"
+        return db, export
 
-    def test_a_copy_under_another_conversation_id_is_recognised_by_the_whole_conversation(self, tmp_path):
-        from revien.adapters.openai_adapter import OpenAIAdapter
-        db = str(tmp_path / "oa2.db")
+    def test_a_forgotten_message_is_left_out_of_the_same_conversation_by_its_id(self, tmp_path):
         secret = fs.new_secret()
-        first = tmp_path / "c1.json"
-        first.write_text(json.dumps(_conversation("conv-1", secret)))
-        with OpenAIAdapter(graph_path=db) as a:
-            a.ingest_conversation(str(first))
+        db, export = self._forgotten(tmp_path, "oa1", secret)
+        out = self._ingest(db, export)
+        assert not out.get("suppressed")
         s = GraphStore(db_path=db)
-        ctxs = [n.node_id for n in s.list_nodes(node_type=NodeType.CONTEXT, limit=10)]
-        GraphOperations(s).forget_node(ctxs[0], cascade=True)
+        blob = " ".join(n.label + n.content for n in s.list_nodes(limit=50))
         s.close()
+        assert secret not in blob
+
+    def test_a_copy_under_another_conversation_id_lands_as_written(self, tmp_path):
+        """A copy under a different identity is not recognised."""
+        secret = fs.new_secret()
+        db, _first = self._forgotten(tmp_path, "oa2", secret)
         copy = tmp_path / "c2.json"
         copy.write_text(json.dumps(_conversation("conv-2", secret, extra=[
             ("user", "An unrelated later remark about parking permits.")])))
-        with OpenAIAdapter(graph_path=db) as a:
-            out = a.ingest_conversation(str(copy))
+        out = self._ingest(db, copy)
         assert not out.get("suppressed")
         s = GraphStore(db_path=db)
         blob = " ".join(n.label + n.content for n in s.list_nodes(limit=100))
         s.close()
-        assert secret not in blob and "parking permits" in blob
+        assert secret in blob and "parking permits" in blob
+
+    def test_a_conversation_that_is_exactly_banned_wording_is_refused(self, tmp_path):
+        secret = fs.new_secret()
+        db, _first = self._forgotten(tmp_path, "oa4", secret)
+        s = GraphStore(db_path=db)
+        fact = s.add_node(Node(node_type=NodeType.FACT, label="x", content="The vault code is " + secret + "."),
+                          owner=(UA, 1, 1))
+        GraphOperations(s).forget_node(fact.node_id, everywhere=True)
+        s.close()
+        only = tmp_path / "c5.json"
+        only.write_text(json.dumps({
+            "id": "conv-9", "title": "T", "create_time": 1_750_000_000, "current_node": "m0",
+            "mapping": {"root": {"id": "root", "message": None, "parent": None, "children": ["m0"]},
+                        "m0": {"id": "m0", "parent": "root", "children": [],
+                               "message": {"id": "m0", "author": {"role": "user"}, "create_time": 1_750_000_001,
+                                           "content": {"content_type": "text",
+                                                       "parts": ["The vault code is " + secret + "."]}}}}}))
+        out = self._ingest(db, only)
+        assert out.get("suppressed") is True and out["node_count"] == 0
 
     def test_another_conversation_that_shares_a_line_keeps_it(self, tmp_path):
-        from revien.adapters.openai_adapter import OpenAIAdapter
-        db = str(tmp_path / "oa3.db")
         secret = fs.new_secret()
-        first = tmp_path / "c1.json"
-        first.write_text(json.dumps(_conversation("conv-1", secret)))
-        with OpenAIAdapter(graph_path=db) as a:
-            a.ingest_conversation(str(first))
-        s = GraphStore(db_path=db)
-        ctxs = [n.node_id for n in s.list_nodes(node_type=NodeType.CONTEXT, limit=10)]
-        GraphOperations(s).forget_node(ctxs[0], cascade=True)
-        s.close()
+        db, _first = self._forgotten(tmp_path, "oa3", secret)
         other = tmp_path / "c3.json"
         other.write_text(json.dumps(_conversation("conv-3", fs.new_secret(), extra=[
             ("user", "A long unrelated discussion about the quarterly budget."),
             ("assistant", "Understood, the quarterly budget is on the agenda."),
             ("user", f"Also remember that my safe code is {secret}.")])))
-        with OpenAIAdapter(graph_path=db) as a:
-            a.ingest_conversation(str(other))
+        self._ingest(db, other)
         s = GraphStore(db_path=db)
         blob = " ".join(n.content for n in s.list_nodes(limit=100))
         s.close()
@@ -1040,41 +963,48 @@ class TestImportGraphPaths:
         secret = fs.new_secret()
         src = GraphStore(db_path=str(tmp_path / "gs.db"))
         pipe = IngestionPipeline(src)
-        out = cap(pipe, "chatgpt:conversation:GI", f"User: remember that my safe code is {secret}.\nUser: We decided to use {secret} as the codename.")
+        cap(pipe, "chatgpt:conversation:GI", f"User: Plain opening line of the conversation.\nUser: We decided to use {secret} as the codename.")
         graph = src.export_graph()
         src.close()
         dst = GraphStore(db_path=str(tmp_path / "gd.db"))
         dst.import_graph(graph, mode="merge")
-        ctx_node = [n for n in dst.list_nodes(node_type=NodeType.CONTEXT, limit=10)][0]
-        return secret, graph, dst, ctx_node
+        target = [n for n in dst.list_nodes(node_type=NodeType.DECISION, limit=10)
+                  if secret in n.content][0]
+        return secret, graph, dst, target
 
-    def test_a_node_of_a_forgotten_unit_is_not_imported_even_when_its_text_changed(self, tmp_path):
-        secret, graph, dst, ctx_node = self._forgotten_session(tmp_path)
-        res = GraphOperations(dst).forget_node(ctx_node.node_id, cascade=True)
-        assert any(x["unit_id"] == "item:chatgpt:conversation:GI" for x in res["suppressed"])
+    def test_a_sentence_of_a_forgotten_origin_is_not_imported_even_when_the_text_changed(self, tmp_path):
+        secret, graph, dst, target = self._forgotten_session(tmp_path)
+        res = GraphOperations(dst).forget_node(target.node_id)
+        assert any(x["unit_id"] == "item:chatgpt:conversation:GI" for x in res["bound_to"])
         for n in graph.nodes:
             if n.node_type == NodeType.CONTEXT:
+                n.node_id = "context-after-the-forget"
                 n.content = n.content + "\nNew text written after the forget."
+        graph.edges = []
         out = dst.import_graph(graph, mode="merge")
-        ctxs = dst.list_nodes(node_type=NodeType.CONTEXT, limit=10)
+        back = dst.get_node("context-after-the-forget")
         dst.close()
-        assert ctxs == [] and out["skipped_suppressed"] >= 1
+        assert back is not None and secret not in back.content
+        assert "New text written after the forget" in back.content
+        assert out["skipped_suppressed"] >= 1
 
-    def test_a_copy_without_an_owner_is_cut_by_content_and_the_rest_comes_in(self, tmp_path):
-        secret, graph, dst, ctx_node = self._forgotten_session(tmp_path)
-        GraphOperations(dst).forget_node(ctx_node.node_id, cascade=True)
+    def test_a_copy_without_an_identity_is_not_recognised_and_lands(self, tmp_path):
+        secret, graph, dst, target = self._forgotten_session(tmp_path)
+        GraphOperations(dst).forget_node(target.node_id)
         copy = [n for n in graph.nodes if n.node_type == NodeType.CONTEXT][0]
         copy.node_id = "copy-of-the-session"
-        copy.metadata = {}                          # no ingest key: whose it is cannot be said
+        copy.metadata = {}
+        copy.source_id = "somewhere-else"            # no source key, no session: whose it is cannot be said
+        copy.origin_runtime = None
+        copy.session_key = None
         copy.content = copy.content + "\nA later unrelated remark about parking permits."
-        keep = [copy]
-        graph.nodes = keep
+        graph.nodes = [copy]
         graph.edges = []
         dst.import_graph(graph, mode="merge")
         back = dst.get_node("copy-of-the-session")
         dst.close()
         assert back is not None
-        assert secret not in back.content and "parking permits" in back.content
+        assert secret in back.content and "parking permits" in back.content
 
 
 class TestSkillPaths:
@@ -1086,28 +1016,40 @@ class TestSkillPaths:
         fs._age(path)
         return path
 
-    def test_a_forgotten_skill_is_refused_until_its_file_changes(self, tmp_path):
+    def test_a_skill_is_a_whole_file_forget_refuses_it_and_delete_removes_it(self, tmp_path):
         from revien.skills.ingest import ingest_roots
         secret = fs.new_secret()
         self._skill(tmp_path, f"Use the code {secret} to unlock the release.\n")
         s = GraphStore(db_path=str(tmp_path / "sk1.db"))
         ingest_roots(s, paths=[str(tmp_path / "skills")])
         node = s.list_nodes(node_type=NodeType.SKILL, limit=5)[0]
-        GraphOperations(s).forget_node(node.node_id, cascade=True)
+        res = GraphOperations(s).forget_node(node.node_id)
+        assert res["status"] == "refused" and res["reason"] == "whole_conversation"
+        assert s.get_node(node.node_id) is not None
+        assert GraphOperations(s).delete_node(node.node_id) is True
+        s.close()
+
+    def test_a_skill_whose_text_is_exactly_banned_wording_is_refused(self, tmp_path):
+        from revien.skills.ingest import build_skill_node, ingest_roots
+        secret = fs.new_secret()
+        path = self._skill(tmp_path, f"Use the code {secret} to unlock the release.\n")
+        body = build_skill_node(path, "user", None, None).content
+        s = GraphStore(db_path=str(tmp_path / "sk3.db"))
+        fact = s.add_node(Node(node_type=NodeType.FACT, label="code", content=body), owner=(UA, 1, 1))
+        GraphOperations(s).forget_node(fact.node_id, everywhere=True)
         again = ingest_roots(s, paths=[str(tmp_path / "skills")])
         left = s.list_nodes(node_type=NodeType.SKILL, limit=5)
         s.close()
         assert again["suppressed"] == 1 and left == []
 
-    def test_a_changed_skill_comes_back_without_the_forgotten_sentence(self, tmp_path):
+    def test_a_skill_file_is_captured_without_a_sentence_forgotten_everywhere(self, tmp_path):
         from revien.skills.ingest import ingest_roots
         secret = fs.new_secret()
-        path = self._skill(tmp_path, f"Use the code {secret} to unlock the release.\n")
+        wording = f"Use the code {secret} to unlock the release."
         s = GraphStore(db_path=str(tmp_path / "sk2.db"))
-        ingest_roots(s, paths=[str(tmp_path / "skills")])
-        node = s.list_nodes(node_type=NodeType.SKILL, limit=5)[0]
-        GraphOperations(s).forget_node(node.node_id, cascade=True)
-        self._skill(tmp_path, f"Use the code {secret} to unlock the release.\nThen tag the build and notify the team.\n")
+        fact = s.add_node(Node(node_type=NodeType.FACT, label="code", content=wording), owner=(UA, 1, 1))
+        GraphOperations(s).forget_node(fact.node_id, everywhere=True)
+        self._skill(tmp_path, f"{wording}\nThen tag the build and notify the team.\n")
         again = ingest_roots(s, paths=[str(tmp_path / "skills")])
         skills = s.list_nodes(node_type=NodeType.SKILL, limit=5)
         s.close()
@@ -1126,10 +1068,17 @@ class TestVaultReconcilePaths:
         rec = VaultReconciler(s, str(tmp_path), semantic=SemanticIndex(s, enabled=False))
         return s, ent, rec
 
-    def test_a_forgotten_nodes_text_typed_back_into_a_note_is_not_captured(self, tmp_path):
+    def test_a_note_is_not_the_origin_a_plain_forget_was_made_in(self, tmp_path):
         s, ent, rec = self._reconciler(tmp_path)
         fact = s.add_node(Node(node_type=NodeType.FACT, label="pg", content=self.SENTENCE), owner=(UA, 1, 1))
         GraphOperations(s).forget_node(fact.node_id)
+        assert rec._new_claim_node(ent.node_id, self.SENTENCE, None) is not None
+        s.close()
+
+    def test_a_wording_forgotten_everywhere_typed_back_into_a_note_is_not_captured(self, tmp_path):
+        s, ent, rec = self._reconciler(tmp_path)
+        fact = s.add_node(Node(node_type=NodeType.FACT, label="pg", content=self.SENTENCE), owner=(UA, 1, 1))
+        GraphOperations(s).forget_node(fact.node_id, everywhere=True)
         assert rec._new_claim_node(ent.node_id, self.SENTENCE, None) is None
         assert rec._new_claim_node(ent.node_id, "A different claim typed into a note.", None) is not None
         s.close()
@@ -1149,7 +1098,7 @@ class TestTheGlobalBanCanBeLifted:
         fact = a_only_fact(store)
         GraphOperations(store).forget_node(fact.node_id, everywhere=True)
         from revien.forget.restore import liftable, plan_restore, restore
-        (ban,) = [r for r in liftable(store) if r["kind"] == "wording"]
+        (ban,) = [r for r in liftable(store) if r["scope"] == "global"]
         assert ban["scope"] == "global" and ban["unit_id"].startswith("forget:")
         plan = plan_restore(store, ban["unit_id"])
         assert plan["status"] == "ok" and plan["lifts"][0]["id"] == ban["id"]
@@ -1164,7 +1113,7 @@ class TestSpecAndChangelogAgree:
         spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")
         log = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
         for text in (spec, log):
-            assert "bound to the origin that was forgotten" in text
+            assert "bound to the origin" in text
             assert "for every source, inside the write transaction" not in text
             assert "removes the wording from every unit that holds it" not in text
         assert "only the exact wording that was targeted" in spec

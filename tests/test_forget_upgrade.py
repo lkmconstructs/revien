@@ -99,15 +99,19 @@ class TestUpgrade:
                                  for r in s.get_provenance(n.node_id))]
             unproven = {nid for nid, n in all_nodes.items() if n not in proven_ctx}
             ops = GraphOperations(s)
-            forgotten = set()
+            # a conversation's own record is refused: nothing is changed
+            before = {n.node_id for n in s.list_nodes(limit=10000)}
             for ctx in proven_ctx:
-                res = ops.forget_node(ctx.node_id, cascade=True)
-                assert res["status"] == "forgotten"
-                forgotten |= set(res["forgotten"])
-            # only proven context nodes (and what the pipeline later proves
-            # they wrote) were removed; every unproven node is still there
-            assert forgotten <= {n.node_id for n in proven_ctx}
-            assert unproven <= {n.node_id for n in s.list_nodes(limit=10000)}
+                res = ops.forget_node(ctx.node_id)
+                assert res["status"] == "refused" and res["reason"] == "whole_conversation"
+            assert before == {n.node_id for n in s.list_nodes(limit=10000)}
+            # forgetting one unproven node names it, and only it, for removal
+            if unproven:
+                target = sorted(unproven)[0]
+                res = ops.forget_node(target)
+                assert res["status"] in ("forgotten", "refused")
+                after = {n.node_id for n in s.list_nodes(limit=10000)}
+                assert (before - after) <= {target}
         finally:
             s.close()
 

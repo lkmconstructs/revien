@@ -28,7 +28,7 @@ def new_secret() -> str:
 
 def sentence(secret: str) -> str:
     """Text the rule extractor turns into several node types."""
-    return (f"User: remember that my safe code is {secret}.\n"
+    return (f"User: remember that the parking permit is blue.\n"
             f"Assistant: Noted. We decided to use {secret} as the project "
             f"codename.")
 
@@ -84,6 +84,72 @@ def node_holding(db: str, secret: str, not_type=NodeType.CONTEXT) -> Optional[st
     finally:
         store.close()
     return None
+
+
+def holders(db: str, secret: str) -> List[str]:
+    """The nodes a user could name to forget the secret: every node that holds
+    it except a conversation's or a skill's whole record."""
+    store = GraphStore(db_path=db)
+    try:
+        return [n.node_id for n in store.list_nodes(limit=1000)
+                if n.node_type not in (NodeType.CONTEXT, NodeType.SKILL)
+                and secret in n.label + n.content]
+    finally:
+        store.close()
+
+
+def decision_text(db: str, secret: str) -> str:
+    """The wording of the decision the seed made of the secret."""
+    store = GraphStore(db_path=db)
+    try:
+        return [n.content for n in store.list_nodes(limit=1000)
+                if n.node_type == NodeType.DECISION and secret in n.content][0]
+    finally:
+        store.close()
+
+
+def forget_all(db: str, secret: str, ops=None, **kwargs) -> Dict:
+    """Forget, one node at a time, every node that holds the secret (what a
+    user does to take a wording out of a conversation). Returns the results
+    merged: counts summed, the last response's leftovers."""
+    own = ops is None
+    store = None
+    if own:
+        store = GraphStore(db_path=db)
+        ops = _ops(store)
+    results = []
+    try:
+        while True:
+            ids = [n.node_id for n in ops.store.list_nodes(limit=1000)
+                   if n.node_type not in (NodeType.CONTEXT, NodeType.SKILL)
+                   and secret in n.label + n.content]
+            if not ids:
+                break
+            r = ops.forget_node(ids[0], **kwargs)
+            results.append(r)
+            if r["status"] != "forgotten":
+                break
+    finally:
+        if own:
+            store.close()
+    if not results:
+        return {"status": "nothing", "forgotten": [], "count": 0}
+    out = dict(results[-1])
+    out["forgotten"] = [i for r in results for i in r.get("forgotten", [])]
+    for key in ("count", "removed_nodes", "tombstones_created"):
+        out[key] = sum(r.get(key, 0) for r in results)
+    out["nodes_before"] = results[0]["nodes_before"]
+    out["edges_before"] = results[0]["edges_before"]
+    out["cut_back"] = [i for r in results for i in r.get("cut_back", [])]
+    out["bound_to"] = [b for r in results for b in r.get("bound_to", [])]
+    out["not_bound"] = [b for r in results for b in r.get("not_bound", [])]
+    out["steps"] = len(results)
+    return out
+
+
+def _ops(store):
+    from revien.graph.operations import GraphOperations
+    return GraphOperations(store)
 
 
 def _resync(db: str, name: str, adapter) -> None:
@@ -176,7 +242,7 @@ def seed_ollama(tmp: Path, secret: str) -> Seeded:
     a = OllamaAdapter(graph_path=db)
     try:
         a.ingest_ollama_history([
-            {"role": "user", "content": f"remember that my safe code is {secret}."},
+            {"role": "user", "content": f"remember that the parking permit is blue."},
             {"role": "assistant", "content": f"Noted. We decided to use {secret} as the codename."}])
     finally:
         a.close()
@@ -188,7 +254,7 @@ def seed_ollama_exchange(tmp: Path, secret: str) -> Seeded:
     db = str(tmp / "ollama2.db")
     a = OllamaAdapter(graph_path=db)
     try:
-        a._ingest_exchange(f"remember that my safe code is {secret}.",
+        a._ingest_exchange(f"remember that the parking permit is blue.",
                            f"Noted. We decided to use {secret} as the codename.")
     finally:
         a.close()
@@ -199,7 +265,7 @@ def seed_langchain(tmp: Path, secret: str) -> Seeded:
     from revien.adapters import RevienMemory
     db = str(tmp / "langchain.db")
     with RevienMemory(graph_path=db, session_scope="sess-lc") as mem:
-        mem.save_context({"input": f"remember that my safe code is {secret}."},
+        mem.save_context({"input": f"remember that the parking permit is blue."},
                          {"output": f"Noted. We decided to use {secret} as the codename."})
     return Seeded("langchain", db, secret, context_ids(db), stable=False)
 
@@ -255,7 +321,7 @@ def seed_generic_api(tmp: Path, secret: str, monkeypatch) -> Seeded:
 # ── file-backed units ─────────────────────────────────────────────────
 
 def _claude_lines(secret: str, session_id: Optional[str] = None):
-    turns = [("user", f"remember that my safe code is {secret}."),
+    turns = [("user", f"remember that the parking permit is blue."),
              ("assistant", f"Noted. We decided to use {secret} as the codename.")]
     out = []
     for role, text in turns:
@@ -301,7 +367,7 @@ def seed_codex(tmp: Path, secret: str) -> Seeded:
     lines = [json.dumps({"timestamp": "2026-07-01T10:00:00Z", "type": "session_meta",
                          "payload": {"id": "0197-codex-forgotten", "cwd": "/work/proj-c"}})]
     for role, kind, text in (
-            ("user", "input_text", f"remember that my safe code is {secret}."),
+            ("user", "input_text", f"remember that the parking permit is blue."),
             ("assistant", "output_text",
              f"Noted. We decided to use {secret} as the codename.")):
         lines.append(json.dumps({
@@ -338,7 +404,7 @@ def seed_obsidian(tmp: Path, secret: str) -> Seeded:
     vault = tmp / "vault"
     vault.mkdir()
     path = vault / "Atlas.md"
-    path.write_text(f"# Atlas\nThe launch codename is {secret}. "
+    path.write_text(f"# Atlas\nThe launch date is tomorrow. "
                     f"We decided to use {secret} for the demo.\n",
                     encoding="utf-8")
     _age(path)
@@ -360,7 +426,7 @@ def _chatgpt_export(path: Path, secret: str) -> None:
             "m1": {"id": "m1", "parent": "root", "children": ["m2"], "message": {
                 "id": "m1", "author": {"role": "user"}, "create_time": 1_750_000_001,
                 "content": {"content_type": "text", "parts": [
-                    f"remember that my safe code is {secret}."]}}},
+                    f"remember that the parking permit is blue."]}}},
             "m2": {"id": "m2", "parent": "m1", "children": [], "message": {
                 "id": "m2", "author": {"role": "assistant"}, "create_time": 1_750_000_002,
                 "content": {"content_type": "text", "parts": [
@@ -396,8 +462,8 @@ def seed_claude_import(tmp: Path, secret: str) -> Seeded:
         "uuid": "cc-1", "name": "Plans", "created_at": "2026-07-01T10:00:00Z",
         "chat_messages": [
             {"uuid": "a", "sender": "human", "created_at": "2026-07-01T10:00:01Z",
-             "text": f"remember that my safe code is {secret}.",
-             "content": [{"type": "text", "text": f"remember that my safe code is {secret}."}]},
+             "text": f"remember that the parking permit is blue.",
+             "content": [{"type": "text", "text": f"remember that the parking permit is blue."}]},
             {"uuid": "b", "sender": "assistant", "created_at": "2026-07-01T10:00:02Z",
              "text": f"Noted. We decided to use {secret} as the codename.",
              "content": [{"type": "text", "text": f"Noted. We decided to use {secret} as the codename."}]}]}]),
@@ -420,7 +486,7 @@ def seed_readwise_import(tmp: Path, secret: str) -> Seeded:
     export = tmp / "readwise.csv"
     export.write_text(
         "Highlight,Book Title,Book Author,Amazon Book ID,Note,Color,Tags,Location Type,Location,Highlighted at,Document tags\n"
-        f"\"My safe code is {secret}. We decided to use {secret}.\",Safe Book,Some Author,,,,,page,12,2026-07-01 10:00:00,\n",
+        f"\"The parking permit is blue. We decided to use {secret}.\",Safe Book,Some Author,,,,,page,12,2026-07-01 10:00:00,\n",
         encoding="utf-8")
     def again():
         st = GraphStore(db_path=db)

@@ -75,8 +75,8 @@ class TestEverywhereContract:
         assert after[entity.node_id].content == entity.content      # the co-owned entity is whole
         assert {r["unit_id"] for r in store.get_provenance(entity.node_id)} == {
             "session:claude-code:sA", "session:claude-code:sB"}
-        assert res["suppressed"] == [] and res["cut_back"] == []
-        assert "session:claude-code:sB" not in json.dumps(res["suppressed"])
+        assert res["bound_to"] == [] and res["cut_back"] == []
+        assert "session:claude-code:sB" not in json.dumps(res["bound_to"])
         # both conversations were cut in place, and both are listed there
         cut = {c["node_id"]: c for c in res["cut_in_place"]}
         for sid in ("sA", "sB"):
@@ -84,7 +84,7 @@ class TestEverywhereContract:
                         and f"session:claude-code:{sid}" in str(store.get_provenance(n.node_id))][0]
             assert ctx_node.node_id in cut and "ZQXHARBOR" not in ctx_node.content
         assert not res["wording_cut"] or all(w["context_node_id"] in cut for w in res["wording_cut"])
-        assert "several sources" in res["identity_note"] and "none of them is suppressed" in res["identity_note"]
+        assert "several sources" in res["identity_note"] and "no single origin" in res["identity_note"]
         # the label that was a piece of the cut wording went with it, so nothing is left to find
         assert not any("ZQXHARBOR" in n.label + n.content for n in after.values())
         assert res["scope"] == "gone everywhere" and res["remaining"] == {}
@@ -94,8 +94,8 @@ class TestEverywhereContract:
         fact = [n for n in store.list_nodes(node_type=NodeType.FACT, limit=10)][0]
         res = GraphOperations(store).forget_node(fact.node_id, everywhere=True)
         msg = res["message"]
-        assert "suppresses future imports" not in msg          # nothing was suppressed
-        assert "suppresses no source" in msg
+        assert "later captures of" not in msg                   # no single source was bound
+        assert "keeps its exact wording out of every source" in msg
         assert "cut back" not in msg.lower().replace("never cut back", "")
         assert "nothing deleted, nothing suppressed" not in msg
         for c in res["cut_in_place"]:
@@ -114,8 +114,8 @@ class TestEverywhereContract:
             entity = [n for n in before.values() if n.label == "Kubernetes"][0]
             res = GraphOperations(s).forget_node(fact.node_id, everywhere=True)
             after = nodes_by_id(s)
-            assert [x["unit_id"] for x in res["suppressed"]] == ["session:claude-code:sA"]    # the target's own source key
-            assert not any(r["unit_id"] == "session:claude-code:sB" and r["kind"] != "wording"
+            assert [x["unit_id"] for x in res["bound_to"]] == ["session:claude-code:sA"]    # the target's own source key
+            assert not any("unit:session:claude-code:sB" in r["path_keys"]
                            for r in s.list_suppressions("active"))
             assert res["cut_back"] == [] and "cut back" not in res["message"].lower()
             assert set(before) - set(after) == {fact.node_id}
@@ -160,27 +160,22 @@ class TestEverywhereContract:
         b_ctx = store.add_node(Node(node_type=NodeType.CONTEXT, label="B", content=f"User: {sentence}\nUser: {B_TAIL}"),
                                owner=("session:claude-code:sB", 1, 1))
         res = GraphOperations(store).forget_node(fact.node_id, everywhere=True)
-        assert [x["unit_id"] for x in res["suppressed"]] == ["session:claude-code:sA"]
+        assert [x["unit_id"] for x in res["bound_to"]] == ["session:claude-code:sA"]
         assert store.get_node(b_ctx.node_id) is not None and B_TAIL in store.get_node(b_ctx.node_id).content
         assert {c["node_id"] for c in res["cut_in_place"]} >= {b_ctx.node_id}
 
-    @pytest.mark.parametrize("mode", ["plain", "everywhere", "cascade", "cascade_everywhere"])
+    @pytest.mark.parametrize("mode", ["plain", "everywhere"])
     def test_no_sentence_of_the_message_is_false(self, store, mode):
         two_claude_sessions(store)
         ops = GraphOperations(store)
-        if mode.startswith("cascade"):
-            a_ctx = [n for n in store.list_nodes(node_type=NodeType.CONTEXT, limit=10)
-                     if "session:claude-code:sA" in str(store.get_provenance(n.node_id))][0]
-            res = ops.forget_node(a_ctx.node_id, cascade=True, everywhere=mode.endswith("everywhere"))
-        else:
-            fact = [n for n in store.list_nodes(node_type=NodeType.FACT, limit=10)][0]
-            res = ops.forget_node(fact.node_id, everywhere=(mode == "everywhere"))
+        fact = [n for n in store.list_nodes(node_type=NodeType.FACT, limit=10)][0]
+        res = ops.forget_node(fact.node_id, everywhere=(mode == "everywhere"))
         msg = res["message"]
         assert "nothing deleted, nothing suppressed" not in msg      # (a template, true or not)
-        if not res["suppressed"]:
-            assert "suppresses future imports" not in msg
+        if not res["bound_to"]:
+            assert "keeps its wording out of later captures" not in msg
         else:
-            assert "suppresses no source" not in msg
+            assert "keeps nothing out of a later capture" not in msg
         if not res["cut_in_place"]:
             assert "cut the exact wording in place" not in msg
         else:
@@ -214,7 +209,7 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
 
     def test_a_label_that_is_the_claim_is_residue_and_its_holders_are_named(self, store):
         ctx_a, fact = self._merged_fact(store)
-        res = GraphOperations(store).forget_node(ctx_a.node_id, cascade=True)
+        res = GraphOperations(store).forget_node(fact.node_id)
         survivor = store.get_node(fact.node_id)
         assert survivor is not None and self.SECRET in survivor.label        # the name stays: others vouched for it
         assert res["scope"] == "forgotten from Revien"
@@ -235,6 +230,10 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
                                            f"{self.SECRET} as its harbor code", "fact", 0.5, 1, "t"))
         conn.execute("INSERT INTO retrieval_signals (query, node_id, node_label, node_type, score, was_used, timestamp) "
                      "VALUES ('unrelated', 'other', 'plain label', 'fact', 0.5, 0, 't')")
+        # a row about the cut node that quotes none of the forgotten words: only
+        # its node id says whose it is
+        conn.execute("INSERT INTO retrieval_signals (query, node_id, node_label, node_type, score, was_used, timestamp) "
+                     "VALUES ('a plain question', ?, 'plain', 'fact', 0.5, 1, 't')", (fact.node_id,))
         conn.commit()
         conn.close()
         ops = GraphOperations(store)
@@ -246,7 +245,7 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
             return True
 
         ops.retrain = retrain
-        ops.forget_node(ctx_a.node_id, cascade=True)
+        ops.forget_node(fact.node_id)
         assert self.SECRET not in seen["data"]                  # what the retrain read
         assert "plain label" in seen["data"]                    # ...and it kept what is unrelated
         assert loop.get_signal_count() == 1
@@ -257,10 +256,13 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
         ctx_a = store.add_node(Node(node_type=NodeType.CONTEXT, label="A",
                                     content=f"User: Remember that the dock code is {word}.\nUser: Another plain line stays."),
                                owner=("session:claude-code:A", 1, 1))
+        target = store.add_node(Node(node_type=NodeType.FACT, label="dock",
+                                     content=f"Remember that the dock code is {word}."),
+                                owner=("session:claude-code:A", 1, 1))
         ids = [store.add_node(Node(node_type=NodeType.FACT, label=f"hand {i}",
                                    content=f"Hand-written note number {i} mentions {word} again.")).node_id
                for i in range(hand_nodes)]
-        res = GraphOperations(store).forget_node(ctx_a.node_id, cascade=True)
+        res = GraphOperations(store).forget_node(target.node_id)
         held = {l["node_id"] for l in res["leftovers"] if l["kind"] == "other_units"}
         assert set(ids) <= held
         assert res["scope"] == "forgotten from Revien" and res["remaining"].get("nodes")
@@ -273,7 +275,10 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
         store.add_node(Node(node_type=NodeType.CONTEXT, label="B", content=f"User: Bravo also saw {word} on a label."),
                        owner=("session:claude-code:B", 1, 1))
         hand = store.add_node(Node(node_type=NodeType.FACT, label="hand", content=f"A note: {word} was mentioned."))
-        res = GraphOperations(store).forget_node(ctx_a.node_id, cascade=True)
+        target = store.add_node(Node(node_type=NodeType.FACT, label="dock",
+                                     content=f"The dock code is {word} for now."),
+                                owner=("session:claude-code:A", 1, 1))
+        res = GraphOperations(store).forget_node(target.node_id)
         assert hand.node_id in {l["node_id"] for l in res["leftovers"] if l["kind"] == "other_units"}
         assert res["scope"] == "forgotten from Revien"
 
@@ -286,7 +291,10 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
         ctx_a = store.add_node(Node(node_type=NodeType.CONTEXT, label="A",
                                     content="User: The deployment pipeline is down.\nUser: Another plain line stays."),
                                owner=("session:claude-code:A", 1, 1))
-        res = GraphOperations(store).forget_node(ctx_a.node_id, cascade=True)
+        target = store.add_node(Node(node_type=NodeType.FACT, label="pipeline down",
+                                     content="The deployment pipeline is down."),
+                                owner=("session:claude-code:A", 1, 1))
+        res = GraphOperations(store).forget_node(target.node_id)
         assert hand.node_id not in {l["node_id"] for l in res["leftovers"] if l["kind"] == "other_units"}
 
     @pytest.mark.parametrize("path", sorted(fs.ALL_PATHS))
@@ -296,10 +304,9 @@ class TestGoneEverywhereNeverWhileTheWordingSurvives:
             if not LANGCHAIN_AVAILABLE:
                 pytest.skip("langchain-core is not installed")
         seeded = fs.seed(path, tmp_path, monkeypatch)
-        handle = (seeded.ctx_ids or [seeded.node_with_secret])[0]
-        s = GraphStore(db_path=seeded.db)
-        res = GraphOperations(s).forget_node(handle, cascade=True)
-        s.close()
+        res = fs.forget_all(seeded.db, seeded.secret)
+        if res["status"] == "nothing":
+            pytest.skip("a skill is a whole file: forget refuses it")
         conn = sqlite3.connect(seeded.db)
         try:
             in_db = scrub.find_residue(conn, [seeded.secret])
@@ -348,12 +355,14 @@ class TestBusyDatabase:
     def test_a_forget_answers_busy_and_changes_nothing_while_a_capture_holds_the_write_lock(self, store, tmp_path, monkeypatch):
         monkeypatch.setattr(ForgetEngine, "BUSY_WAIT_SECONDS", 0.3)
         store._get_conn().execute("PRAGMA busy_timeout = 50")
-        c = store.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+                       owner=("session:claude-code:Z", 1, 1))
+        c = store.add_node(Node(node_type=NodeType.FACT, label="words", content="some words to forget here."),
                            owner=("session:claude-code:Z", 1, 1))
         before = nodes_by_id(store)
         other = self._hold(store.db_path)
         try:
-            res = GraphOperations(store).forget_node(c.node_id, cascade=True)
+            res = GraphOperations(store).forget_node(c.node_id)
         finally:
             other.rollback()
             other.close()
@@ -361,14 +370,16 @@ class TestBusyDatabase:
         assert res["denylist_written"] is False
         assert "Revien is busy writing; nothing was changed" in res["message"]
         assert nodes_by_id(store).keys() == before.keys()
-        assert store.list_suppressions("active", include_wording=True) == []
+        assert store.list_suppressions("active") == []
         # ...and once the capture is done, the same forget works
-        assert GraphOperations(store).forget_node(c.node_id, cascade=True)["status"] == "forgotten"
+        assert GraphOperations(store).forget_node(c.node_id)["status"] == "forgotten"
 
     def test_when_only_the_removal_is_blocked_the_response_says_the_denylist_is_already_in_force(self, store, monkeypatch):
         monkeypatch.setattr(ForgetEngine, "BUSY_WAIT_SECONDS", 0.3)
         store._get_conn().execute("PRAGMA busy_timeout = 50")
-        c = store.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+                       owner=("session:claude-code:Z", 1, 1))
+        c = store.add_node(Node(node_type=NodeType.FACT, label="words", content="some words to forget here."),
                            owner=("session:claude-code:Z", 1, 1))
         real = ForgetEngine._record_denylist
         held = []
@@ -380,7 +391,7 @@ class TestBusyDatabase:
 
         monkeypatch.setattr(ForgetEngine, "_record_denylist", then_busy)
         try:
-            res = GraphOperations(store).forget_node(c.node_id, cascade=True)
+            res = GraphOperations(store).forget_node(c.node_id)
         finally:
             for h in held:
                 h.rollback()
@@ -393,12 +404,14 @@ class TestBusyDatabase:
     def test_the_retry_waits_for_a_short_lock(self, store, monkeypatch):
         monkeypatch.setattr(ForgetEngine, "BUSY_WAIT_SECONDS", 5.0)
         store._get_conn().execute("PRAGMA busy_timeout = 50")
-        c = store.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+                       owner=("session:claude-code:Z", 1, 1))
+        c = store.add_node(Node(node_type=NodeType.FACT, label="words", content="some words to forget here."),
                            owner=("session:claude-code:Z", 1, 1))
         other = self._hold(store.db_path)
         timer = threading.Timer(0.4, lambda: (other.rollback(), other.close()))
         timer.start()
-        res = GraphOperations(store).forget_node(c.node_id, cascade=True)
+        res = GraphOperations(store).forget_node(c.node_id)
         timer.join()
         assert res["status"] == "forgotten"
 
@@ -410,15 +423,17 @@ class TestBusyDatabase:
         from revien.daemon.server import create_app
         db = str(tmp_path / "busy.db")
         s = GraphStore(db_path=db)
-        c = s.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+        s.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: some words to forget here."),
+                   owner=("session:claude-code:Z", 1, 1))
+        c = s.add_node(Node(node_type=NodeType.FACT, label="words", content="some words to forget here."),
                        owner=("session:claude-code:Z", 1, 1))
         s.close()
         busy = ForgetEngine._busy(c.node_id, committed=False)
         monkeypatch.setattr(GraphOperations, "forget_node", lambda self, *a, **k: busy)
         with TestClient(create_app(db_path=db)) as client:
-            r = client.post(f"/v1/nodes/{c.node_id}/forget", json={"cascade": True})
+            r = client.post(f"/v1/nodes/{c.node_id}/forget", json={})
         assert r.status_code == 503 and r.json()["detail"]["status"] == "busy"
-        out = CliRunner().invoke(main, ["forget", c.node_id, "--db", db, "--yes", "--cascade"])
+        out = CliRunner().invoke(main, ["forget", c.node_id, "--db", db, "--yes"])
         assert out.exit_code == 1 and "Revien is busy writing; nothing was changed" in out.output
 
 
@@ -428,7 +443,10 @@ class TestRetrainReason:
     def test_the_training_loop_keeps_the_reason(self, tmp_path, monkeypatch):
         from revien.neural.training import TrainingLoop
         loop = TrainingLoop(db_path=str(tmp_path / "t.db"), model_dir=str(tmp_path / "m"))
-        assert loop.train() is False and "not installed" in loop.last_failure     # (no sklearn in this environment)
+        # (whether sklearn is installed here or not, the first run is made
+        # without the neural extra, the second with it)
+        monkeypatch.setattr(type(loop), "_neural_available", lambda self: False)
+        assert loop.train() is False and "not installed" in loop.last_failure
         monkeypatch.setattr(type(loop), "_neural_available", lambda self: True)
         assert loop.train() is False and "only 0 retrieval signals are left, 100 are needed" == loop.last_failure
         conn = sqlite3.connect(loop.db_path)
@@ -469,7 +487,9 @@ class TestRetrainReason:
         monkeypatch.setattr("revien.neural.scorer_model.NeuralScorer.train", one_class)
         db = str(tmp_path / "rr.db")
         s = GraphStore(db_path=db)
-        c = s.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: remember the gate code ZQXREASON1."),
+        s.add_node(Node(node_type=NodeType.CONTEXT, label="c", content="User: remember the gate code ZQXREASON1."),
+                   owner=("session:claude-code:Z", 1, 1))
+        c = s.add_node(Node(node_type=NodeType.FACT, label="gate", content="remember the gate code ZQXREASON1."),
                        owner=("session:claude-code:Z", 1, 1))
         s.close()
         app = create_app(db_path=db)
@@ -480,7 +500,7 @@ class TestRetrainReason:
                              "VALUES (?,?,?,?,?,?,?)", (f"q{i}", f"n{i}", "label", "fact", 0.5, 1, "t"))
             conn.commit()
             conn.close()
-            body = client.post(f"/v1/nodes/{c.node_id}/forget", json={"cascade": True}).json()
+            body = client.post(f"/v1/nodes/{c.node_id}/forget", json={}).json()
         assert body["model"]["retrained"] is False
         assert "only one class" in body["model"]["note"]
         assert "too few" not in body["model"]["note"]
@@ -488,10 +508,9 @@ class TestRetrainReason:
 
 # ── gate bindings, one test each ────────────────────────────────────────
 
-def _put(store, path_keys, sentence, scope="origin", signature=()):
-    store.add_suppression("forget:test-" + str(len(store.list_suppressions('active', include_wording=True))),
-                          "wording", None, list(path_keys), [], [], None, "test",
-                          sentence_fps=[fingerprint(sentence)], signature_fps=list(signature), scope=scope)
+def _put(store, path_keys, sentence, scope="origin"):
+    store.add_suppression("forget:test-" + str(len(store.list_suppressions("active"))),
+                          list(path_keys), [], [fingerprint(sentence)], [], "test", scope=scope)
 
 
 class TestBindings:
@@ -499,16 +518,16 @@ class TestBindings:
 
     def test_the_unit_binding(self, store):
         _put(store, ["unit:session:codex:X"], self.S)
-        long_fps, _ = gate.known(store, gate.UnitRef("session:codex:X", None), "unrelated text")
+        long_fps = gate.known(store, gate.UnitRef("session:codex:X", None))[0]
         assert fingerprint(self.S) in long_fps
-        long_fps, _ = gate.known(store, gate.UnitRef("session:codex:Y", None), "unrelated text")
+        long_fps = gate.known(store, gate.UnitRef("session:codex:Y", None))[0]
         assert long_fps == set()
 
     def test_the_session_id_binding(self, store):
         _put(store, ["sid:codex:abc"], self.S)
-        long_fps, _ = gate.known(store, gate.UnitRef("session:codex:renamed", None, sid="sid:codex:abc"), "x")
+        long_fps = gate.known(store, gate.UnitRef("session:codex:renamed", None, sid="sid:codex:abc"))[0]
         assert fingerprint(self.S) in long_fps
-        long_fps, _ = gate.known(store, gate.UnitRef("session:codex:renamed", None, sid="sid:codex:other"), "x")
+        long_fps = gate.known(store, gate.UnitRef("session:codex:renamed", None, sid="sid:codex:other"))[0]
         assert long_fps == set()
 
     def test_the_file_binding(self, store, tmp_path):
@@ -516,14 +535,17 @@ class TestBindings:
         f = tmp_path / "a.md"
         f.write_text("x")
         _put(store, identity_keys(str(f)), self.S)
-        long_fps, _ = gate.known(store, gate.UnitRef(None, str(f)), "x")
+        long_fps = gate.known(store, gate.UnitRef(None, str(f)))[0]
         assert fingerprint(self.S) in long_fps
         g = tmp_path / "b.md"
         g.write_text("y")
-        long_fps, _ = gate.known(store, gate.UnitRef(None, str(g)), "y")
+        long_fps = gate.known(store, gate.UnitRef(None, str(g)))[0]
         assert long_fps == set()
 
     def test_a_global_entry_applies_everywhere(self, store):
-        _put(store, [], self.S, scope="global")
-        long_fps, _ = gate.known(store, gate.UnitRef(None, None), "x")
-        assert fingerprint(self.S) in long_fps
+        store.add_suppression("forget:g", [], [], [], [], "test", scope="global",
+                              window_fps=gate.window_fps_for(["forgotten from one origin"]))
+        windows = gate.known(store, gate.UnitRef(None, None))[3]
+        assert windows and gate.holds_wording("It was Forgotten  from one origin, they say.", windows)
+        assert not gate.holds_wording("Forgotten from another origin.", windows)
+        assert not gate.holds_wording("unforgotten from one originals", windows)

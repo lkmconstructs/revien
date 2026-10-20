@@ -370,19 +370,19 @@ class GraphOperations:
 
     def forget_preview(self, node_id: str) -> Dict:
         """What a forget WOULD do, so it is never blind. Writes nothing."""
-        out = self._forget_engine().forget(node_id, cascade=False, dry_run=True)
+        out = self._forget_engine().forget(node_id, dry_run=True)
         out["exists"] = out.get("status") not in ("not_found", "skipped")
         return out
 
     def forget_node(
-        self, node_id: str, cascade: bool = False, reason: str = "",
+        self, node_id: str, reason: str = "",
         construct_id: str = "", actor: str = "api:forget",
         everywhere: bool = False,
     ) -> Dict:
         """The forget verb. ``reason`` and ``construct_id`` are accepted for
         compatibility and deliberately not stored. See ForgetEngine."""
         return self._forget_engine().forget(
-            node_id, cascade=cascade, actor=actor, everywhere=everywhere)
+            node_id, actor=actor, everywhere=everywhere)
 
     def delete_node(self, node_id: str, actor: str = "api:delete",
                     op: str = "delete") -> bool:

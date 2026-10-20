@@ -13,6 +13,7 @@ from revien.daemon import heartbeat
 from revien.daemon.server import create_app
 from revien.graph.operations import GraphOperations
 from revien.graph.store import GraphStore
+from tests import forget_seed as fs
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -28,7 +29,7 @@ def test_the_cli_commands_and_flags_named_exist():
     sec = forget_section()
     runner = CliRunner()
     for args, needle in (
-            (["forget", "--help"], "--cascade"),
+            (["forget", "--help"], "--everywhere"),
             (["restore", "--help"], "--list"),
             (["sync", "reset", "--help"], "--yes"),
             (["import-chatgpt", "--help"], "--override-suppressed"),
@@ -40,6 +41,9 @@ def test_the_cli_commands_and_flags_named_exist():
         assert out.exit_code == 0 and needle in out.output, (args, out.output)
     for token in ("--override-suppressed", "revien restore --list", "--yes"):
         assert token in sec
+    # the cascade flag is gone from the verb, and the text does not offer it
+    assert "--cascade" not in runner.invoke(main, ["forget", "--help"]).output
+    assert "`--cascade` are removed" in sec
 
 
 def test_the_routes_named_exist(tmp_path):
@@ -96,7 +100,7 @@ def test_the_response_fields_named_exist(tmp_path):
     seeded = fs.seed("pipeline", tmp_path)
     s = GraphStore(db_path=seeded.db)
     try:
-        res = GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True)
+        res = GraphOperations(s).forget_node(fs.holders(seeded.db, seeded.secret)[0])
     finally:
         s.close()
     sec = forget_section()
@@ -105,7 +109,8 @@ def test_the_response_fields_named_exist(tmp_path):
         assert field in res and field in sec, field
     for kind in ("source_file", "exports", "snapshots", "other_units", "vault_note"):
         assert kind in sec
-    assert "eligible for recapture because the source supplied no stable item identity" in sec
+    assert "`not_bound`" in sec and res["not_bound"]
+    assert "shared channel" in res["not_bound"][0]["note"]
 
 
 def test_the_changelog_does_not_promise_what_a_limit_denies():
@@ -139,12 +144,13 @@ def test_the_origin_scope_and_everywhere_fields_named_exist(tmp_path):
     seeded = fs.seed("pipeline", tmp_path)
     s = GraphStore(db_path=seeded.db)
     try:
-        res = GraphOperations(s).forget_node(seeded.ctx_ids[0], cascade=True, everywhere=True)
+        res = GraphOperations(s).forget_node(
+            fs.holders(seeded.db, seeded.secret)[0], everywhere=True)
     finally:
         s.close()
     sec = forget_section()
     for field in ("reentry", "cut_in_place", "still_held_by", "model", "model_stale",
-                  "fallback", "identity_note"):
+                  "fallback", "identity_note", "bound_to", "not_bound"):
         assert field in sec, field
     for field in ("reentry", "cut_in_place", "still_held_by", "model", "model_stale"):
         assert field in res, field
@@ -156,12 +162,23 @@ def test_the_origin_scope_and_everywhere_fields_named_exist(tmp_path):
     assert "--list" in out.output and "revien restore forget:<id>" in sec
 
 
-def test_the_copy_rule_in_the_changelog_is_the_one_in_the_code():
-    from revien.forget import gate
+def test_there_is_no_copy_rule_in_the_code_or_the_text():
+    """A capture with another identity lands as written: nothing in the code
+    or the text recognises a copy by its content."""
+    from revien.forget import engine, gate
+    for name in ("COPY_OF_ORIGIN", "COPY_OF_CAPTURE", "COPY_MIN_SHARED", "is_copy_of",
+                 "long_fingerprints", "known_detail", "strip_forgotten_report"):
+        assert not hasattr(gate, name), name
+    assert not hasattr(engine, "COPY_RULE")
+    assert not hasattr(engine.ForgetEngine, "_held_sentences")
     sec = forget_section()
-    assert gate.COPY_OF_ORIGIN == 0.8 and gate.COPY_OF_CAPTURE == 0.5 and gate.COPY_MIN_SHARED == 2
-    assert "at least 80% of the forgotten source's own sentences of 20 or more characters" in sec
-    assert "(and at least two of them)" in sec and "at least half of the capture's own" in sec
+    spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")
+    for text in (sec, spec):
+        assert "80%" not in text and "copy rule" not in text.lower()
+        assert "held what was forgotten" not in text
+        assert "lands as written" in text
+        assert "a copy of the source under a different identity" in text or \
+            "a copy of this source under a different identity" in text
 
 
 def test_the_known_limit_about_concurrent_forgets_is_the_true_one():
@@ -193,11 +210,17 @@ def test_sentences_that_were_false_are_gone_and_the_true_ones_are_there():
         assert "no source is suppressed on a guess" not in text
         assert "Nothing is deleted, cut back to its label or suppressed because of it" not in text
         assert "at most 8 nodes" not in text
-    # what is claimed now (each is exercised in tests/test_forget_round4.py)
+        assert "suppresses future imports" not in text
+        assert "forgets the whole unit" not in text
+    # what is claimed now (each is exercised in tests/test_forget_narrow.py,
+    # test_forget_round3.py and test_forget_round4.py)
     for phrase in (
-            "The only source it suppresses is the forgotten origin's own identity",
+            "Forget is for one specific thing",
+            "To remove a whole conversation, use delete; to keep a specific detail out, forget that detail.",
+            "never the content string Revien gives it",
+            "A capture that does not have that identity lands as written",
             "a node written by several sources keeps all of its owners",
-            "has no single origin, so none of them is suppressed",
+            "has no single origin",
             "Every node whose wording was cut is listed with its source in `cut_in_place`",
             "no surviving node holding what was forgotten",
             "Every such node is named under `other_units` and `still_held_by`",

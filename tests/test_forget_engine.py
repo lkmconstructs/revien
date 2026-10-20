@@ -47,53 +47,60 @@ def audit_ops(store, node_id):
     return [a["op"] for a in store.get_node_audit(node_id)]
 
 
-class TestSessionCascade:
-    def test_removes_the_unit_and_everything_only_it_wrote(self, store, pipe):
-        a = session(pipe, "A", "User: We decided to use postgres for billing. My code is ZEBRA77.")
+def fact_with(store, needle):
+    return [n for n in store.list_nodes(limit=1000)
+            if n.node_type != NodeType.CONTEXT and needle in n.label + n.content][0]
+
+
+class TestOneThingInOneSource:
+    def test_removes_the_node_and_cuts_its_wording_from_its_own_source_only(self, store, pipe):
+        a = session(pipe, "A", "User: We decided to use postgres for billing. We decided to use ZEBRA77 as the codename.")
         b = session(pipe, "B", "User: We decided to use sqlite for the demo.")
-        ops = GraphOperations(store)
+        target = fact_with(store, "ZEBRA77")
         before_b = {n.node_id for n in store.list_nodes(limit=1000)
                     if any(r["unit_id"].endswith(":B") for r in store.get_provenance(n.node_id))}
-        res = ops.forget_node(a.context_node_id, cascade=True)
+        res = GraphOperations(store).forget_node(target.node_id)
         assert res["status"] == "forgotten"
-        assert store.get_node(a.context_node_id) is None
-        assert all(not any(r["unit_id"].endswith(":A") for r in store.get_provenance(n.node_id))
-                   for n in store.list_nodes(limit=1000))
+        assert store.get_node(target.node_id) is None
+        ctx_a = store.get_node(a.context_node_id)
+        assert ctx_a is not None and "ZEBRA77" not in ctx_a.content
+        assert "postgres for billing" in ctx_a.content
         assert before_b <= {n.node_id for n in store.list_nodes(limit=1000)}
         assert store.get_node(b.context_node_id) is not None
 
-    def test_never_deletes_another_units_context_node(self, store, pipe):
+    def test_never_touches_another_units_context_node(self, store, pipe):
         """Invariant 2: even with edges between the two units' nodes."""
-        a = session(pipe, "A", "User: We decided to use postgres for billing.")
+        a = session(pipe, "A", "User: We decided to use postgres for billing. We decided to use ZEBRA77 as the codename.")
         b = session(pipe, "B", "User: We decided to use postgres for the demo.")
         for edge_type in (EdgeType.RELATED_TO, EdgeType.DERIVED_FROM, EdgeType.FOLLOWED_BY):
             store.add_edge(Edge(edge_type=edge_type, source_node_id=a.context_node_id,
                                 target_node_id=b.context_node_id))
             store.add_edge(Edge(edge_type=edge_type, source_node_id=b.context_node_id,
                                 target_node_id=a.context_node_id))
-        GraphOperations(store).forget_node(a.context_node_id, cascade=True)
-        assert store.get_node(b.context_node_id) is not None
+        GraphOperations(store).forget_node(fact_with(store, "ZEBRA77").node_id)
         assert store.get_node(b.context_node_id).content.startswith("User: We decided to use postgres for the demo")
+        assert store.get_node(a.context_node_id) is not None
 
-    def test_a_node_another_unit_vouched_for_in_full_is_kept(self, store, pipe):
-        a = session(pipe, "A", "User: We chose Postgres for orders.")
-        b = session(pipe, "B", "User: We chose Postgres for billing.")
-        pg = [n for n in nodes_by_type(store, NodeType.ENTITY) if n.label == "Postgres"]
-        assert len(pg) == 1
-        assert {r["unit_id"] for r in store.get_provenance(pg[0].node_id)} == {
-            "session:claude-code:A", "session:claude-code:B"}
-        res = GraphOperations(store).forget_node(a.context_node_id, cascade=True)
-        assert store.get_node(pg[0].node_id) is not None
-        assert [r["unit_id"] for r in store.get_provenance(pg[0].node_id)] == [
-            "session:claude-code:B"]                      # ownership moved
-        assert pg[0].node_id in [k["node_id"] for k in res["kept"]]
+    def test_a_carrier_another_unit_vouched_for_in_full_is_kept(self, store):
+        a_ctx = store.add_node(Node(node_type=NodeType.CONTEXT, label="a", content="A: the code ZEBRA77 opens it"),
+                               owner=("session:claude-code:A", 1, 1))
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="b", content="B: it was opened with the code ZEBRA77 again"),
+                       owner=("session:claude-code:B", 1, 1))
+        target = store.add_node(Node(node_type=NodeType.FACT, label="code", content="the code ZEBRA77"),
+                                owner=("session:claude-code:A", 1, 1))
+        carrier = store.add_node(Node(node_type=NodeType.FACT, label="opens", content="the code ZEBRA77 opens it"),
+                                 owner=("session:claude-code:A", 1, 1))
+        store.record_provenance(carrier.node_id, "session:claude-code:B", True, True)
+        res = GraphOperations(store).forget_node(target.node_id)
+        assert store.get_node(carrier.node_id) is not None
+        assert [r["unit_id"] for r in store.get_provenance(carrier.node_id)] == ["session:claude-code:B"]
+        assert carrier.node_id in [k["node_id"] for k in res["kept"]]
+        assert "ZEBRA77" not in store.get_node(a_ctx.node_id).content
 
-    def test_hand_added_nodes_are_never_removed_by_a_cascade(self, store, pipe):
-        a = session(pipe, "A", "User: We chose Postgres for orders.")
+    def test_hand_added_nodes_are_never_removed(self, store, pipe):
+        session(pipe, "A", "User: We chose Postgres for orders. We decided to use ZEBRA77 as the codename.")
         hand = store.add_node(Node(node_type=NodeType.FACT, label="hand", content="typed by hand"))
-        store.add_edge(Edge(edge_type=EdgeType.DERIVED_FROM,
-                            source_node_id=hand.node_id, target_node_id=a.context_node_id))
-        GraphOperations(store).forget_node(a.context_node_id, cascade=True)
+        GraphOperations(store).forget_node(fact_with(store, "ZEBRA77").node_id)
         assert store.get_node(hand.node_id) is not None
 
     def test_labels_compare_unicode_aware(self, store):
@@ -119,27 +126,28 @@ class TestSessionCascade:
         assert "Jürg Meyer" in store.get_node(b_ctx.node_id).content
 
     def test_forgetting_twice_is_not_found(self, store, pipe):
-        a = session(pipe, "A", "User: We chose Postgres for orders.")
+        session(pipe, "A", "User: We chose Postgres for orders. We decided to use ZEBRA77 as the codename.")
+        target = fact_with(store, "ZEBRA77").node_id
         ops = GraphOperations(store)
-        assert ops.forget_node(a.context_node_id, cascade=True)["status"] == "forgotten"
-        assert ops.forget_node(a.context_node_id, cascade=True)["status"] == "not_found"
+        assert ops.forget_node(target)["status"] == "forgotten"
+        assert ops.forget_node(target)["status"] == "not_found"
 
 
-class TestChatGPTCascade:
-    """The earlier attempt's ChatGPT regression: a cascade on one imported
-    conversation must take that conversation and no other."""
+class TestImportedConversations:
+    """A forget of one detail in one imported conversation touches that
+    conversation and no other."""
 
     def test_importer_conversations_are_independent_units(self, store, pipe):
-        c1 = conversation(pipe, "c1", "User: We chose Postgres for orders.\nAssistant: Noted, Postgres.")
+        c1 = conversation(pipe, "c1", "User: We chose Postgres for orders. We decided to use ZEBRA77 as the codename.\nAssistant: Noted.")
         c2 = conversation(pipe, "c2", "User: We chose SQLite for the demo.\nAssistant: Noted, SQLite.")
         n2_before = {n.node_id for n in store.list_nodes(limit=1000)
                      if any(r["unit_id"].endswith("c2") for r in store.get_provenance(n.node_id))}
-        res = GraphOperations(store).forget_node(c1.context_node_id, cascade=True)
+        res = GraphOperations(store).forget_node(fact_with(store, "ZEBRA77").node_id)
         assert res["status"] == "forgotten"
-        assert store.get_node(c1.context_node_id) is None
+        assert "ZEBRA77" not in store.get_node(c1.context_node_id).content
         assert n2_before and n2_before <= {n.node_id for n in store.list_nodes(limit=1000)}
 
-    def test_openai_adapter_conversations_cascade_whole_and_only(self, tmp_path):
+    def test_openai_adapter_conversations_are_cut_one_at_a_time(self, tmp_path):
         from revien.adapters.openai_adapter import OpenAIAdapter
         from tests.forget_seed import _chatgpt_export
         db = str(tmp_path / "oa.db")
@@ -151,17 +159,15 @@ class TestChatGPTCascade:
                 conv["id"] = cid
                 f.write_text(json.dumps(conv))
                 a.ingest_conversation(str(f))
-            # cross-conversation similarity edges join the two units
-            a.store.add_edge(Edge(edge_type=EdgeType.RELATED_TO,
-                                  source_node_id=a.store.list_nodes(source_id="openai:conversation:conv-1", limit=1)[0].node_id,
-                                  target_node_id=a.store.list_nodes(source_id="openai:conversation:conv-2", limit=1)[0].node_id))
-            ctx1 = [n for n in a.store.list_nodes(source_id="openai:conversation:conv-1", limit=50)
-                    if n.node_type == NodeType.CONTEXT and n.content.startswith("OpenAI conversation")][0]
-            n2 = {n.node_id for n in a.store.list_nodes(source_id="openai:conversation:conv-2", limit=50)}
-            res = GraphOperations(a.store).forget_node(ctx1.node_id, cascade=True)
+            n2 = {n.node_id: n.content for n in a.store.list_nodes(source_id="openai:conversation:conv-2", limit=50)}
+            target = fact_with(a.store, "ALPHA11")
+            res = GraphOperations(a.store).forget_node(target.node_id)
             assert res["status"] == "forgotten"
-            assert a.store.list_nodes(source_id="openai:conversation:conv-1", limit=50) == []
-            assert {n.node_id for n in a.store.list_nodes(source_id="openai:conversation:conv-2", limit=50)} == n2
+            assert a.store.get_node(target.node_id) is None
+            assert all(n.content != target.content for n in a.store.list_nodes(
+                source_id="openai:conversation:conv-1", limit=50))
+            assert {n.node_id: n.content for n in a.store.list_nodes(
+                source_id="openai:conversation:conv-2", limit=50)} == n2
 
 
 class TestSingleNodeForget:
@@ -182,8 +188,8 @@ class TestSingleNodeForget:
         # snapshots of the context node were cut too
         for row in store.get_node_audit(a.context_node_id):
             assert "ZEBRA77XQ" not in json.dumps(row)
-        assert res["suppressed"] == [{"unit_id": "session:claude-code:A", "kind": "file"}]
-        assert "suppresses future imports from claude-code session A" in res["blast_radius"]
+        assert res["bound_to"] == [{"unit_id": "session:claude-code:A"}]
+        assert "keeps its wording out of later captures of claude-code session A" in res["blast_radius"]
 
     def test_every_node_carrying_the_wording_goes_too(self, store, pipe):
         session(pipe, "A", self.TEXT)
@@ -195,8 +201,14 @@ class TestSingleNodeForget:
 
     def test_unicode_secret_is_found_in_escaped_audit_json(self, store, pipe, tmp_path):
         secret = "Zoë-密码-ß9"
-        a = session(pipe, "U", f"User: My locker code is {secret}. We decided to use {secret} as codename.")
-        GraphOperations(store).forget_node(a.context_node_id, cascade=True)
+        session(pipe, "U", f"User: We decided to use {secret} as codename.")
+        ops = GraphOperations(store)
+        while True:
+            held = [n for n in store.list_nodes(limit=100)
+                    if n.node_type != NodeType.CONTEXT and secret in n.label + n.content]
+            if not held:
+                break
+            ops.forget_node(held[0].node_id)
         store.close()
         conn = sqlite3.connect(store.db_path)
         try:
@@ -208,17 +220,19 @@ class TestSingleNodeForget:
         assert json.dumps(secret).strip('"').encode() not in raw   # the \u-escaped form
 
     def test_preview_changes_nothing(self, store, pipe):
-        a = session(pipe, "A", self.TEXT)
+        session(pipe, "A", self.TEXT)
+        target = fact_with(store, "ZEBRA77XQ")
         before = (store.count_nodes(), store.count_edges(), len(store.get_all_audit()))
-        res = GraphOperations(store).forget_preview(a.context_node_id)
+        res = GraphOperations(store).forget_preview(target.node_id)
         assert res["status"] == "preview" and res["exists"]
         assert (store.count_nodes(), store.count_edges(), len(store.get_all_audit())) == before
         assert store.list_suppressions(None) == []
 
     def test_forget_audit_row_is_content_free_and_the_verb_is_the_code_path(self, store, pipe):
-        a = session(pipe, "A", self.TEXT)
+        session(pipe, "A", self.TEXT)
         GraphOperations(store).forget_node(
-            a.context_node_id, cascade=True, reason="my password is hunter2", construct_id="hunter2")
+            fact_with(store, "ZEBRA77XQ").node_id, reason="my password is hunter2",
+            construct_id="hunter2")
         rows = [r for r in store.get_all_audit() if r["op"] == "forget"]
         assert rows
         blob = json.dumps(rows)
@@ -240,7 +254,7 @@ class TestSharedNodes:
 
     def test_name_only_vouching_cuts_back_to_the_label_and_logs_it(self, store):
         a_ctx, b_ctx, shared = self._shared(store, same_words=False)
-        res = GraphOperations(store).forget_node(a_ctx.node_id, cascade=True)
+        res = GraphOperations(store).forget_node(shared.node_id)
         node = store.get_node(shared.node_id)
         assert node is not None and node.content == node.label == "deploys on fridays"
         assert "ZEBRA77" not in json.dumps(node.model_dump(mode="json"))
@@ -250,20 +264,14 @@ class TestSharedNodes:
         assert "ZEBRA77" not in json.dumps(entry) and entry["before"] is None
         assert "cut_back_at" in node.metadata
         assert store.get_node(b_ctx.node_id) is not None
+        assert "ZEBRA77" not in store.get_node(a_ctx.node_id).content
 
-    def test_full_vouching_leaves_the_node_untouched(self, store):
+    def test_a_node_written_in_full_by_two_units_is_forgotten_from_both(self, store):
         a_ctx, b_ctx, shared = self._shared(store, same_words=True)
-        res = GraphOperations(store).forget_node(a_ctx.node_id, cascade=True)
-        node = store.get_node(shared.node_id)
-        assert node.content == "we deploy on fridays ZEBRA77"
-        assert shared.node_id not in res["cut_back"]
-        assert [r["unit_id"] for r in store.get_provenance(shared.node_id)] == ["session:claude-code:B"]
-
-    def test_no_voucher_means_removed_with_the_unit(self, store):
-        a_ctx, _b, shared = self._shared(store, same_words=True)
-        store.delete_provenance(shared.node_id, ["session:claude-code:B"])
-        GraphOperations(store).forget_node(a_ctx.node_id, cascade=True)
+        res = GraphOperations(store).forget_node(shared.node_id)
         assert store.get_node(shared.node_id) is None
+        assert sorted(b["unit_id"] for b in res["bound_to"]) == [
+            "session:claude-code:A", "session:claude-code:B"]
 
     def test_pipeline_merge_records_what_each_unit_vouched_for(self, store, pipe):
         session(pipe, "A", "User: We chose Postgres for orders.")
@@ -294,9 +302,10 @@ class TestRefusal:
         assert (store.count_nodes(), store.count_edges(), len(store.get_all_audit())) == before
         assert store.list_suppressions(None) == []
         assert store.get_node(para.node_id) is not None
-        # the user can then forget the whole conversation
-        assert GraphOperations(store).forget_node(ctx.node_id, cascade=True)["status"] == "forgotten"
-        assert store.get_node(para.node_id) is None
+        # a whole conversation is removed with delete, not forget
+        refused = GraphOperations(store).forget_node(ctx.node_id)
+        assert refused["status"] == "refused"
+        assert GraphOperations(store).delete_node(ctx.node_id) is True
 
 
 class TestUnprovenOwnership:
@@ -307,10 +316,12 @@ class TestUnprovenOwnership:
         legacy = store.add_node(Node(node_type=NodeType.FACT, label="shared fact",
                                      content="we deploy on fridays"))
         store.record_provenance(legacy.node_id, "unproven:", False, False)
-        a_ctx = store.add_node(Node(node_type=NodeType.CONTEXT, label="a", content="A: we deploy on fridays"),
-                               owner=("session:claude-code:A", 1, 1))
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="a", content="A: we deploy on fridays"),
+                       owner=("session:claude-code:A", 1, 1))
         store.record_provenance(legacy.node_id, "session:claude-code:A", True, False)
-        res = GraphOperations(store).forget_node(a_ctx.node_id, cascade=True)
+        target = store.add_node(Node(node_type=NodeType.FACT, label="schedule", content="we deploy on fridays"),
+                                owner=("session:claude-code:A", 1, 1))
+        res = GraphOperations(store).forget_node(target.node_id)
         assert store.get_node(legacy.node_id) is not None
         assert legacy.node_id in res["unproven"] or not res["forgotten"].count(legacy.node_id)
         assert legacy.node_id not in res["forgotten"]
@@ -333,9 +344,12 @@ class TestUnprovenOwnership:
         conn.commit()
         assert [r["unit_id"] for r in store.get_provenance(ctx.node_id)] == ["session:claude-code:old"]
         assert store.get_provenance(fact.node_id)[0]["unit_id"].startswith("unproven:")
-        res = GraphOperations(store).forget_node(ctx.node_id, cascade=True)
+        target = store.add_node(Node(node_type=NodeType.DECISION, label="the code", content="code ZEBRA77 here"),
+                                owner=("session:claude-code:old", 1, 1))
+        res = GraphOperations(store).forget_node(target.node_id)
         assert res["status"] == "forgotten"
-        assert store.get_node(ctx.node_id) is None
+        assert store.get_node(target.node_id) is None
+        assert "ZEBRA77" not in store.get_node(ctx.node_id).content
         assert store.get_node(fact.node_id) is not None            # kept, not deleted
         assert store.get_node(other.node_id) is not None
         assert fact.node_id in res["cut_back"] and fact.node_id not in res["unproven"]

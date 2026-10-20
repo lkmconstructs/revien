@@ -2653,6 +2653,17 @@ class GraphStore(ForgetStoreMixin):
         from revien.forget import gate as forget_gate
         from revien.forget import scrub as forget_scrub
         owners: dict = {}
+        # A session's record names the id inside the file (and the file) its
+        # other nodes came from: the id is the identity, the file name is not.
+        session_ids: dict = {}
+        for n in graph.nodes:
+            md = n.metadata if isinstance(n.metadata, dict) else {}
+            caller = md.get("caller") if isinstance(md.get("caller"), dict) else {}
+            inner = caller.get("session_id")
+            if (n.node_type.value == "context" and n.origin_runtime == "claude-code"
+                    and n.session_key and isinstance(inner, str) and inner.strip()):
+                session_ids[(n.origin_runtime, n.session_key)] = (
+                    inner.strip(), caller.get("path"))
         with self.transaction(immediate=True):
             kept_nodes = []
             dropped_ids = set()
@@ -2662,6 +2673,11 @@ class GraphStore(ForgetStoreMixin):
                     node.source_id, node.metadata)
                 md = node.metadata if isinstance(node.metadata, dict) else {}
                 path = md.get("path") if isinstance(md.get("path"), str) else None
+                named = session_ids.get((node.origin_runtime, node.session_key))
+                if named is not None and likely:
+                    likely = f"session:{node.origin_runtime}:{named[0]}"
+                    if path is None and isinstance(named[1], str):
+                        path = named[1]
                 ref = forget_gate.UnitRef(likely, path)
                 # A node of a forgotten unit, or whose whole text was
                 # forgotten, is not brought back. Its label alone decides
@@ -2671,9 +2687,8 @@ class GraphStore(ForgetStoreMixin):
                     dropped_ids.add(node.node_id)
                     continue
                 # The standing denylist: sentences forgotten from this origin
-                # (or a copy of it) are left out of an imported node; a node
+                # are left out of an imported node; a node
                 # that was only a forgotten sentence is not imported.
-                original = node.content
                 cleaned, left_out = forget_gate.strip_forgotten(
                     self, ref, node.content)
                 if left_out:
@@ -2683,7 +2698,7 @@ class GraphStore(ForgetStoreMixin):
                         continue
                     node.content = cleaned
                 new_label, label_out = forget_gate.strip_forgotten(
-                    self, ref, node.label, match_content=original + "\n" + node.label)
+                    self, ref, node.label)
                 if label_out:
                     first = next(iter(forget_scrub.iter_sentences(node.content)), None)
                     node.label = (new_label.strip()
