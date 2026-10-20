@@ -116,12 +116,9 @@ def register(store, unit: UnitRef) -> None:
 
 def _capture_keys(unit: UnitRef) -> set:
     """Every key that names where this capture comes from: its file (real
-    path, inode) and the id inside it, when it has one."""
+    path, inode). The id inside it (``unit.sid``) is compared by ``binds``."""
     verified = unit.path if (unit.path and is_real_file(unit.path)) else None
-    keys = set(identity_keys(verified)) if verified else set()
-    if unit.sid:
-        keys.add(unit.sid)
-    return keys
+    return set(identity_keys(verified)) if verified else set()
 
 
 def _id_based(unit_id: str) -> bool:

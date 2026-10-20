@@ -537,6 +537,7 @@ class TestBindings:
         _put(store, identity_keys(str(f)), self.S)
         long_fps = gate.known(store, gate.UnitRef(None, str(f)))[0]
         assert fingerprint(self.S) in long_fps
+        assert gate.known(store, gate.UnitRef(None, None))[0] == set()      # no identity at all
         g = tmp_path / "b.md"
         g.write_text("y")
         long_fps = gate.known(store, gate.UnitRef(None, str(g)))[0]
