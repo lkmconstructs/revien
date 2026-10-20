@@ -2675,7 +2675,11 @@ class GraphStore(ForgetStoreMixin):
                 path = md.get("path") if isinstance(md.get("path"), str) else None
                 named = session_ids.get((node.origin_runtime, node.session_key))
                 if named is not None and likely:
-                    likely = f"session:{node.origin_runtime}:{named[0]}"
+                    canonical = f"session:{node.origin_runtime}:{named[0]}"
+                    # the ownership row names the session by the id inside
+                    # the file, not by the file name
+                    unit_id = unit_id.replace(likely, canonical)
+                    likely = canonical
                     if path is None and isinstance(named[1], str):
                         path = named[1]
                 ref = forget_gate.UnitRef(likely, path)

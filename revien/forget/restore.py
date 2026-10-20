@@ -109,12 +109,8 @@ def plan_restore(store, arg: str) -> Dict:
                 "lifts": [_summarize(r) for r in hits]}
     hits = _match_one(records, arg)
     if hits:
-        if len(hits) > 1 and not os.path.exists(arg):
-            return {"status": "ambiguous", "mode": "single",
-                    "candidates": [_summarize(r) for r in hits],
-                    "message": f"'{arg}' names {len(hits)} forget records. "
-                               "Restore one by its full path, or lift several "
-                               "with an explicit pattern."}
+        # an exact path, unit id or record id lifts every record bound to
+        # it (the caller lists them first); only a bare name is ambiguous
         return {"status": "ok", "mode": "single",
                 "lifts": [_summarize(r) for r in hits]}
     # A bare name: list candidates, never lift them.

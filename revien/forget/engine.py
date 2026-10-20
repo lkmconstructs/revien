@@ -171,9 +171,13 @@ class ForgetEngine:
             return any(_word_in(label, w) for w in primary)
         return False
 
-    @staticmethod
-    def _likely_unit(node: Node) -> Optional[str]:
+    def _likely_unit(self, node: Node) -> Optional[str]:
         from revien.graph.units import node_likely_unit
+        # the unit its unproven marker names was recorded with the node (a
+        # graph import records the id inside the session file there)
+        for r in self.store.get_provenance(node.node_id):
+            if r["unit_id"].startswith("unproven:") and len(r["unit_id"]) > 9:
+                return r["unit_id"][len("unproven:"):]
         md = node.metadata if isinstance(node.metadata, dict) else {}
         return node_likely_unit(node.origin_runtime, node.session_key,
                                 node.source_id, md.get("ingest_key"))
@@ -182,9 +186,13 @@ class ForgetEngine:
         out: Dict[str, Node] = {}
         conn = self.store._get_conn()
         with self.store._lock:
+            # SQLite's own lower() folds ASCII only ('Élodie' stays 'Élodie'),
+            # so the prefilter lowers in Python, as the match itself does.
+            conn.create_function("ulower", 1, lambda t: (t or "").lower(),
+                                 deterministic=True)
             for w in primary:
                 for (nid,) in conn.execute(
-                        "SELECT node_id FROM nodes WHERE instr(lower(label || "
+                        "SELECT node_id FROM nodes WHERE instr(ulower(label || "
                         "char(10) || content), ?) > 0", (w.lower(),)):
                     if nid in out or is_tombstone(nid):
                         continue

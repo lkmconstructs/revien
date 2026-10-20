@@ -124,16 +124,38 @@ def _capture_keys(unit: UnitRef) -> set:
     return keys
 
 
+def _id_based(unit_id: str) -> bool:
+    """Units named by an id inside the source (a session id, a conversation
+    or highlight id), not by where the file is."""
+    return unit_id.startswith(("session:claude-code:", "item:"))
+
+
 def binds(rec: Dict, unit: UnitRef, keys: set) -> bool:
     """Does a record speak about THIS capture? Only if it comes from the
     source the wording was forgotten from: the same unit id, or the same file
     by real path or inode (or the id inside it). A different source that
     happens to hold one of the same sentences is not covered, and neither is a
-    copy under a different identity."""
+    copy under a different identity. Strong identities that contradict each
+    other (another Codex id, another session id, another inode) make it a new
+    origin even where the path is the same."""
     covered = set(rec["path_keys"])
+    rec_sids = {k for k in covered if k.startswith("sid:")}
+    if unit.sid and rec_sids:
+        # the id inside the file is the strongest identity either way
+        return unit.sid in rec_sids
     if unit.stable and f"unit:{unit.unit_id}" in covered:
         return True
-    return bool(keys and keys & covered)
+    if not (keys and keys & covered):
+        return False
+    rec_units = {k[len("unit:"):] for k in covered if k.startswith("unit:")}
+    if unit.stable and _id_based(unit.unit_id) and any(
+            _id_based(u) and u != unit.unit_id for u in rec_units):
+        return False
+    rec_inodes = {k for k in covered if k.startswith("inode:")}
+    cap_inodes = {k for k in keys if k.startswith("inode:")}
+    if rec_inodes and cap_inodes and not rec_inodes & cap_inodes:
+        return False
+    return True
 
 
 # The wording that was forgotten is also kept as keyed fingerprints of its
@@ -152,7 +174,7 @@ def _form(text: str) -> str:
     toks = list(_WORD.finditer(text))
     if toks:
         text = text[toks[0].start():toks[-1].end()]
-    return text.casefold()
+    return text.lower()        # simple case folding: what the cut itself uses
 
 
 def window_fps_for(wordings: Iterable[str]) -> List[str]:
