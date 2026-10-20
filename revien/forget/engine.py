@@ -39,8 +39,8 @@ from revien.graph.units import (
 
 TOMBSTONE_PREFIX = "tombstone:"
 VERB = "forget"
-WHOLE_CONVERSATION = ("To remove a whole conversation, use delete; to keep a "
-                      "specific detail out, forget that detail.")
+WHOLE_CONVERSATION = ("To remove a whole conversation or file, use delete; to "
+                      "keep a specific detail out, forget that detail.")
 NO_IDENTITY_NOTE = ("this capture came through a shared channel, which gives "
                     "it no identity of its own, so nothing is kept out of a "
                     "later capture of it; use --everywhere to keep this "
@@ -557,8 +557,10 @@ class ForgetEngine:
                 "unit_id": f"forget:{uuid.uuid4()}", "scope": "origin",
                 "path_keys": sorted(set(covered)),
                 "wording_fps": fingerprints(wording),
+                # (only the wording itself: a fact's extractor label is a
+                # fragment of it, not something the user named)
                 "window_fps": gate.window_fps_for(
-                    scrub.clean_strings(node_wording(plan.target))),
+                    scrub.clean_strings(stated(plan.target))),
                 "sentence_fps": long_fps, "short_fps": short_fps})
         if plan.everywhere_strings:
             # (the wording is matched in any sentence by its windows, so no

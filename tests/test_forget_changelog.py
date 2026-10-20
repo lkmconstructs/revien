@@ -216,7 +216,7 @@ def test_sentences_that_were_false_are_gone_and_the_true_ones_are_there():
     # test_forget_round3.py and test_forget_round4.py)
     for phrase in (
             "Forget is for one specific thing",
-            "To remove a whole conversation, use delete; to keep a specific detail out, forget that detail.",
+            "To remove a whole conversation or file, use delete; to keep a specific detail out, forget that detail.",
             "never the content string Revien gives it",
             "A capture that does not have that identity lands as written",
             "a node written by several sources keeps all of its owners",

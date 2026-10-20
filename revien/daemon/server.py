@@ -1161,9 +1161,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── GET /v1/nodes/{id}/forget/preview ──────────────
     @app.get("/v1/nodes/{node_id}/forget/preview")
-    async def forget_preview(node_id: str, everywhere: bool = Query(False)):
+    async def forget_preview(node_id: str, everywhere: bool = Query(False),
+                             cascade: Optional[bool] = Query(None)):
         """What a forget WOULD do (nodes removed, cut back, kept; the sources
         the wording is kept out of). Writes nothing."""
+        _no_cascade(cascade)
         preview = ops._forget_engine().forget(
             node_id, dry_run=True, everywhere=everywhere)
         if preview.get("status") in ("not_found", "skipped"):
@@ -1172,7 +1174,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return preview
 
     # ── POST /v1/nodes/{id}/forget ─────────────────────
+    def _no_cascade(value) -> None:
+        if value is not None:
+            raise HTTPException(400, detail={
+                "status": "refused", "reason": "cascade_removed",
+                "message": "cascade was removed: forget names one specific "
+                           "thing. To remove a whole conversation or file, "
+                           "use delete (DELETE /v1/nodes/{id})."})
+
     class ForgetRequest(BaseModel):
+        cascade: Optional[bool] = None      # removed: any value is a 400
         # Also remove the wording from every other unit that holds it (the
         # default forgets it from this node's source only and names the rest).
         everywhere: bool = False
@@ -1197,6 +1208,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         from revien.daemon.heartbeat import FORGET_REQUIRES, daemons_lacking
 
         req = request or ForgetRequest()
+        _no_cascade(req.cascade)
         old = daemons_lacking(store, FORGET_REQUIRES, exclude_pid=os.getpid())
         if old:
             raise HTTPException(409, detail={

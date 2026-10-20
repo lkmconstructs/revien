@@ -162,7 +162,7 @@ class TestSweepsAndCleanup:
             detail = r.json()["detail"]
             assert detail["status"] == "refused" and ctx.node_id in detail["message"]
             # a conversation is removed with delete, not forget
-            whole = "To remove a whole conversation, use delete; to keep a specific detail out, forget that detail."
+            whole = "To remove a whole conversation or file, use delete; to keep a specific detail out, forget that detail."
             r = client.post(f"/v1/nodes/{ctx.node_id}/forget", json={})
             assert r.status_code == 409 and r.json()["detail"]["message"] == whole
             prev = client.get(f"/v1/nodes/{ctx.node_id}/forget/preview")

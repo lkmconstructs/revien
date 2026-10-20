@@ -1014,8 +1014,8 @@ class GraphStore(ForgetStoreMixin):
         ``owner`` is ``(unit_id, label_ok, wording_ok)``: the writer's record
         of who wrote this node, stored in the same commit as the node
         (docs/FORGET_SPEC.md §3). A writer with no unit passes nothing and
-        the node has no ownership row, i.e. it is never removed by a
-        cascade."""
+        the node has no ownership row, i.e. a forget of another node
+        never removes it."""
         self._check_validity_window(node.valid_from, node.valid_until)
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.

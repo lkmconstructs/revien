@@ -148,6 +148,30 @@ class TestTheDenylistIsBoundToTheOrigin:
         assert not holders_of(db, NAME)
         assert "catering is confirmed" in " ".join(n.content for n in nodes(db))
 
+    def test_a_facts_extractor_label_is_not_wording_a_later_sentence_may_not_say(self, tmp_path):
+        """Forgetting "the API through Kong." must not keep out an unrelated
+        sentence that only shares the extractor's label ("through Kong"); a
+        new sentence with the whole wording is still left out."""
+        root = tmp_path / "kong"
+        db = str(tmp_path / "kong.db")
+        base = [("user", "We decided to expose the API through Kong."),
+                ("user", "The venue is booked for the whole of June.")]
+        write_session(root, "p", "s1", "uuid-K", base)
+        sync(db, root)
+        fact = [n for n in nodes(db) if n.node_type == NodeType.FACT and n.content == "the API through Kong."]
+        assert fact and fact[0].label == "through Kong"
+        s = GraphStore(db_path=db)
+        GraphOperations(s).forget_node(fact[0].node_id)
+        s.close()
+        write_session(root, "p", "s1", "uuid-K", base + [
+            ("user", "Later we routed billing through Kong too."),
+            ("user", "Someone asked about the API through Kong again.")])
+        sync(db, root)
+        body = " ".join(n.content for n in nodes(db) if n.node_type == NodeType.CONTEXT)
+        assert "Later we routed billing through Kong too" in body        # unrelated: lands
+        assert "the API through Kong" not in body                         # the wording: out
+        assert "venue is booked" in body
+
     def test_the_name_inside_a_longer_word_is_not_the_name(self, tmp_path):
         root = tmp_path / "c"
         db = str(tmp_path / "w.db")
@@ -265,7 +289,7 @@ class TestAConversationIsRefused:
         res = GraphOperations(s).forget_node(ctx.node_id)
         s.close()
         assert res["status"] == "refused" and res["reason"] == "whole_conversation"
-        assert res["message"] == ("To remove a whole conversation, use delete; "
+        assert res["message"] == ("To remove a whole conversation or file, use delete; "
                                   "to keep a specific detail out, forget that detail.")
         assert res["message"] == WHOLE_CONVERSATION
         assert self._snapshot(db) == before
@@ -287,6 +311,7 @@ class TestAConversationIsRefused:
 
     def test_cascade_is_gone_everywhere(self, tmp_path):
         db, ctx = self._seed(tmp_path)
+        before = self._snapshot(db)
         out = CliRunner().invoke(main, ["forget", "--help"])
         assert "--cascade" not in out.output and "--everywhere" in out.output
         s = GraphStore(db_path=db)
@@ -295,7 +320,14 @@ class TestAConversationIsRefused:
         s.close()
         with TestClient(create_app(db_path=db)) as client:
             r = client.get(f"/v1/nodes/{ctx.node_id}/forget/preview", params={"cascade": "true"})
-            assert r.json()["status"] == "refused"          # the parameter means nothing
+            assert r.status_code == 400 and "use delete" in r.json()["detail"]["message"]
+            for body in ({"cascade": True}, {"cascade": False}):
+                r = client.post(f"/v1/nodes/{ctx.node_id}/forget", json=body)
+                assert r.status_code == 400
+                assert r.json()["detail"]["reason"] == "cascade_removed"
+                assert "cascade was removed" in r.json()["detail"]["message"]
+                assert "use delete" in r.json()["detail"]["message"]
+        assert self._snapshot(db) == before
 
     def test_delete_is_how_a_conversation_goes(self, tmp_path):
         db, ctx = self._seed(tmp_path)
