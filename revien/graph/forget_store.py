@@ -70,7 +70,9 @@ class ForgetStoreMixin:
         -- scope 'origin': the sentences are kept out of captures that come
         -- from the forgotten origin (its unit id, its file identity, or a
         -- copy of it recognised by signature_fps, the keyed fingerprints of
-        -- the origin's own sentences). scope 'global': the exact wording a
+        -- the origin's own sentences; held_fps: of those, the ones that held
+        -- what was forgotten, the only ones a copy recognised by content alone
+        -- loses). scope 'global': the exact wording a
         -- forget --everywhere targeted, kept out of every source.
         CREATE TABLE IF NOT EXISTS suppressions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +85,7 @@ class ForgetStoreMixin:
             sentence_fps TEXT NOT NULL DEFAULT '[]',
             short_fps TEXT NOT NULL DEFAULT '[]',
             signature_fps TEXT NOT NULL DEFAULT '[]',
+            held_fps TEXT NOT NULL DEFAULT '[]',
             scope TEXT NOT NULL DEFAULT 'origin',
             file_fp TEXT,
             created_at TEXT NOT NULL,
@@ -135,6 +138,7 @@ class ForgetStoreMixin:
                 ("sentence_fps", "TEXT NOT NULL DEFAULT '[]'"),
                 ("short_fps", "TEXT NOT NULL DEFAULT '[]'"),
                 ("signature_fps", "TEXT NOT NULL DEFAULT '[]'"),
+                ("held_fps", "TEXT NOT NULL DEFAULT '[]'"),
                 ("scope", "TEXT NOT NULL DEFAULT 'origin'")):
             if col not in have:
                 conn.execute(f"ALTER TABLE suppressions ADD COLUMN {col} {ddl}")
@@ -331,12 +335,13 @@ class ForgetStoreMixin:
             "short_fps": json.loads(r[14] or "[]"),
             "signature_fps": json.loads(r[15] or "[]"),
             "scope": r[16] or "origin",
+            "held_fps": json.loads(r[17] or "[]"),
         }
 
     _SUPPRESSION_COLS = (
         "id, unit_id, kind, path, path_keys, content_fps, wording_fps, "
         "file_fp, created_at, actor, status, lifted_at, lifted_by, sentence_fps, short_fps, "
-        "signature_fps, scope")
+        "signature_fps, scope, held_fps")
 
     @_locked
     def add_suppression(
@@ -347,6 +352,7 @@ class ForgetStoreMixin:
         short_fps: Optional[List[str]] = None,
         signature_fps: Optional[List[str]] = None,
         scope: str = "origin",
+        held_fps: Optional[List[str]] = None,
     ) -> int:
         """Write (or extend) the active record for a unit. A second forget of
         the same unit merges its fingerprints into the one record."""
@@ -363,7 +369,7 @@ class ForgetStoreMixin:
                 "UPDATE suppressions SET kind = ?, path = COALESCE(?, path), "
                 "path_keys = ?, content_fps = ?, wording_fps = ?, "
                 "sentence_fps = ?, short_fps = ?, signature_fps = ?, "
-                "file_fp = COALESCE(?, file_fp) WHERE id = ?",
+                "held_fps = ?, file_fp = COALESCE(?, file_fp) WHERE id = ?",
                 (kind, path,
                  json.dumps(sorted(set(cur["path_keys"]) | set(path_keys))),
                  json.dumps(sorted(set(cur["content_fps"]) | set(content_fps))),
@@ -371,19 +377,22 @@ class ForgetStoreMixin:
                  json.dumps(sorted(set(cur["sentence_fps"]) | set(sentence_fps or []))),
                  json.dumps(sorted(set(cur["short_fps"]) | set(short_fps or []))),
                  json.dumps(sorted(set(cur["signature_fps"]) | set(signature_fps or []))),
+                 json.dumps(sorted(set(cur["held_fps"]) | set(held_fps or []))),
                  file_fp, cur["id"]))
             self._commit(conn)
             return cur["id"]
         cur = conn.execute(
             "INSERT INTO suppressions (unit_id, kind, path, path_keys, "
             "content_fps, wording_fps, sentence_fps, short_fps, signature_fps, "
-            "scope, file_fp, created_at, actor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "scope, held_fps, file_fp, created_at, actor) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (unit_id, kind, path, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(content_fps))),
              json.dumps(sorted(set(wording_fps))),
              json.dumps(sorted(set(sentence_fps or []))),
              json.dumps(sorted(set(short_fps or []))),
              json.dumps(sorted(set(signature_fps or []))), scope,
+             json.dumps(sorted(set(held_fps or []))),
              file_fp, _now(), actor))
         self._commit(conn)
         return cur.lastrowid

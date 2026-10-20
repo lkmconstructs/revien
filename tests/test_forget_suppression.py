@@ -289,7 +289,13 @@ class TestFileBackedUnitsLiftOnlyWhenTheFileChanges:
         with TestClient(create_app(db_path=seeded.db)) as client:
             r = client.post("/v1/ingest", json={
                 "source_id": "elsewhere", "content": content})
-            assert r.json()["suppressed"] is True
+            # recognised as a copy by content alone (it has no id and no
+            # path): it is not refused whole, the sentences that held what was
+            # forgotten are left out and the response says so
+            body = r.json()
+            assert body["suppressed"] is False
+            assert body["left_out"]["matched_by"] == "content"
+        assert not has_secret(seeded)
 
     def test_a_case_changed_path_names_the_same_unit(self, tmp_path, monkeypatch):
         seeded = fs.seed("file_watcher", tmp_path, monkeypatch)
@@ -423,8 +429,10 @@ class TestOtherGates:
         GraphOperations(store).forget_node(seeded.ctx_ids[0], cascade=True)
         result = store.import_graph(graph, mode="merge")
         store.close()
-        assert result["skipped_suppressed"] == len(graph.nodes)
-        assert result["nodes_added"] == 0
+        # the nodes of the forgotten unit, and the sentences that held what was
+        # forgotten, do not come back (what remains of the context node is a
+        # copy recognised by content only: the rest of it lands)
+        assert result["skipped_suppressed"] >= len(graph.nodes) - 1
         assert not has_secret(seeded)
 
     def test_rest_graph_import_is_gated_too(self, tmp_path, monkeypatch):

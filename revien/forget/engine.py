@@ -480,6 +480,96 @@ class ForgetEngine:
                 out.append(n.content)
         return out
 
+    #: A token that can be a secret: at least 6 characters and a digit (a
+    #: code, a key, a PIN, a number-bearing name). See _held_sentences.
+    _IDENTIFIER = re.compile(r"\w*\d\w*", re.UNICODE)
+
+    def _identifier_tokens(self, text: str) -> Set[str]:
+        return {t.casefold() for t in self._IDENTIFIER.findall(scrub.nfc(text or ""))
+                if len(t) >= 6}
+
+    def _held_sentences(self, plan: Plan) -> List[str]:
+        """The sentences that HELD what was forgotten: the only ones a copy
+        recognised by content alone (no id, and no path or inode that
+        matches) loses. Everything else in such a copy lands, a shared
+        template and boilerplate included.
+
+        Node-level forget (a fact, a decision, an entity): the sentences, in
+        the forgotten source's stored conversation and in the forgotten
+        nodes' own text, that contain the wording of the forgotten node as
+        whole words (at least 8 characters of it).
+
+        Cascade (or a forgotten context node): a sentence of the forgotten
+        record is held when either
+          (a) it contains the wording of a node this forget removed, cut back
+              or cut (a fact's, decision's or preference's text; at least 8
+              characters; not an entity's bare name), and no node another
+              live unit vouches for contains that wording; or
+          (b) it contains a secret-shaped token (6 or more characters with a
+              digit: a code, a key, a PIN) that no node another live unit
+              vouches for uses, whether or not the extractor made a node of it.
+        A sentence that yielded no forgotten node and has no such token, one
+        whose wording another live unit also uses, and boilerplate lands."""
+        gone = [n for n in plan.remove + plan.cut_back + plan.legacy_cut
+                if not is_holder(n)]
+        texts: List[str] = [h.content for h in plan.holders]
+        for unit_id in plan.units:
+            texts += self._holder_texts(unit_id)
+        out: List[str] = []
+        target_holder = is_holder(plan.target)
+        if not (plan.cascade or target_holder):
+            wording = [w for w in scrub.clean_strings(
+                [plan.target.content] + [n.content for n in gone])
+                if len(w) >= scrub.MIN_SHORT]
+            for t in texts + [n.content for n in gone] + [plan.target.content]:
+                out += self._sentences_containing(t, wording)
+            return list(dict.fromkeys(out))
+        # (a) the wording of what the extractor made of the record
+        # (an entity is only a name the extractor lifted out of a capitalised
+        # phrase, "This tool" as often as a person: its name alone does not
+        # make a sentence held, or ordinary lines of a document would go)
+        taken = [n for n in plan.remove + plan.cut_back + plan.legacy_cut
+                 if n.node_type not in (NodeType.CONTEXT, NodeType.SKILL, NodeType.ENTITY)
+                 and not (n.metadata or {}).get("verbatim")]
+        wording: List[str] = []
+        for n in taken:
+            wording += [p.strip() for p in (n.content, n.label)
+                        if len((p or "").strip()) >= scrub.MIN_SHORT]
+        for u in plan.unproven:
+            if not is_holder(u) and len((u.content or "").strip()) >= 12 and any(
+                    scrub.contains(t, [u.content.strip()]) for t in texts):
+                wording += [p.strip() for p in (u.content, u.label)
+                            if len((p or "").strip()) >= scrub.MIN_SHORT]
+        tokens: Set[str] = set()
+        for t in texts:
+            tokens |= self._identifier_tokens(t)
+        wording = scrub.clean_strings(wording)
+        if not wording and not tokens:
+            return []
+        forgotten_units = set(plan.units)
+        skip = {n.node_id for n in plan.remove + plan.cut_back + plan.legacy_cut} | {plan.target.node_id}
+        conn = self.store._get_conn()
+        with self.store._lock:
+            vouched = set()
+            for nid, unit in conn.execute("SELECT node_id, unit_id FROM node_provenance"):
+                if not is_unproven(unit) and unit not in forgotten_units:
+                    vouched.add(nid)
+            elsewhere = [f"{label}\n{content}" for nid, label, content in
+                         conn.execute("SELECT node_id, label, content FROM nodes")
+                         if nid in vouched and nid not in skip and not is_tombstone(nid)]
+        shared_tokens: Set[str] = set()
+        for text in elsewhere:
+            shared_tokens |= self._identifier_tokens(text) & tokens
+        tokens -= shared_tokens
+        wording = [w for w in wording
+                   if not any(scrub.contains(text, [w]) for text in elsewhere)]
+        needles = wording + sorted(tokens)
+        if not needles:
+            return []
+        for t in texts:
+            out += self._sentences_containing(t, needles)
+        return list(dict.fromkeys(out))
+
     def _forgotten_keys(self, plan: Plan) -> List[str]:
         """Every sentence this forget takes out (before anything is cut): the
         sentences of what is removed, the sentences that hold the wording in
@@ -516,8 +606,11 @@ class ForgetEngine:
         store = self.store
         specs = []
         gone = plan.remove + plan.cut_back + plan.legacy_cut
-        wording = [n.content for n in gone] + [n.label for n in gone] \
-            + [plan.target.content, plan.target.label]
+        # (what counts as a forgotten node's own text: not the whole record of
+        # a source, which a copy recognised by content alone must not be
+        # refused for)
+        nodes_text = [n for n in gone + [plan.target] if not is_holder(n)]
+        wording = [n.content for n in nodes_text] + [n.label for n in nodes_text]
         denylist_keys = self._forgotten_keys(plan)
         signature_texts: List[str] = []
         covered: List[str] = []
@@ -570,6 +663,7 @@ class ForgetEngine:
             "content_fps": [], "wording_fps": fingerprints(wording),
             "sentence_fps": long_fps, "short_fps": short_fps, "file_fp": None,
             "signature_fps": sorted(signature), "scope": "origin",
+            "held_fps": fingerprints(self._held_sentences(plan)),
         }
         global_spec = None
         if plan.everywhere_strings:
@@ -626,7 +720,8 @@ class ForgetEngine:
                     w["unit_id"], "wording", None, w["path_keys"], [],
                     w["wording_fps"], None, actor,
                     sentence_fps=w["sentence_fps"], short_fps=w["short_fps"],
-                    signature_fps=w["signature_fps"], scope=w["scope"])
+                    signature_fps=w["signature_fps"], scope=w["scope"],
+                    held_fps=w.get("held_fps"))
                 store.record_audit(f"suppression:{sid}", "suppress", actor=actor,
                                    after={"kind": "wording", "scope": w["scope"],
                                           "verb": VERB}, ts=now)

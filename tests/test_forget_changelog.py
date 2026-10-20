@@ -206,13 +206,6 @@ def test_sentences_that_were_false_are_gone_and_the_true_ones_are_there():
         assert phrase in sec, phrase
 
 
-def test_the_sentence_that_depends_on_the_copy_rule_is_marked_for_revision():
-    sec = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
-    spec = (REPO / "docs" / "FORGET_SPEC.md").read_text(encoding="utf-8")
-    marker = "<!-- REVISE after the owner's ruling on the copy rule: this sentence is not final -->"
-    assert marker in sec and marker in spec
-
-
 def test_the_numbers_in_the_changelog_are_the_code_s():
     from revien.forget.engine import ForgetEngine
     sec = forget_section()

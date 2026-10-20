@@ -217,6 +217,30 @@ class IngestionOutput:
     # must not come back). Nothing was written. suppression_note says why.
     suppressed: bool = False
     suppression_note: str = ""
+    # Set when sentences were left out of this capture because a forget said
+    # they must not come back (never the text itself): {"left_out": n,
+    # "lines": [...], "matched_by": "identity" | "content" | "both",
+    # "sources": [...]}, and a sentence saying so in left_out_note.
+    left_out: Optional[Dict] = None
+    left_out_note: str = ""
+
+
+def _left_out_note(report: Dict) -> str:
+    """What was left out of a capture, said without saying the text."""
+    lines = ", ".join(str(n) for n in report["lines"])
+    n = report["left_out"]
+    what = f"{n} sentence(s) (line {lines})"
+    if report["matched_by"] == "content":
+        return (f"{what} left out: this looks like a copy of a source that "
+                "was forgotten, recognised by its content and not by an "
+                "identity, so only the sentences that held what was "
+                "forgotten were removed. The rest of it was kept.")
+    if report["matched_by"] == "both":
+        return (f"{what} left out: some come from a source that was "
+                "forgotten (matched by identity), the others only look like "
+                "a copy of one (matched by content). The rest was kept.")
+    return (f"{what} left out: they were forgotten from this source "
+            "(matched by identity). The rest was kept.")
 
 
 class _ContextGone(Exception):
@@ -334,6 +358,14 @@ class IngestionPipeline:
         return created
 
     def ingest(self, input_data: IngestionInput) -> IngestionOutput:
+        out = self._ingest(input_data)
+        report = getattr(input_data, "_left_out_report", None)
+        if report:
+            out.left_out = report
+            out.left_out_note = _left_out_note(report)
+        return out
+
+    def _ingest(self, input_data: IngestionInput) -> IngestionOutput:
         """
         Ingest raw content into the graph.
         Returns a summary of what was created/deduplicated.
@@ -414,8 +446,9 @@ class IngestionPipeline:
         # fingerprint). Mutates the content like the fence does, so the
         # ingest hash and the extraction both see what will be stored.
         if not input_data.override_suppression:
-            input_data.content, _left_out = _gate.strip_forgotten(
+            input_data.content, _left_out, _report = _gate.strip_forgotten_report(
                 self.store, unit, input_data.content)
+            input_data._left_out_report = _report
             if _left_out and not input_data.content.strip():
                 return self._suppressed_output(_gate.Block(
                     {"unit_id": unit.unit_id or "(shared channel)"},

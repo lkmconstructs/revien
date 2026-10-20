@@ -171,23 +171,35 @@ def is_copy_of(signature, capture_fps) -> bool:
             and shared / len(capture_fps) >= COPY_OF_CAPTURE)
 
 
-def _origin_applies(rec: Dict, unit: UnitRef, keys: set, capture_fps) -> bool:
-    """Does an origin-scoped record speak about THIS capture? Only if the
-    capture comes from the forgotten origin: the same unit id (for a session
-    that is the sessionId when the file carries one), the same file by real
-    path or inode, or a copy recognised by signature. A different source that
-    happens to hold one of the same sentences is not covered."""
+IDENTITY, CONTENT = "identity", "content"
+
+
+def _origin_match(rec: Dict, unit: UnitRef, keys: set, capture_fps) -> Optional[str]:
+    """How an origin-scoped record speaks about THIS capture, if it does:
+    ``IDENTITY`` when the capture comes from the forgotten origin itself (the
+    same unit id, which for a session is the id inside the file; the same file
+    by real path or inode; an id that travels with a copy), ``CONTENT`` when it
+    only looks like a copy of it (see is_copy_of), or None. A different source
+    that merely holds one of the same sentences is not covered."""
     if rec["unit_id"].startswith("forget:"):
         covered = set(rec["path_keys"])
         if unit.stable and f"unit:{unit.unit_id}" in covered:
-            return True
+            return IDENTITY
         if keys and keys & covered:
-            return True
-        return is_copy_of(rec.get("signature_fps") or [], capture_fps)
+            return IDENTITY
+        if is_copy_of(rec.get("signature_fps") or [], capture_fps):
+            return CONTENT
+        return None
     if unit.stable and rec["unit_id"] == unit.unit_id:
-        return True
-    return bool(rec["unit_id"].startswith(FILE_LEVEL) and keys
-                and keys & set(rec["path_keys"]))
+        return IDENTITY
+    if rec["unit_id"].startswith(FILE_LEVEL) and keys \
+            and keys & set(rec["path_keys"]):
+        return IDENTITY
+    return None
+
+
+def _origin_applies(rec: Dict, unit: UnitRef, keys: set, capture_fps) -> bool:
+    return _origin_match(rec, unit, keys, capture_fps) is not None
 
 
 def _capture_keys(unit: UnitRef) -> set:
@@ -200,28 +212,53 @@ def _capture_keys(unit: UnitRef) -> set:
     return keys
 
 
-def known(store, unit: UnitRef, content: str, match_content: Optional[str] = None):
-    """(long fingerprints, short fingerprints) of the sentences a forget left
-    out of captures from this origin. ``match_content`` is the whole text the
-    capture belongs to, when ``content`` is only a part of it (one message of
-    a conversation), so a copy is recognised by the whole."""
+def known_detail(store, unit: UnitRef, content: str,
+                 match_content: Optional[str] = None):
+    """(long fps, short fps, content_only, sources) of the sentences a forget
+    left out of captures from this origin.
+
+    A capture that comes from the forgotten origin itself (identity) loses
+    every sentence the forget took out. A capture only recognised as a copy by
+    its content loses NOTHING but the sentences that held what was forgotten
+    (``held_fps``): the rest of the document, and every short fragment, lands.
+    ``content_only`` is the set of long fps that only a content match asked
+    for; ``sources`` names the origins matched by content. ``match_content``
+    is the whole text the capture belongs to, when ``content`` is only a part
+    of it (one message of a conversation)."""
     records = [r for r in store.list_suppressions("active", include_wording=True)
                if r.get("sentence_fps") or r.get("short_fps")]
     if not records:
-        return set(), set()
+        return set(), set(), set(), []
     keys = _capture_keys(unit)
     capture_fps = None
     long_fps, short_fps = set(), set()
+    identity_long, content_long = set(), set()
+    sources: List[str] = []
     for rec in records:
         if rec.get("scope") == "global":
             long_fps |= set(rec["sentence_fps"])
+            identity_long |= set(rec["sentence_fps"])
             continue
         if capture_fps is None:
             capture_fps = long_fingerprints(
                 match_content if match_content is not None else content)
-        if _origin_applies(rec, unit, keys, capture_fps):
+        how = _origin_match(rec, unit, keys, capture_fps)
+        if how == IDENTITY:
             long_fps |= set(rec["sentence_fps"])
             short_fps |= set(rec["short_fps"])
+            identity_long |= set(rec["sentence_fps"])
+        elif how == CONTENT:
+            held = set(rec.get("held_fps") or [])
+            long_fps |= held
+            content_long |= held
+            sources += [k[len("unit:"):] for k in rec["path_keys"]
+                        if k.startswith("unit:")]
+    return long_fps, short_fps, content_long - identity_long, sources
+
+
+def known(store, unit: UnitRef, content: str, match_content: Optional[str] = None):
+    """(long fingerprints, short fingerprints): see known_detail."""
+    long_fps, short_fps, _c, _s = known_detail(store, unit, content, match_content)
     return long_fps, short_fps
 
 
@@ -248,8 +285,13 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
         file_level = rec["unit_id"].startswith(FILE_LEVEL)
         by_unit = unit.stable and rec["unit_id"] == unit.unit_id
         by_key = file_level and bool(named & set(rec["path_keys"]))
-        by_fp = fp is not None and (
-            fp in rec["content_fps"] or fp in rec["wording_fps"])
+        by_text = fp is not None and fp in rec["wording_fps"]       # a forgotten node's own text
+        by_whole = fp is not None and fp in rec["content_fps"]      # the forgotten record, whole
+        # A capture that is the forgotten record's whole text but comes from
+        # no identity of the origin is only a copy by content: it is not
+        # refused, the sentences that held what was forgotten are cut (see
+        # strip_forgotten).
+        by_fp = by_text or (by_whole and (by_unit or by_key))
         if rec["kind"] == "wording":
             # A standing denylist entry, not a suppressed source: it blocks a
             # capture only when the whole text is a forgotten text, and then
@@ -287,29 +329,61 @@ def check(store, unit: UnitRef, content: str) -> Optional[Block]:
     return None
 
 
-def strip_forgotten(store, unit: UnitRef, content: str,
-                    match_content: Optional[str] = None):
+def strip_forgotten_report(store, unit: UnitRef, content: str,
+                           match_content: Optional[str] = None):
     """Leave forgotten sentences out of a capture. THE STANDING DENYLIST.
 
     Forget is a rule, not a one-time subtraction, and it is bound to the
-    origin that was forgotten, not to the world: a sentence a forget cut or
-    removed (at least ``scrub.MIN_SENTENCE`` characters) is left out of
-    captures that come from that origin (its unit id, its file by real path or
-    inode, or a copy of it that carries at least half of its sentences), and
-    out of every source only when a ``forget --everywhere`` named that exact
-    wording. Another source that happens to hold the same sentence keeps its
-    own copy. Shorter fragments (down to ``scrub.MIN_SHORT``) cannot be
-    recognised in a copy, so they are left out of the forgotten origin only.
-    Returns (content, how many sentences were left out)."""
+    origin that was forgotten, not to the world:
+
+    * a capture from the forgotten origin itself (its unit id, which for a
+      session is the id inside the file; its file by real path or inode)
+      loses every sentence the forget took out;
+    * a capture only recognised as a COPY of it by content (see is_copy_of)
+      loses nothing but the sentences that held what was forgotten
+      (``held_fps``); the rest of the document lands, and so does every
+      boilerplate sentence;
+    * a ``forget --everywhere`` also keeps the exact wording it named out of
+      every source.
+
+    Another source that merely holds the same sentence keeps its own copy.
+    Returns (content, how many sentences were left out, report); the report
+    is None when nothing was, else says which lines went (never what they
+    said) and whether the match was by identity or by content alone."""
     from revien.forget import scrub
 
     if not content:
-        return content, 0
-    long_fps, short_fps = known(store, unit, content, match_content)
+        return content, 0, None
+    long_fps, short_fps, content_only, sources = known_detail(
+        store, unit, content, match_content)
     if not long_fps and not short_fps:
-        return content, 0
-    return scrub.strip_sentences(
-        content, _forgotten_test(long_fps, short_fps), min_len=scrub.MIN_SHORT)
+        return content, 0, None
+    forgotten = _forgotten_test(long_fps, short_fps)
+    lines, by_content = [], 0
+    for start, _end, body in scrub.iter_sentences(content):
+        key = scrub.sentence_key(body)
+        if len(key) >= scrub.MIN_SHORT and forgotten(key):
+            lines.append(content.count("\n", 0, start) + 1)
+            if len(key) >= scrub.MIN_SENTENCE and fingerprint(key) in content_only:
+                by_content += 1
+    new_text, n = scrub.strip_sentences(content, forgotten, min_len=scrub.MIN_SHORT)
+    if not n:
+        return new_text, 0, None
+    report = {
+        "left_out": n, "lines": sorted(set(lines)),
+        "matched_by": ("content" if by_content == n
+                       else "identity" if by_content == 0 else "both"),
+        "sources": sorted(set(sources)) if by_content else [],
+    }
+    return new_text, n, report
+
+
+def strip_forgotten(store, unit: UnitRef, content: str,
+                    match_content: Optional[str] = None):
+    """(content without the forgotten sentences, how many): see
+    strip_forgotten_report."""
+    text, n, _report = strip_forgotten_report(store, unit, content, match_content)
+    return text, n
 
 
 def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=(),

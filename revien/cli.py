@@ -791,6 +791,8 @@ def ingest(content: str, source: str, db: Optional[str]):
             click.echo("Not ingested: " + result.suppression_note)
             return
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
+        if getattr(result, "left_out_note", ""):
+            click.echo(result.left_out_note)
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
                    f"{result.total_edges_in_graph} edges")
     finally:

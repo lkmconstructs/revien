@@ -2673,6 +2673,7 @@ class GraphStore(ForgetStoreMixin):
                 # The standing denylist: sentences forgotten from this origin
                 # (or a copy of it) are left out of an imported node; a node
                 # that was only a forgotten sentence is not imported.
+                original = node.content
                 cleaned, left_out = forget_gate.strip_forgotten(
                     self, ref, node.content)
                 if left_out:
@@ -2682,7 +2683,7 @@ class GraphStore(ForgetStoreMixin):
                         continue
                     node.content = cleaned
                 new_label, label_out = forget_gate.strip_forgotten(
-                    self, ref, node.label, match_content=node.content + "\n" + node.label)
+                    self, ref, node.label, match_content=original + "\n" + node.label)
                 if label_out:
                     first = next(iter(forget_scrub.iter_sentences(node.content)), None)
                     node.label = (new_label.strip()

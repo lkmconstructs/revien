@@ -69,6 +69,8 @@ class IngestResponse(BaseModel):
     # through a shared channel has no stable identity the gate can protect.
     suppressed: bool = False
     suppression_note: str = ""
+    left_out: Optional[dict] = None
+    left_out_note: str = ""
 
 
 class ConsolidateRequest(BaseModel):
@@ -554,6 +556,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             total_edges_in_graph=result.total_edges_in_graph,
             suppressed=result.suppressed,
             suppression_note=result.suppression_note,
+            left_out=result.left_out,
+            left_out_note=result.left_out_note,
         )
 
     # ── POST /v1/recall ───────────────────────────────
