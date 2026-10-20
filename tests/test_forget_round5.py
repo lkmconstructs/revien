@@ -124,6 +124,24 @@ class TestAcceptance:
             assert kept in text, kept
         assert out.left_out["matched_by"] == "content"
 
+    def test_3b_wording_that_another_live_unit_holds_in_its_own_record_is_not_held(self, store, tmp_path):
+        shared = "We chose the blue pelican route for every night delivery."
+        a_lines = README[:4] + [shared]
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="A", content="\n".join(a_lines)),
+                       owner=("session:claude-code:HA", 1, 1))
+        a_ctx = store.list_nodes(node_type=NodeType.CONTEXT, limit=5)[0].node_id
+        store.add_node(Node(node_type=NodeType.FACT, label="route", content="chose the blue pelican route for every night delivery"),
+                       owner=("session:claude-code:HA", 1, 1))
+        # another live unit says the same thing in its own record (no node of it)
+        store.add_node(Node(node_type=NodeType.CONTEXT, label="C",
+                            content=f"{shared}\nAnd some other business of its own, entirely."),
+                       owner=("session:claude-code:HC", 1, 1))
+        GraphOperations(store).forget_node(a_ctx, cascade=True)
+        pipe = IngestionPipeline(store)
+        out = capture(pipe, put(tmp_path, "copy3b.md", a_lines + ["A line only the copy has."]))
+        assert out.left_out is None                                 # nothing was held
+        assert shared in stored_text(store)
+
     def test_4_boilerplate_and_templates_are_never_stripped_from_a_content_matched_capture(self, store, tmp_path):
         boiler = ["Let me run the tests to verify the change.",
                   "Here is the standard template for the weekly report.",
