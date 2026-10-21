@@ -28,6 +28,7 @@ import os
 import re
 import sqlite3
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -595,7 +596,9 @@ class WordingForget:
                                 conn, part, f"snapshot {f.name} "))
                         finally:
                             conn.close()
-                except (OSError, sqlite3.Error):
+                except (OSError, EOFError, zlib.error, sqlite3.Error):
+                    # A .gz cut short mid-write raises EOFError; bad deflate
+                    # data raises zlib.error. Both are unreadable, not fatal.
                     unreadable.append(str(f))
         return found, unreadable
 

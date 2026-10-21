@@ -65,6 +65,26 @@ def test_an_unreadable_snapshot_is_a_leftover_and_not_gone_everywhere(db):
     assert res["scope"] != "gone everywhere"
 
 
+@pytest.mark.parametrize("damage", ["truncated", "bad_deflate"])
+def test_a_damaged_gzip_snapshot_is_a_leftover_not_a_crash(db, damage):
+    import gzip
+    key = new_key()
+    s, a, b = _seed(db, key)
+    s.close()
+    snaps = Path(db + ".snapshots")
+    snaps.mkdir()
+    whole = gzip.compress(Path(db).read_bytes())
+    bad = snaps / "half.db.gz"
+    if damage == "truncated":  # a kill mid-write leaves the file cut short
+        bad.write_bytes(whole[: len(whole) // 2])
+    else:  # valid gzip header, garbage deflate stream
+        bad.write_bytes(whole[:10] + b"\xff" * 200)
+    res = forget_wording(db, key)
+    left = [l for l in res["leftovers"] if l["kind"] == "snapshot_unreadable"]
+    assert left and str(bad) in left[0]["note"]
+    assert res["scope"] != "gone everywhere"
+
+
 def test_revien_own_actor_is_not_reported_as_a_piece(db):
     secret = "api:forget-secret-9z8y7x"
     cc(db, "s1", f"User: We decided to use {secret} as the project codename.")
