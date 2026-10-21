@@ -642,8 +642,8 @@ M = [
      "        if False:\n            for f in sorted(snap.iterdir()):\n                if not (f.name.endswith(\".db\")",
      ["tests/test_forget_wording_round10.py -k renamed_node"]),
     ("partial-copy-skips-the-audit-rows", 1, "revien/forget/wording.py",
-     "\"SELECT id, node_id, actor, before_json, after_json FROM audit_log\"",
-     "\"SELECT id, node_id, actor, before_json, after_json FROM audit_log WHERE 0\"",
+     "\"SELECT id, node_id, op, actor, before_json, after_json FROM audit_log\"",
+     "\"SELECT id, node_id, op, actor, before_json, after_json FROM audit_log WHERE 0\"",
      ["tests/test_forget_wording_round10.py -k renamed_node"]),
     # ── round 11: every table, the unreadable snapshot, own actors ──────
     ("align-start-any-position", 1, "revien/forget/scrub.py",
