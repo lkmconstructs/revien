@@ -316,6 +316,19 @@ def cut_json(value: Any, strings: List[str]) -> Tuple[Any, int]:
     return walk(value), total
 
 
+#: What a truncated label ends with ("... " / "…"): the text stops at it.
+_MARKERS = ("...", "\u2026")
+
+
+def split_marker(text: str):
+    """(text without a trailing truncation marker, the marker or "")."""
+    t = (text or "").rstrip()
+    for m in _MARKERS:
+        if t.endswith(m):
+            return t[:len(t) - len(m)].rstrip(), m
+    return text or "", ""
+
+
 def edge_fragments(text: str, part: str, floor: int, report: bool = False):
     """[("end"|"start", length)] of the pieces of the string ``part`` that sit
     at the very edge of ``text``: the text ENDS with a proper prefix of it
@@ -326,6 +339,7 @@ def edge_fragments(text: str, part: str, floor: int, report: bool = False):
     found = []
     if not text or not part:
         return found
+    text, _marker = split_marker(text)
     tail, head = text.rstrip(), text.lstrip()
     for k in range(len(part) - 1, floor - 1, -1):
         if tail.endswith(part[:k]):
@@ -365,7 +379,8 @@ def aligned_edge_fragment(field: str, content: str, spans, part: str):
     there). ``spans`` are the (start, end) of the occurrences in the original
     content. A piece that is merely equal to a prefix or suffix of the string
     somewhere in the field is not this, and is never cut."""
-    t = (field or "").strip()
+    t, _marker = split_marker((field or "").strip())
+    t = t.strip()
     if not t or not content or not spans:
         return ""
     floor = edge_floor(part)
@@ -391,20 +406,21 @@ def cut_edge_fragment(text: str, part: str, fragment=None):
     cut (an audit snapshot of the same field)."""
     if not isinstance(text, str) or not text:
         return text, ""
+    body, marker = split_marker(text)
     if fragment is not None:
-        t = text.rstrip()
+        t = body.rstrip()
         if t.endswith(fragment) and part.startswith(fragment):
-            return t[:len(t) - len(fragment)], fragment
-        h = text.lstrip()
+            return t[:len(t) - len(fragment)] + marker, fragment
+        h = body.lstrip()
         if h.startswith(fragment) and part.endswith(fragment):
-            return h[len(fragment):], fragment
+            return h[len(fragment):] + marker, fragment
         return text, ""
-    for kind, k in edge_fragments(text, part, edge_floor(part)):
+    for kind, k in edge_fragments(body, part, edge_floor(part)):
         if kind == "end":
-            t = text.rstrip()
-            return t[:len(t) - k], part[:k]
-        h = text.lstrip()
-        return h[k:], part[-k:]
+            t = body.rstrip()
+            return t[:len(t) - k] + marker, part[:k]
+        h = body.lstrip()
+        return h[k:] + marker, part[-k:]
     return text, ""
 
 
@@ -540,10 +556,35 @@ def _is_content_cell(table: str, cols: List[str], row, i: int) -> bool:
 def find_residue(conn: sqlite3.Connection, strings: List[str],
                  ignore=frozenset()) -> Dict[str, int]:
     """{table: rows} where any forgotten string still appears in a text
-    column. Reads the whole database; run once per forget."""
+    column. Reads the whole database; run once per forget. For a literal
+    secret the columns are the inventory (revien/forget/inventory.py): every
+    text column of every table, identity columns included; a cell that is
+    exactly one of Revien's own constant actor names is not content."""
+    from revien.forget import inventory
+
     pat = _pattern(strings)
     out: Dict[str, int] = {}
     if pat is None:
+        return out
+    if pat.literal:
+        for table, cols in inventory.columns(conn).items():
+            try:
+                rows = conn.execute(
+                    "SELECT " + ", ".join(f'"{c}"' for c in cols) + f' FROM "{table}"')
+            except sqlite3.Error:
+                continue
+            hits = 0
+            for row in rows:
+                for v in row:
+                    if isinstance(v, (bytes, bytearray)):
+                        v = bytes(v).decode("utf-8", "ignore")
+                    if not isinstance(v, str) or not v or inventory.is_own(v):
+                        continue
+                    if any(pat.search(s) for s in _iter_strings(v)):
+                        hits += 1
+                        break
+            if hits:
+                out[table] = hits
         return out
     tables = [r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE "

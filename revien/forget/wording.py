@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from revien.forget import keys, scrub
+from revien.forget import inventory, keys, scrub
 from revien.graph.store import StoreBusy
 from revien.graph.units import is_file_backed
 
@@ -79,69 +79,125 @@ class WordingForget:
 
     # ── what a string would cut (read only) ──────────────
 
+    @staticmethod
+    def _derive_cut(value, part, pat, ctx=None):
+        """Cut, in a decoded JSON value, the half of an occurrence that a
+        derived string (a label, a preview) kept next to a ``content`` string
+        that held it. Returns (value, pieces). Derived = a verbatim stretch of
+        that content that stops exactly inside the occurrence."""
+        pieces: List[str] = []
+
+        def walk(v, ctx):
+            if isinstance(v, dict):
+                content = v.get("content")
+                if isinstance(content, str) and content:
+                    spans = [(m.start(), m.end()) for m in pat.finditer(content)]
+                    if spans:
+                        ctx = (content, spans)
+                out = {}
+                for k, x in v.items():
+                    if isinstance(x, str) and ctx and not (k == "content" and x is v.get("content")):
+                        piece = scrub.aligned_edge_fragment(x, ctx[0], ctx[1], part)
+                        if piece:
+                            x, _ = scrub.cut_edge_fragment(x, part, piece)
+                            pieces.append(piece)
+                    else:
+                        x = walk(x, ctx)
+                    out[k] = x
+                return out
+            if isinstance(v, list):
+                return [walk(x, ctx) for x in v]
+            return v
+
+        return walk(value, ctx), pieces
+
     def _scan_literal(self, conn, lit, apply: bool, live: bool = False,
                       nodes_only_ids: Optional[set] = None) -> Dict:
-        """Find (and with ``apply`` cut) the string in every table that can
-        hold it. Returns counts and the ids of the nodes it touched."""
+        """Find (and with ``apply`` cut) the string in every text column of
+        the store (revien/forget/inventory.py, read from the schema of
+        ``conn``: the live database and each snapshot alike). Returns counts,
+        the ids of the nodes it touched and the identities it renamed."""
         out = {"nodes": 0, "occurrences": 0, "node_ids": [], "tables": {},
-               "inside_words": 0, "fragments": 0}
+               "inside_words": 0, "fragments": 0, "renamed": {},
+               "renamed_ids": [], "unrenamed": []}
+        strings = [lit]
         part = scrub.canonical(str(lit))
         pat = scrub._pattern([lit])
         fragments: Dict[str, List[str]] = {}
-        strings = [lit]
-        for table, (keycol, plain, jsoncols) in _TARGETS.items():
-            cols = list(plain) + list(jsoncols)
+        sources: Dict[str, tuple] = {}
+        for table, cols in inventory.columns(conn).items():
             try:
                 rows = conn.execute(
-                    f'SELECT "{keycol}", ' + ", ".join(f'"{c}"' for c in cols)
+                    "SELECT rowid, " + ", ".join(f'"{c}"' for c in cols)
                     + f' FROM "{table}"').fetchall()
             except sqlite3.OperationalError:
-                continue                     # a snapshot from before that table
+                continue
+            nkey = None
+            if table == "nodes":
+                try:
+                    nkey = {r[0]: r[1] for r in conn.execute(
+                        'SELECT rowid, node_id FROM nodes')}
+                except sqlite3.OperationalError:
+                    nkey = {}
             hit_rows = 0
             for row in rows:
-                key, vals = row[0], list(row[1:])
-                new_vals, cuts, content_cut = [], 0, 0
-                for col, val in zip(cols, vals):
+                rowid, vals = row[0], list(row[1:])
+                new_vals, cuts, content_cut = list(vals), 0, 0
+                node_id = nkey.get(rowid) if nkey is not None else None
+                orig_content = vals[cols.index("content")] if table == "nodes" else None
+                spans = []
+                if orig_content:
+                    spans = [(m.start(), m.end()) for m in pat.finditer(orig_content)]
+                for i, (col, val) in enumerate(zip(cols, vals)):
+                    if isinstance(val, (bytes, bytearray)):
+                        val = bytes(val).decode("utf-8", "ignore")
                     if not isinstance(val, str) or not val:
-                        new_vals.append(val)
                         continue
-                    if col in jsoncols:
-                        new, n = scrub.cut_json_text(val, strings)
-                    else:
-                        new, n = scrub.cut_text(val, strings)
+                    work = val
+                    got = []
+                    # a derived string next to its content, cut where it stops
+                    # inside the occurrence (before the whole-string cut
+                    # removes the occurrence it is measured against)
+                    if table == "nodes" and spans and col in (
+                            "label", "event_time_text", "source_context"):
+                        piece = scrub.aligned_edge_fragment(work, orig_content, spans, part)
+                        if piece:
+                            work, _ = scrub.cut_edge_fragment(work, part, piece)
+                            got.append(piece)
+                    elif work[:1] in "{[" and (table == "nodes" or "content" in work):
+                        try:
+                            decoded = json.loads(work)
+                        except (TypeError, ValueError):
+                            decoded = None
+                        if isinstance(decoded, (dict, list)):
+                            ctx = (orig_content, spans) if (table == "nodes" and spans) else None
+                            decoded, pieces = self._derive_cut(decoded, part, pat, ctx)
+                            if pieces:
+                                work = json.dumps(decoded)
+                                got.extend(pieces)
+                    new, n = scrub.cut_json_text(work, strings)
                     if n:
                         out["inside_words"] += scrub.inside_longer_words(
-                            val, strings, col in jsoncols)
-                    cuts += n
-                    if col == "content":
-                        content_cut = n
-                    new_vals.append(new)
-                if table == "nodes" and content_cut:
-                    # A label (or a preview, a context line) is the content
-                    # cut off somewhere: when this node's content held the
-                    # string and the field stops exactly inside the occurrence,
-                    # the piece it kept goes too (never a piece anywhere else).
-                    orig_content = vals[cols.index("content")]
-                    spans = [(m.start(), m.end()) for m in pat.finditer(orig_content)]
-                    for fld in ("label", "event_time_text", "source_context"):
-                        i = cols.index(fld)
-                        if new_vals[i] != vals[i]:
-                            continue          # the whole string was cut from it
-                        piece = scrub.aligned_edge_fragment(
-                            vals[i], orig_content, spans, part)
-                        if piece:
-                            new_vals[i], _ = scrub.cut_edge_fragment(
-                                new_vals[i], part, piece)
-                            fragments.setdefault(key, []).append(piece)
-                            out["fragments"] += 1
-                            cuts += 1
+                            val, strings, True)
+                    if n or got:
+                        new_vals[i] = new
+                        cuts += n + len(got)
+                        out["fragments"] += len(got)
+                        if col == "content":
+                            content_cut = n
+                        if got and node_id:
+                            fragments.setdefault(node_id, []).extend(got)
                 if not cuts:
                     continue
                 hit_rows += 1
                 out["occurrences"] += cuts
                 if table == "nodes":
                     out["nodes"] += 1
-                    out["node_ids"].append(key)
+                    out["node_ids"].append(node_id)
+                    if content_cut:
+                        sources[node_id] = (orig_content, spans)
+                renames = [(table, c) for c, a, b in zip(cols, vals, new_vals)
+                           if a != b and (table, c) in inventory.IDENTITY]
                 if apply:
                     if table == "nodes":
                         li, ci = cols.index("label"), cols.index("content")
@@ -151,15 +207,82 @@ class WordingForget:
                             new_vals[ci] = "[removed]"
                         new_vals[li] = new_vals[li][:200]
                     sets = ", ".join(f'"{c}" = ?' for c in cols)
-                    conn.execute(f'UPDATE "{table}" SET {sets} WHERE "{keycol}" = ?',
-                                 (*new_vals, key))
+                    try:
+                        conn.execute(f'UPDATE "{table}" SET {sets} WHERE rowid = ?',
+                                     (*new_vals, rowid))
+                    except sqlite3.IntegrityError:
+                        # the cut form of an identity is already taken: keep
+                        # the row as it was (the string is still in it, and
+                        # that is reported, never hidden)
+                        out["unrenamed"].append(
+                            sorted({f"{t}.{c}" for t, c in renames})
+                            or [f"{table}"])
+                        continue
                     if table == "nodes" and live:
-                        self.store._enqueue_embed_stmt(conn, key)
+                        self.store._enqueue_embed_stmt(conn, node_id)
+                for t, c in renames:
+                    key = f"{t}.{c}"
+                    out["renamed"][key] = out["renamed"].get(key, 0) + 1
+                    if len(out["renamed_ids"]) < 20:
+                        out["renamed_ids"].append(new_vals[cols.index(c)])
             if hit_rows:
                 out["tables"][table] = hit_rows
+        self._cut_siblings(conn, sources, part, apply, out, fragments)
         if fragments:
             self._cut_fragments_in_audit(conn, fragments, part, apply, out)
         return out
+
+    def _cut_siblings(self, conn, sources, part, apply, out, fragments) -> None:
+        """Nodes written by the same capture as a node the string was cut from
+        (a fact or a topic taken from a conversation) keep a derived stretch of
+        it: the first words of the sentence up to where the extractor stopped.
+        Cut it only where it stops exactly inside the cut occurrence."""
+        if not sources:
+            return
+        try:
+            conn.execute("SELECT 1 FROM node_provenance LIMIT 1")
+        except sqlite3.OperationalError:
+            return
+        fields = ("label", "content", "event_time_text", "source_context")
+        for nid, (content, spans) in sources.items():
+            units = [r[0] for r in conn.execute(
+                "SELECT unit_id FROM node_provenance WHERE node_id = ?", (nid,))]
+            sib = set()
+            for u in units:
+                sib.update(r[0] for r in conn.execute(
+                    "SELECT node_id FROM node_provenance WHERE unit_id = ?", (u,)))
+            sib.discard(nid)
+            for sid in sib:
+                row = conn.execute(
+                    "SELECT " + ", ".join(fields) + " FROM nodes WHERE node_id = ?",
+                    (sid,)).fetchone()
+                if row is None:
+                    continue
+                new = list(row)
+                got = []
+                for i, text in enumerate(row):
+                    piece = scrub.aligned_edge_fragment(text or "", content, spans, part)
+                    if piece:
+                        new[i], _ = scrub.cut_edge_fragment(text, part, piece)
+                        got.append(piece)
+                if not got:
+                    continue
+                out["fragments"] += len(got)
+                out["occurrences"] += len(got)
+                out["tables"]["nodes"] = out["tables"].get("nodes", 0) + 1
+                fragments.setdefault(sid, []).extend(got)
+                if apply:
+                    if not (new[0] or "").strip():
+                        new[0] = "[removed]"
+                    if not (new[1] or "").strip():
+                        new[1] = "[removed]"
+                    conn.execute(
+                        "UPDATE nodes SET " + ", ".join(f"{f} = ?" for f in fields)
+                        + " WHERE node_id = ?", (*new, sid))
+                    if sid not in out["node_ids"]:
+                        out["node_ids"].append(sid)
+                        out["nodes"] += 1
+                        self.store._enqueue_embed_stmt(conn, sid)
 
     @staticmethod
     def _cut_fragments_in_audit(conn, fragments, part, apply, out) -> None:
@@ -284,6 +407,7 @@ class WordingForget:
     def _execute_wording(self, lit, wording: str, actor: str) -> Dict:
         store = self.store
         now = datetime.now(timezone.utc)
+        self._snapshot_cuts = 0
         before = {"nodes": store.count_nodes(), "edges": store.count_edges()}
         with store.transaction(immediate=True, wait=self.BUSY_WAIT_SECONDS) as conn:
             scan = self._scan_literal(conn, lit, apply=True, live=True)
@@ -313,8 +437,7 @@ class WordingForget:
         storage = store.scrub_storage()
         after = {"nodes": store.count_nodes(), "edges": store.count_edges()}
         with store._lock:
-            residue = scrub.find_residue(store._get_conn(), [lit],
-                                         ignore=scrub.NOT_CONTENT_TABLES)
+            residue = scrub.find_residue(store._get_conn(), [lit])
         raw_hits = self._raw_hits(lit)
         files = self._source_files_holding(touched, lit)
         leftovers = self._wording_leftovers(
@@ -323,11 +446,25 @@ class WordingForget:
         orphaned = self._key_leftover()
         if orphaned:
             leftovers.append(orphaned)
-        partial, unreadable = self._partial_copies(lit)
+        left = self._leftover_scan(lit)
+        partial, unreadable = left["pieces"], left["unreadable"]
         for path in unreadable:
             leftovers.append({
                 "kind": "snapshot_unreadable", "path": path,
                 "note": f"snapshot could not be read: {path}"})
+        for hit in left["snapshot_hits"]:
+            leftovers.append({
+                "kind": "snapshot_residue", **hit,
+                "note": f"snapshot {hit['snapshot']} still holds the string "
+                        f"({hit['where']}); `revien watch` snapshots are not "
+                        "edited by any other verb"})
+        for cols in scan["unrenamed"]:
+            leftovers.append({
+                "kind": "identity_unrenamed", "columns": cols,
+                "note": "an identity (" + ", ".join(cols) + ") holds the "
+                        "string and could not be renamed, because the cut "
+                        "form is already taken by another record; no verb "
+                        "removes it"})
         if partial:
             shown = partial[:10]
             where = "; ".join(
@@ -355,7 +492,9 @@ class WordingForget:
             "still_held_by": sorted({u for f in files for u in f["units"]}),
             "training_db": training, "snapshots": snapshots, "storage": storage,
             "remaining": remaining, "leftovers": leftovers,
-            "scope": (("nothing found" if not scan["occurrences"] else "gone everywhere")
+            "renamed": dict(scan["renamed"]), "renamed_ids": list(scan["renamed_ids"]),
+            "scope": (("nothing found" if not (scan["occurrences"] or self._snapshot_cuts)
+                       else "gone everywhere")
                       if gone else "forgotten from Revien"),
             "model": model, "model_stale": model["stale"],
             "warnings": list(getattr(self, "_warnings", [])),
@@ -385,6 +524,7 @@ class WordingForget:
         try:
             conn.execute("PRAGMA secure_delete = ON")
             scan = self._scan_literal(conn, lit, apply=True, live=False)
+            self._snapshot_cuts = getattr(self, "_snapshot_cuts", 0) + scan["occurrences"]
             has_vec = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'vec_nodes'").fetchone() is not None
             vec_ok = False
@@ -409,8 +549,29 @@ class WordingForget:
             conn.close()
         return notes
 
+    @staticmethod
+    def _piece_len(part: str) -> int:
+        """How long a stretch of the string has to be to be looked for in raw
+        bytes as "a piece of it": 16 characters, or all but one of a shorter
+        string; 0 when the string is too short to have a piece worth finding."""
+        k = min(len(part) - 1, max(scrub.edge_floor(part), 16))
+        return k if k >= scrub.MIN_EDGE else 0
+
+    def _raw_scan(self, data: bytes, lit) -> str:
+        """"" when ``data`` holds neither the string (a line wrap, raw or
+        JSON-escaped, does not hide it) nor a long piece of it at either end;
+        else what it holds."""
+        if secret_regex(str(lit)).search(data):
+            return "the whole string"
+        part = scrub.canonical(str(lit))
+        k = self._piece_len(part)
+        if k:
+            for piece in {part[:k], part[-k:]}:
+                if piece.encode("utf-8") in data:
+                    return f"{k} characters of it"
+        return ""
+
     def _raw_hits(self, lit) -> List[str]:
-        pat = secret_regex(str(lit))
         hits = []
         base = str(self.store.db_path)
         for suffix, name in (("", "database file"), ("-wal", "write-ahead log"),
@@ -419,8 +580,10 @@ class WordingForget:
             if os.path.exists(p):
                 try:
                     with open(p, "rb") as fh:
-                        if pat.search(fh.read()):
-                            hits.append(name)
+                        what = self._raw_scan(fh.read(), lit)
+                    if what:
+                        hits.append(name if what == "the whole string"
+                                    else f"{name} ({what})")
                 except OSError:
                     pass
         return hits
@@ -494,9 +657,10 @@ class WordingForget:
 
     @staticmethod
     def _fragment_report(conn, part, surface: str) -> List[Dict]:
-        """Pieces of the string (MIN_EDGE characters or more) at the edge of a
-        text field, on one database connection: every node field, and every
-        audit row by the content of its cells. Where and how long only."""
+        """Pieces of the string (MIN_EDGE characters or more) at the start or
+        end of a text, in every column of the inventory and every audit row,
+        on one database connection. Where and how long only; a cell that is
+        exactly one of Revien's own constant actor names is skipped."""
         found = []
 
         def best(text):
@@ -510,97 +674,83 @@ class WordingForget:
                 return [raw]
             return list(scrub._iter_strings(value))
 
-        try:
-            for nid, label, content, ett, sctx, meta in conn.execute(
-                    "SELECT node_id, label, content, event_time_text, "
-                    "source_context, metadata FROM nodes"):
-                for field, text in (("label", label), ("content", content),
-                                    ("event_time_text", ett),
-                                    ("source_context", sctx)):
-                    k = best(text)
-                    if k:
-                        found.append({"surface": surface + "node", "node_id": nid,
-                                      "field": field, "characters": k})
-                k = max((best(x) for x in strings_of(meta or "")), default=0)
-                if k:
-                    found.append({"surface": surface + "node", "node_id": nid,
-                                  "field": "metadata", "characters": k})
-        except sqlite3.OperationalError:
-            pass
-        try:
-            for rid, nid, op, actor, bj, aj in conn.execute(
-                    "SELECT id, node_id, op, actor, before_json, after_json FROM audit_log"):
-                for field, raw in (("actor", actor), ("before_json", bj),
-                                   ("after_json", aj)):
-                    if not raw:
-                        continue
-                    if field == "actor" and op not in scrub._MERGE_OPS:
-                        continue        # Revien's own actor ("api:forget"), not content
-                    k = max((best(x) for x in strings_of(raw)), default=0)
-                    if k:
-                        found.append({"surface": surface + "audit_log",
-                                      "node_id": nid, "row": rid, "field": field,
-                                      "characters": k})
-        except sqlite3.OperationalError:
-            pass
-        # the other tables that keep text: edges, candidates, judgments, receipts
-        for table, (keycol, plain, jsoncols) in _TARGETS.items():
-            if table in ("nodes", "audit_log"):
-                continue
-            cols = list(plain) + list(jsoncols)
+        for table, cols in inventory.columns(conn).items():
+            extra = ""
             try:
+                has_nid = any(r[1] == "node_id" for r in conn.execute(
+                    f'PRAGMA table_info("{table}")'))
+                if has_nid and table in ("nodes", "audit_log"):
+                    extra = ', "node_id"'
                 rows = conn.execute(
-                    f'SELECT "{keycol}", ' + ", ".join(f'"{c}"' for c in cols)
+                    "SELECT rowid, " + ", ".join(f'"{c}"' for c in cols) + extra
                     + f' FROM "{table}"').fetchall()
             except sqlite3.OperationalError:
                 continue
+            nid_at = len(cols) + 1 if extra else None
+            surf = surface + ("node" if table == "nodes" else table)
             for row in rows:
-                for field, raw in zip(cols, row[1:]):
-                    if not isinstance(raw, str) or not raw:
+                for field, raw in zip(cols, row[1:1 + len(cols)]):
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = bytes(raw).decode("utf-8", "ignore")
+                    if not isinstance(raw, str) or not raw or inventory.is_own(raw):
                         continue
-                    k = max((best(x) for x in strings_of(raw)), default=0)
+                    k = max((best(x) for x in strings_of(raw)
+                             if not inventory.is_own(x)), default=0)
                     if k:
-                        found.append({"surface": surface + table, "row": row[0],
-                                      "field": field, "characters": k})
+                        item = {"surface": surf, "field": field, "characters": k}
+                        if nid_at:
+                            item["node_id"] = row[nid_at]
+                        if table != "nodes":
+                            item["row"] = row[0]
+                        found.append(item)
         return found
 
-    def _partial_copies(self, lit):
-        """Where a piece of the string still sits: the live database (every
-        node field, every audit row) and every `revien watch` snapshot, plain
-        or gzip. Read only. A piece is cut only where an occurrence was cut
-        from the same node (see scrub.aligned_edge_fragment); anywhere else it
-        is only reported, and the answer is then not "gone everywhere"."""
+    def _snapshot_files(self):
+        snap = Path(str(self.store.db_path) + ".snapshots")
+        if snap.is_dir():
+            for f in sorted(snap.iterdir()):
+                if f.name.endswith(".db") or f.name.endswith(".db.gz"):
+                    yield f
+
+    def _leftover_scan(self, lit) -> Dict:
+        """Where a piece of the string, or the string, still sits: the live
+        database (every text column, every audit row) and every `revien
+        watch` snapshot, plain or gzip, by column and by raw bytes. Read only.
+        Anything found keeps the answer from being "gone everywhere"."""
         import gzip
         import shutil
         import tempfile
 
         part = scrub.canonical(str(lit))
-        unreadable: List[str] = []
+        out = {"pieces": [], "unreadable": [], "snapshot_hits": []}
         with self.store._lock:
-            found = self._fragment_report(self.store._get_conn(), part, "")
-        snap = Path(str(self.store.db_path) + ".snapshots")
-        if snap.is_dir():
-            for f in sorted(snap.iterdir()):
-                if not (f.name.endswith(".db") or f.name.endswith(".db.gz")):
-                    continue
-                try:
-                    with tempfile.TemporaryDirectory() as tmp:
-                        path = f
-                        if f.name.endswith(".gz"):
-                            path = Path(tmp) / "snap.db"
-                            with gzip.open(f, "rb") as src, open(path, "wb") as dst:
-                                shutil.copyfileobj(src, dst)
-                        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-                        try:
-                            found.extend(self._fragment_report(
-                                conn, part, f"snapshot {f.name} "))
-                        finally:
-                            conn.close()
-                except (OSError, EOFError, zlib.error, sqlite3.Error):
-                    # A .gz cut short mid-write raises EOFError; bad deflate
-                    # data raises zlib.error. Both are unreadable, not fatal.
-                    unreadable.append(str(f))
-        return found, unreadable
+            out["pieces"] = self._fragment_report(self.store._get_conn(), part, "")
+        for f in self._snapshot_files():
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = f
+                    if f.name.endswith(".gz"):
+                        path = Path(tmp) / "snap.db"
+                        with gzip.open(f, "rb") as src, open(path, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    what = self._raw_scan(Path(path).read_bytes(), lit)
+                    if what:
+                        out["snapshot_hits"].append(
+                            {"snapshot": f.name, "where": f"raw bytes ({what})"})
+                    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                    try:
+                        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                        for table, n in scrub.find_residue(conn, [lit]).items():
+                            out["snapshot_hits"].append(
+                                {"snapshot": f.name, "where": f"table {table}",
+                                 "rows": n})
+                        out["pieces"].extend(self._fragment_report(
+                            conn, part, f"snapshot {f.name} "))
+                    finally:
+                        conn.close()
+            except (OSError, EOFError, zlib.error, sqlite3.Error, ValueError):
+                out["unreadable"].append(str(f))
+        return out
 
     def _wording_message(self, r: Dict) -> str:
         if r["scope"] == "nothing found":

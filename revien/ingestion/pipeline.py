@@ -365,6 +365,15 @@ class IngestionPipeline:
         return out
 
     def _ingest(self, input_data: IngestionInput) -> IngestionOutput:
+        # A source id, a session or a project key can carry a secret (a URL
+        # with ?token=): the same cut forget made in the stored identities is
+        # made here first, so a unit is named the same before and after, and
+        # the identity of a capture never lands the string again.
+        for _name in ("source_id", "ingest_key", "origin_source",
+                      "project_key", "session_key"):
+            _v = getattr(input_data, _name, None)
+            if isinstance(_v, str) and _v:
+                setattr(input_data, _name, _gate.strip_literals(self.store, _v)[0])
         # 0. Per-source ingestion policy (leg 6b). If this source_id is on the
         #    deny list, capture is a clean no-op: nothing is extracted, stored,
         #    or embedded, and the reason is logged. The graph is untouched.

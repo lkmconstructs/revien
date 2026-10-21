@@ -196,6 +196,9 @@ class ForgetStoreMixin:
         that vouched once keeps having vouched. ``proves`` drops this node's
         ``unproven:`` markers (used only when the write itself proves the
         node is the unit's own record, e.g. a keyed refresh)."""
+        from revien.graph.store import GraphStore
+
+        unit_id, = GraphStore._cut_secret_strings(conn, unit_id)
         conn.execute(
             "INSERT INTO node_provenance (node_id, unit_id, label_ok, wording_ok) "
             "VALUES (?,?,?,?) ON CONFLICT(node_id, unit_id) DO UPDATE SET "
@@ -276,27 +279,27 @@ class ForgetStoreMixin:
                       path_keys: Optional[List[str]] = None) -> None:
         """Note that a stable unit was captured (and where its file is).
         Keys accumulate: a file seen at two paths keeps both."""
-        conn = self._get_conn()
-        now = _now()
-        row = conn.execute(
-            "SELECT path_keys FROM capture_units WHERE unit_id = ?",
-            (unit_id,)).fetchone()
-        keys = list(path_keys or [])
-        if row is not None:
-            try:
-                keys = sorted(set(json.loads(row[0] or "[]")) | set(keys))
-            except ValueError:
-                pass
-            conn.execute(
-                "UPDATE capture_units SET last_seen = ?, "
-                "path = COALESCE(?, path), path_keys = ? WHERE unit_id = ?",
-                (now, path, json.dumps(keys), unit_id))
-        else:
-            conn.execute(
-                "INSERT INTO capture_units (unit_id, path, path_keys, "
-                "first_seen, last_seen) VALUES (?,?,?,?,?)",
-                (unit_id, path, json.dumps(sorted(set(keys))), now, now))
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            now = _now()
+            unit_id, path = self._cut_secret_strings(conn, unit_id, path)
+            keys = [self._cut_secret_strings(conn, k)[0] for k in (path_keys or [])]
+            row = conn.execute(
+                "SELECT path_keys FROM capture_units WHERE unit_id = ?",
+                (unit_id,)).fetchone()
+            if row is not None:
+                try:
+                    keys = sorted(set(json.loads(row[0] or "[]")) | set(keys))
+                except ValueError:
+                    pass
+                conn.execute(
+                    "UPDATE capture_units SET last_seen = ?, "
+                    "path = COALESCE(?, path), path_keys = ? WHERE unit_id = ?",
+                    (now, path, json.dumps(keys), unit_id))
+            else:
+                conn.execute(
+                    "INSERT INTO capture_units (unit_id, path, path_keys, "
+                    "first_seen, last_seen) VALUES (?,?,?,?,?)",
+                    (unit_id, path, json.dumps(sorted(set(keys))), now, now))
 
     @_locked
     def get_unit(self, unit_id: str) -> Optional[Dict]:

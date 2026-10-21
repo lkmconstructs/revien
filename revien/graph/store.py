@@ -1096,11 +1096,17 @@ class GraphStore(ForgetStoreMixin):
         the transaction (add_node wraps it; import_graph batches many).
         A secret a ``forget --wording`` named is cut out of the node first
         (the node object itself, so its audit row quotes the cut text)."""
+        GraphStore._cut_derived(conn, node)
         (node.label, node.content, node.source_context,
          node.event_time_text) = GraphStore._cut_secret_strings(
             conn, node.label, node.content, node.source_context,
             node.event_time_text)
         node.metadata = GraphStore._cut_secret_metadata(conn, node.metadata)
+        # identity columns: the same cut as everywhere they are stored
+        (node.source_id, node.origin_source, node.session_key,
+         node.project_key, node.confidence_set_by) = GraphStore._cut_secret_strings(
+            conn, node.source_id, node.origin_source, node.session_key,
+            node.project_key, node.confidence_set_by)
         conn.execute(
             """INSERT INTO nodes
                (node_id, node_type, label, content, source_id,
@@ -1926,6 +1932,50 @@ class GraphStore(ForgetStoreMixin):
         return tuple(out)
 
     @classmethod
+    def _cut_derived(cls, conn, node) -> None:
+        """A label, a preview or a context line derived from the content
+        (cut off where the text was truncated) keeps the piece of a named
+        secret that came before the cut. Before the content itself is cut:
+        measure each derived string against the occurrence in the content,
+        and cut the piece that stops exactly inside it. The secret is read off
+        the content (the entries hold only keyed hashes)."""
+        from revien.forget import gate as forget_gate
+        from revien.forget import keys as forget_keys
+        from revien.forget import scrub
+
+        entries = cls._named_secrets(conn)
+        content = node.content
+        if not entries or not isinstance(content, str) or not content:
+            return
+        spans = forget_keys.find_literals(content, entries)
+        if not spans:
+            return
+
+        def fix(text):
+            if not isinstance(text, str) or not text:
+                return text
+            for s0, e0 in spans:
+                part = scrub.canonical(content[s0:e0])
+                piece = scrub.aligned_edge_fragment(text, content, [(s0, e0)], part)
+                if piece:
+                    return scrub.cut_edge_fragment(text, part, piece)[0]
+            return text
+
+        node.label = fix(node.label)
+        node.source_context = fix(node.source_context)
+        node.event_time_text = fix(node.event_time_text)
+        if isinstance(node.metadata, dict):
+            def walk(v):
+                if isinstance(v, str):
+                    return fix(v)
+                if isinstance(v, list):
+                    return [walk(x) for x in v]
+                if isinstance(v, dict):
+                    return {k: walk(x) for k, x in v.items()}
+                return v
+            node.metadata = walk(node.metadata)
+
+    @classmethod
     def _cut_secret_metadata(cls, conn, meta):
         from revien.forget import gate as forget_gate
 
@@ -2402,7 +2452,8 @@ class GraphStore(ForgetStoreMixin):
         """The bare INSERT for one edge — no commit, no audit. Callers own
         the transaction (add_edge and add_edge_audited both wrap it).
         A secret a ``forget --wording`` named is cut out first."""
-        edge.source_context, = GraphStore._cut_secret_strings(conn, edge.source_context)
+        edge.source_context, edge.confidence_set_by = GraphStore._cut_secret_strings(
+            conn, edge.source_context, edge.confidence_set_by)
         edge.metadata = GraphStore._cut_secret_metadata(conn, edge.metadata)
         conn.execute(
             """INSERT INTO edges

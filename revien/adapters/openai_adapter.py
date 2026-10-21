@@ -349,6 +349,9 @@ class OpenAIAdapter:
 
         # Extract title and timestamps
         title = conv_data.get("title", "Untitled")
+        # a title is text like any other: named secrets are cut before a label
+        # or a preview is derived from it
+        title = forget_gate.strip_literals(self.store, str(title))[0]
         create_time = self._unix_to_datetime(conv_data.get("create_time"))
         update_time = self._unix_to_datetime(conv_data.get("update_time"))
 
