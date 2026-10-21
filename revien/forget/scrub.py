@@ -353,6 +353,37 @@ def edge_floor(part: str) -> int:
     return max(MIN_EDGE, (len(part) + 3) // 4)
 
 
+def aligned_edge_fragment(field: str, content: str, spans, part: str):
+    """The piece of ``part`` that ``field`` (a label, a preview, a context
+    line) kept of an occurrence cut from ``content``, or "".
+
+    Exactness: the field must be a verbatim stretch of the content, and the
+    piece must sit exactly where the field's text stops inside the occurrence
+    (the field ends with the first k characters of an occurrence that starts
+    right there), or begins exactly where the field's text starts inside one
+    (it begins with the last k characters of an occurrence that ends right
+    there). ``spans`` are the (start, end) of the occurrences in the original
+    content. A piece that is merely equal to a prefix or suffix of the string
+    somewhere in the field is not this, and is never cut."""
+    t = (field or "").strip()
+    if not t or not content or not spans:
+        return ""
+    floor = edge_floor(part)
+    for kind, k in edge_fragments(t, part, floor):
+        i = content.find(t)
+        while i >= 0:
+            if kind == "end":
+                pos = i + len(t) - k
+                if any(s0 == pos and e0 >= pos + k for s0, e0 in spans):
+                    return part[:k]
+            else:
+                end = i + k
+                if any(e0 == end and s0 <= i for s0, e0 in spans):
+                    return part[-k:]
+            i = content.find(t, i + 1)
+    return ""
+
+
 def cut_edge_fragment(text: str, part: str, fragment=None):
     """(text without the piece of ``part`` at its edge, the piece cut or "").
     The piece is a proper prefix of ``part`` at the end of the text, or a

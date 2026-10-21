@@ -85,6 +85,7 @@ class WordingForget:
         out = {"nodes": 0, "occurrences": 0, "node_ids": [], "tables": {},
                "inside_words": 0, "fragments": 0}
         part = scrub.canonical(str(lit))
+        pat = scrub._pattern([lit])
         fragments: Dict[str, List[str]] = {}
         strings = [lit]
         for table, (keycol, plain, jsoncols) in _TARGETS.items():
@@ -115,15 +116,21 @@ class WordingForget:
                         content_cut = n
                     new_vals.append(new)
                 if table == "nodes" and content_cut:
-                    # A label (or a preview, a context line) is the content cut
-                    # off where a line wrapped: when this node's content held
-                    # the string, the half of it a derived field kept goes too.
-                    # Only a prefix at the end or a suffix at the start of
-                    # that field, and only on a node an occurrence was cut from.
+                    # A label (or a preview, a context line) is the content
+                    # cut off somewhere: when this node's content held the
+                    # string and the field stops exactly inside the occurrence,
+                    # the piece it kept goes too (never a piece anywhere else).
+                    orig_content = vals[cols.index("content")]
+                    spans = [(m.start(), m.end()) for m in pat.finditer(orig_content)]
                     for fld in ("label", "event_time_text", "source_context"):
                         i = cols.index(fld)
-                        new_vals[i], piece = scrub.cut_edge_fragment(new_vals[i], part)
+                        if new_vals[i] != vals[i]:
+                            continue          # the whole string was cut from it
+                        piece = scrub.aligned_edge_fragment(
+                            vals[i], orig_content, spans, part)
                         if piece:
+                            new_vals[i], _ = scrub.cut_edge_fragment(
+                                new_vals[i], part, piece)
                             fragments.setdefault(key, []).append(piece)
                             out["fragments"] += 1
                             cuts += 1
@@ -317,15 +324,19 @@ class WordingForget:
             leftovers.append(orphaned)
         partial = self._partial_copies(lit)
         if partial:
-            where = "; ".join(f"node {p['node_id']} {p['field']} "
-                              f"({p['characters']} characters)" for p in partial)
+            shown = partial[:10]
+            where = "; ".join(
+                f"{p['surface']} {p['node_id']} {p['field']} "
+                f"({p['characters']} characters)" for p in shown)
+            more = (f" and {len(partial) - len(shown)} more"
+                    if len(partial) > len(shown) else "")
             leftovers.append({
                 "kind": "partial_copy", "pieces": partial,
                 "note": f"a piece of the string, not the whole of it, sits at "
                         f"the edge of a field in {len(partial)} place(s): "
-                        f"{where}. It was not cut because no occurrence was "
-                        "cut from that node; name the piece with another "
-                        "--wording if it is also secret"})
+                        f"{where}{more}. It was not cut because it is not "
+                        "where an occurrence was cut from the same node; name "
+                        "the piece with another --wording if it is also secret"})
         remaining = dict(residue)
         gone = not leftovers and not remaining
         result = {
@@ -475,25 +486,90 @@ class WordingForget:
                                  + (storage.get("note") or "another connection is open")})
         return left
 
-    def _partial_copies(self, lit) -> List[Dict]:
-        """Nodes whose label, content or context line begins or ends with a
-        piece (MIN_EDGE characters or more) of the string, in the places a cut
-        or a truncation would leave one. Read only, every node: a piece in a
-        node the string was never cut from is not cut, only reported. Says
-        where and how long; never the characters."""
-        part = scrub.canonical(str(lit))
+    @staticmethod
+    def _fragment_report(conn, part, surface: str) -> List[Dict]:
+        """Pieces of the string (MIN_EDGE characters or more) at the edge of a
+        text field, on one database connection: every node field, and every
+        audit row by the content of its cells. Where and how long only."""
         found = []
-        with self.store._lock:
-            conn = self.store._get_conn()
-            for nid, label, content, sctx in conn.execute(
-                    "SELECT node_id, label, content, source_context FROM nodes"):
+
+        def best(text):
+            return max((k for _kind, k in scrub.edge_fragments(
+                text or "", part, scrub.MIN_EDGE, report=True)), default=0)
+
+        def strings_of(raw):
+            try:
+                value = json.loads(raw)
+            except (TypeError, ValueError):
+                return [raw]
+            return list(scrub._iter_strings(value))
+
+        try:
+            for nid, label, content, ett, sctx, meta in conn.execute(
+                    "SELECT node_id, label, content, event_time_text, "
+                    "source_context, metadata FROM nodes"):
                 for field, text in (("label", label), ("content", content),
+                                    ("event_time_text", ett),
                                     ("source_context", sctx)):
-                    best = max((k for _kind, k in scrub.edge_fragments(
-                        text or "", part, scrub.MIN_EDGE, report=True)), default=0)
-                    if best:
-                        found.append({"node_id": nid, "field": field,
-                                      "characters": best})
+                    k = best(text)
+                    if k:
+                        found.append({"surface": surface + "node", "node_id": nid,
+                                      "field": field, "characters": k})
+                k = max((best(x) for x in strings_of(meta or "")), default=0)
+                if k:
+                    found.append({"surface": surface + "node", "node_id": nid,
+                                  "field": "metadata", "characters": k})
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for rid, nid, actor, bj, aj in conn.execute(
+                    "SELECT id, node_id, actor, before_json, after_json FROM audit_log"):
+                for field, raw in (("actor", actor), ("before_json", bj),
+                                   ("after_json", aj)):
+                    if not raw:
+                        continue
+                    k = max((best(x) for x in strings_of(raw)), default=0)
+                    if k:
+                        found.append({"surface": surface + "audit_log",
+                                      "node_id": nid, "row": rid, "field": field,
+                                      "characters": k})
+        except sqlite3.OperationalError:
+            pass
+        return found
+
+    def _partial_copies(self, lit) -> List[Dict]:
+        """Where a piece of the string still sits: the live database (every
+        node field, every audit row) and every `revien watch` snapshot, plain
+        or gzip. Read only. A piece is cut only where an occurrence was cut
+        from the same node (see scrub.aligned_edge_fragment); anywhere else it
+        is only reported, and the answer is then not "gone everywhere"."""
+        import gzip
+        import shutil
+        import tempfile
+
+        part = scrub.canonical(str(lit))
+        with self.store._lock:
+            found = self._fragment_report(self.store._get_conn(), part, "")
+        snap = Path(str(self.store.db_path) + ".snapshots")
+        if snap.is_dir():
+            for f in sorted(snap.iterdir()):
+                if not (f.name.endswith(".db") or f.name.endswith(".db.gz")):
+                    continue
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = f
+                        if f.name.endswith(".gz"):
+                            path = Path(tmp) / "snap.db"
+                            with gzip.open(f, "rb") as src, open(path, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                        try:
+                            found.extend(self._fragment_report(
+                                conn, part, f"snapshot {f.name} "))
+                        finally:
+                            conn.close()
+                except (OSError, sqlite3.Error):
+                    continue
         return found
 
     def _wording_message(self, r: Dict) -> str:
