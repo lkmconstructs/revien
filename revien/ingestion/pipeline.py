@@ -420,6 +420,10 @@ class IngestionPipeline:
                 return self._suppressed_output(_gate.Block(
                     {"unit_id": unit.unit_id or "(shared channel)"},
                     "everything in it was forgotten"), fenced_spans)
+        else:
+            # an override lifts a unit's suppression, never a named secret
+            input_data.content, _ = _gate.strip_literals(
+                self.store, input_data.content)
 
         # 0b. Stable ingestion key (repair leg R3). With a key, look for the
         #     context node a previous ingest of this same unit stamped:

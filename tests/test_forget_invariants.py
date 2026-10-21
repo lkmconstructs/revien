@@ -223,3 +223,60 @@ def test_gone_everywhere_is_said_only_when_it_is_true(tmp_path, monkeypatch):
     result = _forget(seeded)
     assert result["leftovers"] and result["scope"] == "forgotten from Revien"
     assert result["message"].startswith("Forgotten from Revien.")
+
+
+def test_wording_forget_leaves_nothing_after_every_kind_of_history(tmp_path):
+    """Invariant 1 for a secret named by its characters: a deleted node, an
+    edited node, a line refreshed away, and the three key shapes (a Bearer on
+    its own line, a URL with ?token=, a key wrapped across two lines) all end
+    at zero rows and zero raw bytes in every table, the db, -wal and -shm,
+    the vectors, training.db and the snapshots."""
+    from revien.watch import snapshot_db
+    from tests.test_forget_wording import cc, leaks, new_key
+
+    db = str(tmp_path / "hist.db")
+    k_del, k_edit, k_ref, k_bear, k_url, k_wrap = (new_key() for _ in range(6))
+    half = len(k_wrap) // 2
+    cc(db, "del", f"User: We decided to use {k_del} as the deploy key.")
+    cc(db, "edit", f"User: We decided to use {k_edit} as the deploy key.")
+    cc(db, "ref", f"User: We decided to use {k_ref} as the deploy key.\nUser: The venue is booked.")
+    cc(db, "ref", "User: The venue is booked.\nUser: A later remark about parking.")      # the line is refreshed away
+    cc(db, "shapes",
+       f"User: The header was\nAuthorization:\nBearer {k_bear}\nand it failed.\n"
+       f"User: call https://api.example.com/v1/data?token={k_url}&x=1 and retry.\n"
+       f"User: the key is {k_wrap[:half]}\n   {k_wrap[half:]} and it is live.")
+    s = GraphStore(db_path=db)
+    ops = GraphOperations(s)
+    for n in s.list_nodes(limit=500):
+        if k_del in n.label + n.content:
+            ops.delete_node(n.node_id)
+        elif k_edit in n.label + n.content:
+            s.update_node(n.node_id, content="[edited]", label="[edited]")
+    ids = [n.node_id for n in s.list_nodes(limit=500)
+           if any(k in n.label + n.content for k in (k_bear, k_url, k_wrap))]
+    assert ids
+    s.close()
+    planted = surf.plant(db, k_wrap, tmp_path, ids)
+    snaps = Path(db + ".snapshots")
+    plain = snapshot_db(db, use_gzip=False, out_dir=snaps)
+    everything = (k_del, k_edit, k_ref, k_bear, k_url, k_wrap, k_wrap[:half], k_wrap[half:])
+    assert leaks(db, *everything)           # the history is really there to be found
+    s = GraphStore(db_path=db)
+    ops = GraphOperations(s)
+    ops.training_dbs = (planted["training_db"],)
+    for k in (k_del, k_edit, k_ref, k_bear, k_url, k_wrap):
+        res = ops.forget_wording(k)
+        assert res["status"] == "forgotten", res
+    s.close()
+    assert leaks(db, *everything) == {}
+    for piece in everything:
+        assert piece.encode() not in Path(plain).read_bytes()
+        assert piece.encode() not in open(planted["training_db"], "rb").read()
+    conn = sqlite3.connect(db)
+    conn.enable_load_extension(True)
+    import sqlite_vec
+    sqlite_vec.load(conn)
+    for nid in planted["ids"]:
+        row = conn.execute("SELECT count(*) FROM vec_nodes WHERE node_id = ?", (nid,)).fetchone()[0]
+        assert row == 0
+    conn.close()

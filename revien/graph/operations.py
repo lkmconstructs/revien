@@ -384,6 +384,13 @@ class GraphOperations:
         return self._forget_engine().forget(
             node_id, actor=actor, everywhere=everywhere)
 
+    def forget_wording(self, wording: str, actor: str = "api:forget",
+                       dry_run: bool = False) -> Dict:
+        """Forget a literal string everywhere (see revien/forget/wording.py).
+        The string is never stored, logged or returned."""
+        return self._forget_engine().forget_wording(
+            wording, actor=actor, dry_run=dry_run)
+
     def delete_node(self, node_id: str, actor: str = "api:delete",
                     op: str = "delete") -> bool:
         """The delete verb: remove the node and its edges now. Leaves one

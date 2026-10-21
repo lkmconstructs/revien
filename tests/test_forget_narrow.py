@@ -289,8 +289,8 @@ class TestAConversationIsRefused:
         res = GraphOperations(s).forget_node(ctx.node_id)
         s.close()
         assert res["status"] == "refused" and res["reason"] == "whole_conversation"
-        assert res["message"] == ("To remove a whole conversation or file, use delete; "
-                                  "to keep a specific detail out, forget that detail.")
+        for real in ("revien delete", "revien forget --wording"):
+            assert real in res["message"]
         assert res["message"] == WHOLE_CONVERSATION
         assert self._snapshot(db) == before
         assert holders_of(db, NAME)                      # the conversation is still there

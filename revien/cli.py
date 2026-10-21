@@ -2028,7 +2028,15 @@ def _has_sync_row(db_path: str, name: str) -> bool:
 
 
 @main.command()
-@click.argument("node_id")
+@click.argument("node_id", required=False)
+@click.option("--wording", "wording", default=None, metavar="STRING",
+              help="Forget a literal string (a key, a token, a password) "
+                   "wherever it appears: every node, the audit trail, recall "
+                   "records, training data and snapshots, and keep the same "
+                   "characters out of every later capture. Use --wording - to "
+                   "read the string from standard input, so it does not sit "
+                   "in your shell history. The string is never stored, "
+                   "logged or printed")
 @click.option("--everywhere", is_flag=True,
               help="Also cut the exact forgotten wording (this node's own "
                    "wording) out of every other node that holds it, in place "
@@ -2043,8 +2051,9 @@ def _has_sync_row(db_path: str, name: str) -> bool:
               help="Where to look for a running daemon (loopback addresses "
                    "only; default http://127.0.0.1:7437)")
 @click.option("--json-output", is_flag=True, help="Output the result as JSON")
-def forget(node_id: str, everywhere: bool, db: Optional[str], yes: bool,
-           preview: bool, daemon_url: str, json_output: bool):
+def forget(node_id: Optional[str], wording: Optional[str], everywhere: bool,
+           db: Optional[str], yes: bool, preview: bool, daemon_url: str,
+           json_output: bool):
     """Forget one specific thing: a fact, an entity, a decision or a
     preference. Privacy, not housekeeping.
 
@@ -2058,14 +2067,32 @@ def forget(node_id: str, everywhere: bool, db: Optional[str], yes: bool,
     Revien cannot reach (your own source file, exports, distilled notes), and
     which way back it does and does not close.
 
-    A whole conversation is not one thing to forget: to remove it, use
-    delete. To only remove a node and let it be captured again, use the
-    delete endpoint. A running daemon from before forget protection makes
-    this refuse; restart it first."""
+    A whole conversation is not one thing to forget: to remove it, run
+    `revien delete NODE_ID`. To remove a secret that should never have been
+    recorded, name its exact characters: `revien forget --wording -` (the
+    string on standard input). For a leaked key, rotate it first and forget
+    second: a forget cannot recall what already left this machine. A running
+    daemon from before forget protection makes this refuse; restart it
+    first."""
     import sqlite3
 
     from revien.graph.operations import GraphOperations
     from revien.graph.store import GraphStore
+
+    if wording is not None:
+        if node_id or everywhere:
+            click.echo("--wording takes no NODE_ID and no --everywhere: it "
+                       "always reaches every node and every later capture.")
+            raise SystemExit(1)
+        if wording == "-":
+            wording = click.get_text_stream("stdin").read()
+            if wording.endswith("\r\n"):
+                wording = wording[:-2]
+            elif wording.endswith("\n"):
+                wording = wording[:-1]
+    elif not node_id:
+        click.echo("Give a NODE_ID, or --wording STRING.")
+        raise SystemExit(1)
 
     config = _load_config()
     db_path = db or config.get("db_path", _default_db_path())
@@ -2088,6 +2115,40 @@ def forget(node_id: str, everywhere: bool, db: Optional[str], yes: bool,
     except (sqlite3.Error, OSError) as e:
         click.echo(f"Cannot open {db_path}: {e}")
         raise SystemExit(1)
+    if wording is not None:
+        try:
+            ops = GraphOperations(store)
+            plan = ops.forget_wording(wording, actor="cli:forget", dry_run=True)
+            if plan.get("status") == "refused":
+                click.echo(plan["message"])
+                raise SystemExit(1)
+            if preview:
+                if json_output:
+                    click.echo(json.dumps(plan, indent=2))
+                else:
+                    click.echo(plan["blast_radius"])
+                    for t, n in sorted(plan["would_cut_in"].items()):
+                        click.echo(f"  {t}: {n} row(s)")
+                return
+            if not yes:
+                click.echo(plan["blast_radius"])
+                if not plan["would_cut_occurrences"]:
+                    click.echo("The string is not in this database yet; it "
+                               "would still be kept out of later captures.")
+                if not click.confirm("Forget this string?"):
+                    click.echo("Nothing was changed.")
+                    raise SystemExit(1)
+            result = ops.forget_wording(wording, actor="cli:forget")
+        finally:
+            store.close()
+        if json_output:
+            click.echo(json.dumps(result, indent=2))
+            return
+        click.echo(result["message"])
+        if result["status"] in ("refused", "busy"):
+            raise SystemExit(1)
+        return
+
     try:
         ops = GraphOperations(store)
         plan = ops._forget_engine().forget(
@@ -2145,6 +2206,50 @@ def forget(node_id: str, everywhere: bool, db: Optional[str], yes: bool,
         click.echo(f"  {u['note']}")
 
 
+@main.command(name="delete")
+@click.argument("node_id")
+@click.option("--db", default=None, help="Database path")
+@click.option("--yes", "yes", is_flag=True, help="Do not ask before deleting")
+def delete_cmd(node_id: str, db: Optional[str], yes: bool):
+    """Delete one node now (operational, not privacy).
+
+    Removes the node and its edges and writes one content-free `delete` audit
+    entry. It writes no forget record, so the content can be captured again if
+    its source still holds it, and the facts taken from a conversation are
+    separate nodes that stay. To keep a secret out for good, use
+    `revien forget --wording`."""
+    import sqlite3
+
+    from revien.graph.operations import GraphOperations
+    from revien.graph.store import GraphStore
+
+    config = _load_config()
+    db_path = db or config.get("db_path", _default_db_path())
+    problem = _sqlite_problem(db_path)
+    if problem:
+        click.echo(problem)
+        raise SystemExit(1)
+    try:
+        store = GraphStore(db_path=db_path)
+    except (sqlite3.Error, OSError) as e:
+        click.echo(f"Cannot open {db_path}: {e}")
+        raise SystemExit(1)
+    try:
+        node = store.get_node(node_id)
+        if node is None:
+            click.echo(f"No node {node_id} to delete.")
+            raise SystemExit(1)
+        if not yes and not click.confirm(
+                f"Delete this {node.node_type.value} node ({node_id})?"):
+            click.echo("Nothing was changed.")
+            raise SystemExit(1)
+        GraphOperations(store).delete_node(node_id, actor="cli:delete")
+    finally:
+        store.close()
+    click.echo(f"Deleted {node_id}. It can be captured again if its source "
+               "still holds it; no forget record was written.")
+
+
 @main.command()
 @click.argument("target", required=False)
 @click.option("--db", default=None, help="Database path")
@@ -2186,6 +2291,12 @@ def restore(target: Optional[str], db: Optional[str], list_only: bool, yes: bool
                 return
             click.echo(f"{len(rows)} active forget record(s):")
             for r in rows:
+                if r.get("literal_fps"):
+                    click.echo(
+                        f"  #{r['id']} {r['unit_id']} (a secret string kept out "
+                        f"of every source by forget --wording), since "
+                        f"{r['created_at'][:19]}")
+                    continue
                 if r["scope"] == "global":
                     click.echo(
                         f"  #{r['id']} {r['unit_id']} (an exact wording kept "

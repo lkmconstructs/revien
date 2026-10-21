@@ -104,3 +104,83 @@ def fingerprints(texts: Iterable[str]) -> list:
             seen.add(fp)
             out.append(fp)
     return out
+
+
+# ── a literal string, found inside any text without being stored ─────────
+#
+# A secret named with ``forget --wording`` must never land again in any new
+# sentence. The record keeps no text: its length in characters, a keyed
+# rolling hash (Rabin-Karp with a base derived from forget.key, so it can be
+# slid along a capture in one pass) and a keyed HMAC of the string itself that
+# confirms a candidate. The length is the one thing the record discloses.
+
+_RK_MOD = (1 << 61) - 1
+
+
+def _rk_base() -> int:
+    key = load_key(create=True)
+    raw = hmac.new(key, b"revien-literal-base", hashlib.sha256).digest()
+    return int.from_bytes(raw[:8], "big") % (_RK_MOD - 3) + 2
+
+
+def rolling_hash(text: str) -> int:
+    base, h = _rk_base(), 0
+    for ch in text:
+        h = (h * base + ord(ch) + 1) % _RK_MOD
+    return h
+
+
+def literal_confirm(text: str) -> str:
+    return fingerprint("literal:" + text)
+
+
+def literal_entry(canonical_text: str) -> str:
+    """``"<chars>:<rolling hash>:<hmac>"`` for a (canonical) secret."""
+    return f"{len(canonical_text)}:{rolling_hash(canonical_text):x}:{literal_confirm(canonical_text)}"
+
+
+def find_literals(text: str, entries) -> list:
+    """[(start, end)] of every place in ``text`` where one of the entries'
+    strings occurs (line wraps inside it ignored), as offsets into ``text``.
+    Nothing but the entries is needed to find them."""
+    import re
+
+    wanted = {}
+    for e in entries:
+        n, roll, fp = e.split(":", 2)
+        wanted.setdefault(int(n), {})[int(roll, 16)] = fp
+    if not wanted or not text:
+        return []
+    kept, chars, pos = [], [], 0
+    for m in re.finditer(r"\r?\n[ \t]*", text):
+        for i in range(pos, m.start()):
+            kept.append(i)
+        pos = m.end()
+    for i in range(pos, len(text)):
+        kept.append(i)
+    canon = "".join(text[i] for i in kept)
+    base = _rk_base()
+    spans = []
+    for n, rolls in wanted.items():
+        if n > len(canon) or n <= 0:
+            continue
+        top = pow(base, n - 1, _RK_MOD)
+        h = 0
+        for ch in canon[:n]:
+            h = (h * base + ord(ch) + 1) % _RK_MOD
+        i = 0
+        while True:
+            fp = rolls.get(h)
+            if fp is not None and literal_confirm(canon[i:i + n]) == fp:
+                spans.append((kept[i], kept[i + n - 1] + 1))
+            if i + n >= len(canon):
+                break
+            h = ((h - (ord(canon[i]) + 1) * top) * base + ord(canon[i + n]) + 1) % _RK_MOD
+            i += 1
+    return spans
+
+
+def key_check() -> str:
+    """A keyed fixed string: compare it with the one stored at the last forget
+    to learn that forget.key was lost or replaced."""
+    return fingerprint("revien-forget-key-check")

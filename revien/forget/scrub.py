@@ -45,10 +45,74 @@ def _bounded(s: str) -> str:
     return pre + re.escape(s) + post
 
 
+class Literal(str):
+    """A string to cut as exact characters (``forget --wording``): case
+    sensitive, no word boundaries (a secret sits inside ``?token=...&x`` and
+    ``ghp_...``), and tolerant of a line break the text wrapped it at."""
+
+
+_WRAP = re.compile(r"\r?\n[ \t]*")
+
+
+def canonical(text: str) -> str:
+    """The text with line wraps (a newline and the indent after it) removed:
+    what a secret looks like however it was wrapped."""
+    return _WRAP.sub("", text)
+
+
+#: A cut field that begins or ends with at least this much of a literal
+#: secret (and a quarter of it) loses that piece too: a label or a preview is
+#: the text cut off wherever the line wrapped, so it holds half a key.
+MIN_EDGE = 8
+
+
+class _Pat:
+    """A compiled pattern and how to normalise text before searching it."""
+
+    def __init__(self, rx, literal: bool, parts=()):
+        self.rx, self.literal, self.parts = rx, literal, list(parts)
+
+    def trim_edges(self, text: str) -> Tuple[str, int]:
+        """Cut a piece of a secret left at the very start or end of a field."""
+        n = 0
+        for part in self.parts:
+            floor = max(MIN_EDGE, (len(part) + 3) // 4)
+            for k in range(len(part) - 1, floor - 1, -1):
+                tail = text.rstrip()
+                if tail.endswith(part[:k]):
+                    text, n = tail[:len(tail) - k], n + 1
+                    break
+            for k in range(len(part) - 1, floor - 1, -1):
+                head = text.lstrip()
+                if head.startswith(part[-k:]):
+                    text, n = head[k:], n + 1
+                    break
+        return text, n
+
+    def norm(self, text: str) -> str:
+        return text if self.literal else _nfc(text)
+
+    def finditer(self, text):
+        return self.rx.finditer(text)
+
+    def search(self, text):
+        return self.rx.search(text)
+
+
 def _pattern(strings: List[str]):
     if not strings:
         return None
-    return re.compile("|".join(_bounded(s) for s in strings), re.IGNORECASE)
+    lits = [s for s in strings if isinstance(s, Literal)]
+    if lits:
+        if len(lits) != len(strings):
+            raise ValueError("literal and word strings cannot be mixed")
+        parts = sorted({canonical(s) for s in lits if canonical(s)}, key=len, reverse=True)
+        if not parts:
+            return None
+        wrap = r"(?:\r?\n[ \t]*)?"
+        return _Pat(re.compile("|".join(
+            wrap.join(re.escape(ch) for ch in part) for part in parts)), True, parts)
+    return _Pat(re.compile("|".join(_bounded(s) for s in strings), re.IGNORECASE), False)
 
 
 _TERMINATORS = ".!?"
@@ -178,10 +242,21 @@ def cut_text(text: str, strings: List[str], sentences: bool = True) -> Tuple[str
     pat = _pattern(strings)
     if pat is None or not text:
         return text, 0
-    normalized = _nfc(text)
+    normalized = pat.norm(text)
+    if pat.literal:
+        # exactly the characters: nothing around them goes
+        out, pos, n = [], 0, 0
+        for m in pat.finditer(normalized):
+            out.append(normalized[pos:m.start()])
+            pos, n = m.end(), n + 1
+        out.append(normalized[pos:])
+        cut, edges = pat.trim_edges("".join(out))
+        if not n and not edges:
+            return text, 0
+        return cut, n + edges
     spans = []
     for m in pat.finditer(normalized):
-        if sentences:
+        if sentences and not pat.literal:
             spans.append(list(_sentence_span(normalized, m.start(), m.end())))
         else:
             spans.append([m.start(), m.end()])
@@ -286,7 +361,7 @@ def nfc(text: str) -> str:
 
 def contains(text: str, strings: List[str]) -> bool:
     pat = _pattern(strings)
-    return bool(pat and text and pat.search(_nfc(text)))
+    return bool(pat and text and pat.search(pat.norm(text)))
 
 
 # Tables whose rows are vector blobs or SQLite internals: not text stores.
@@ -340,12 +415,12 @@ def find_residue(conn: sqlite3.Connection, strings: List[str],
             for i, v in enumerate(row):
                 if i in skip and not _is_content_cell(table, cols, row, i):
                     continue
-                if isinstance(v, str) and any(pat.search(_nfc(s)) for s in _iter_strings(v)):
+                if isinstance(v, str) and any(pat.search(pat.norm(s)) for s in _iter_strings(v)):
                     hits += 1
                     break
                 if isinstance(v, (bytes, bytearray)):
                     try:
-                        if pat.search(_nfc(bytes(v).decode("utf-8", "ignore"))):
+                        if pat.search(pat.norm(bytes(v).decode("utf-8", "ignore"))):
                             hits += 1
                             break
                     except Exception:  # noqa: BLE001

@@ -230,6 +230,72 @@ def known(store, unit: UnitRef):
     return long_fps, short_fps, wording, _split_windows(windows)
 
 
+def literals(store) -> List[str]:
+    """The keyed entries of every secret string a ``forget --wording`` named.
+    They apply to every capture from every source."""
+    out: List[str] = []
+    for rec in store.list_suppressions("active"):
+        out.extend(rec.get("literal_fps") or [])
+    return out
+
+
+def cut_literals(text: str, entries) -> tuple:
+    """(text with every named secret cut out, occurrences). Exactly the
+    characters of the secret go; nothing around them."""
+    from revien.forget.keys import find_literals
+
+    if not text or not entries:
+        return text, 0
+    spans = sorted(find_literals(text, entries))
+    if not spans:
+        return text, 0
+    out, pos, n = [], 0, 0
+    for l, r in spans:
+        if l < pos:
+            pos = max(pos, r)
+            continue
+        out.append(text[pos:l])
+        pos, n = r, n + 1
+    out.append(text[pos:])
+    return "".join(out), n
+
+
+def cut_literals_json(raw, entries) -> tuple:
+    """The same inside a JSON document held as text (plain text if it is not)."""
+    import json
+
+    if not raw or not entries:
+        return raw, 0
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return cut_literals(raw, entries)
+    total = 0
+
+    def walk(v):
+        nonlocal total
+        if isinstance(v, str):
+            new, n = cut_literals(v, entries)
+            total += n
+            return new
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        return v
+
+    new = walk(value)
+    return (json.dumps(new) if total else raw), total
+
+
+def strip_literals(store, text: str) -> tuple:
+    """Leave every named secret out of a capture. Applies even when a
+    re-import was told to override sentence-level suppression: only
+    ``revien restore forget:<id>`` lifts a secret."""
+    entries = literals(store)
+    return cut_literals(text, entries) if entries else (text, 0)
+
+
 def _forgotten_test(long_fps, short_fps, windows):
     from revien.forget import scrub
 
@@ -283,6 +349,39 @@ def _scrub_audit_rows(conn, node_id: str, forgotten) -> None:
                          "after_json = NULL WHERE id = ?", (rid,))
 
 
+def _cut_secret_from_node(store, conn, nid: str, entries) -> None:
+    """Cut every named secret out of one node's text fields and out of the
+    audit snapshots written for it, inside the capture's own transaction."""
+    row = conn.execute(
+        "SELECT label, content, event_time_text, source_context, metadata "
+        "FROM nodes WHERE node_id = ?", (nid,)).fetchone()
+    if row is None:
+        return
+    label, content, ett, sctx, meta = row
+    n_label, a = cut_literals(label or "", entries)
+    n_content, b = cut_literals(content or "", entries)
+    n_ett, c = cut_literals(ett or "", entries)
+    n_sctx, d = cut_literals(sctx or "", entries)
+    n_meta, e = cut_literals_json(meta or "", entries)
+    if a or b or c or d or e:
+        conn.execute(
+            "UPDATE nodes SET label = ?, content = ?, event_time_text = ?, "
+            "source_context = ?, metadata = ? WHERE node_id = ?",
+            ((n_label if n_label.strip() else "[removed]")[:200],
+             n_content if n_content.strip() else "[removed]",
+             n_ett, n_sctx, n_meta, nid))
+        store._enqueue_embed_stmt(conn, nid)
+    for rid, bj, aj, actor in conn.execute(
+            "SELECT id, before_json, after_json, actor FROM audit_log "
+            "WHERE node_id = ?", (nid,)).fetchall():
+        nb, x = cut_literals_json(bj, entries)
+        na, y = cut_literals_json(aj, entries)
+        nact, z = cut_literals(actor or "", entries)
+        if x or y or z:
+            conn.execute("UPDATE audit_log SET before_json = ?, after_json = ?, "
+                         "actor = ? WHERE id = ?", (nb, na, nact, rid))
+
+
 def check(store, unit: UnitRef, content: str) -> Optional[Block]:
     """The record that refuses this capture whole, or None. Only a
     ``forget --everywhere`` can: when the capture IS the exact wording it
@@ -316,12 +415,14 @@ def strip_forgotten(store, unit: UnitRef, content: str):
 
     if not content:
         return content, 0
+    content, cut = strip_literals(store, content)
     long_fps, short_fps, _wording, windows = known(store, unit)
     if not long_fps and not short_fps and not windows:
-        return content, 0
-    return scrub.strip_sentences(
+        return content, cut
+    content, n = scrub.strip_sentences(
         content, _forgotten_test(long_fps, short_fps, windows),
         min_len=scrub.MIN_SHORT)
+    return content, n + cut
 
 
 def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=(),
@@ -354,12 +455,16 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
             for nid in merged_ids:
                 store.delete_provenance(nid, [unit.owner])
             return block
+        entries = literals(store)
+        fresh = set(new_ids)
+        if entries:
+            for nid in list(new_ids) + [i for i in existing_ids if i not in fresh]:
+                _cut_secret_from_node(store, conn, nid, entries)
         long_fps, short_fps, wording, windows = known(store, unit)
         if not long_fps and not short_fps and not wording and not windows:
             return None
         forgotten = _forgotten_test(long_fps, short_fps, windows)
 
-        fresh = set(new_ids)
         for nid in list(new_ids) + [i for i in existing_ids if i not in fresh]:
             row = conn.execute(
                 "SELECT node_type, label, content FROM nodes WHERE node_id = ?",

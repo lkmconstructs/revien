@@ -77,6 +77,7 @@ class ForgetStoreMixin:
             sentence_fps TEXT NOT NULL DEFAULT '[]',
             short_fps TEXT NOT NULL DEFAULT '[]',
             window_fps TEXT NOT NULL DEFAULT '[]',
+            literal_fps TEXT NOT NULL DEFAULT '[]',
             scope TEXT NOT NULL DEFAULT 'origin',
             created_at TEXT NOT NULL,
             actor TEXT NOT NULL DEFAULT '',
@@ -106,8 +107,10 @@ class ForgetStoreMixin:
                     "?" * len(self._FORGET_OBJECTS)), self._FORGET_OBJECTS)}
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version >= 6 and len(have) == len(self._FORGET_OBJECTS):
+                self._ensure_record_columns(conn)
                 return
             conn.executescript(self._FORGET_LAYER_DDL)
+            self._ensure_record_columns(conn)
             if version < 6:
                 self._backfill_provenance(conn)
                 conn.execute("PRAGMA user_version = 6")
@@ -117,6 +120,17 @@ class ForgetStoreMixin:
                 print(f"Migration note: {e}")
             else:
                 raise
+
+    @staticmethod
+    def _ensure_record_columns(conn: sqlite3.Connection) -> None:
+        """A forget-record table made by an earlier build of this branch gets
+        the columns added since (the table was never in a release)."""
+        have = {r[1] for r in conn.execute("PRAGMA table_info(suppressions)")}
+        for col in ("window_fps", "literal_fps"):
+            if col not in have:
+                conn.execute(f"ALTER TABLE suppressions ADD COLUMN {col} "
+                             "TEXT NOT NULL DEFAULT '[]'")
+                conn.commit()
 
     @staticmethod
     def ownership_for_fields(node_type: str, runtime: Optional[str],
@@ -305,19 +319,22 @@ class ForgetStoreMixin:
             "sentence_fps": json.loads(r[4] or "[]"),
             "short_fps": json.loads(r[5] or "[]"),
             "window_fps": json.loads(r[6] or "[]"),
-            "scope": r[7] or "origin", "created_at": r[8], "actor": r[9],
-            "status": r[10], "lifted_at": r[11], "lifted_by": r[12],
+            "literal_fps": json.loads(r[7] or "[]"),
+            "scope": r[8] or "origin", "created_at": r[9], "actor": r[10],
+            "status": r[11], "lifted_at": r[12], "lifted_by": r[13],
         }
 
     _SUPPRESSION_COLS = (
         "id, unit_id, path_keys, wording_fps, sentence_fps, short_fps, "
-        "window_fps, scope, created_at, actor, status, lifted_at, lifted_by")
+        "window_fps, literal_fps, scope, created_at, actor, status, lifted_at, "
+        "lifted_by")
 
     @_locked
     def add_suppression(
         self, unit_id: str, path_keys: List[str], wording_fps: List[str],
         sentence_fps: List[str], short_fps: List[str], actor: str,
         scope: str = "origin", window_fps: Optional[List[str]] = None,
+        literal_fps: Optional[List[str]] = None,
     ) -> int:
         """Write one forget record: the keyed fingerprints of the sentences
         that held the forgotten wording, and the identities (path_keys) of
@@ -327,13 +344,14 @@ class ForgetStoreMixin:
         conn = self._get_conn()
         cur = conn.execute(
             "INSERT INTO suppressions (unit_id, path_keys, wording_fps, "
-            "sentence_fps, short_fps, window_fps, scope, created_at, actor) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "sentence_fps, short_fps, window_fps, literal_fps, scope, "
+            "created_at, actor) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (unit_id, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(wording_fps))),
              json.dumps(sorted(set(sentence_fps))),
              json.dumps(sorted(set(short_fps))),
-             json.dumps(sorted(set(window_fps or []))), scope, _now(), actor))
+             json.dumps(sorted(set(window_fps or []))),
+             json.dumps(sorted(set(literal_fps or []))), scope, _now(), actor))
         self._commit(conn)
         return cur.lastrowid
 

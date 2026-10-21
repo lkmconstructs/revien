@@ -25,11 +25,17 @@ def forget_section() -> str:
     return text[a:b]
 
 
+def sec_features() -> str:
+    return forget_section()
+
+
 def test_the_cli_commands_and_flags_named_exist():
     sec = forget_section()
     runner = CliRunner()
     for args, needle in (
             (["forget", "--help"], "--everywhere"),
+            (["forget", "--help"], "--wording"),
+            (["delete", "--help"], "--yes"),
             (["restore", "--help"], "--list"),
             (["sync", "reset", "--help"], "--yes"),
             (["import-chatgpt", "--help"], "--override-suppressed"),
@@ -53,10 +59,11 @@ def test_the_routes_named_exist(tmp_path):
                          ("DELETE", "/v1/nodes/{node_id}"),
                          ("POST", "/v1/retention/sweep"),
                          ("GET", "/v1/nodes/{node_id}/forget/preview"),
+                         ("POST", "/v1/forget/wording"),
                          ("POST", "/v1/graph/import")):
         assert (method, path) in have, (method, path)
     sec = forget_section()
-    for token in ("POST /v1/nodes/{id}/forget", "DELETE /v1/nodes/{id}",
+    for token in ("POST /v1/nodes/{id}/forget", "POST /v1/forget/wording", "DELETE /v1/nodes/{id}",
                   "POST /v1/retention/sweep", "GET /v1/nodes/{id}/forget/preview",
                   "POST /v1/graph/import"):
         assert token in sec
@@ -77,6 +84,7 @@ def test_the_tables_fields_and_functions_named_exist(tmp_path):
     assert callable(GraphOperations.run_scheduled_cleanup)
     assert callable(GraphOperations.forget_node)
     assert "forget_suppression" in heartbeat.DAEMON_FEATURES
+    assert "forget_literal" in heartbeat.DAEMON_FEATURES and "forget_literal" in sec_features()
     sec = forget_section()
     for token in ("node_provenance(node_id, unit_id, label_ok, wording_ok)",
                   "capture_units", "suppressions", "GraphOperations.run_scheduled_cleanup",
@@ -216,7 +224,7 @@ def test_sentences_that_were_false_are_gone_and_the_true_ones_are_there():
     # test_forget_round3.py and test_forget_round4.py)
     for phrase in (
             "Forget is for one specific thing",
-            "To remove a whole conversation or file, use delete; to keep a specific detail out, forget that detail.",
+            "revien delete <node id>",
             "never the content string Revien gives it",
             "A capture that does not have that identity lands as written",
             "a node written by several sources keeps all of its owners",

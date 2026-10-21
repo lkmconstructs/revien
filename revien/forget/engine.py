@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
-from revien.forget import gate, scrub
+from revien.forget import gate, keys as forget_keys, scrub
+from revien.forget.wording import WordingForget
 from revien.forget.keys import fingerprints
 from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
 from revien.graph.store import StoreBusy
@@ -39,8 +40,12 @@ from revien.graph.units import (
 
 TOMBSTONE_PREFIX = "tombstone:"
 VERB = "forget"
-WHOLE_CONVERSATION = ("To remove a whole conversation or file, use delete; to "
-                      "keep a specific detail out, forget that detail.")
+WHOLE_CONVERSATION = (
+    "A conversation's or file's stored text is not one thing to forget. To "
+    "remove it, run `revien delete <node id>` (or DELETE /v1/nodes/<node id>); "
+    "the facts taken from it are separate nodes, forget each. To remove a "
+    "specific secret or detail wherever it appears, run `revien forget "
+    "--wording` (or POST /v1/forget/wording).")
 NO_IDENTITY_NOTE = ("this capture came through a shared channel, which gives "
                     "it no identity of its own, so nothing is kept out of a "
                     "later capture of it; use --everywhere to keep this "
@@ -123,7 +128,7 @@ class Plan:
     refusal: Optional[Dict] = None
 
 
-class ForgetEngine:
+class ForgetEngine(WordingForget):
     #: How long a forget keeps waiting for a capture that holds the write lock
     #: (after SQLite's own timeout), before it refuses cleanly.
     BUSY_WAIT_SECONDS = 25.0
@@ -139,6 +144,9 @@ class ForgetEngine:
         self.retrain = retrain
         #: Says why the last retrain produced no model.
         self.retrain_reason = retrain_reason
+        #: Things the caller must be told that are about the forget record,
+        #: not about this node (for example a lost forget.key).
+        self._warnings: List[str] = []
 
     # ── planning (read only) ──────────────────────────────
 
@@ -435,6 +443,7 @@ class ForgetEngine:
             if dry_run:
                 return self._summary(plan, preview=True)
             records, bound, not_bound = self._denylist_records(plan)
+            self._warnings = []
             try:
                 fallback = self._record_denylist(records, actor)
             except StoreBusy:
@@ -581,6 +590,20 @@ class ForgetEngine:
                 "sentence_fps": [], "short_fps": []})
         return records, bound, not_bound
 
+    def _check_key(self, store) -> None:
+        """forget.key decides every fingerprint. If it was lost or replaced
+        since the last forget, the earlier records no longer match anything:
+        say so, once, and remember the key now in use."""
+        now = forget_keys.key_check()
+        was = store.get_meta("forget_key_check")
+        if was and was != now:
+            self._warnings.append(
+                "forget.key is not the key the earlier forgets were made "
+                "with (it was lost or replaced), so they can no longer keep "
+                "their wording out of new captures; forget those again.")
+        if was != now:
+            store.set_meta("forget_key_check", now)
+
     def _record_denylist(self, records, actor):
         """Phase 1: commit the forget records (the standing denylist) under
         BEGIN IMMEDIATE, visible to every other connection at once."""
@@ -592,10 +615,12 @@ class ForgetEngine:
                 sid = store.add_suppression(
                     r["unit_id"], r["path_keys"], r["wording_fps"],
                     r["sentence_fps"], r["short_fps"], actor, scope=r["scope"],
-                    window_fps=r["window_fps"])
+                    window_fps=r["window_fps"],
+                    literal_fps=r.get("literal_fps"))
                 store.record_audit(f"suppression:{sid}", "suppress", actor=actor,
                                    after={"scope": r["scope"], "verb": VERB},
                                    ts=now)
+        self._check_key(store)
         if not short_total:
             return None
         return {
@@ -1045,7 +1070,8 @@ class ForgetEngine:
     # ── reporting ─────────────────────────────────────────
 
     def _scrub_snapshots(self, removed_ids, touched_ids, strings, episodes,
-                         receipt_ids=frozenset(), place=(frozenset(), (), ())) -> Dict:
+                         receipt_ids=frozenset(), place=(frozenset(), (), ()),
+                         scrub_fn=None) -> Dict:
         """`revien watch` backups are copies of the raw store, so the forget
         reaches them too, with the same treatment as the live database: the
         removed nodes go (and their vectors), the cut ones are cut, the
@@ -1057,6 +1083,13 @@ class ForgetEngine:
         import tempfile
 
         out = {"scrubbed": 0, "unreadable": []}
+
+        def one(path):
+            if scrub_fn is not None:
+                return scrub_fn(path)
+            return self._scrub_db_copy(path, removed_ids, touched_ids, strings,
+                                       episodes, receipt_ids, place)
+
         snap = Path(str(self.store.db_path) + ".snapshots")
         if not snap.is_dir():
             return out
@@ -1070,17 +1103,13 @@ class ForgetEngine:
                         raw = Path(tmp) / "snap.db"
                         with gzip.open(f, "rb") as src, open(raw, "wb") as dst:
                             shutil.copyfileobj(src, dst)
-                        partial = self._scrub_db_copy(
-                            raw, removed_ids, touched_ids, strings, episodes,
-                            receipt_ids, place)
+                        partial = one(raw)
                         packed = Path(tmp) / "snap.db.gz"
                         with open(raw, "rb") as src, gzip.open(packed, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                         shutil.copyfile(packed, f)
                 else:
-                    partial = self._scrub_db_copy(
-                        f, removed_ids, touched_ids, strings, episodes,
-                        receipt_ids, place)
+                    partial = one(f)
                 out["scrubbed"] += 1
                 for note in partial:
                     out["unreadable"].append(f"{name}: {note}")
@@ -1341,6 +1370,10 @@ class ForgetEngine:
             sentences += scrub.clean_strings([plan.target.content])
         sentence_pat = scrub.compile_strings(scrub.clean_strings(sentences))
         token_pat = scrub.compile_strings(scrub.clean_strings(sorted(loose)))
+        # a rare word that looks like a key or a code (8+ characters with a
+        # digit or an underscore): reported wherever it is, owned or not
+        idents = [t for t in loose if len(t) >= 8 and any(c.isdigit() or c == "_" for c in t)]
+        ident_pat = scrub.compile_strings(scrub.clean_strings(sorted(idents)))
         whole = list(forgotten_keys)
         if plan.target is not None:
             whole.append(plan.target.content)
@@ -1361,6 +1394,11 @@ class ForgetEngine:
                 continue
             if token_pat is not None and token_pat.search(text) \
                     and nid not in vouched:
+                found[nid] = None
+                continue
+            if ident_pat is not None and ident_pat.search(text):
+                # (an owned conversation counts too: a copy of a key in another
+                # source's own record is still a copy, however it is worded)
                 found[nid] = None
                 continue
             if nid in touched:
@@ -1571,6 +1609,8 @@ class ForgetEngine:
                 "source")
         if fallback:
             result["fallback"] = fallback
+        if self._warnings:
+            result["warnings"] = list(self._warnings)
         result["message"] = self._message(result)
         return result
 
@@ -1612,6 +1652,8 @@ class ForgetEngine:
                 f"{len(r['cut_in_place'])} node(s): "
                 + "; ".join(f"{c['node_id']} ({', '.join(c['units'])})"
                             for c in r["cut_in_place"]) + ".")
+        for w in r.get("warnings", []):
+            lines.append(w)
         re_ = r["reentry"]
         lines.append(f"Scope: {re_['scope']}. Stops coming back: "
                      + (" | ".join(re_["stops"]) or "nothing") + ". Does not stop: "

@@ -23,7 +23,8 @@ from typing import Dict, List, Optional
 # a sync position only if no reset happened meanwhile (sync_cursors.generation).
 # "forget_suppression": every capture it makes goes through the suppression
 # gate, so a forgotten unit does not come back through it.
-DAEMON_FEATURES = ("sync_reset_fence", "usage_receipts", "forget_suppression")
+DAEMON_FEATURES = ("sync_reset_fence", "usage_receipts", "forget_suppression",
+                   "forget_literal")
 
 # Features `revien sync reset` needs a daemon on the database to have.
 RESET_REQUIRES = ("sync_reset_fence",)
@@ -31,7 +32,7 @@ RESET_REQUIRES = ("sync_reset_fence",)
 # Features `revien forget` needs: a daemon without the gate would capture the
 # forgotten source again, and one without the fence could undo a reset made
 # because of it.
-FORGET_REQUIRES = ("sync_reset_fence", "forget_suppression")
+FORGET_REQUIRES = ("sync_reset_fence", "forget_suppression", "forget_literal")
 
 HEARTBEAT_PREFIX = "daemon_heartbeat:"
 HEARTBEAT_INTERVAL = 10.0   # seconds between refreshes

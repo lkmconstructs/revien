@@ -1230,6 +1230,40 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(503, detail=result)
         return result
 
+    # ── POST /v1/forget/wording ────────────────────────
+    class ForgetWordingRequest(BaseModel):
+        wording: str
+        # Only count what the string would cut; change nothing.
+        preview: bool = False
+
+    @app.post("/v1/forget/wording", dependencies=[_mutation_auth])
+    async def forget_wording_endpoint(request: ForgetWordingRequest):
+        """Forget a literal string (a key, a token, a password) everywhere:
+        every node, the audit trail, recall records, training data and
+        snapshots, and keep the same characters out of every later capture.
+        The string is never stored, logged or returned (docs/FORGET_SPEC.md
+        §2a)."""
+        from revien.daemon.heartbeat import FORGET_REQUIRES, daemons_lacking
+
+        old = daemons_lacking(store, FORGET_REQUIRES, exclude_pid=os.getpid())
+        if old:
+            raise HTTPException(409, detail={
+                "status": "refused", "reason": "restart_required",
+                "message": (
+                    f"A daemon (pid {old[0]['pid']}) is serving this database "
+                    "from before forget protection. It would capture the "
+                    "string again. Restart required: stop it, start it "
+                    "again with 'revien start', then forget again. Nothing "
+                    "was changed.")})
+        result = ops.forget_wording(request.wording, actor="api:forget",
+                                    dry_run=request.preview)
+        status = result.get("status")
+        if status == "refused":
+            raise HTTPException(400, detail=result)
+        if status == "busy":
+            raise HTTPException(503, detail=result)
+        return result
+
     # ── GET /v1/export ─────────────────────────────────
     @app.get("/v1/export")
     async def export_everything():

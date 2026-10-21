@@ -1017,6 +1017,17 @@ class GraphStore(ForgetStoreMixin):
         the node has no ownership row, i.e. a forget of another node
         never removes it."""
         self._check_validity_window(node.valid_from, node.valid_until)
+        # a node cannot be created holding a secret a forget --wording named
+        clean = self._without_named_secrets({
+            "label": node.label, "content": node.content,
+            "source_context": node.source_context,
+            "metadata": node.metadata if isinstance(node.metadata, dict) else None})
+        if clean["label"] != node.label or clean["content"] != node.content \
+                or clean["source_context"] != node.source_context:
+            node.label, node.content = clean["label"], clean["content"]
+            node.source_context = clean["source_context"]
+        if clean["metadata"] is not None and clean["metadata"] != node.metadata:
+            node.metadata = clean["metadata"]
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.
         with self.transaction() as conn:
@@ -1886,6 +1897,26 @@ class GraphStore(ForgetStoreMixin):
         return [self._row_to_node(r) for r in rows]
 
     @_locked
+    def _without_named_secrets(self, kwargs: dict) -> dict:
+        """An edit (PUT /v1/nodes, a correction, a supersession) cannot write a
+        secret a ``forget --wording`` named back into a node."""
+        import json
+
+        from revien.forget import gate as forget_gate
+
+        entries = forget_gate.literals(self)
+        if not entries:
+            return kwargs
+        out = dict(kwargs)
+        for key in ("label", "content", "source_context", "event_time_text"):
+            if isinstance(out.get(key), str):
+                out[key], _ = forget_gate.cut_literals(out[key], entries)
+        if isinstance(out.get("metadata"), dict):
+            raw, n = forget_gate.cut_literals_json(json.dumps(out["metadata"]), entries)
+            if n:
+                out["metadata"] = json.loads(raw)
+        return out
+
     def update_node(
         self, node_id: str, _audit_op: Optional[str] = "update",
         _audit_actor: str = "", **kwargs
@@ -1902,6 +1933,10 @@ class GraphStore(ForgetStoreMixin):
         existing = self.get_node(node_id)
         if existing is None:
             return None
+
+        if any(k in kwargs for k in ("label", "content", "source_context",
+                                     "event_time_text", "metadata")):
+            kwargs = self._without_named_secrets(kwargs)
 
         updates = {}
         allowed_fields = (
