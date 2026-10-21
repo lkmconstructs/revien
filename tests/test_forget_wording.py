@@ -407,7 +407,10 @@ def test_the_preview_counts_without_changing_anything(db):
 def test_raw_characters_are_cut_inside_a_token_and_case_is_exact(db):
     key = new_key()
     cc(db, "s1", f"User: see prefix{key}suffix and also {key.upper()} in a header.")
-    forget_wording(db, key)
+    refused = forget_wording(db, key)               # inside a longer word: asked first
+    assert refused["status"] == "refused" and refused["reason"] == "inside_longer_words"
+    assert key in all_text(db)
+    forget_wording(db, key, allow_inside_words=True)
     body = all_text(db)
     assert key not in body
     assert "prefixsuffix" in body                     # no word boundary needed
@@ -547,8 +550,9 @@ def test_a_replaced_forget_key_is_disclosed_at_the_next_forget(db, tmp_path):
     keys._cache.clear()
     second = forget_wording(db, other)
     assert second["warnings"] and "forget.key" in second["warnings"][0]
-    assert "forget those again" in second["message"]
-    assert keys.key_check() == GraphStore(db_path=db).get_meta("forget_key_check")
+    assert "forget the same text again" in second["message"]
+    assert second["scope"] != "gone everywhere"
+    assert any(l["kind"] == "forget_key" for l in second["leftovers"])
 
 
 # ── restore lifts a secret's record, and nothing else does ───────────────

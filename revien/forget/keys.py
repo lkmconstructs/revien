@@ -179,3 +179,11 @@ def key_check() -> str:
     """A keyed fixed string: compare it with the one stored at the last forget
     to learn that forget.key was lost or replaced."""
     return fingerprint("revien-forget-key-check")
+
+
+def current_check() -> Optional[str]:
+    """``key_check()`` for the key now in use, WITHOUT making one: None when
+    forget.key is missing (a lost key is not silently replaced by looking)."""
+    if load_key(create=False) is None:
+        return None
+    return key_check()

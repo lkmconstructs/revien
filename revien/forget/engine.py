@@ -444,6 +444,7 @@ class ForgetEngine(WordingForget):
                 return self._summary(plan, preview=True)
             records, bound, not_bound = self._denylist_records(plan)
             self._warnings = []
+            self._key_problem = None
             try:
                 fallback = self._record_denylist(records, actor)
             except StoreBusy:
@@ -591,18 +592,23 @@ class ForgetEngine(WordingForget):
         return records, bound, not_bound
 
     def _check_key(self, store) -> None:
-        """forget.key decides every fingerprint. If it was lost or replaced
-        since the last forget, the earlier records no longer match anything:
-        say so, once, and remember the key now in use."""
-        now = forget_keys.key_check()
-        was = store.get_meta("forget_key_check")
-        if was and was != now:
-            self._warnings.append(
-                "forget.key is not the key the earlier forgets were made "
-                "with (it was lost or replaced), so they can no longer keep "
-                "their wording out of new captures; forget those again.")
-        if was != now:
-            store.set_meta("forget_key_check", now)
+        """forget.key decides every fingerprint. A record made under another
+        key (lost, replaced, restored elsewhere) matches nothing: the forget
+        that finds it says so in its answer, never as "gone everywhere"."""
+        problem = gate.key_problem(store)
+        self._key_problem = problem
+        if problem:
+            self._warnings.append(gate.key_problem_text(problem))
+        else:
+            store.set_meta("forget_key_check", forget_keys.key_check())
+
+    def _key_leftover(self):
+        problem = getattr(self, "_key_problem", None)
+        if not problem:
+            return None
+        return {"kind": "forget_key", "records": problem["records"],
+                "literals": problem["literals"],
+                "note": gate.key_problem_text(problem)}
 
     def _record_denylist(self, records, actor):
         """Phase 1: commit the forget records (the standing denylist) under
@@ -1554,6 +1560,9 @@ class ForgetEngine(WordingForget):
         leftovers = self._leftovers(
             plan, manifest_notes, problems, training, storage, snapshots, held,
             model)
+        orphaned = self._key_leftover()
+        if orphaned:
+            leftovers.append(orphaned)
         remaining = dict(residue)
         # "Gone everywhere" is printed only when it is true: nothing left in
         # Revien's own tables and nothing named as left behind.
@@ -1664,6 +1673,8 @@ class ForgetEngine(WordingForget):
             note = r["identity_note"]
             lines.append(note[0].upper() + note[1:] + ".")
         for l in r["leftovers"]:
+            if l["kind"] == "forget_key":
+                continue                     # said above, as a warning
             if l["kind"] == "vault_note":
                 lines.append(f"Forgotten from Revien only: {l['note_text']}. "
                              f"Run '{l['fix']}' to remove it from the note.")

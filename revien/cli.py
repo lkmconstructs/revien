@@ -790,6 +790,8 @@ def ingest(content: str, source: str, db: Optional[str]):
         if result.suppressed:
             click.echo("Not ingested: " + result.suppression_note)
             return
+        for w in result.warnings:
+            click.echo("WARNING: " + w, err=True)
         click.echo(f"Ingested: {result.nodes_created} nodes, {result.edges_created} edges")
         click.echo(f"Graph total: {result.total_nodes_in_graph} nodes, "
                    f"{result.total_edges_in_graph} edges")
@@ -2027,6 +2029,49 @@ def _has_sync_row(db_path: str, name: str) -> bool:
         return False
 
 
+def _echo_wording_plan(plan: dict) -> None:
+    """The blast radius of a string forget, with the count up front. Never
+    the string."""
+    n = plan.get("would_cut_occurrences", 0)
+    click.echo(f"Occurrences found: {n} in {plan.get('would_cut_nodes', 0)} node(s)."
+               + ("" if n else " The string is not in this database yet; it "
+                  "would still be kept out of later captures."))
+    if plan.get("inside_longer_words"):
+        click.echo(f"{plan['inside_longer_words']} of them sit inside a longer "
+                   "word and would be cut out of it.")
+    click.echo(plan["blast_radius"])
+    for t, c in sorted(plan.get("would_cut_in", {}).items()):
+        click.echo(f"  {t}: {c} row(s)")
+
+
+def _open_tty():
+    """The terminal itself, for a question standard input cannot answer
+    because it carried the secret. None when there is no terminal."""
+    try:
+        return open("CONIN$" if os.name == "nt" else "/dev/tty", "r")
+    except OSError:
+        return None
+
+
+def _confirm_forget(prompt: str, stdin_was_used: bool) -> bool:
+    """Ask yes/no. When standard input carried the string, the answer is read
+    from the terminal, so the blast-radius check still happens without --yes."""
+    if not stdin_was_used:
+        return click.confirm(prompt)
+    tty = _open_tty()
+    if tty is None:
+        click.echo("The string came in on standard input and there is no "
+                   "terminal to ask on. Read the preview above; to go ahead, "
+                   "run the same command again with --yes. Nothing was changed.")
+        return False
+    try:
+        click.echo(f"{prompt} [y/N]: ", nl=False)
+        answer = tty.readline().strip().lower()
+    finally:
+        tty.close()
+    return answer in ("y", "yes")
+
+
 @main.command()
 @click.argument("node_id", required=False)
 @click.option("--wording", "wording", default=None, metavar="STRING",
@@ -2045,6 +2090,11 @@ def _has_sync_row(db_path: str, name: str) -> bool:
                    "the other sources that still hold the wording")
 @click.option("--db", default=None, help="Database path")
 @click.option("--yes", "yes", is_flag=True, help="Do not ask before forgetting")
+@click.option("--include-longer-words", "include_longer_words", is_flag=True,
+              help="With --wording: also cut the string out of longer words "
+                   "that contain it ('secret' inside 'secretary'). Without "
+                   "it, a string that sits inside a longer word is refused "
+                   "and the preview says how many")
 @click.option("--preview", is_flag=True,
               help="Show what would be forgotten and change nothing")
 @click.option("--daemon-url", default="http://127.0.0.1:7437",
@@ -2052,8 +2102,8 @@ def _has_sync_row(db_path: str, name: str) -> bool:
                    "only; default http://127.0.0.1:7437)")
 @click.option("--json-output", is_flag=True, help="Output the result as JSON")
 def forget(node_id: Optional[str], wording: Optional[str], everywhere: bool,
-           db: Optional[str], yes: bool, preview: bool, daemon_url: str,
-           json_output: bool):
+           db: Optional[str], yes: bool, include_longer_words: bool,
+           preview: bool, daemon_url: str, json_output: bool):
     """Forget one specific thing: a fact, an entity, a decision or a
     preference. Privacy, not housekeeping.
 
@@ -2079,12 +2129,14 @@ def forget(node_id: Optional[str], wording: Optional[str], everywhere: bool,
     from revien.graph.operations import GraphOperations
     from revien.graph.store import GraphStore
 
+    from_stdin = False
     if wording is not None:
         if node_id or everywhere:
             click.echo("--wording takes no NODE_ID and no --everywhere: it "
                        "always reaches every node and every later capture.")
             raise SystemExit(1)
         if wording == "-":
+            from_stdin = True
             wording = click.get_text_stream("stdin").read()
             if wording.endswith("\r\n"):
                 wording = wording[:-2]
@@ -2122,23 +2174,26 @@ def forget(node_id: Optional[str], wording: Optional[str], everywhere: bool,
             if plan.get("status") == "refused":
                 click.echo(plan["message"])
                 raise SystemExit(1)
+            inside = plan.get("inside_longer_words", 0)
             if preview:
                 if json_output:
                     click.echo(json.dumps(plan, indent=2))
                 else:
-                    click.echo(plan["blast_radius"])
-                    for t, n in sorted(plan["would_cut_in"].items()):
-                        click.echo(f"  {t}: {n} row(s)")
+                    _echo_wording_plan(plan)
                 return
+            if inside and not include_longer_words:
+                _echo_wording_plan(plan)
+                click.echo(f"{inside} occurrence(s) sit inside a longer word. "
+                           "Nothing was changed. Name a longer string, or run "
+                           "again with --include-longer-words to cut them too.")
+                raise SystemExit(1)
             if not yes:
-                click.echo(plan["blast_radius"])
-                if not plan["would_cut_occurrences"]:
-                    click.echo("The string is not in this database yet; it "
-                               "would still be kept out of later captures.")
-                if not click.confirm("Forget this string?"):
+                _echo_wording_plan(plan)
+                if not _confirm_forget("Forget this string?", from_stdin):
                     click.echo("Nothing was changed.")
                     raise SystemExit(1)
-            result = ops.forget_wording(wording, actor="cli:forget")
+            result = ops.forget_wording(wording, actor="cli:forget",
+                                        allow_inside_words=include_longer_words)
         finally:
             store.close()
         if json_output:

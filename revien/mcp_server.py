@@ -290,6 +290,8 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             "total_nodes_in_graph": result.total_nodes_in_graph,
             "total_edges_in_graph": result.total_edges_in_graph,
         }
+        if result.warnings:
+            out["warnings"] = list(result.warnings)
         if result.suppressed:
             # The forget gate refused it; say so rather than look stored.
             out["suppressed"] = True

@@ -314,6 +314,32 @@ def cut_json(value: Any, strings: List[str]) -> Tuple[Any, int]:
     return walk(value), total
 
 
+def inside_longer_words(raw: str, strings: List[str], is_json: bool = False) -> int:
+    """How many occurrences of a literal string sit INSIDE a longer word: a
+    letter or digit right before it (when it starts with one) or right after
+    it (when it ends with one). 'secret' in 'secretary' counts."""
+    pat = _pattern(strings)
+    if pat is None or not pat.literal or not raw:
+        return 0
+    lit = str(strings[0])
+    first, last = lit[:1], lit[-1:]
+    texts = [raw]
+    if is_json:
+        try:
+            texts = list(_iter_strings(json.loads(raw)))
+        except (TypeError, ValueError):
+            texts = [raw]
+    n = 0
+    for t in texts:
+        for m in pat.finditer(t):
+            a, b = m.start(), m.end()
+            before = t[a - 1] if a > 0 else ""
+            after = t[b] if b < len(t) else ""
+            if (first.isalnum() and before.isalnum()) or (last.isalnum() and after.isalnum()):
+                n += 1
+    return n
+
+
 def cut_json_text(raw: str, strings: List[str]) -> Tuple[str, int]:
     """Cut inside a JSON document held as text; non-JSON is cut as plain text."""
     if not raw:

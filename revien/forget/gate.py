@@ -230,12 +230,84 @@ def known(store, unit: UnitRef):
     return long_fps, short_fps, wording, _split_windows(windows)
 
 
+def key_problem(store) -> Optional[Dict]:
+    """None when every active forget record was made with the forget.key now
+    in use. Otherwise ``{"records": n, "literals": m, "missing": bool}``: n
+    records (m of them holding secret strings named by ``forget --wording``)
+    were made under another key, so they match nothing and what they kept out
+    can be captured again. Records from before the key was tracked are judged
+    by the key recorded at the last forget."""
+    from revien.forget import keys as _keys
+
+    try:
+        records = store.list_suppressions("active")
+    except Exception:  # noqa: BLE001
+        return None
+    if not records:
+        return None
+    now = _keys.current_check()
+    fallback = store.get_meta("forget_key_check")
+    bad = []
+    for rec in records:
+        if not (rec.get("literal_fps") or rec.get("sentence_fps")
+                or rec.get("wording_fps") or rec.get("short_fps")
+                or rec.get("window_fps")):
+            continue
+        made = rec.get("key_check") or fallback
+        if made and made != now:
+            bad.append(rec)
+    if not bad:
+        return None
+    return {"records": len(bad),
+            "literals": sum(1 for r in bad if r.get("literal_fps")),
+            "missing": now is None}
+
+
+KEY_PROBLEM_TEXT = (
+    "forget.key is not the key the earlier forgets were made with (it was "
+    "lost, replaced or restored from another machine). {n} earlier forget "
+    "record(s) now match nothing, so what they kept out of new captures can "
+    "be captured again{lit}. Restore the original forget.key from a backup, "
+    "or forget the same text again (for a secret string: run `revien forget "
+    "--wording` again for each one); the old entries cannot be rebuilt "
+    "without it.")
+
+
+def key_problem_text(problem: Dict) -> str:
+    n, m = problem["records"], problem["literals"]
+    lit = (f" (including {m} secret string(s) named with --wording: they no "
+           "longer apply)") if m else ""
+    return KEY_PROBLEM_TEXT.format(n=n, lit=lit)
+
+
 def literals(store) -> List[str]:
     """The keyed entries of every secret string a ``forget --wording`` named.
     They apply to every capture from every source."""
     out: List[str] = []
     for rec in store.list_suppressions("active"):
         out.extend(rec.get("literal_fps") or [])
+    return out
+
+
+def literals_on(conn) -> List[str]:
+    """``literals`` read straight off a connection (the one about to write),
+    so the answer belongs to that connection's transaction."""
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    try:
+        rows = conn.execute(
+            "SELECT literal_fps FROM suppressions WHERE status = 'active' "
+            "AND literal_fps IS NOT NULL AND literal_fps != '[]' "
+            "AND literal_fps != ''").fetchall()
+    except _sqlite3.OperationalError:
+        return []                     # a store from before literals
+    out: List[str] = []
+    for (raw,) in rows:
+        try:
+            out.extend(_json.loads(raw) or [])
+        except (TypeError, ValueError):
+            continue
     return out
 
 

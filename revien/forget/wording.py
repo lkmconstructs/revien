@@ -52,6 +52,14 @@ _TARGETS = {
     "recall_receipts": ("recall_id", ("query",), ()),
 }
 
+INSIDE_WORDS = (
+    "{n} of the {m} occurrence(s) of this string sit inside a longer word "
+    "(for example 'secret' inside 'secretary', which would be left as "
+    "'ary'). The string is cut exactly as named, wherever it is, so those "
+    "words would be damaged. Nothing was changed. Name a longer, more "
+    "specific string, or confirm that you want them cut "
+    "(--include-longer-words, or \"allow_inside_words\": true).")
+
 TOO_SHORT = (f"--wording needs at least {MIN_WORDING} characters: a shorter "
              "string would cut ordinary text. Nothing was changed.")
 
@@ -73,7 +81,8 @@ class WordingForget:
                       nodes_only_ids: Optional[set] = None) -> Dict:
         """Find (and with ``apply`` cut) the string in every table that can
         hold it. Returns counts and the ids of the nodes it touched."""
-        out = {"nodes": 0, "occurrences": 0, "node_ids": [], "tables": {}}
+        out = {"nodes": 0, "occurrences": 0, "node_ids": [], "tables": {},
+               "inside_words": 0}
         strings = [lit]
         for table, (keycol, plain, jsoncols) in _TARGETS.items():
             cols = list(plain) + list(jsoncols)
@@ -95,6 +104,9 @@ class WordingForget:
                         new, n = scrub.cut_json_text(val, strings)
                     else:
                         new, n = scrub.cut_text(val, strings)
+                    if n:
+                        out["inside_words"] += scrub.inside_longer_words(
+                            val, strings, col in jsoncols)
                     cuts += n
                     new_vals.append(new)
                 if not cuts:
@@ -132,7 +144,8 @@ class WordingForget:
     # ── the verb ─────────────────────────────────────────
 
     def forget_wording(self, wording: str, actor: str = "forget",
-                       dry_run: bool = False) -> Dict:
+                       dry_run: bool = False,
+                       allow_inside_words: bool = False) -> Dict:
         """Forget a literal string (see the module docstring). The string is
         never put in the result, an audit row, a record or a log."""
         lit, refusal = self._wording_check(wording)
@@ -147,14 +160,26 @@ class WordingForget:
                     "would_cut_occurrences": scan["occurrences"],
                     "would_cut_nodes": scan["nodes"],
                     "would_cut_in": dict(scan["tables"]),
+                    "inside_longer_words": scan["inside_words"],
                     "count": 0, "forgotten": [],
                     "blast_radius": self._wording_radius(scan, preview=True)}
+            with self.store._lock:
+                scan = self._scan_literal(self.store._get_conn(), lit, apply=False)
+            if scan["inside_words"] and not allow_inside_words:
+                return {
+                    "status": "refused", "verb": "forget", "wording": True,
+                    "reason": "inside_longer_words", "forgotten": [], "count": 0,
+                    "would_cut_occurrences": scan["occurrences"],
+                    "inside_longer_words": scan["inside_words"],
+                    "message": INSIDE_WORDS.format(
+                        n=scan["inside_words"], m=scan["occurrences"])}
             record = {
                 "unit_id": f"forget:{uuid.uuid4()}", "scope": "global",
                 "path_keys": [], "wording_fps": [], "sentence_fps": [],
                 "short_fps": [], "window_fps": [],
                 "literal_fps": [keys.literal_entry(scrub.canonical(wording))]}
             self._warnings = []
+            self._key_problem = None
             try:
                 self._record_denylist([record], actor)
             except StoreBusy:
@@ -168,7 +193,11 @@ class WordingForget:
     def _wording_radius(scan: Dict, preview: bool = False) -> str:
         n, m = scan["occurrences"], scan["nodes"]
         verb = "would cut" if preview else "cut"
-        return (f"This {verb} {n} occurrence(s) of the string from {m} node(s) "
+        inside = scan.get("inside_words", 0)
+        warn = (f"{inside} of them sit inside a longer word and would be cut "
+                "out of it. " if inside else "")
+        return (f"This {verb} {n} occurrence(s) of the string. {warn}"
+                f"It reaches {m} node(s) "
                 f"and {sum(v for t, v in scan['tables'].items() if t != 'nodes')} "
                 "row(s) of the audit trail, recall records and edges, and keeps "
                 "the same characters out of every later capture from any source.")
@@ -212,6 +241,9 @@ class WordingForget:
         leftovers = self._wording_leftovers(
             manifest_notes, problems, training, storage, snapshots, model,
             raw_hits, files)
+        orphaned = self._key_leftover()
+        if orphaned:
+            leftovers.append(orphaned)
         partial = self._partial_copies(touched, lit)
         if partial:
             leftovers.append({
@@ -405,6 +437,8 @@ class WordingForget:
         lines.append("Stops coming back: " + " | ".join(re_["stops"])
                      + ". Does not stop: " + " | ".join(re_["does_not_stop"]) + ".")
         for l in r["leftovers"]:
+            if l["kind"] == "forget_key":
+                continue                     # said above, as a warning
             if l["kind"] == "vault_note":
                 lines.append(f"Forgotten from Revien only: {l['note_text']}. "
                              f"Run '{l['fix']}' to remove it from the note.")

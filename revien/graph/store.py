@@ -901,6 +901,9 @@ class GraphStore(ForgetStoreMixin):
         """
         conn = self._get_conn()
         stamp = (ts or datetime.now(timezone.utc)).isoformat()
+        before = self._cut_secret_metadata(conn, before)
+        after = self._cut_secret_metadata(conn, after)
+        actor, = self._cut_secret_strings(conn, actor or "")
         conn.execute(
             """INSERT INTO audit_log (node_id, op, actor, ts, before_json, after_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -1017,20 +1020,12 @@ class GraphStore(ForgetStoreMixin):
         the node has no ownership row, i.e. a forget of another node
         never removes it."""
         self._check_validity_window(node.valid_from, node.valid_until)
-        # a node cannot be created holding a secret a forget --wording named
-        clean = self._without_named_secrets({
-            "label": node.label, "content": node.content,
-            "source_context": node.source_context,
-            "metadata": node.metadata if isinstance(node.metadata, dict) else None})
-        if clean["label"] != node.label or clean["content"] != node.content \
-                or clean["source_context"] != node.source_context:
-            node.label, node.content = clean["label"], clean["content"]
-            node.source_context = clean["source_context"]
-        if clean["metadata"] is not None and clean["metadata"] != node.metadata:
-            node.metadata = clean["metadata"]
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.
-        with self.transaction() as conn:
+        # IMMEDIATE: the denylist is read (in _add_node_stmt) with the write
+        # lock already held, so a forget in another process cannot slip in
+        # between the read and the insert.
+        with self.transaction(immediate=True) as conn:
             self._add_node_stmt(conn, node)
             self._enqueue_embed_stmt(conn, node.node_id)
             if owner is not None:
@@ -1098,7 +1093,14 @@ class GraphStore(ForgetStoreMixin):
     @staticmethod
     def _add_node_stmt(conn: sqlite3.Connection, node: Node) -> None:
         """The bare INSERT for one node — no commit, no audit. Callers own
-        the transaction (add_node wraps it; import_graph batches many)."""
+        the transaction (add_node wraps it; import_graph batches many).
+        A secret a ``forget --wording`` named is cut out of the node first
+        (the node object itself, so its audit row quotes the cut text)."""
+        (node.label, node.content, node.source_context,
+         node.event_time_text) = GraphStore._cut_secret_strings(
+            conn, node.label, node.content, node.source_context,
+            node.event_time_text)
+        node.metadata = GraphStore._cut_secret_metadata(conn, node.metadata)
         conn.execute(
             """INSERT INTO nodes
                (node_id, node_type, label, content, source_id,
@@ -1623,17 +1625,18 @@ class GraphStore(ForgetStoreMixin):
         pair. Returns True only for the caller whose insert landed — only that
         caller may apply it, so a judgment is counted at most once even across
         processes. Rows are never updated."""
-        conn = self._get_conn()
-        cursor = conn.execute(
-            """INSERT OR IGNORE INTO use_judgments
-               (episode_key, node_id, used, reason, shared_terms, similarity,
-                query, mode, applied, judged_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (episode_key, node_id, int(bool(used)), reason,
-             json.dumps(list(shared_terms)), similarity, query, mode,
-             int(bool(applied)), datetime.now(timezone.utc).isoformat()),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            reason, query = self._cut_secret_strings(conn, reason, query)
+            terms = [self._cut_secret_strings(conn, t)[0] for t in shared_terms]
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO use_judgments
+                   (episode_key, node_id, used, reason, shared_terms, similarity,
+                    query, mode, applied, judged_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (episode_key, node_id, int(bool(used)), reason,
+                 json.dumps(terms), similarity, query, mode,
+                 int(bool(applied)), datetime.now(timezone.utc).isoformat()),
+            )
         return cursor.rowcount == 1
 
     @_locked
@@ -1729,14 +1732,14 @@ class GraphStore(ForgetStoreMixin):
         node_ids: List[str], issued_at: datetime, expires_at: datetime,
     ) -> None:
         """Record one issued receipt (status open)."""
-        conn = self._get_conn()
-        conn.execute(
-            f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
-            (recall_id, runtime, query, json.dumps(list(node_ids)),
-             issued_at.isoformat(), expires_at.isoformat()),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            query, = self._cut_secret_strings(conn, query)
+            conn.execute(
+                f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
+                (recall_id, runtime, query, json.dumps(list(node_ids)),
+                 issued_at.isoformat(), expires_at.isoformat()),
+            )
 
     @_locked
     def get_recall_receipt(self, recall_id: str) -> Optional[Dict]:
@@ -1896,25 +1899,52 @@ class GraphStore(ForgetStoreMixin):
         rows = conn.execute(query, params).fetchall()
         return [self._row_to_node(r) for r in rows]
 
-    @_locked
-    def _without_named_secrets(self, kwargs: dict) -> dict:
-        """An edit (PUT /v1/nodes, a correction, a supersession) cannot write a
-        secret a ``forget --wording`` named back into a node."""
-        import json
-
+    @staticmethod
+    def _named_secrets(conn) -> list:
+        """The keyed entries of every secret string a ``forget --wording``
+        named, read on the connection that is about to write. Read inside the
+        write transaction (BEGIN IMMEDIATE), so a forget committed by another
+        process is either seen here or waits for this write and cuts it."""
         from revien.forget import gate as forget_gate
 
-        entries = forget_gate.literals(self)
+        return forget_gate.literals_on(conn)
+
+    @classmethod
+    def _cut_secret_strings(cls, conn, *values):
+        """The values with the named secrets cut out, in order. Strings and
+        JSON text only; anything else is returned as it came."""
+        from revien.forget import gate as forget_gate
+
+        entries = cls._named_secrets(conn)
         if not entries:
-            return kwargs
+            return values
+        out = []
+        for v in values:
+            if isinstance(v, str) and v:
+                v, _ = forget_gate.cut_literals(v, entries)
+            out.append(v)
+        return tuple(out)
+
+    @classmethod
+    def _cut_secret_metadata(cls, conn, meta):
+        from revien.forget import gate as forget_gate
+
+        entries = cls._named_secrets(conn)
+        if not entries or not isinstance(meta, dict):
+            return meta
+        raw, n = forget_gate.cut_literals_json(json.dumps(meta), entries)
+        return json.loads(raw) if n else meta
+
+    def _without_named_secrets(self, kwargs: dict, conn=None) -> dict:
+        """An edit (PUT /v1/nodes, a correction, a supersession) cannot write a
+        secret a ``forget --wording`` named back into a node."""
+        conn = conn or self._get_conn()
         out = dict(kwargs)
         for key in ("label", "content", "source_context", "event_time_text"):
             if isinstance(out.get(key), str):
-                out[key], _ = forget_gate.cut_literals(out[key], entries)
+                out[key], = self._cut_secret_strings(conn, out[key])
         if isinstance(out.get("metadata"), dict):
-            raw, n = forget_gate.cut_literals_json(json.dumps(out["metadata"]), entries)
-            if n:
-                out["metadata"] = json.loads(raw)
+            out["metadata"] = self._cut_secret_metadata(conn, out["metadata"])
         return out
 
     def update_node(
@@ -1930,75 +1960,79 @@ class GraphStore(ForgetStoreMixin):
         decay/invalidate/access) pass ``_audit_op=None`` to suppress this
         generic entry and avoid double-logging.
         """
-        existing = self.get_node(node_id)
-        if existing is None:
-            return None
+        # The write lock is taken BEFORE the denylist is read, so a forget in
+        # another process cannot land between the check and the write.
+        text_edit = any(k in kwargs for k in (
+            "label", "content", "source_context", "event_time_text", "metadata"))
+        with self.transaction(immediate=text_edit) as conn:
+            existing = self.get_node(node_id)
+            if existing is None:
+                return None
 
-        if any(k in kwargs for k in ("label", "content", "source_context",
-                                     "event_time_text", "metadata")):
-            kwargs = self._without_named_secrets(kwargs)
+            if text_edit:
+                kwargs = self._without_named_secrets(kwargs, conn)
 
-        updates = {}
-        allowed_fields = (
-            "label", "content", "source_id", "access_count", "metadata",
-            "last_accessed", "confidence", "pinned", "source_type",
-            "confidence_set_at", "confidence_set_by", "source_context",
-            "last_referenced", "invalidated_at",
-            # Claim Sovereignty Layer (Leg 1): modality fields are mutable so a
-            # later vision pass can flip vision_processed / answerable_by_text.
-            "source_modality", "answerable_by_text", "vision_processed",
-            # Claim Sovereignty Layer (Leg 2): temporal fields, populated by the
-            # resolver at ingest and revisable by a later verify pass.
-            "recorded_at", "event_time_start", "event_time_end",
-            "event_time_granularity", "event_time_confidence", "event_time_text",
-        )
-        for field in allowed_fields:
-            if field in kwargs:
-                updates[field] = kwargs[field]
-
-        if not updates:
-            return existing
-
-        conn = self._get_conn()
-        set_clauses = []
-        values = []
-        datetime_fields = (
-            "last_accessed", "confidence_set_at", "last_referenced", "invalidated_at",
-            "recorded_at", "event_time_start", "event_time_end",
-        )
-        for key, val in updates.items():
-            set_clauses.append(f"{key} = ?")
-            if key == "metadata":
-                values.append(json.dumps(val))
-            elif key in datetime_fields:
-                values.append(val.isoformat() if isinstance(val, datetime) else val)
-            elif key in ("source_type", "source_modality", "event_time_granularity"):
-                values.append(val.value if hasattr(val, "value") else val)
-            elif key in ("pinned", "answerable_by_text", "vision_processed"):
-                values.append(1 if val else 0)
-            else:
-                values.append(val)
-        values.append(node_id)
-
-        # Mutation + audit in ONE commit; audit failure rolls the UPDATE back.
-        with self.transaction():
-            conn.execute(
-                f"UPDATE nodes SET {', '.join(set_clauses)} WHERE node_id = ?",
-                values,
+            updates = {}
+            allowed_fields = (
+                "label", "content", "source_id", "access_count", "metadata",
+                "last_accessed", "confidence", "pinned", "source_type",
+                "confidence_set_at", "confidence_set_by", "source_context",
+                "last_referenced", "invalidated_at",
+                # Claim Sovereignty Layer (Leg 1): modality fields are mutable so a
+                # later vision pass can flip vision_processed / answerable_by_text.
+                "source_modality", "answerable_by_text", "vision_processed",
+                # Claim Sovereignty Layer (Leg 2): temporal fields, populated by the
+                # resolver at ingest and revisable by a later verify pass.
+                "recorded_at", "event_time_start", "event_time_end",
+                "event_time_granularity", "event_time_confidence", "event_time_text",
             )
-            updated = self.get_node(node_id)
-            if updated is not None and (
-                updated.label != existing.label
-                or updated.content != existing.content
-            ):
-                self._enqueue_embed_stmt(conn, node_id)
-            # Provenance hook: generic update entry unless a semantic caller
-            # (reinforce/correct/decay/invalidate/access) suppresses it.
-            if _audit_op:
-                self._record_node_audit(
-                    node_id, _audit_op, actor=_audit_actor,
-                    before_node=existing, after_node=updated,
+            for field in allowed_fields:
+                if field in kwargs:
+                    updates[field] = kwargs[field]
+
+            if not updates:
+                return existing
+
+            conn = self._get_conn()
+            set_clauses = []
+            values = []
+            datetime_fields = (
+                "last_accessed", "confidence_set_at", "last_referenced", "invalidated_at",
+                "recorded_at", "event_time_start", "event_time_end",
+            )
+            for key, val in updates.items():
+                set_clauses.append(f"{key} = ?")
+                if key == "metadata":
+                    values.append(json.dumps(val))
+                elif key in datetime_fields:
+                    values.append(val.isoformat() if isinstance(val, datetime) else val)
+                elif key in ("source_type", "source_modality", "event_time_granularity"):
+                    values.append(val.value if hasattr(val, "value") else val)
+                elif key in ("pinned", "answerable_by_text", "vision_processed"):
+                    values.append(1 if val else 0)
+                else:
+                    values.append(val)
+            values.append(node_id)
+
+            # Mutation + audit in ONE commit; audit failure rolls the UPDATE back.
+            if True:                       # (one block with the guard above)
+                conn.execute(
+                    f"UPDATE nodes SET {', '.join(set_clauses)} WHERE node_id = ?",
+                    values,
                 )
+                updated = self.get_node(node_id)
+                if updated is not None and (
+                    updated.label != existing.label
+                    or updated.content != existing.content
+                ):
+                    self._enqueue_embed_stmt(conn, node_id)
+                # Provenance hook: generic update entry unless a semantic caller
+                # (reinforce/correct/decay/invalidate/access) suppresses it.
+                if _audit_op:
+                    self._record_node_audit(
+                        node_id, _audit_op, actor=_audit_actor,
+                        before_node=existing, after_node=updated,
+                    )
         # Content listeners: fire only when the embedded text actually changed,
         # so metadata/access-count updates (the hot path) never trigger a
         # re-embed.
@@ -2172,15 +2206,15 @@ class GraphStore(ForgetStoreMixin):
         reason: str = "", trace: str = "",
     ) -> int:
         """Park a contradiction the gate routed to review. Mutates no node."""
-        conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
-        cur = conn.execute(
-            """INSERT INTO supersession_candidates
-               (existing_node_id, new_node_id, action, reason, trace, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (existing_node_id, new_node_id, action, reason, trace, now),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            reason, trace = self._cut_secret_strings(conn, reason, trace)
+            cur = conn.execute(
+                """INSERT INTO supersession_candidates
+                   (existing_node_id, new_node_id, action, reason, trace, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (existing_node_id, new_node_id, action, reason, trace, now),
+            )
         return cur.lastrowid
 
     @_locked
@@ -2198,13 +2232,13 @@ class GraphStore(ForgetStoreMixin):
     @_locked
     def resolve_candidate(self, candidate_id: int, resolution: str) -> None:
         """Mark a queued candidate adjudicated (resolution is free-text/audit)."""
-        conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE supersession_candidates SET resolved_at = ?, resolution = ? WHERE id = ?",
-            (now, resolution, candidate_id),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            resolution, = self._cut_secret_strings(conn, resolution)
+            conn.execute(
+                "UPDATE supersession_candidates SET resolved_at = ?, resolution = ? WHERE id = ?",
+                (now, resolution, candidate_id),
+            )
 
     @_locked
     def count_candidates(self, unresolved_only: bool = True) -> int:
@@ -2366,7 +2400,10 @@ class GraphStore(ForgetStoreMixin):
     @staticmethod
     def _add_edge_stmt(conn: sqlite3.Connection, edge: Edge) -> None:
         """The bare INSERT for one edge — no commit, no audit. Callers own
-        the transaction (add_edge and add_edge_audited both wrap it)."""
+        the transaction (add_edge and add_edge_audited both wrap it).
+        A secret a ``forget --wording`` named is cut out first."""
+        edge.source_context, = GraphStore._cut_secret_strings(conn, edge.source_context)
+        edge.metadata = GraphStore._cut_secret_metadata(conn, edge.metadata)
         conn.execute(
             """INSERT INTO edges
                (edge_id, edge_type, source_node_id, target_node_id,
@@ -2396,9 +2433,8 @@ class GraphStore(ForgetStoreMixin):
         callers (mention-linking, connect_nodes, tombstone re-pointing, the
         /v1/edges endpoint, import_graph). See add_edge_audited for the
         provenance-bearing path (alias leg)."""
-        conn = self._get_conn()
-        self._add_edge_stmt(conn, edge)
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            self._add_edge_stmt(conn, edge)
         return edge
 
     @_locked
@@ -2409,7 +2445,7 @@ class GraphStore(ForgetStoreMixin):
         trail can't account for. Use this for edges whose provenance matters
         (ALIAS_OF today); add_edge above is UNCHANGED for every other caller.
         """
-        with self.transaction() as conn:
+        with self.transaction(immediate=True) as conn:
             self._add_edge_stmt(conn, edge)
             self._record_edge_audit(
                 edge.edge_id, "create", actor=actor,
@@ -2490,7 +2526,13 @@ class GraphStore(ForgetStoreMixin):
                 values.append(val)
         values.append(edge_id)
 
-        with self.transaction():
+        with self.transaction(immediate=True):
+            # the denylist is read with the write lock held
+            for i, key in enumerate(updates):
+                if key == "source_context":
+                    values[i], = self._cut_secret_strings(conn, values[i])
+                elif key == "metadata":
+                    values[i] = json.dumps(self._cut_secret_metadata(conn, updates[key]))
             conn.execute(
                 f"UPDATE edges SET {', '.join(set_clauses)} WHERE edge_id = ?",
                 values,

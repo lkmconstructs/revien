@@ -3,6 +3,7 @@ Revien REST API Server — FastAPI application exposing all Revien endpoints.
 Runs as local daemon on port 7437 or as hosted service.
 """
 
+import logging
 import asyncio
 import time
 import os
@@ -69,6 +70,9 @@ class IngestResponse(BaseModel):
     # through a shared channel has no stable identity the gate can protect.
     suppressed: bool = False
     suppression_note: str = ""
+    # forget.key is not the key the earlier forgets were made with: they
+    # match nothing, so a secret they kept out can be captured again.
+    warnings: List[str] = []
 
 
 class ConsolidateRequest(BaseModel):
@@ -178,6 +182,9 @@ class HealthResponse(BaseModel):
     # A daemon from before fencing has no such field, which is how
     # `revien sync reset` recognises it. Names only: no path, no id.
     features: List[str] = []
+    # "ok", or "mismatch" when forget.key is not the key the earlier forgets
+    # were made with (they then match nothing). Says nothing else.
+    forget_key: str = "ok"
 
 
 class SyncResponse(BaseModel):
@@ -398,8 +405,23 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if MCP_AVAILABLE:
             mcp_server = build_mcp_server(engine=engine, pipeline=pipeline)
 
+    def _forget_key_problem():
+        from revien.forget import gate as _g
+        try:
+            return _g.key_problem(store)
+        except Exception:  # noqa: BLE001
+            return None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Say it at start, loudly, if the earlier forgets no longer apply
+        # (forget.key lost or replaced): the daemon would capture again what
+        # they kept out. It starts anyway; refusing would only hide it.
+        problem = _forget_key_problem()
+        if problem:
+            from revien.forget import gate as _g
+            logging.getLogger("revien").error(
+                "forget.key mismatch: %s", _g.key_problem_text(problem))
         # Startup: start the scheduler INSIDE uvicorn's running loop when the
         # daemon attached one (RevienDaemon sets app.state.scheduler before
         # uvicorn.run). AsyncIOScheduler.start() needs the running event
@@ -554,6 +576,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             total_edges_in_graph=result.total_edges_in_graph,
             suppressed=result.suppressed,
             suppression_note=result.suppression_note,
+            warnings=list(result.warnings),
         )
 
     # ── POST /v1/recall ───────────────────────────────
@@ -940,6 +963,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             uptime_seconds=round(time.time() - start_time, 2),
             version=__version__,
             features=list(DAEMON_FEATURES),
+            forget_key="mismatch" if _forget_key_problem() else "ok",
         )
 
     # ── POST /v1/sync ─────────────────────────────────
@@ -1231,10 +1255,32 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return result
 
     # ── POST /v1/forget/wording ────────────────────────
+    # FastAPI's own 422 quotes the input it could not parse. For this route
+    # the input IS the secret, so the answer names the fields and the kinds of
+    # problem and nothing the caller sent.
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.exception_handlers import request_validation_exception_handler
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_without_the_secret(request, exc):
+        if request.url.path.rstrip("/") != "/v1/forget/wording":
+            return await request_validation_exception_handler(request, exc)
+        problems = [{"field": ".".join(str(p) for p in e.get("loc", ())[1:]) or "body",
+                     "problem": e.get("type", "invalid")} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={
+            "status": "refused", "reason": "invalid_request",
+            "problems": problems,
+            "message": ("Send a JSON object {\"wording\": \"<the string>\"} "
+                        "(optional \"preview\": true). Nothing was changed, "
+                        "and nothing you sent is repeated here.")})
+
     class ForgetWordingRequest(BaseModel):
         wording: str
         # Only count what the string would cut; change nothing.
         preview: bool = False
+        # Cut it out of longer words that contain it too ('secret' inside
+        # 'secretary'). Refused otherwise: the preview counts them.
+        allow_inside_words: bool = False
 
     @app.post("/v1/forget/wording", dependencies=[_mutation_auth])
     async def forget_wording_endpoint(request: ForgetWordingRequest):
@@ -1256,7 +1302,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     "again with 'revien start', then forget again. Nothing "
                     "was changed.")})
         result = ops.forget_wording(request.wording, actor="api:forget",
-                                    dry_run=request.preview)
+                                    dry_run=request.preview,
+                                    allow_inside_words=request.allow_inside_words)
         status = result.get("status")
         if status == "refused":
             raise HTTPException(400, detail=result)

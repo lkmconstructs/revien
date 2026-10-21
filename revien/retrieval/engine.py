@@ -958,8 +958,11 @@ class RetrievalEngine:
         # opt-in. Unconditional "signals accumulate for later" is how the
         # ambient global model got trained in the first place.
         if self.neural_enabled:
+            from revien.forget import gate as _forget_gate
+            # (a query is text nobody vetted: a secret named by forget
+            # --wording is cut out of it before it is kept)
             self.training_loop.log_retrieval(
-                query=query,
+                query=_forget_gate.strip_literals(self.store, query)[0],
                 results=[
                     {
                         "node_id": r.node_id,

@@ -3,6 +3,7 @@ Revien Ingestion Pipeline — Orchestrates extraction, deduplication, and storag
 The main entry point for feeding content into the graph.
 """
 
+import logging
 import hashlib
 import json
 import os
@@ -217,6 +218,12 @@ class IngestionOutput:
     # must not come back). Nothing was written. suppression_note says why.
     suppressed: bool = False
     suppression_note: str = ""
+    # Things the caller must be told (forget.key not matching the earlier
+    # forgets, so they stopped applying). Empty when nothing is wrong.
+    warnings: List[str] = field(default_factory=list)
+
+
+_KEY_WARNED: set = set()
 
 
 class _ContextGone(Exception):
@@ -337,7 +344,27 @@ class IngestionPipeline:
         """
         Ingest raw content into the graph.
         Returns a summary of what was created/deduplicated.
+
+        A capture made while forget.key is not the key the earlier forgets
+        were made with still runs (a refusal would be a silent failure inside
+        a hook), but says so: in the output's ``warnings`` and, once per
+        process, in the log. The standing denylist matches nothing then.
         """
+        out = self._ingest(input_data)
+        try:
+            from revien.forget import gate as _g
+            problem = _g.key_problem(self.store)
+        except Exception:  # noqa: BLE001
+            problem = None
+        if problem:
+            text = _g.key_problem_text(problem)
+            out.warnings = [text]
+            if text not in _KEY_WARNED:
+                _KEY_WARNED.add(text)
+                logging.getLogger("revien").error("forget.key mismatch: %s", text)
+        return out
+
+    def _ingest(self, input_data: IngestionInput) -> IngestionOutput:
         # 0. Per-source ingestion policy (leg 6b). If this source_id is on the
         #    deny list, capture is a clean no-op: nothing is extracted, stored,
         #    or embedded, and the reason is logged. The graph is untouched.

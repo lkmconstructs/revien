@@ -83,7 +83,8 @@ class ForgetStoreMixin:
             actor TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'active',
             lifted_at TEXT,
-            lifted_by TEXT
+            lifted_by TEXT,
+            key_check TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_suppressions_unit
             ON suppressions(unit_id, status);
@@ -126,10 +127,11 @@ class ForgetStoreMixin:
         """A forget-record table made by an earlier build of this branch gets
         the columns added since (the table was never in a release)."""
         have = {r[1] for r in conn.execute("PRAGMA table_info(suppressions)")}
-        for col in ("window_fps", "literal_fps"):
+        for col, default in (("window_fps", "'[]'"), ("literal_fps", "'[]'"),
+                             ("key_check", "''")):
             if col not in have:
                 conn.execute(f"ALTER TABLE suppressions ADD COLUMN {col} "
-                             "TEXT NOT NULL DEFAULT '[]'")
+                             f"TEXT NOT NULL DEFAULT {default}")
                 conn.commit()
 
     @staticmethod
@@ -322,12 +324,13 @@ class ForgetStoreMixin:
             "literal_fps": json.loads(r[7] or "[]"),
             "scope": r[8] or "origin", "created_at": r[9], "actor": r[10],
             "status": r[11], "lifted_at": r[12], "lifted_by": r[13],
+            "key_check": r[14] or "",
         }
 
     _SUPPRESSION_COLS = (
         "id, unit_id, path_keys, wording_fps, sentence_fps, short_fps, "
         "window_fps, literal_fps, scope, created_at, actor, status, lifted_at, "
-        "lifted_by")
+        "lifted_by, key_check")
 
     @_locked
     def add_suppression(
@@ -341,17 +344,22 @@ class ForgetStoreMixin:
         the origin they are kept out of, or none for scope 'global'."""
         if scope not in ("origin", "global"):
             raise ValueError(f"forget scope must be origin or global, got {scope!r}")
+        from revien.forget import keys as forget_keys
+
         conn = self._get_conn()
         cur = conn.execute(
             "INSERT INTO suppressions (unit_id, path_keys, wording_fps, "
             "sentence_fps, short_fps, window_fps, literal_fps, scope, "
-            "created_at, actor) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "created_at, actor, key_check) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (unit_id, json.dumps(sorted(set(path_keys))),
              json.dumps(sorted(set(wording_fps))),
              json.dumps(sorted(set(sentence_fps))),
              json.dumps(sorted(set(short_fps))),
              json.dumps(sorted(set(window_fps or []))),
-             json.dumps(sorted(set(literal_fps or []))), scope, _now(), actor))
+             json.dumps(sorted(set(literal_fps or []))), scope, _now(), actor,
+             # which forget.key made these fingerprints: a record whose key
+             # is not the key now in use matches nothing (gate.key_problem)
+             forget_keys.key_check()))
         self._commit(conn)
         return cur.lastrowid
 
