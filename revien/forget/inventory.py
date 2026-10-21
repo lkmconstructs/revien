@@ -13,7 +13,6 @@ reason it cannot hold anything a person typed. A column the schema gains and
 nobody has reviewed is included until someone does (and
 ``tests/test_forget_inventory.py`` fails until it is classified).
 """
-import re
 import sqlite3
 from typing import Dict, List, Tuple
 
@@ -73,7 +72,7 @@ EXCLUDED: Dict[Tuple[str, str], str] = {
     ("suppressions", "created_at"): _TIME, ("suppressions", "status"): _ENUM,
     ("suppressions", "lifted_at"): _TIME, ("suppressions", "key_check"): _HASH,
     ("sync_cursors", "updated_at"): _TIME,
-    ("use_judgments", "episode_key"): _ID, ("use_judgments", "node_id"): _ID,
+    ("use_judgments", "node_id"): _ID,
     ("use_judgments", "mode"): _ENUM, ("use_judgments", "judged_at"): _TIME,
     ("pending_embeds", "node_id"): _ID, ("pending_embeds", "queued_at"): _TIME,
 }
@@ -88,10 +87,28 @@ IDENTITY = frozenset({
     ("node_provenance", "unit_id"), ("suppressions", "path_keys"),
     ("sync_cursors", "adapter_name"), ("sync_cursors", "cursor"),
     ("distill_manifest", "note_stem"), ("distill_manifest", "section"),
+    ("use_judgments", "episode_key"),
 })
 
 _SKIP_PREFIXES = ("sqlite_", "vec_nodes")
-_TEXTLIKE = re.compile(r"CHAR|CLOB|TEXT|BLOB|^$", re.I)
+
+
+def text_bearing(declared_type) -> bool:
+    """Can a column of this declared type hold text? SQLite decides by the
+    type's affinity (https://sqlite.org/datatype3.html §3.1): INTEGER and REAL
+    columns keep numbers; TEXT, BLOB (and no type) and NUMERIC columns ("JSON",
+    "DATETIME", "BOOLEAN", "DECIMAL", ...) will keep a string that is not a
+    number as text. So everything except INTEGER and REAL affinity counts."""
+    t = (declared_type or "").upper()
+    if "INT" in t:
+        return False
+    if "CHAR" in t or "CLOB" in t or "TEXT" in t:
+        return True
+    if "BLOB" in t or t == "":
+        return True
+    if "REAL" in t or "FLOA" in t or "DOUB" in t:
+        return False
+    return True                    # NUMERIC affinity can still hold a string
 
 
 def columns(conn: sqlite3.Connection) -> Dict[str, List[str]]:
@@ -110,7 +127,7 @@ def columns(conn: sqlite3.Connection) -> Dict[str, List[str]]:
         except sqlite3.Error:
             continue
         cols = [r[1] for r in info
-                if _TEXTLIKE.search(r[2] or "") and (name, r[1]) not in EXCLUDED]
+                if text_bearing(r[2]) and (name, r[1]) not in EXCLUDED]
         if cols:
             out[name] = cols
     return out
@@ -125,7 +142,7 @@ def all_text_columns(conn: sqlite3.Connection) -> List[Tuple[str, str]]:
         if name.startswith(_SKIP_PREFIXES) or (sql and "VIRTUAL" in sql.upper()):
             continue
         for r in conn.execute(f'PRAGMA table_info("{name}")').fetchall():
-            if _TEXTLIKE.search(r[2] or ""):
+            if text_bearing(r[2]):
                 out.append((name, r[1]))
     return out
 

@@ -113,6 +113,19 @@ class WordingForget:
         pat = scrub._pattern([lit])
         fragments: Dict[str, List[str]] = {}
         sources: Dict[str, tuple] = {}
+        # Units whose cut form is already another unit: renaming their
+        # ownership rows would merge two sources into one, so they are kept
+        # as they are and listed (identity_unrenamed).
+        blocked = set()
+        try:
+            units = [r[0] for r in conn.execute("SELECT unit_id FROM capture_units")]
+            have = set(units)
+            for u in units:
+                cut, n = scrub.cut_json_text(u, strings)
+                if n and cut != u and cut in have:
+                    blocked.add(u)
+        except sqlite3.OperationalError:
+            pass
         for table, cols in inventory.columns(conn).items():
             try:
                 rows = conn.execute(
@@ -137,9 +150,14 @@ class WordingForget:
                 if orig_content:
                     spans = [(m.start(), m.end()) for m in pat.finditer(orig_content)]
                 for i, (col, val) in enumerate(zip(cols, vals)):
-                    if isinstance(val, (bytes, bytearray)):
+                    as_bytes = isinstance(val, (bytes, bytearray))
+                    if as_bytes:
                         val = bytes(val).decode("utf-8", "ignore")
                     if not isinstance(val, str) or not val:
+                        continue
+                    if table == "node_provenance" and col == "unit_id" and val in blocked:
+                        if ["node_provenance.unit_id"] not in out["unrenamed"]:
+                            out["unrenamed"].append(["node_provenance.unit_id"])
                         continue
                     work = val
                     got = []
@@ -168,7 +186,7 @@ class WordingForget:
                         out["inside_words"] += scrub.inside_longer_words(
                             val, strings, True)
                     if n or got:
-                        new_vals[i] = new
+                        new_vals[i] = new.encode("utf-8") if as_bytes else new
                         cuts += n + len(got)
                         out["fragments"] += len(got)
                         if col == "content":
@@ -240,6 +258,18 @@ class WordingForget:
                 sib.update(r[0] for r in conn.execute(
                     "SELECT node_id FROM node_provenance WHERE unit_id = ?", (u,)))
             sib.discard(nid)
+            # The captured text is the record a sibling's words come from: the
+            # context node(s) of the capture. Where a sibling's text stands
+            # there outside a cut occurrence ("reset the password." in
+            # another sentence), it is ambiguous and is reported, not cut.
+            # (Other derived facts are not evidence: they share the sentence.)
+            others = []
+            for oid in sib:
+                r = conn.execute("SELECT node_type, content FROM nodes WHERE node_id = ?",
+                                 (oid,)).fetchone()
+                if r is None or r[0] != "context":
+                    continue
+                others.append(sources[oid] if oid in sources else (r[1], []))
             for sid in sib:
                 row = conn.execute(
                     "SELECT " + ", ".join(fields) + " FROM nodes WHERE node_id = ?",
@@ -248,8 +278,10 @@ class WordingForget:
                     continue
                 new = list(row)
                 got = []
+                mine = others
                 for i, text in enumerate(row):
-                    piece = scrub.aligned_edge_fragment(text or "", content, spans, part)
+                    piece = scrub.aligned_edge_fragment(
+                        text or "", content, spans, part, others=mine)
                     if piece:
                         new[i], _ = scrub.cut_edge_fragment(text, part, piece)
                         got.append(piece)
@@ -633,9 +665,16 @@ class WordingForget:
         for p in training.get("problems", []):
             left.append({"kind": "training_db", "note": p})
         if raw_hits:
+            whole = [h for h in raw_hits if "(" not in h]
+            pieces = [h for h in raw_hits if "(" in h]
+            parts = []
+            if whole:
+                parts.append("the string was still found in the " + ", ".join(whole))
+            if pieces:
+                parts.append("a piece of the string (not the whole of it) was "
+                             "found in the " + ", ".join(pieces))
             left.append({"kind": "storage",
-                         "note": "the string was still found in the "
-                                 + ", ".join(raw_hits) + " after the rewrite"})
+                         "note": "; ".join(parts) + " after the rewrite"})
         elif not storage.get("vacuumed") or not storage.get("wal_truncated"):
             left.append({"kind": "storage",
                          "note": "the database file could not be fully "
@@ -656,6 +695,8 @@ class WordingForget:
                 text or "", part, scrub.MIN_EDGE, report=True)), default=0)
 
         def strings_of(raw):
+            if raw[:1] not in ("{", "["):
+                return [raw]
             try:
                 value = json.loads(raw)
             except (TypeError, ValueError):

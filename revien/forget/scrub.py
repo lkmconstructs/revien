@@ -131,7 +131,24 @@ class _Pat:
         return None
 
 
+_PATTERNS: Dict[tuple, Any] = {}
+
+
 def _pattern(strings: List[str]):
+    """The compiled pattern for ``strings`` (cached: a forget asks for the
+    same one for every cell of the store)."""
+    if not strings:
+        return None
+    key = tuple((isinstance(x, Literal), str(x)) for x in strings)
+    hit = _PATTERNS.get(key)
+    if hit is None:
+        if len(_PATTERNS) > 64:
+            _PATTERNS.clear()
+        hit = _PATTERNS[key] = _build_pattern(strings)
+    return hit
+
+
+def _build_pattern(strings: List[str]):
     if not strings:
         return None
     lits = [s for s in strings if isinstance(s, Literal)]
@@ -367,7 +384,7 @@ def edge_floor(part: str) -> int:
     return max(MIN_EDGE, (len(part) + 3) // 4)
 
 
-def aligned_edge_fragment(field: str, content: str, spans, part: str):
+def aligned_edge_fragment(field: str, content: str, spans, part: str, others=()):
     """The piece of ``part`` that ``field`` (a label, a preview, a context
     line) kept of an occurrence cut from ``content``, or "".
 
@@ -378,24 +395,43 @@ def aligned_edge_fragment(field: str, content: str, spans, part: str):
     (it begins with the last k characters of an occurrence that ends right
     there). ``spans`` are the (start, end) of the occurrences in the original
     content. A piece that is merely equal to a prefix or suffix of the string
-    somewhere in the field is not this, and is never cut."""
+    somewhere in the field is not this, and is never cut.
+
+    ``others`` are further (content, spans) pairs the field could just as well
+    come from (the other records of the same capture): the field's text must
+    not stand anywhere in them except inside a cut occurrence, or it is
+    ambiguous and not cut."""
     t, _marker = split_marker((field or "").strip())
     t = t.strip()
     if not t or not content or not spans:
         return ""
     floor = edge_floor(part)
     for kind, k in edge_fragments(t, part, floor):
-        i = content.find(t)
-        while i >= 0:
-            if kind == "end":
-                pos = i + len(t) - k
-                if any(s0 == pos and e0 >= pos + k for s0, e0 in spans):
-                    return part[:k]
-            else:
-                end = i + k
-                if any(e0 == end and s0 <= i for s0, e0 in spans):
-                    return part[-k:]
-            i = content.find(t, i + 1)
+        # Every place the field's text stands in the content must be one that
+        # stops (or starts) inside a cut occurrence. If any copy of it stands
+        # alone ("reset the password." earlier in the same text), the field
+        # may well come from there: ambiguous, so it is reported, not cut.
+        found = False
+        ok = True
+        for ctx_content, ctx_spans in [(content, spans), *others]:
+            i = ctx_content.find(t) if ctx_content else -1
+            while i >= 0:
+                if kind == "end":
+                    pos = i + len(t) - k
+                    aligned = any(s0 == pos and e0 >= pos + k for s0, e0 in ctx_spans)
+                else:
+                    end = i + k
+                    aligned = any(e0 == end and s0 <= i for s0, e0 in ctx_spans)
+                if aligned:
+                    found = found or (ctx_content is content)
+                else:
+                    ok = False
+                    break
+                i = ctx_content.find(t, i + 1)
+            if not ok:
+                break
+        if found and ok:
+            return part[:k] if kind == "end" else part[-k:]
     return ""
 
 
@@ -454,6 +490,8 @@ def cut_json_text(raw: str, strings: List[str]) -> Tuple[str, int]:
     """Cut inside a JSON document held as text; non-JSON is cut as plain text."""
     if not raw:
         return raw, 0
+    if raw[:1] not in ('{', '[', '"'):
+        return cut_text(raw, strings)      # not JSON: skip the decode attempt
     try:
         value = json.loads(raw)
     except (TypeError, ValueError):
@@ -465,6 +503,8 @@ def cut_json_text(raw: str, strings: List[str]) -> Tuple[str, int]:
 def _iter_strings(value: Any):
     if isinstance(value, str):
         yield value
+        if value[:1] not in ('{', '['):
+            return
         try:
             inner = json.loads(value)
         except (TypeError, ValueError):

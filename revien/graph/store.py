@@ -1460,6 +1460,7 @@ class GraphStore(ForgetStoreMixin):
         """(cursor or None, generation). No row = (None, 0). A reset row
         (blank cursor) = (None, generation). Read this BEFORE fetching and
         pass the generation to ``set_sync_cursor_if_generation``."""
+        adapter_name = self._cut_ident(adapter_name)
         conn = self._get_conn()
         row = conn.execute(
             "SELECT cursor, generation FROM sync_cursors WHERE adapter_name = ?",
@@ -1479,6 +1480,7 @@ class GraphStore(ForgetStoreMixin):
         """Persist an adapter's sync position (upsert, unfenced; keeps the
         row's generation). For callers that cannot be reset (usage observer).
         The adapter scheduler uses ``set_sync_cursor_if_generation``."""
+        adapter_name = self._cut_ident(adapter_name)
         conn = self._get_conn()
         conn.execute(
             """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
@@ -1499,6 +1501,7 @@ class GraphStore(ForgetStoreMixin):
         Returns False, writing nothing, when a reset happened in between.
         Atomic in SQL, so it also fences a reset from another process.
         Absent row is generation 0."""
+        adapter_name = self._cut_ident(adapter_name)
         conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
         cur = conn.execute(
@@ -1536,6 +1539,7 @@ class GraphStore(ForgetStoreMixin):
         compare-and-set and cannot write its older position back. Returns
         None if the adapter has no row (nothing recorded, nothing changed),
         else True if it held a real position, False if already blank."""
+        adapter_name = self._cut_ident(adapter_name)
         conn = self._get_conn()
         row = conn.execute(
             "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
@@ -1571,12 +1575,12 @@ class GraphStore(ForgetStoreMixin):
     @_locked
     def set_meta(self, key: str, value: str) -> None:
         """Upsert one ``store_meta`` row (table created by migration 005)."""
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT INTO store_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value))
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            value, = self._cut_secret_strings(conn, value)
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value))
 
     @_locked
     def get_meta(self, key: str) -> Optional[str]:
@@ -1607,6 +1611,7 @@ class GraphStore(ForgetStoreMixin):
     def has_use_judgment(self, episode_key: str, node_id: str) -> bool:
         """True when this (episode, node) pair has already been judged."""
         conn = self._get_conn()
+        episode_key, = self._cut_secret_strings(conn, episode_key)
         row = conn.execute(
             "SELECT 1 FROM use_judgments WHERE episode_key = ? AND node_id = ?",
             (episode_key, node_id),
@@ -1632,7 +1637,8 @@ class GraphStore(ForgetStoreMixin):
         caller may apply it, so a judgment is counted at most once even across
         processes. Rows are never updated."""
         with self.transaction(immediate=True) as conn:
-            reason, query = self._cut_secret_strings(conn, reason, query)
+            reason, query, episode_key = self._cut_secret_strings(
+                conn, reason, query, episode_key)
             terms = [self._cut_secret_strings(conn, t)[0] for t in shared_terms]
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO use_judgments
@@ -1650,6 +1656,7 @@ class GraphStore(ForgetStoreMixin):
         """The ledger row for one (episode, memory) pair, or None. ``applied``
         is 0 (not applied), 2 (an apply is in progress) or 1 (applied)."""
         conn = self._get_conn()
+        episode_key, = self._cut_secret_strings(conn, episode_key)
         r = conn.execute(
             "SELECT used, mode, applied, reason, shared_terms, similarity "
             "FROM use_judgments WHERE episode_key = ? AND node_id = ?",
@@ -1739,7 +1746,7 @@ class GraphStore(ForgetStoreMixin):
     ) -> None:
         """Record one issued receipt (status open)."""
         with self.transaction(immediate=True) as conn:
-            query, = self._cut_secret_strings(conn, query)
+            query, runtime = self._cut_secret_strings(conn, query, runtime)
             conn.execute(
                 f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
                 "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
@@ -1931,6 +1938,13 @@ class GraphStore(ForgetStoreMixin):
             out.append(v)
         return tuple(out)
 
+    def _cut_ident(self, value):
+        """An identity string with the secrets a forget --wording named cut
+        out (the same cut the forget made in the stored identities)."""
+        if not isinstance(value, str) or not value:
+            return value
+        return self._cut_secret_strings(self._get_conn(), value)[0]
+
     @classmethod
     def _cut_derived(cls, conn, node) -> None:
         """A label, a preview or a context line derived from the content
@@ -1951,12 +1965,15 @@ class GraphStore(ForgetStoreMixin):
         if not spans:
             return
 
+        groups = {}
+        for s0, e0 in spans:
+            groups.setdefault(scrub.canonical(content[s0:e0]), []).append((s0, e0))
+
         def fix(text):
             if not isinstance(text, str) or not text:
                 return text
-            for s0, e0 in spans:
-                part = scrub.canonical(content[s0:e0])
-                piece = scrub.aligned_edge_fragment(text, content, [(s0, e0)], part)
+            for part, group in groups.items():
+                piece = scrub.aligned_edge_fragment(text, content, group, part)
                 if piece:
                     return scrub.cut_edge_fragment(text, part, piece)[0]
             return text
@@ -1990,7 +2007,9 @@ class GraphStore(ForgetStoreMixin):
         secret a ``forget --wording`` named back into a node."""
         conn = conn or self._get_conn()
         out = dict(kwargs)
-        for key in ("label", "content", "source_context", "event_time_text"):
+        for key in ("label", "content", "source_context", "event_time_text",
+                    "source_id", "confidence_set_by", "origin_source",
+                    "session_key", "project_key"):
             if isinstance(out.get(key), str):
                 out[key], = self._cut_secret_strings(conn, out[key])
         if isinstance(out.get("metadata"), dict):
@@ -2013,7 +2032,9 @@ class GraphStore(ForgetStoreMixin):
         # The write lock is taken BEFORE the denylist is read, so a forget in
         # another process cannot land between the check and the write.
         text_edit = any(k in kwargs for k in (
-            "label", "content", "source_context", "event_time_text", "metadata"))
+            "label", "content", "source_context", "event_time_text", "metadata",
+            "source_id", "confidence_set_by", "origin_source", "session_key",
+            "project_key"))
         with self.transaction(immediate=text_edit) as conn:
             existing = self.get_node(node_id)
             if existing is None:

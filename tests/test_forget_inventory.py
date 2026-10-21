@@ -25,7 +25,7 @@ INCLUDED = {
     ("supersession_candidates", "resolution"),
     ("suppressions", "path_keys"), ("suppressions", "actor"), ("suppressions", "lifted_by"),
     ("sync_cursors", "adapter_name"), ("sync_cursors", "cursor"),
-    ("use_judgments", "reason"), ("use_judgments", "shared_terms"), ("use_judgments", "query"),
+    ("use_judgments", "episode_key"), ("use_judgments", "reason"), ("use_judgments", "shared_terms"), ("use_judgments", "query"),
 }
 
 
@@ -80,3 +80,22 @@ def test_the_inventory_is_what_the_schema_says_not_a_list(tmp_path):
 def test_own_actor_names_are_matched_exactly():
     assert inventory.is_own("api:forget") and not inventory.is_own("api:forget-secret-9z8y")
     assert not inventory.is_own("api:forget ")
+
+
+def test_a_column_of_any_type_that_can_hold_text_is_seen(tmp_path):
+    s = _store(tmp_path)
+    conn = s._get_conn()
+    try:
+        conn.execute("CREATE TABLE dummy (payload JSON, at DATETIME, flag BOOLEAN, "
+                     "raw BLOB, free, n INTEGER, w REAL, big BIGINT)")
+        seen = set(inventory.all_text_columns(conn))
+        for col in ("payload", "at", "flag", "raw", "free"):
+            assert ("dummy", col) in seen, col
+        assert ("dummy", "n") not in seen and ("dummy", "w") not in seen
+        assert ("dummy", "big") not in seen
+        assert set(inventory.columns(conn)["dummy"]) == {"payload", "at", "flag", "raw", "free"}
+        # and the classification test would fail on it
+        unknown = seen - INCLUDED - set(inventory.EXCLUDED)
+        assert ("dummy", "payload") in unknown
+    finally:
+        s.close()
