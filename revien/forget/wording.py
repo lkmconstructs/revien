@@ -322,11 +322,16 @@ class WordingForget:
         orphaned = self._key_leftover()
         if orphaned:
             leftovers.append(orphaned)
-        partial = self._partial_copies(lit)
+        partial, unreadable = self._partial_copies(lit)
+        for path in unreadable:
+            leftovers.append({
+                "kind": "snapshot_unreadable", "path": path,
+                "note": f"snapshot could not be read: {path}"})
         if partial:
             shown = partial[:10]
             where = "; ".join(
-                f"{p['surface']} {p['node_id']} {p['field']} "
+                f"{p['surface']} {p.get('node_id') or 'row ' + str(p.get('row'))} "
+                f"{p['field']} "
                 f"({p['characters']} characters)" for p in shown)
             more = (f" and {len(partial) - len(shown)} more"
                     if len(partial) > len(shown) else "")
@@ -522,12 +527,14 @@ class WordingForget:
         except sqlite3.OperationalError:
             pass
         try:
-            for rid, nid, actor, bj, aj in conn.execute(
-                    "SELECT id, node_id, actor, before_json, after_json FROM audit_log"):
+            for rid, nid, op, actor, bj, aj in conn.execute(
+                    "SELECT id, node_id, op, actor, before_json, after_json FROM audit_log"):
                 for field, raw in (("actor", actor), ("before_json", bj),
                                    ("after_json", aj)):
                     if not raw:
                         continue
+                    if field == "actor" and op not in scrub._MERGE_OPS:
+                        continue        # Revien's own actor ("api:forget"), not content
                     k = max((best(x) for x in strings_of(raw)), default=0)
                     if k:
                         found.append({"surface": surface + "audit_log",
@@ -535,9 +542,28 @@ class WordingForget:
                                       "characters": k})
         except sqlite3.OperationalError:
             pass
+        # the other tables that keep text: edges, candidates, judgments, receipts
+        for table, (keycol, plain, jsoncols) in _TARGETS.items():
+            if table in ("nodes", "audit_log"):
+                continue
+            cols = list(plain) + list(jsoncols)
+            try:
+                rows = conn.execute(
+                    f'SELECT "{keycol}", ' + ", ".join(f'"{c}"' for c in cols)
+                    + f' FROM "{table}"').fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for row in rows:
+                for field, raw in zip(cols, row[1:]):
+                    if not isinstance(raw, str) or not raw:
+                        continue
+                    k = max((best(x) for x in strings_of(raw)), default=0)
+                    if k:
+                        found.append({"surface": surface + table, "row": row[0],
+                                      "field": field, "characters": k})
         return found
 
-    def _partial_copies(self, lit) -> List[Dict]:
+    def _partial_copies(self, lit):
         """Where a piece of the string still sits: the live database (every
         node field, every audit row) and every `revien watch` snapshot, plain
         or gzip. Read only. A piece is cut only where an occurrence was cut
@@ -548,6 +574,7 @@ class WordingForget:
         import tempfile
 
         part = scrub.canonical(str(lit))
+        unreadable: List[str] = []
         with self.store._lock:
             found = self._fragment_report(self.store._get_conn(), part, "")
         snap = Path(str(self.store.db_path) + ".snapshots")
@@ -569,8 +596,8 @@ class WordingForget:
                         finally:
                             conn.close()
                 except (OSError, sqlite3.Error):
-                    continue
-        return found
+                    unreadable.append(str(f))
+        return found, unreadable
 
     def _wording_message(self, r: Dict) -> str:
         if r["scope"] == "nothing found":
