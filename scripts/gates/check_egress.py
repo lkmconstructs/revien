@@ -349,6 +349,36 @@ def _docstring_ids(tree):
 # is allowed; every other reach (import, attribute, a longer string) still fails.
 PATH_NAMERS = {"scripts/forget_mutation_check.py": "revien/loopback_probe.py"}
 
+# In that file the path is a file-text target, nothing more, so the ways to
+# LOAD a file as code are closed there: these imports, attributes and names
+# are reported (a loader given the path string would run the probe).
+LOADER_MODULES = ("runpy", "importlib", "imp", "pkgutil", "zipimport")
+LOADER_ATTRS = ("load_module", "exec_module", "run_path", "run_module",
+                "spec_from_file_location", "SourceFileLoader",
+                "SourcelessFileLoader", "ExtensionFileLoader", "import_module",
+                "load_source", "load_compiled")
+LOADER_NAMES = ("exec", "eval", "compile", "__import__", "execfile")
+
+
+def _loader_reaches(src: str):
+    out = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in LOADER_MODULES:
+                    out.append((node.lineno, f"import {a.name}"))
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in LOADER_MODULES:
+                out.append((node.lineno, f"from {node.module} import ..."))
+            for a in node.names:
+                if a.name in LOADER_ATTRS:
+                    out.append((node.lineno, f"imports {a.name}"))
+        elif isinstance(node, ast.Attribute) and node.attr in LOADER_ATTRS:
+            out.append((node.lineno, f"attribute {node.attr}"))
+        elif isinstance(node, ast.Name) and node.id in LOADER_NAMES:
+            out.append((node.lineno, f"name {node.id}"))
+    return out
+
 
 def probe_reaches(src: str, allow_path: str = ""):
     """[(line, why)] for every way `src` touches the pinned probe module other
@@ -428,6 +458,10 @@ def closure_violations(root: Path):
             try:
                 src = path.read_text(encoding="utf-8")
                 hits = probe_reaches(src, PATH_NAMERS.get(rel, ""))
+                if rel in PATH_NAMERS:
+                    hits = sorted(set(hits) | {
+                        (ln, f"{why} (a file that names the probe path may not load code)")
+                        for ln, why in _loader_reaches(src)})
             except (SyntaxError, UnicodeDecodeError) as e:
                 fail(f"{rel} could not be parsed for the probe scan: {e}")
             found.extend((rel, line, why) for line, why in hits)
@@ -617,6 +651,8 @@ PROBE_EVASIONS = (
      "import sys\nm = sys.modules[__name__.split('.')[0] + '.loop' + 'back_probe']\n"),
     ("a path assembled at run time (the mutation script once did this)",
      "p = 'revien/loopback' + '_probe.py'\n"),
+    ("the probe file run as a script by a subprocess (not a loader)",
+     "import subprocess\nsubprocess.run(['python', 'revien/loopback' + '_probe.py'])\n"),
 )
 # What the gate does not look at at all.
 OUT_OF_SCOPE = (

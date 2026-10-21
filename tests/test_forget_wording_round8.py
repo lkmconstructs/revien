@@ -94,6 +94,7 @@ def test_stdin_string_with_no_terminal_changes_nothing_and_says_how_to_go_on(db,
     out = _cli(db, "--wording", "-", input=key + "\n")
     assert out.exit_code == 1 and "--yes" in out.output and "no terminal" in out.output
     assert "Occurrences found" in out.output and key not in out.output
+    assert out.output.count("Nothing was changed.") == 1
     assert leaks(db, key)
 
 

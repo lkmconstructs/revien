@@ -264,9 +264,7 @@ def test_wording_forget_leaves_nothing_after_every_kind_of_history(tmp_path):
     s = GraphStore(db_path=db)
     ops = GraphOperations(s)
     ops.training_dbs = (planted["training_db"],)
-    # (the wrapped key's label kept the first half: only the whole string is
-    # ever cut, so the halves are named in turn once the leftover says so)
-    for k in (k_del, k_edit, k_ref, k_bear, k_url, k_wrap, k_wrap[:half], k_wrap[half:]):
+    for k in (k_del, k_edit, k_ref, k_bear, k_url, k_wrap):
         res = ops.forget_wording(k)
         assert res["status"] == "forgotten", res
     s.close()

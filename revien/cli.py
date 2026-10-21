@@ -2062,7 +2062,7 @@ def _confirm_forget(prompt: str, stdin_was_used: bool) -> bool:
     if tty is None:
         click.echo("The string came in on standard input and there is no "
                    "terminal to ask on. Read the preview above; to go ahead, "
-                   "run the same command again with --yes. Nothing was changed.")
+                   "run the same command again with --yes.")
         return False
     try:
         click.echo(f"{prompt} [y/N]: ", nl=False)

@@ -23,6 +23,7 @@ shorter than ``MIN_WORDING`` characters is refused, and the preview says how
 much a string would cut before it does.
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -82,7 +83,9 @@ class WordingForget:
         """Find (and with ``apply`` cut) the string in every table that can
         hold it. Returns counts and the ids of the nodes it touched."""
         out = {"nodes": 0, "occurrences": 0, "node_ids": [], "tables": {},
-               "inside_words": 0}
+               "inside_words": 0, "fragments": 0}
+        part = scrub.canonical(str(lit))
+        fragments: Dict[str, List[str]] = {}
         strings = [lit]
         for table, (keycol, plain, jsoncols) in _TARGETS.items():
             cols = list(plain) + list(jsoncols)
@@ -95,7 +98,7 @@ class WordingForget:
             hit_rows = 0
             for row in rows:
                 key, vals = row[0], list(row[1:])
-                new_vals, cuts = [], 0
+                new_vals, cuts, content_cut = [], 0, 0
                 for col, val in zip(cols, vals):
                     if not isinstance(val, str) or not val:
                         new_vals.append(val)
@@ -108,7 +111,22 @@ class WordingForget:
                         out["inside_words"] += scrub.inside_longer_words(
                             val, strings, col in jsoncols)
                     cuts += n
+                    if col == "content":
+                        content_cut = n
                     new_vals.append(new)
+                if table == "nodes" and content_cut:
+                    # A label (or a preview, a context line) is the content cut
+                    # off where a line wrapped: when this node's content held
+                    # the string, the half of it a derived field kept goes too.
+                    # Only a prefix at the end or a suffix at the start of
+                    # that field, and only on a node an occurrence was cut from.
+                    for fld in ("label", "event_time_text", "source_context"):
+                        i = cols.index(fld)
+                        new_vals[i], piece = scrub.cut_edge_fragment(new_vals[i], part)
+                        if piece:
+                            fragments.setdefault(key, []).append(piece)
+                            out["fragments"] += 1
+                            cuts += 1
                 if not cuts:
                     continue
                 hit_rows += 1
@@ -131,7 +149,60 @@ class WordingForget:
                         self.store._enqueue_embed_stmt(conn, key)
             if hit_rows:
                 out["tables"][table] = hit_rows
+        if fragments:
+            self._cut_fragments_in_audit(conn, fragments, part, apply, out)
         return out
+
+    @staticmethod
+    def _cut_fragments_in_audit(conn, fragments, part, apply, out) -> None:
+        """The same pieces, cut from the audit snapshots of the same nodes
+        (the create row quotes the label as it was)."""
+        rows = 0
+        for node_id, pieces in fragments.items():
+            try:
+                found = conn.execute(
+                    "SELECT id, before_json, after_json FROM audit_log "
+                    "WHERE node_id = ?", (node_id,)).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for rid, bj, aj in found:
+                new = []
+                changed = False
+                for raw in (bj, aj):
+                    if not raw:
+                        new.append(raw)
+                        continue
+                    try:
+                        value = json.loads(raw)
+                    except (TypeError, ValueError):
+                        new.append(raw)
+                        continue
+
+                    def walk(v):
+                        nonlocal changed
+                        if isinstance(v, str):
+                            for piece in pieces:
+                                v2, cut = scrub.cut_edge_fragment(v, part, piece)
+                                if cut:
+                                    changed = True
+                                    return v2
+                            return v
+                        if isinstance(v, list):
+                            return [walk(x) for x in v]
+                        if isinstance(v, dict):
+                            return {k: walk(x) for k, x in v.items()}
+                        return v
+
+                    value = walk(value)
+                    new.append(json.dumps(value))
+                if changed:
+                    rows += 1
+                    if apply:
+                        conn.execute("UPDATE audit_log SET before_json = ?, "
+                                     "after_json = ? WHERE id = ?",
+                                     (new[0], new[1], rid))
+        if rows:
+            out["tables"]["audit_log"] = out["tables"].get("audit_log", 0) + rows
 
     def _wording_check(self, wording: str):
         canon = scrub.canonical(wording)
@@ -244,15 +315,17 @@ class WordingForget:
         orphaned = self._key_leftover()
         if orphaned:
             leftovers.append(orphaned)
-        partial = self._partial_copies(touched, lit)
+        partial = self._partial_copies(lit)
         if partial:
+            where = "; ".join(f"node {p['node_id']} {p['field']} "
+                              f"({p['characters']} characters)" for p in partial)
             leftovers.append({
-                "kind": "partial_copy", "node_ids": partial,
-                "note": f"a piece of the string (not the whole of it) is left "
-                        f"at the edge of {len(partial)} node(s) that held it; "
-                        "Revien cuts only the whole string you named, so "
-                        "name that piece with another --wording if it is "
-                        "also secret"})
+                "kind": "partial_copy", "pieces": partial,
+                "note": f"a piece of the string, not the whole of it, sits at "
+                        f"the edge of a field in {len(partial)} place(s): "
+                        f"{where}. It was not cut because no occurrence was "
+                        "cut from that node; name the piece with another "
+                        "--wording if it is also secret"})
         remaining = dict(residue)
         gone = not leftovers and not remaining
         result = {
@@ -402,26 +475,25 @@ class WordingForget:
                                  + (storage.get("note") or "another connection is open")})
         return left
 
-    def _partial_copies(self, node_ids, lit) -> List[str]:
-        """Nodes that held the whole string and now begin or end with a long
-        piece of it (a label cut where a line wrapped). Read only: nothing but
-        the whole string is ever cut."""
+    def _partial_copies(self, lit) -> List[Dict]:
+        """Nodes whose label, content or context line begins or ends with a
+        piece (MIN_EDGE characters or more) of the string, in the places a cut
+        or a truncation would leave one. Read only, every node: a piece in a
+        node the string was never cut from is not cut, only reported. Says
+        where and how long; never the characters."""
         part = scrub.canonical(str(lit))
-        floor = max(scrub.MIN_EDGE, (len(part) + 3) // 4)
         found = []
         with self.store._lock:
             conn = self.store._get_conn()
-            for nid in node_ids:
-                row = conn.execute("SELECT label, content FROM nodes WHERE node_id = ?",
-                                   (nid,)).fetchone()
-                if row is None:
-                    continue
-                for text in row:
-                    t = (text or "").strip()
-                    if any(t.endswith(part[:k]) or t.startswith(part[-k:])
-                           for k in range(floor, len(part))):
-                        found.append(nid)
-                        break
+            for nid, label, content, sctx in conn.execute(
+                    "SELECT node_id, label, content, source_context FROM nodes"):
+                for field, text in (("label", label), ("content", content),
+                                    ("source_context", sctx)):
+                    best = max((k for _kind, k in scrub.edge_fragments(
+                        text or "", part, scrub.MIN_EDGE, report=True)), default=0)
+                    if best:
+                        found.append({"node_id": nid, "field": field,
+                                      "characters": best})
         return found
 
     def _wording_message(self, r: Dict) -> str:

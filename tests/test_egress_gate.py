@@ -119,6 +119,24 @@ class TestTreeScan:
         (root / "scripts" / "forget_mutation_check.py").write_text(body)
         assert bool(gate.closure_violations(root)) == flagged
 
+    @pytest.mark.parametrize("body", [
+        'from importlib.machinery import SourceFileLoader\n'
+        'SourceFileLoader("p", "revien/loopback_probe.py").load_module()\n',
+        'import runpy\nrunpy.run_path("revien/loopback_probe.py")\n',
+        'import importlib.util as u\nu.spec_from_file_location("p", "revien/loopback_probe.py")\n',
+        'exec(open("revien/loopback_probe.py").read())\n',
+        'compile(open("revien/loopback_probe.py").read(), "p", "exec")\n',
+    ])
+    def test_the_mutation_script_cannot_load_the_probe_it_names(self, gate, tmp_path, body):
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "forget_mutation_check.py").write_text(body)
+        assert gate.closure_violations(root)
+
+    def test_the_real_mutation_script_loads_nothing(self, gate):
+        assert not [h for h in gate.closure_violations(REPO)
+                    if h[0] == "scripts/forget_mutation_check.py"]
+
     def test_the_path_is_named_by_no_other_file(self, gate, tmp_path):
         root = tmp_path / "repo"
         (root / "scripts").mkdir(parents=True)

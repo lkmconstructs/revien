@@ -61,9 +61,11 @@ def canonical(text: str) -> str:
     return _WRAP.sub("", text)
 
 
-#: A line break counts as a wrap of one long line only when the line it ends
-#: is at least this many characters: a short line ("token") followed by another
-#: ("abc") is two pieces of text, and joining them would make up a match.
+#: A line break (and the indent after it) is treated as a wrap of one long
+#: line when the line before it has at least this many characters. After a
+#: shorter line ("token" / "abc") the two are separate texts and are never
+#: joined. The rule is a heuristic, stated exactly: a named string that
+#: coincides with a join after a long line is cut across it.
 MIN_WRAPPED_LINE = 20
 
 #: A piece of a secret at least this long (and a quarter of it) left at the
@@ -312,6 +314,67 @@ def cut_json(value: Any, strings: List[str]) -> Tuple[Any, int]:
         return v
 
     return walk(value), total
+
+
+def edge_fragments(text: str, part: str, floor: int, report: bool = False):
+    """[("end"|"start", length)] of the pieces of the string ``part`` that sit
+    at the very edge of ``text``: the text ENDS with a proper prefix of it
+    (where a label was cut off at the end of a line), or STARTS with a proper
+    suffix of it. Only pieces of ``floor`` characters or more count. With
+    ``report`` the other two edges (starts with a prefix, ends with a suffix)
+    are looked at too: those are never cut, only reported."""
+    found = []
+    if not text or not part:
+        return found
+    tail, head = text.rstrip(), text.lstrip()
+    for k in range(len(part) - 1, floor - 1, -1):
+        if tail.endswith(part[:k]):
+            found.append(("end", k))
+            break
+    for k in range(len(part) - 1, floor - 1, -1):
+        if head.startswith(part[-k:]):
+            found.append(("start", k))
+            break
+    if report:
+        for k in range(len(part) - 1, floor - 1, -1):
+            if head.startswith(part[:k]):
+                found.append(("start-of-string", k))
+                break
+        for k in range(len(part) - 1, floor - 1, -1):
+            if tail.endswith(part[-k:]):
+                found.append(("end-of-string", k))
+                break
+    return found
+
+
+def edge_floor(part: str) -> int:
+    """The shortest piece that is cut: MIN_EDGE characters and a quarter of
+    the string. Shorter pieces are only ever reported."""
+    return max(MIN_EDGE, (len(part) + 3) // 4)
+
+
+def cut_edge_fragment(text: str, part: str, fragment=None):
+    """(text without the piece of ``part`` at its edge, the piece cut or "").
+    The piece is a proper prefix of ``part`` at the end of the text, or a
+    proper suffix at the start. With ``fragment`` only that exact piece is
+    cut (an audit snapshot of the same field)."""
+    if not isinstance(text, str) or not text:
+        return text, ""
+    if fragment is not None:
+        t = text.rstrip()
+        if t.endswith(fragment) and part.startswith(fragment):
+            return t[:len(t) - len(fragment)], fragment
+        h = text.lstrip()
+        if h.startswith(fragment) and part.endswith(fragment):
+            return h[len(fragment):], fragment
+        return text, ""
+    for kind, k in edge_fragments(text, part, edge_floor(part)):
+        if kind == "end":
+            t = text.rstrip()
+            return t[:len(t) - k], part[:k]
+        h = text.lstrip()
+        return h[k:], part[-k:]
+    return text, ""
 
 
 def inside_longer_words(raw: str, strings: List[str], is_json: bool = False) -> int:
