@@ -42,18 +42,6 @@ from revien.graph.units import is_file_backed
 #: smallest secrets people actually paste (tokens, keys, passwords) are longer.
 MIN_WORDING = 6
 
-#: table -> (key column, plain text columns, JSON columns)
-_TARGETS = {
-    "nodes": ("node_id",
-              ("label", "content", "event_time_text", "source_context"),
-              ("metadata",)),
-    "edges": ("edge_id", ("source_context",), ("metadata",)),
-    "audit_log": ("id", ("actor",), ("before_json", "after_json")),
-    "supersession_candidates": ("id", ("reason",), ("trace",)),
-    "use_judgments": ("id", ("reason", "query"), ("shared_terms",)),
-    "recall_receipts": ("recall_id", ("query",), ()),
-}
-
 INSIDE_WORDS = (
     "{n} of the {m} occurrence(s) of this string sit inside a longer word "
     "(for example 'secret' inside 'secretary', which would be left as "
