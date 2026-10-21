@@ -119,24 +119,35 @@ class TestAnswers:
     def test_nothing_listening_is_none(self):
         assert probe_daemon(f"http://127.0.0.1:{_free_port()}") is None
 
+    def test_a_listener_that_never_answers_is_unanswered_not_none(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)             # accepts the connection (kernel backlog), never replies
+        try:
+            out = probe_daemon(f"http://127.0.0.1:{srv.getsockname()[1]}")
+        finally:
+            srv.close()
+        assert out is not None and set(out) == {"unanswered"}
+
     def test_the_body_is_never_returned(self, serve):
         s = serve(body={**CURRENT, "secret": "do-not-leak", "db_path": "/x"})
         assert set(probe_daemon(s.url)) == {"features", "version"}
 
     @pytest.mark.parametrize("status", [201, 204, 404, 500])
     def test_only_http_200_counts(self, serve, status):
-        assert probe_daemon(serve(status=status).url) is None
+        assert probe_daemon(serve(status=status).url) == {"unanswered": f"HTTP {status}"}
 
     @pytest.mark.parametrize("raw", [
         b"not json", b"[]", b'{"hello": "world"}',
         json.dumps({"node_count": 1}).encode(),
     ])
-    def test_not_revien_health_is_none(self, serve, raw):
-        assert probe_daemon(serve(raw=raw).url) is None
+    def test_not_revien_health_is_unanswered(self, serve, raw):
+        assert set(probe_daemon(serve(raw=raw).url)) == {"unanswered"}
 
     def test_oversized_answer_is_none(self, serve):
         big = json.dumps({**CURRENT, "pad": "x" * 70000}).encode()
-        assert probe_daemon(serve(raw=big).url) is None
+        assert set(probe_daemon(serve(raw=big).url)) == {"unanswered"}
 
     def test_path_in_the_url_does_not_change_what_is_asked(self, serve):
         s = serve()
@@ -239,7 +250,7 @@ class TestLoopbackOnly:
                 return ("203.0.113.9", s.port)
 
         monkeypatch.setattr(socket, "socket", Lying)
-        assert probe_daemon(s.url) is None
+        assert set(probe_daemon(s.url)) == {"unanswered"}
 
 
 class TestPort:
@@ -265,12 +276,12 @@ class TestNoRedirectsNoProxies:
         target = serve()
         hop = serve(status=code, headers={
             "Location": f"http://127.0.0.1:{target.port}/v1/health"})
-        assert probe_daemon(hop.url) is None
+        assert set(probe_daemon(hop.url)) == {"unanswered"}
         assert hop.hits and target.hits == []
 
     def test_redirect_to_another_host_is_not_followed(self, serve):
         hop = serve(status=302, headers={"Location": "http://203.0.113.9/v1/health"})
-        assert probe_daemon(hop.url) is None
+        assert set(probe_daemon(hop.url)) == {"unanswered"}
 
     def test_proxy_settings_are_ignored(self, monkeypatch, serve):
         proxy = serve()

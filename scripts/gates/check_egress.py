@@ -287,7 +287,7 @@ def new_network_uses(head_src: str, base_src: str):
 # WHOLE FILE (CRLF normalized). A change to anything in it, however small or
 # wherever in the file, fails the gate until this hash is changed on purpose.
 PINNED = {
-    "revien/loopback_probe.py": "c083718c91df27ab3beb0647d251db07b95938f0160822d3e5b83f96ecfdbfdf",
+    "revien/loopback_probe.py": "7bf209326ed6b4ec03e76ac457f8afcc860ce27c415c446e7a371c70f2088d56",
 }
 PROBE_TEST = "tests/test_loopback_probe.py"
 PROBE_MODULE = "revien.loopback_probe"

@@ -1912,7 +1912,9 @@ def _old_daemon_problem(db_path: str, daemon_url: str,
       is a daemon from before fencing. Whether it serves this database cannot
       be told from its answer, so it refuses either way.
 
-    No heartbeat and no answer: no daemon is running, nothing to restart.
+    No heartbeat and nothing listening: no daemon is running, nothing to
+    restart. Something listening that does not answer as a current Revien
+    daemon (a hang, an HTTP error, not JSON) refuses.
 
     ``what`` is "reset" (sync reset) or "forget"; it only changes the wording."""
     from revien.daemon.heartbeat import RESET_REQUIRES, live_heartbeats_readonly
@@ -1938,6 +1940,15 @@ def _old_daemon_problem(db_path: str, daemon_url: str,
     health = probe_daemon(daemon_url)
     if health is None:
         return None
+    if "unanswered" in health:
+        # something accepted the connection and did not give a current Revien
+        # health answer: it may be a daemon from before the protection, and
+        # one that syncs afterwards writes the forgotten text back
+        return (f"Something is listening at {daemon_url} but did not give a "
+                f"current Revien health answer ({health['unanswered']}). It "
+                "may be a Revien daemon that is busy, hung or from before "
+                "this protection, so " + ("the forget" if forgetting else "this")
+                + " is refused rather than guessed. " + restart)
     if "rejected" in health:
         if forgetting:
             return (f"--daemon-url {daemon_url!r} was not used "
