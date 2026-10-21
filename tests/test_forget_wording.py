@@ -651,3 +651,32 @@ def test_a_capture_in_flight_when_the_forget_lands_cannot_write_the_string(tmp_p
         store.close()
     assert Forgetting.fired
     assert leaks(db, key) == {}
+
+
+def test_the_extractor_never_sees_the_string_after_a_forget(tmp_path):
+    """The string is cut before extraction, on the plain path and on the
+    override path, not only when the nodes are written."""
+    from revien.ingestion.extractor import RuleBasedExtractor
+    key = new_key()
+    db = str(tmp_path / "spy.db")
+    cc(db, "s1", f"User: We decided to use {key} as the deploy key.")
+    forget_wording(db, key)
+    seen = []
+
+    class Spy(RuleBasedExtractor):
+        def extract(self, content, source_id=""):
+            seen.append(content)
+            return super().extract(content, source_id)
+
+    store = GraphStore(db_path=db)
+    try:
+        pipe = IngestionPipeline(store, extractor=Spy())
+        for override in (False, True):
+            pipe.ingest(IngestionInput(
+                source_id=f"claude-code:proj:spy{override}", origin_runtime="claude-code",
+                session_key=f"spy{override}", override_suppression=override,
+                content=f"User: We decided to use {key} as the deploy key.\nUser: The venue is booked."))
+    finally:
+        store.close()
+    assert seen and all(key not in c for c in seen), seen
+    assert leaks(db, key) == {}

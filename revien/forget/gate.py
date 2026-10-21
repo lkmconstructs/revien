@@ -349,39 +349,6 @@ def _scrub_audit_rows(conn, node_id: str, forgotten) -> None:
                          "after_json = NULL WHERE id = ?", (rid,))
 
 
-def _cut_secret_from_node(store, conn, nid: str, entries) -> None:
-    """Cut every named secret out of one node's text fields and out of the
-    audit snapshots written for it, inside the capture's own transaction."""
-    row = conn.execute(
-        "SELECT label, content, event_time_text, source_context, metadata "
-        "FROM nodes WHERE node_id = ?", (nid,)).fetchone()
-    if row is None:
-        return
-    label, content, ett, sctx, meta = row
-    n_label, a = cut_literals(label or "", entries)
-    n_content, b = cut_literals(content or "", entries)
-    n_ett, c = cut_literals(ett or "", entries)
-    n_sctx, d = cut_literals(sctx or "", entries)
-    n_meta, e = cut_literals_json(meta or "", entries)
-    if a or b or c or d or e:
-        conn.execute(
-            "UPDATE nodes SET label = ?, content = ?, event_time_text = ?, "
-            "source_context = ?, metadata = ? WHERE node_id = ?",
-            ((n_label if n_label.strip() else "[removed]")[:200],
-             n_content if n_content.strip() else "[removed]",
-             n_ett, n_sctx, n_meta, nid))
-        store._enqueue_embed_stmt(conn, nid)
-    for rid, bj, aj, actor in conn.execute(
-            "SELECT id, before_json, after_json, actor FROM audit_log "
-            "WHERE node_id = ?", (nid,)).fetchall():
-        nb, x = cut_literals_json(bj, entries)
-        na, y = cut_literals_json(aj, entries)
-        nact, z = cut_literals(actor or "", entries)
-        if x or y or z:
-            conn.execute("UPDATE audit_log SET before_json = ?, after_json = ?, "
-                         "actor = ? WHERE id = ?", (nb, na, nact, rid))
-
-
 def check(store, unit: UnitRef, content: str) -> Optional[Block]:
     """The record that refuses this capture whole, or None. Only a
     ``forget --everywhere`` can: when the capture IS the exact wording it
@@ -455,11 +422,7 @@ def enforce_after_write(store, unit: UnitRef, content: str, new_ids, merged_ids=
             for nid in merged_ids:
                 store.delete_provenance(nid, [unit.owner])
             return block
-        entries = literals(store)
         fresh = set(new_ids)
-        if entries:
-            for nid in list(new_ids) + [i for i in existing_ids if i not in fresh]:
-                _cut_secret_from_node(store, conn, nid, entries)
         long_fps, short_fps, wording, windows = known(store, unit)
         if not long_fps and not short_fps and not wording and not windows:
             return None
