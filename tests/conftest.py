@@ -76,3 +76,24 @@ def _no_real_daemon_probe(request, monkeypatch):
 
     monkeypatch.setattr(lp, "probe_daemon", lambda url: None)
     yield
+
+
+# ── a failing forget test never prints a key ────────────────────────────
+# The forget tests build fake keys (ghp_..., tok_..., eyJFAKE....). pytest's
+# assertion rewriting prints the operands of a failing assert, which would put
+# a key in the report. Whatever is printed is redacted here.
+import re as _re
+
+_FAKE_KEY = _re.compile(r"(?:ghp_|tok_|eyJFAKE\.)[0-9a-fA-F]{6,}")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.failed and rep.longrepr is not None:
+        text = str(rep.longrepr)
+        if _FAKE_KEY.search(text):
+            rep.longrepr = _FAKE_KEY.sub("<fake-key>", text)
+    rep.sections = [(name, _FAKE_KEY.sub("<fake-key>", body))
+                    for name, body in rep.sections]

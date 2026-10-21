@@ -113,6 +113,17 @@ class WordingForget:
         pat = scrub._pattern([lit])
         fragments: Dict[str, List[str]] = {}
         sources: Dict[str, tuple] = {}
+        # the captured texts (context records) as they were before any cut:
+        # the evidence a derived stretch is judged against
+        ctx_orig: Dict[str, tuple] = {}
+        try:
+            for cid, ctext in conn.execute(
+                    "SELECT node_id, content FROM nodes WHERE node_type = 'context'"):
+                if ctext:
+                    ctx_orig[cid] = (ctext, [(m.start(), m.end())
+                                             for m in pat.finditer(ctext)])
+        except sqlite3.OperationalError:
+            pass
         # Units whose cut form is already another unit: renaming their
         # ownership rows would merge two sources into one, so they are kept
         # as they are and listed (identity_unrenamed).
@@ -124,6 +135,16 @@ class WordingForget:
                 cut, n = scrub.cut_json_text(u, strings)
                 if n and cut != u and cut in have:
                     blocked.add(u)
+        except sqlite3.OperationalError:
+            pass
+        blocked_sources = set()
+        try:
+            srcs = {r[0] for r in conn.execute(
+                "SELECT DISTINCT source_id FROM nodes WHERE source_id IS NOT NULL")}
+            for u in srcs:
+                cut, n = scrub.cut_json_text(u, strings)
+                if n and cut != u and cut in srcs:
+                    blocked_sources.add(u)
         except sqlite3.OperationalError:
             pass
         for table, cols in inventory.columns(conn).items():
@@ -159,6 +180,10 @@ class WordingForget:
                         if ["node_provenance.unit_id"] not in out["unrenamed"]:
                             out["unrenamed"].append(["node_provenance.unit_id"])
                         continue
+                    if table == "nodes" and col == "source_id" and val in blocked_sources:
+                        if ["nodes.source_id"] not in out["unrenamed"]:
+                            out["unrenamed"].append(["nodes.source_id"])
+                        continue
                     work = val
                     got = []
                     # a derived string next to its content, cut where it stops
@@ -166,7 +191,9 @@ class WordingForget:
                     # removes the occurrence it is measured against)
                     if table == "nodes" and spans and col in (
                             "label", "event_time_text", "source_context"):
-                        piece = scrub.aligned_edge_fragment(work, orig_content, spans, part)
+                        piece = scrub.aligned_edge_fragment(
+                            work, orig_content, spans, part,
+                            others=self._evidence(conn, node_id, (), ctx_orig))
                         if piece:
                             work, _ = scrub.cut_edge_fragment(work, part, piece)
                             got.append(piece)
@@ -233,12 +260,40 @@ class WordingForget:
                         out["renamed_ids"].append(new_vals[cols.index(c)])
             if hit_rows:
                 out["tables"][table] = hit_rows
-        self._cut_siblings(conn, sources, part, apply, out, fragments)
+        self._cut_siblings(conn, sources, part, apply, out, fragments, ctx_orig)
         if fragments:
             self._cut_fragments_in_audit(conn, fragments, part, apply, out)
         return out
 
-    def _cut_siblings(self, conn, sources, part, apply, out, fragments) -> None:
+    @staticmethod
+    def _evidence(conn, node_id, extra_units, ctx_orig):
+        """(content, spans) of the captured text (context records) of every
+        unit that vouches for ``node_id`` (and of ``extra_units``), as it was
+        before this forget cut anything, without ``node_id`` itself."""
+        units = set(extra_units)
+        try:
+            units.update(r[0] for r in conn.execute(
+                "SELECT unit_id FROM node_provenance WHERE node_id = ?", (node_id,)))
+            ids = set()
+            for u in units:
+                ids.update(r[0] for r in conn.execute(
+                    "SELECT p.node_id FROM node_provenance p JOIN nodes n "
+                    "ON n.node_id = p.node_id WHERE p.unit_id = ? "
+                    "AND n.node_type = 'context'", (u,)))
+        except sqlite3.OperationalError:
+            return []
+        ids.discard(node_id)
+        out = []
+        for oid in ids:
+            if oid in ctx_orig:
+                out.append(ctx_orig[oid])
+            else:
+                r = conn.execute("SELECT content FROM nodes WHERE node_id = ?",
+                                 (oid,)).fetchone()
+                out.append((r[0] if r and r[0] else "", []))
+        return out
+
+    def _cut_siblings(self, conn, sources, part, apply, out, fragments, ctx_orig) -> None:
         """Nodes written by the same capture as a node the string was cut from
         (a fact or a topic taken from a conversation) keep a derived stretch of
         it: the first words of the sentence up to where the extractor stopped.
@@ -258,18 +313,6 @@ class WordingForget:
                 sib.update(r[0] for r in conn.execute(
                     "SELECT node_id FROM node_provenance WHERE unit_id = ?", (u,)))
             sib.discard(nid)
-            # The captured text is the record a sibling's words come from: the
-            # context node(s) of the capture. Where a sibling's text stands
-            # there outside a cut occurrence ("reset the password." in
-            # another sentence), it is ambiguous and is reported, not cut.
-            # (Other derived facts are not evidence: they share the sentence.)
-            others = []
-            for oid in sib:
-                r = conn.execute("SELECT node_type, content FROM nodes WHERE node_id = ?",
-                                 (oid,)).fetchone()
-                if r is None or r[0] != "context":
-                    continue
-                others.append(sources[oid] if oid in sources else (r[1], []))
             for sid in sib:
                 row = conn.execute(
                     "SELECT " + ", ".join(fields) + " FROM nodes WHERE node_id = ?",
@@ -278,7 +321,7 @@ class WordingForget:
                     continue
                 new = list(row)
                 got = []
-                mine = others
+                mine = self._evidence(conn, sid, units, ctx_orig)
                 for i, text in enumerate(row):
                     piece = scrub.aligned_edge_fragment(
                         text or "", content, spans, part, others=mine)

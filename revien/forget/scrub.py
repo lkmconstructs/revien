@@ -414,7 +414,11 @@ def aligned_edge_fragment(field: str, content: str, spans, part: str, others=())
         found = False
         ok = True
         for ctx_content, ctx_spans in [(content, spans), *others]:
-            i = ctx_content.find(t) if ctx_content else -1
+            # (case-insensitive: a copy that differs only by case is a copy)
+            hay, needle = ctx_content or "", t
+            if len(hay.lower()) == len(hay) and len(needle.lower()) == len(needle):
+                hay, needle = hay.lower(), needle.lower()
+            i = hay.find(needle) if hay else -1
             while i >= 0:
                 if kind == "end":
                     pos = i + len(t) - k
@@ -427,7 +431,7 @@ def aligned_edge_fragment(field: str, content: str, spans, part: str, others=())
                 else:
                     ok = False
                     break
-                i = ctx_content.find(t, i + 1)
+                i = hay.find(needle, i + 1)
             if not ok:
                 break
         if found and ok:

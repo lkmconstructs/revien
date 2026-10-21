@@ -129,10 +129,11 @@ def test_a_judgment_episode_key_cannot_carry_the_key_and_is_still_found(db):
     ep = f"https://x.example/?token={key}#tool_1"
     s.record_use_judgment(episode_key=ep, node_id=n.node_id, used=True, reason="r",
                           shared_terms=[], similarity=0.5, query="q", mode="m", applied=True)
-    assert s.has_use_judgment(ep, n.node_id)
-    assert s.get_use_judgment(ep, n.node_id) is not None
+    found = s.has_use_judgment(ep, n.node_id) and s.get_use_judgment(ep, n.node_id) is not None
     s.close()
-    assert everywhere(db, key) == {}
+    assert found, "the judgment was not found again by its episode key"
+    clean = everywhere(db, key) == {}
+    assert clean
 
 
 def test_an_episode_key_forgotten_with_its_row_is_renamed_not_left(db):

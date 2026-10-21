@@ -1355,23 +1355,25 @@ class GraphStore(ForgetStoreMixin):
         """Replace all manifest rows for a note (full regen at distill time).
         Each row is a dict: entity_id, anchor_node_id, current_node_id,
         content_hash, section."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM distill_manifest WHERE note_stem = ?", (note_stem,))
-        for r in rows:
-            conn.execute(
-                """INSERT INTO distill_manifest
-                   (note_stem, entity_id, anchor_node_id, current_node_id,
-                    content_hash, section)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (note_stem, r["entity_id"], r["anchor_node_id"],
-                 r["current_node_id"], r["content_hash"], r.get("section", "")),
-            )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            note_stem, = self._cut_secret_strings(conn, note_stem)
+            conn.execute("DELETE FROM distill_manifest WHERE note_stem = ?", (note_stem,))
+            for r in rows:
+                section, = self._cut_secret_strings(conn, r.get("section", ""))
+                conn.execute(
+                    """INSERT INTO distill_manifest
+                       (note_stem, entity_id, anchor_node_id, current_node_id,
+                        content_hash, section)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (note_stem, r["entity_id"], r["anchor_node_id"],
+                     r["current_node_id"], r["content_hash"], section),
+                )
 
     @_locked
     def get_distill_manifest(self, note_stem: str) -> list:
         """All manifest rows for one note, as dicts."""
         conn = self._get_conn()
+        note_stem, = self._cut_secret_strings(conn, note_stem)
         rows = conn.execute(
             """SELECT entity_id, anchor_node_id, current_node_id, content_hash, section
                FROM distill_manifest WHERE note_stem = ?""",
@@ -1400,13 +1402,13 @@ class GraphStore(ForgetStoreMixin):
         """After absorbing an edit: point the anchor at its correction and
         record the new text hash, so the next reconcile sees no phantom diff.
         The anchor_node_id (file join key) is never changed."""
-        conn = self._get_conn()
-        conn.execute(
-            """UPDATE distill_manifest SET current_node_id = ?, content_hash = ?
-               WHERE note_stem = ? AND anchor_node_id = ?""",
-            (current_node_id, content_hash, note_stem, anchor_node_id),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            note_stem, = self._cut_secret_strings(conn, note_stem)
+            conn.execute(
+                """UPDATE distill_manifest SET current_node_id = ?, content_hash = ?
+                   WHERE note_stem = ? AND anchor_node_id = ?""",
+                (current_node_id, content_hash, note_stem, anchor_node_id),
+            )
 
     @_locked
     def add_manifest_row(
@@ -1415,21 +1417,22 @@ class GraphStore(ForgetStoreMixin):
     ) -> None:
         """Record a user-added claim so a later re-add of the same line is a
         no-op, and it round-trips like any other line."""
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT OR REPLACE INTO distill_manifest
-               (note_stem, entity_id, anchor_node_id, current_node_id,
-                content_hash, section)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (note_stem, entity_id, anchor_node_id, current_node_id, content_hash, section),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            note_stem, section = self._cut_secret_strings(conn, note_stem, section)
+            conn.execute(
+                """INSERT OR REPLACE INTO distill_manifest
+                   (note_stem, entity_id, anchor_node_id, current_node_id,
+                    content_hash, section)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (note_stem, entity_id, anchor_node_id, current_node_id, content_hash, section),
+            )
 
     @_locked
     def delete_manifest_row(self, note_stem: str, anchor_node_id: str) -> None:
         """After absorbing a deletion: drop the row so the forgotten claim is
         no longer expected in the note."""
         conn = self._get_conn()
+        note_stem, = self._cut_secret_strings(conn, note_stem)
         conn.execute(
             "DELETE FROM distill_manifest WHERE note_stem = ? AND anchor_node_id = ?",
             (note_stem, anchor_node_id),
@@ -1480,17 +1483,18 @@ class GraphStore(ForgetStoreMixin):
         """Persist an adapter's sync position (upsert, unfenced; keeps the
         row's generation). For callers that cannot be reset (usage observer).
         The adapter scheduler uses ``set_sync_cursor_if_generation``."""
-        adapter_name = self._cut_ident(adapter_name)
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(adapter_name) DO UPDATE SET
-                   cursor = excluded.cursor, updated_at = excluded.updated_at""",
-            (adapter_name, cursor.isoformat(),
-             datetime.now(timezone.utc).isoformat()),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True):
+            adapter_name = self._cut_ident(adapter_name)
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(adapter_name) DO UPDATE SET
+                       cursor = excluded.cursor, updated_at = excluded.updated_at""",
+                (adapter_name, cursor.isoformat(),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            self._commit(conn)
 
     @_locked
     def set_sync_cursor_if_generation(
@@ -1501,26 +1505,27 @@ class GraphStore(ForgetStoreMixin):
         Returns False, writing nothing, when a reset happened in between.
         Atomic in SQL, so it also fences a reset from another process.
         Absent row is generation 0."""
-        adapter_name = self._cut_ident(adapter_name)
-        conn = self._get_conn()
-        now = datetime.now(timezone.utc).isoformat()
-        cur = conn.execute(
-            "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
-            "WHERE adapter_name = ? AND generation = ?",
-            (cursor.isoformat(), now, adapter_name, expected_generation),
-        )
-        ok = cur.rowcount > 0
-        if not ok and expected_generation == 0:
-            # No row yet? INSERT OR IGNORE loses to any row that exists.
-            ins = conn.execute(
-                "INSERT OR IGNORE INTO sync_cursors "
-                "(adapter_name, cursor, updated_at, generation) "
-                "VALUES (?, ?, ?, 0)",
-                (adapter_name, cursor.isoformat(), now),
+        with self.transaction(immediate=True):
+            adapter_name = self._cut_ident(adapter_name)
+            conn = self._get_conn()
+            now = datetime.now(timezone.utc).isoformat()
+            cur = conn.execute(
+                "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
+                "WHERE adapter_name = ? AND generation = ?",
+                (cursor.isoformat(), now, adapter_name, expected_generation),
             )
-            ok = ins.rowcount > 0
-        self._commit(conn)
-        return ok
+            ok = cur.rowcount > 0
+            if not ok and expected_generation == 0:
+                # No row yet? INSERT OR IGNORE loses to any row that exists.
+                ins = conn.execute(
+                    "INSERT OR IGNORE INTO sync_cursors "
+                    "(adapter_name, cursor, updated_at, generation) "
+                    "VALUES (?, ?, ?, 0)",
+                    (adapter_name, cursor.isoformat(), now),
+                )
+                ok = ins.rowcount > 0
+            self._commit(conn)
+            return ok
 
     @_locked
     def list_sync_cursor_names(self) -> List[str]:
@@ -1539,22 +1544,23 @@ class GraphStore(ForgetStoreMixin):
         compare-and-set and cannot write its older position back. Returns
         None if the adapter has no row (nothing recorded, nothing changed),
         else True if it held a real position, False if already blank."""
-        adapter_name = self._cut_ident(adapter_name)
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
-            (adapter_name,),
-        ).fetchone()
-        if row is None:
-            return None
-        had_position = bool(row[0])
-        conn.execute(
-            "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
-            "updated_at = ? WHERE adapter_name = ?",
-            (datetime.now(timezone.utc).isoformat(), adapter_name),
-        )
-        self._commit(conn)
-        return had_position
+        with self.transaction(immediate=True):
+            adapter_name = self._cut_ident(adapter_name)
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+                (adapter_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            had_position = bool(row[0])
+            conn.execute(
+                "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
+                "updated_at = ? WHERE adapter_name = ?",
+                (datetime.now(timezone.utc).isoformat(), adapter_name),
+            )
+            self._commit(conn)
+            return had_position
 
     @_locked
     def delete_sync_cursor(self, adapter_name: str) -> bool:
@@ -2601,7 +2607,7 @@ class GraphStore(ForgetStoreMixin):
         with self.transaction(immediate=True):
             # the denylist is read with the write lock held
             for i, key in enumerate(updates):
-                if key == "source_context":
+                if key in ("source_context", "confidence_set_by"):
                     values[i], = self._cut_secret_strings(conn, values[i])
                 elif key == "metadata":
                     values[i] = json.dumps(self._cut_secret_metadata(conn, updates[key]))

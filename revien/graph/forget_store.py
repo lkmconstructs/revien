@@ -380,12 +380,12 @@ class ForgetStoreMixin:
 
     @_locked
     def lift_suppression(self, suppression_id: int, by: str) -> bool:
-        conn = self._get_conn()
-        cur = conn.execute(
-            "UPDATE suppressions SET status = 'lifted', lifted_at = ?, "
-            "lifted_by = ? WHERE id = ? AND status = 'active'",
-            (_now(), by, suppression_id))
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            by, = self._cut_secret_strings(conn, by)
+            cur = conn.execute(
+                "UPDATE suppressions SET status = 'lifted', lifted_at = ?, "
+                "lifted_by = ? WHERE id = ? AND status = 'active'",
+                (_now(), by, suppression_id))
         return cur.rowcount > 0
 
     # ── storage hygiene ───────────────────────────────────
