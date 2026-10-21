@@ -143,22 +143,17 @@ def find_literals(text: str, entries) -> list:
     """[(start, end)] of every place in ``text`` where one of the entries'
     strings occurs (line wraps inside it ignored), as offsets into ``text``.
     Nothing but the entries is needed to find them."""
-    import re
-
     wanted = {}
     for e in entries:
         n, roll, fp = e.split(":", 2)
         wanted.setdefault(int(n), {})[int(roll, 16)] = fp
     if not wanted or not text:
         return []
-    kept, chars, pos = [], [], 0
-    for m in re.finditer(r"\r?\n[ \t]*", text):
-        for i in range(pos, m.start()):
-            kept.append(i)
-        pos = m.end()
-    for i in range(pos, len(text)):
-        kept.append(i)
-    canon = "".join(text[i] for i in kept)
+    from revien.forget.scrub import unwrap
+
+    canon, kept = unwrap(text)
+    if kept is None:
+        kept = range(len(text))
     base = _rk_base()
     spans = []
     for n, rolls in wanted.items():

@@ -105,6 +105,26 @@ class TestTreeScan:
             "probe_daemon.__globals__['http'] = None\n")
         assert gate.closure_violations(root)
 
+    @pytest.mark.parametrize("body,flagged", [
+        ('P = "revien/loopback_probe.py"\n', False),
+        ('P = "revien/loopback_probe.py.bak"\n', True),
+        ('from revien.loopback_probe import probe_daemon\nprobe_daemon.__globals__\n', True),
+        ('import revien.loopback_probe\n', True),
+        ('p = "revien/loopback_probe.py"\nimport importlib\nx = "revien.loopback_probe"\n', True),
+    ])
+    def test_the_mutation_script_may_name_the_path_and_nothing_else(
+            self, gate, tmp_path, body, flagged):
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "forget_mutation_check.py").write_text(body)
+        assert bool(gate.closure_violations(root)) == flagged
+
+    def test_the_path_is_named_by_no_other_file(self, gate, tmp_path):
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "other.py").write_text('P = "revien/loopback_probe.py"\n')
+        assert gate.closure_violations(root)
+
 
 class TestPin:
     def test_the_pinned_file_matches(self, gate):

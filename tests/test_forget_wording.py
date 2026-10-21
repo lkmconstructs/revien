@@ -237,8 +237,15 @@ def test_b_key_shapes(db, shape):
     cc(db, "s1", text + "\nUser: The venue is booked.")
     res = forget_wording(db, key)
     assert res["status"] == "forgotten", res
-    pieces = (key, key[:half], key[half:]) if shape == "wrapped" else (key,)
-    assert leaks(db, *pieces) == {}
+    assert leaks(db, key) == {}
+    if shape == "wrapped":
+        # only the whole string is cut: a half a label kept is reported, and
+        # the answer is not "gone everywhere" until the half is named too
+        assert res["scope"] != "gone everywhere"
+        assert any(l["kind"] == "partial_copy" for l in res["leftovers"]), res["leftovers"]
+        for piece in (key[:half], key[half:]):
+            forget_wording(db, piece)
+        assert leaks(db, key, key[:half], key[half:]) == {}
     body = all_text(db)
     assert "The venue is booked." in body
     if shape == "url_token":

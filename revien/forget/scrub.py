@@ -9,6 +9,7 @@ forgotten string still appears, instead of assuming it is gone.
 """
 
 import json
+from typing import List, Optional
 import re
 import sqlite3
 import unicodedata
@@ -60,10 +61,46 @@ def canonical(text: str) -> str:
     return _WRAP.sub("", text)
 
 
-#: A cut field that begins or ends with at least this much of a literal
-#: secret (and a quarter of it) loses that piece too: a label or a preview is
-#: the text cut off wherever the line wrapped, so it holds half a key.
+#: A line break counts as a wrap of one long line only when the line it ends
+#: is at least this many characters: a short line ("token") followed by another
+#: ("abc") is two pieces of text, and joining them would make up a match.
+MIN_WRAPPED_LINE = 20
+
+#: A piece of a secret at least this long (and a quarter of it) left at the
+#: edge of a field is reported, never cut: only the whole string is cut.
 MIN_EDGE = 8
+
+
+def unwrap(text: str) -> Tuple[str, Optional[List[int]]]:
+    """(text with real wraps removed, original offset of every kept character).
+    The offsets are None when nothing was removed. A wrap is a newline (and
+    the indent after it) that ends a line of MIN_WRAPPED_LINE characters or
+    more and is followed by more text on the next line."""
+    breaks = []
+    for m in _WRAP.finditer(text):
+        start = text.rfind("\n", 0, m.start()) + 1
+        if m.start() - start >= MIN_WRAPPED_LINE and m.end() < len(text) \
+                and text[m.end()] not in "\r\n":
+            breaks.append((m.start(), m.end()))
+    if not breaks:
+        return text, None
+    kept, pos = [], 0
+    for s, e in breaks:
+        kept.extend(range(pos, s))
+        pos = e
+    kept.extend(range(pos, len(text)))
+    return "".join(text[i] for i in kept), kept
+
+
+class _Hit:
+    def __init__(self, s, e):
+        self._s, self._e = s, e
+
+    def start(self):
+        return self._s
+
+    def end(self):
+        return self._e
 
 
 class _Pat:
@@ -72,31 +109,24 @@ class _Pat:
     def __init__(self, rx, literal: bool, parts=()):
         self.rx, self.literal, self.parts = rx, literal, list(parts)
 
-    def trim_edges(self, text: str) -> Tuple[str, int]:
-        """Cut a piece of a secret left at the very start or end of a field."""
-        n = 0
-        for part in self.parts:
-            floor = max(MIN_EDGE, (len(part) + 3) // 4)
-            for k in range(len(part) - 1, floor - 1, -1):
-                tail = text.rstrip()
-                if tail.endswith(part[:k]):
-                    text, n = tail[:len(tail) - k], n + 1
-                    break
-            for k in range(len(part) - 1, floor - 1, -1):
-                head = text.lstrip()
-                if head.startswith(part[-k:]):
-                    text, n = head[k:], n + 1
-                    break
-        return text, n
-
     def norm(self, text: str) -> str:
         return text if self.literal else _nfc(text)
 
     def finditer(self, text):
-        return self.rx.finditer(text)
+        if not self.literal:
+            return self.rx.finditer(text)
+        canon, kept = unwrap(text)
+        if kept is None:
+            return self.rx.finditer(text)
+        # offsets in the canonical text map back to the original: a match
+        # that spans a wrap takes the wrap with it, and nothing else
+        return [_Hit(kept[m.start()], kept[m.end() - 1] + 1)
+                for m in self.rx.finditer(canon)]
 
     def search(self, text):
-        return self.rx.search(text)
+        for m in self.finditer(text):
+            return m
+        return None
 
 
 def _pattern(strings: List[str]):
@@ -109,9 +139,7 @@ def _pattern(strings: List[str]):
         parts = sorted({canonical(s) for s in lits if canonical(s)}, key=len, reverse=True)
         if not parts:
             return None
-        wrap = r"(?:\r?\n[ \t]*)?"
-        return _Pat(re.compile("|".join(
-            wrap.join(re.escape(ch) for ch in part) for part in parts)), True, parts)
+        return _Pat(re.compile("|".join(re.escape(part) for part in parts)), True, parts)
     return _Pat(re.compile("|".join(_bounded(s) for s in strings), re.IGNORECASE), False)
 
 
@@ -250,10 +278,9 @@ def cut_text(text: str, strings: List[str], sentences: bool = True) -> Tuple[str
             out.append(normalized[pos:m.start()])
             pos, n = m.end(), n + 1
         out.append(normalized[pos:])
-        cut, edges = pat.trim_edges("".join(out))
-        if not n and not edges:
+        if not n:
             return text, 0
-        return cut, n + edges
+        return "".join(out), n
     spans = []
     for m in pat.finditer(normalized):
         if sentences and not pat.literal:

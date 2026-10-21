@@ -342,7 +342,15 @@ def _docstring_ids(tree):
     return ids
 
 
-def probe_reaches(src: str):
+# The one file outside the probe that may NAME its path. scripts/
+# forget_mutation_check.py edits the text of a temp copy of
+# revien/loopback_probe.py to prove its tests catch the change; it never
+# imports or runs the probe. Only a string constant exactly equal to the path
+# is allowed; every other reach (import, attribute, a longer string) still fails.
+PATH_NAMERS = {"scripts/forget_mutation_check.py": "revien/loopback_probe.py"}
+
+
+def probe_reaches(src: str, allow_path: str = ""):
     """[(line, why)] for every way `src` touches the pinned probe module other
     than `from revien.loopback_probe import probe_daemon` used as a call."""
     tree = ast.parse(src)
@@ -386,6 +394,7 @@ def probe_reaches(src: str):
             flag(node, "name of the module")
         elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
               and id(node) not in docs
+              and not (allow_path and node.value == allow_path)
               and (PROBE_MODULE.split(".")[-1] in node.value
                    or node.value == PROBE_ENTRY)):
             flag(node, f"string naming the probe: {node.value[:40]!r}")
@@ -418,7 +427,7 @@ def closure_violations(root: Path):
             rel = path.relative_to(root).as_posix()
             try:
                 src = path.read_text(encoding="utf-8")
-                hits = probe_reaches(src)
+                hits = probe_reaches(src, PATH_NAMERS.get(rel, ""))
             except (SyntaxError, UnicodeDecodeError) as e:
                 fail(f"{rel} could not be parsed for the probe scan: {e}")
             found.extend((rel, line, why) for line, why in hits)
@@ -606,6 +615,8 @@ PROBE_EVASIONS = (
      "import revien\ngetattr(revien, 'loopback_' + 'probe')\n"),
     ("the module reached through a name the scanner does not follow",
      "import sys\nm = sys.modules[__name__.split('.')[0] + '.loop' + 'back_probe']\n"),
+    ("a path assembled at run time (the mutation script once did this)",
+     "p = 'revien/loopback' + '_probe.py'\n"),
 )
 # What the gate does not look at at all.
 OUT_OF_SCOPE = (

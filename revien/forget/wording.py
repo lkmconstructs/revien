@@ -212,6 +212,15 @@ class WordingForget:
         leftovers = self._wording_leftovers(
             manifest_notes, problems, training, storage, snapshots, model,
             raw_hits, files)
+        partial = self._partial_copies(touched, lit)
+        if partial:
+            leftovers.append({
+                "kind": "partial_copy", "node_ids": partial,
+                "note": f"a piece of the string (not the whole of it) is left "
+                        f"at the edge of {len(partial)} node(s) that held it; "
+                        "Revien cuts only the whole string you named, so "
+                        "name that piece with another --wording if it is "
+                        "also secret"})
         remaining = dict(residue)
         gone = not leftovers and not remaining
         result = {
@@ -224,7 +233,8 @@ class WordingForget:
             "still_held_by": sorted({u for f in files for u in f["units"]}),
             "training_db": training, "snapshots": snapshots, "storage": storage,
             "remaining": remaining, "leftovers": leftovers,
-            "scope": "gone everywhere" if gone else "forgotten from Revien",
+            "scope": (("nothing found" if not scan["occurrences"] else "gone everywhere")
+                      if gone else "forgotten from Revien"),
             "model": model, "model_stale": model["stale"],
             "warnings": list(getattr(self, "_warnings", [])),
             "blast_radius": self._wording_radius(scan),
@@ -360,10 +370,35 @@ class WordingForget:
                                  + (storage.get("note") or "another connection is open")})
         return left
 
+    def _partial_copies(self, node_ids, lit) -> List[str]:
+        """Nodes that held the whole string and now begin or end with a long
+        piece of it (a label cut where a line wrapped). Read only: nothing but
+        the whole string is ever cut."""
+        part = scrub.canonical(str(lit))
+        floor = max(scrub.MIN_EDGE, (len(part) + 3) // 4)
+        found = []
+        with self.store._lock:
+            conn = self.store._get_conn()
+            for nid in node_ids:
+                row = conn.execute("SELECT label, content FROM nodes WHERE node_id = ?",
+                                   (nid,)).fetchone()
+                if row is None:
+                    continue
+                for text in row:
+                    t = (text or "").strip()
+                    if any(t.endswith(part[:k]) or t.startswith(part[-k:])
+                           for k in range(floor, len(part))):
+                        found.append(nid)
+                        break
+        return found
+
     def _wording_message(self, r: Dict) -> str:
-        lines = [f"{r['scope'][0].upper()}{r['scope'][1:]}. {r['blast_radius']}"]
-        if not r["occurrences_cut"]:
-            lines.append("The string was not found in this database.")
+        if r["scope"] == "nothing found":
+            lines = ["Nothing was found and nothing was changed: the string is "
+                     "not in this database. It is still kept out of every later "
+                     "capture."]
+        else:
+            lines = [f"{r['scope'][0].upper()}{r['scope'][1:]}. {r['blast_radius']}"]
         for w in r["warnings"]:
             lines.append(w)
         re_ = r["reentry"]
