@@ -43,8 +43,9 @@ def _two_sessions(db, a_text):
     s.add_node(Node(node_type=NodeType.CONTEXT, label="session B",
                     content="User: We decided to rotate the staging-credentials-77x1 today."),
                owner=("unitB", 1, 1))
+    # (its own words do not repeat the stretch: only the sessions' texts do)
     d = s.add_node(Node(node_type=NodeType.DECISION, label="rotate the staging-credentials",
-                        content="We decided to rotate the staging-credentials."),
+                        content="A rotation decision was recorded."),
                    owner=("unitA", 1, 1))
     s.record_provenance(d.node_id, "unitB")
     s.close()
