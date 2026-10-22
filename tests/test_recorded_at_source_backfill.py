@@ -93,7 +93,7 @@ def test_backfill_on_legacy_db_then_idempotent(tmp_path):
     path = _legacy_db(tmp_path)
     GraphStore(db_path=path).close()
     first, keep, version = _sources(path)
-    assert version == 5  # chain ends at 5 (usage layer, migration 005)
+    assert version == 6  # chain ends at 6 (forget layer, migration 006)
     assert keep == {1}  # other metadata untouched
     for i, (_, _, expected) in enumerate(TABLE):
         assert first[f"n{i}"] == expected
@@ -124,7 +124,7 @@ def test_migration_004_matches_in_store_guard(tmp_path):
     first = mod.migrate(b)
     assert first["backfilled"] == sum(1 for t in TABLE if t[2])
     assert _sources(a)[0] == _sources(b)[0]
-    assert _sources(b)[2] == 5
+    assert _sources(b)[2] == 6
     assert mod.migrate(b)["backfilled"] == 0
 
 

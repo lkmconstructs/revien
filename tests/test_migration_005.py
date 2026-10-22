@@ -91,7 +91,7 @@ class TestUpgrade:
         s = GraphStore(db_path=path)
         s.close()
         tables, indexes, uv, cols = catalogue(path)
-        assert uv == 5
+        assert uv == 6
         assert NEW_TABLES <= tables
         assert NEW_INDEXES <= indexes
         assert "generation" in cols["sync_cursors"]
@@ -163,7 +163,7 @@ class TestIdempotent:
         first = migration().migrate(path)
         assert set(first["created"]) == NEW_TABLES | {"sync_cursors.generation"}
         assert migration().migrate(path)["created"] == []
-        assert catalogue(path)[2] == 5
+        assert catalogue(path)[2] == 6
 
     def test_standalone_equals_the_connect_time_guard(self, tmp_path):
         (tmp_path / "a").mkdir()
@@ -183,7 +183,7 @@ class TestIdempotent:
         conn.execute("CREATE TABLE sync_cursors (adapter_name TEXT PRIMARY KEY, "
                      "cursor TEXT NOT NULL, updated_at TEXT NOT NULL)")
         conn.commit()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
         conn.close()
         GraphStore(db_path=path).close()
         tables, indexes, _uv, cols = catalogue(path)
@@ -210,7 +210,7 @@ class TestFreshDatabase:
         path = str(tmp_path / "fresh.db")
         GraphStore(db_path=path).close()
         tables, indexes, uv, cols = catalogue(path)
-        assert uv == 5
+        assert uv == 6
         assert NEW_TABLES <= tables and NEW_INDEXES <= indexes
         assert "generation" in cols["sync_cursors"]
 
@@ -275,7 +275,7 @@ class TestMainDatabaseThatWasUsed:
         before = snap()
         GraphStore(db_path=path).close()
         assert snap() == before
-        assert catalogue(path)[2] == 5
+        assert catalogue(path)[2] == 6
 
     def test_recall_sync_and_reset_work_on_the_upgraded_database(self, tmp_path):
         import asyncio

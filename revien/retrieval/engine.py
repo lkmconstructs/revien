@@ -362,6 +362,10 @@ class RetrievalEngine:
         )
         self.neural_scorer = NeuralScorer(model_dir=model_dir)
         self.training_loop = TrainingLoop(db_path=training_db, model_dir=model_dir)
+        # A retrain writes a new model to disk; this process keeps the one it
+        # loaded in memory, so it reloads after every run.
+        self._model_dir = model_dir
+        self.training_loop.on_trained = self.reload_scorer
 
         # Semantic/vector layer (SPINE — core deps as of the promote-to-spine
         # change). Constructs cleanly even when the deps are absent (source
@@ -954,8 +958,11 @@ class RetrievalEngine:
         # opt-in. Unconditional "signals accumulate for later" is how the
         # ambient global model got trained in the first place.
         if self.neural_enabled:
+            from revien.forget import gate as _forget_gate
+            # (a query is text nobody vetted: a secret named by forget
+            # --wording is cut out of it before it is kept)
             self.training_loop.log_retrieval(
-                query=query,
+                query=_forget_gate.strip_literals(self.store, query)[0],
                 results=[
                     {
                         "node_id": r.node_id,
@@ -1346,6 +1353,14 @@ class RetrievalEngine:
             "training": self.training_loop.get_stats(),
             "scorer": self.neural_scorer.get_stats(),
         }
+
+    def last_train_failure(self) -> Optional[str]:
+        """Why the last training run produced no model, or None."""
+        return self.training_loop.last_failure
+
+    def reload_scorer(self) -> None:
+        """Load the model from disk again (after a retrain)."""
+        self.neural_scorer = NeuralScorer(model_dir=self._model_dir)
 
     def force_train(self) -> bool:
         """Force training run regardless of threshold. For testing/manual triggers.

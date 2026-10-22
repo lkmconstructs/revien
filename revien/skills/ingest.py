@@ -188,22 +188,39 @@ def _link_matching_entities(store: GraphStore, skill_node: Node) -> int:
 def ingest_skill_file(store: GraphStore, skill_md_path: Path, scope: str, project_key: Optional[str], origin_runtime: Optional[str]) -> Tuple[Node, bool, int]:
     """Ingest one SKILL.md. Returns (node, created, edges_created). Idempotent
     by ingest_key: an unchanged path refreshes label/content/metadata on the
-    existing node in place rather than duplicating it."""
+    existing node in place rather than duplicating it.
+
+    A skill file whose exact text a ``forget --everywhere`` banned is refused
+    by the gate (docs/FORGET_SPEC.md §6) and this returns ``(None, False, 0)``
+    with nothing written; sentences that were forgotten are left out of it."""
+    from revien.forget import gate as forget_gate
+
     fresh = build_skill_node(skill_md_path, scope, project_key, origin_runtime)
     ikey = fresh.metadata["ingest_key"]
-    existing = store.find_context_node_by_ingest_key(ikey, node_type=NodeType.SKILL)
+    unit = forget_gate.UnitRef(ikey, str(skill_md_path))
+    # BEGIN IMMEDIATE: the gate decides after the write lock is held, so a
+    # forget from another connection either committed first (and is seen) or
+    # waits until this skill has landed (and then removes it).
+    with store._capture_lock, store.transaction(immediate=True):
+        if forget_gate.check(store, unit, fresh.content) is not None:
+            return None, False, 0
+        forget_gate.register(store, unit)
+        fresh.content, _left_out = forget_gate.strip_forgotten(
+            store, unit, fresh.content)
+        existing = store.find_context_node_by_ingest_key(ikey, node_type=NodeType.SKILL)
 
-    if existing is None:
-        node = store.add_node(fresh)
-        created = True
-    else:
-        node = store.update_node(
-            existing.node_id,
-            label=fresh.label,
-            content=fresh.content,
-            metadata=fresh.metadata,
-        )
-        created = False
+        if existing is None:
+            node = store.add_node(fresh, owner=(ikey, 1, 1))
+            created = True
+        else:
+            node = store.update_node(
+                existing.node_id,
+                label=fresh.label,
+                content=fresh.content,
+                metadata=fresh.metadata,
+            )
+            store.record_provenance(existing.node_id, ikey, proves=True)
+            created = False
 
     edges = _link_matching_entities(store, node)
     return node, created, edges
@@ -218,12 +235,16 @@ def ingest_roots(
     """Scan every resolved root and ingest each SKILL.md found. Returns a
     summary dict: {"scanned", "created", "refreshed", "edges", "skills": [...]}"""
     roots = resolve_roots(paths=paths, include_global=include_global, cwd=cwd)
-    summary = {"scanned": 0, "created": 0, "refreshed": 0, "edges": 0, "skills": []}
+    summary = {"scanned": 0, "created": 0, "refreshed": 0, "edges": 0,
+               "suppressed": 0, "skills": []}
     for root, scope, project_key in roots:
         origin_runtime = _origin_runtime_for_root(root)
         for skill_md in discover_skill_files(root):
             node, created, edges = ingest_skill_file(store, skill_md, scope, project_key, origin_runtime)
             summary["scanned"] += 1
+            if node is None:
+                summary["suppressed"] += 1
+                continue
             summary["edges"] += edges
             if created:
                 summary["created"] += 1

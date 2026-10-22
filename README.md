@@ -75,6 +75,12 @@ The discipline behind these claims is the product. Revien ships with a benchmark
 
 ---
 
+### If a secret got recorded: rotate it first, forget it second
+
+For a leaked key or token, **rotate it first.** Then run `echo "THE-EXACT-STRING" | revien forget --wording -` (the string on standard input, so it stays out of your shell history). Revien cuts exactly those characters out of every node, the audit trail, recall records, training data and snapshots, and keeps the same characters out of everything it captures afterwards, from any source. It prints what it cut and what it could not reach (your own files, exports, distilled notes); it never prints the string.
+
+A forget cannot recall a copy that already left your machine: with a cloud extractor on (`REVIEN_EXTRACTOR=openrouter`, for example) the captured sentence was sent to that provider at capture time. It also does not guess: a different spelling or encoding of the same secret is a different string, so name each one. To forget a fact rather than a string, use `revien forget NODE_ID`; to remove a whole conversation's stored text, `revien delete NODE_ID`.
+
 ## How it works
 
 ### Memory is a graph, not a compaction buffer

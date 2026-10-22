@@ -482,6 +482,9 @@ class VaultReconciler:
                 # Anchor it IN PLACE so the next reconcile treats it as known
                 # (no re-add), without regenerating the note.
                 new_node = self._apply_add(stem, entity_id, claim_text, current_section)
+                if new_node is None:
+                    out_lines.append(line)  # suppressed: not captured
+                    continue
                 out_lines.append(f"{line} <!--rv:{new_node.node_id}-->")
                 file_changed = True
                 added += 1
@@ -524,31 +527,44 @@ class VaultReconciler:
                 return ent.node_id
         return None
 
-    def _new_claim_node(self, entity_id: str, text: str, section: Optional[str]) -> Node:
+    def _new_claim_node(self, entity_id: str, text: str, section: Optional[str]) -> Optional[Node]:
         from datetime import datetime, timezone
+        from revien.forget import gate as forget_gate
         from revien.graph.schema import Edge, EdgeType, SourceType
         node_type = _SECTION_TYPE.get(section or "", NodeType.FACT)
         now = datetime.now(timezone.utc)
-        node = self.store.add_node(Node(
-            node_type=node_type,
-            label=text[:80],
-            content=text,
-            source_type=SourceType.EXTRACTED,
-            confidence=1.0,
-            created_at=now,
-            last_accessed=now,
-            recorded_at=now,
-            metadata={"curated": True, "source": "vault_reconcile",
-                      "recorded_at_source": "capture"},
-        ))
-        # Attach to the note's entity so it renders on the entity's note and is
-        # reachable in the graph walk.
-        self.store.add_edge(Edge(
-            edge_type=EdgeType.RELATED_TO,
-            source_node_id=entity_id,
-            target_node_id=node.node_id,
-            weight=0.9,  # human-authored, high trust
-        ))
+        # A line the user (re)typed into a distilled note is a capture like
+        # any other. If it is text a forget suppressed, it stays out: the
+        # keyed fingerprint stops the unchanged note being re-imported.
+        unit = forget_gate.UnitRef(None)
+        # Decided inside the write transaction, after the write lock is held
+        # (BEGIN IMMEDIATE), so a forget from another connection is either
+        # seen here or waits until this claim has landed.
+        with self.store.transaction(immediate=True):
+            if forget_gate.check(self.store, unit, text) is not None:
+                return None
+            if forget_gate.strip_forgotten(self.store, unit, text)[1]:
+                return None
+            node = self.store.add_node(Node(
+                node_type=node_type,
+                label=text[:80],
+                content=text,
+                source_type=SourceType.EXTRACTED,
+                confidence=1.0,
+                created_at=now,
+                last_accessed=now,
+                recorded_at=now,
+                metadata={"curated": True, "source": "vault_reconcile",
+                          "recorded_at_source": "capture"},
+            ), owner=(unit.owner, 1, 1))
+            # Attach to the note's entity so it renders on the entity's note
+            # and is reachable in the graph walk.
+            self.store.add_edge(Edge(
+                edge_type=EdgeType.RELATED_TO,
+                source_node_id=entity_id,
+                target_node_id=node.node_id,
+                weight=0.9,  # human-authored, high trust
+            ))
         # Index for semantic recall (add_node does not; the pipeline would, but
         # reconcile bypasses it). No-op without the semantic extra.
         if self.semantic.is_enabled:
@@ -558,6 +574,8 @@ class VaultReconciler:
     def _apply_edit(self, stem, entity_id, row, claim_text, section) -> None:
         from revien.graph.schema import Edge, EdgeType
         new_node = self._new_claim_node(entity_id, claim_text, section)
+        if new_node is None:
+            return  # suppressed text: the old claim is left as it is
         old_id = row["current_node_id"]
         # The correction supersedes the claim it replaces.
         self.store.add_edge(Edge(
@@ -576,8 +594,10 @@ class VaultReconciler:
             stem, row["anchor_node_id"], new_node.node_id, _hash(claim_text)
         )
 
-    def _apply_add(self, stem, entity_id, claim_text, section) -> Node:
+    def _apply_add(self, stem, entity_id, claim_text, section) -> Optional[Node]:
         new_node = self._new_claim_node(entity_id, claim_text, section)
+        if new_node is None:
+            return None
         self.store.add_manifest_row(
             stem, entity_id, new_node.node_id, new_node.node_id,
             _hash(claim_text), section or "",

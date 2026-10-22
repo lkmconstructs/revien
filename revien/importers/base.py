@@ -163,6 +163,7 @@ class ImportReport:
     units_ingested: int = 0
     units_unchanged: int = 0
     units_denied: int = 0
+    units_suppressed: int = 0
     units_skipped_empty: int = 0
     nodes_created: int = 0
     edges_created: int = 0
@@ -177,6 +178,7 @@ def run_import(
     pipeline: Optional[IngestionPipeline],
     dry_run: bool = False,
     progress: Optional[Callable[[ImportUnit], None]] = None,
+    override_suppression: bool = False,
 ) -> ImportReport:
     """Feed every unit through the pipeline, one IngestionInput per unit.
 
@@ -235,11 +237,19 @@ def run_import(
                     origin_runtime=unit.origin_runtime,
                     origin_source=unit.origin_source,
                     session_key=unit.session_key,
+                    override_suppression=override_suppression,
                 ))
             except Exception as exc:  # noqa: BLE001 - one bad unit must not sink the batch
                 if len(report.errors) < _MAX_IMPORT_ERRORS:
                     report.errors.append((unit.source_id, str(exc)))
             else:
+                if output.suppressed:
+                    # A forget said this unit must not come back
+                    # (docs/FORGET_SPEC.md §6): counted, never written.
+                    report.units_suppressed += 1
+                    if progress is not None:
+                        progress(unit)
+                    continue
                 # F2: unchanged vs ingested. A keyed re-ingest of
                 # byte-identical content is pipeline.ingest()'s true no-op
                 # path: 0 new nodes, 0 new edges, refreshed=False, the

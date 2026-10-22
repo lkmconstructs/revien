@@ -3,6 +3,7 @@ Revien REST API Server — FastAPI application exposing all Revien endpoints.
 Runs as local daemon on port 7437 or as hosted service.
 """
 
+import logging
 import asyncio
 import time
 import os
@@ -64,6 +65,14 @@ class IngestResponse(BaseModel):
     edges_created: int
     total_nodes_in_graph: int
     total_edges_in_graph: int
+    # True when the suppression gate refused the capture (a forget said it
+    # must not come back); nothing was written. A capture that arrives
+    # through a shared channel has no stable identity the gate can protect.
+    suppressed: bool = False
+    suppression_note: str = ""
+    # forget.key is not the key the earlier forgets were made with: they
+    # match nothing, so a secret they kept out can be captured again.
+    warnings: List[str] = []
 
 
 class ConsolidateRequest(BaseModel):
@@ -173,6 +182,9 @@ class HealthResponse(BaseModel):
     # A daemon from before fencing has no such field, which is how
     # `revien sync reset` recognises it. Names only: no path, no id.
     features: List[str] = []
+    # "ok", or "mismatch" when forget.key is not the key the earlier forgets
+    # were made with (they then match nothing). Says nothing else.
+    forget_key: str = "ok"
 
 
 class SyncResponse(BaseModel):
@@ -393,8 +405,23 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if MCP_AVAILABLE:
             mcp_server = build_mcp_server(engine=engine, pipeline=pipeline)
 
+    def _forget_key_problem():
+        from revien.forget import gate as _g
+        try:
+            return _g.key_problem(store)
+        except Exception:  # noqa: BLE001
+            return None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Say it at start, loudly, if the earlier forgets no longer apply
+        # (forget.key lost or replaced): the daemon would capture again what
+        # they kept out. It starts anyway; refusing would only hide it.
+        problem = _forget_key_problem()
+        if problem:
+            from revien.forget import gate as _g
+            logging.getLogger("revien").error(
+                "forget.key mismatch: %s", _g.key_problem_text(problem))
         # Startup: start the scheduler INSIDE uvicorn's running loop when the
         # daemon attached one (RevienDaemon sets app.state.scheduler before
         # uvicorn.run). AsyncIOScheduler.start() needs the running event
@@ -478,6 +505,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     app.state.engine = engine
     app.state.clustering = clustering
     app.state.semantic = semantic
+    # What a forget needs beyond the store: the vectors to drop, the
+    # training database to scrub, the community labels to rebuild.
+    ops.semantic = semantic
+    ops.clustering = clustering
+    ops.training_dbs = (engine.training_loop.db_path,)
+    # With neural ranking on, a forget retrains the model from the scrubbed
+    # signals; with it off nothing trains and the model stays marked stale.
+    ops.retrain = engine.force_train if engine.neural_enabled else None
+    ops.retrain_reason = engine.last_train_failure if engine.neural_enabled else None
 
     # ── POST /v1/ingest ───────────────────────────────
 
@@ -538,6 +574,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             edges_created=result.edges_created,
             total_nodes_in_graph=result.total_nodes_in_graph,
             total_edges_in_graph=result.total_edges_in_graph,
+            suppressed=result.suppressed,
+            suppression_note=result.suppression_note,
+            warnings=list(result.warnings),
         )
 
     # ── POST /v1/recall ───────────────────────────────
@@ -754,8 +793,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.delete("/v1/nodes/{node_id}", dependencies=[_mutation_auth])
     async def delete_node(node_id: str):
-        """Delete a node and its edges. Permanent."""
-        deleted = store.delete_node(node_id)
+        """The DELETE verb: remove the node and its edges now. Permanent.
+        Leaves a content-free delete audit entry and NO suppression record;
+        the content can be captured again if its source still holds it. To
+        keep it from coming back, use POST /v1/nodes/{id}/forget."""
+        deleted = ops.delete_node(node_id, actor="api:delete")
         if not deleted:
             raise HTTPException(404, f"Node not found: {node_id}")
         return {"status": "deleted", "node_id": node_id}
@@ -921,6 +963,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             uptime_seconds=round(time.time() - start_time, 2),
             version=__version__,
             features=list(DAEMON_FEATURES),
+            forget_key="mismatch" if _forget_key_problem() else "ok",
         )
 
     # ── POST /v1/sync ─────────────────────────────────
@@ -1142,16 +1185,34 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # ── GET /v1/nodes/{id}/forget/preview ──────────────
     @app.get("/v1/nodes/{node_id}/forget/preview")
-    async def forget_preview(node_id: str):
-        """Show what a cascade forget WOULD remove (count + ids) — never blind."""
-        preview = ops.forget_preview(node_id)
-        if not preview.get("exists", False):
+    async def forget_preview(node_id: str, everywhere: bool = Query(False),
+                             cascade: Optional[bool] = Query(None)):
+        """What a forget WOULD do (nodes removed, cut back, kept; the sources
+        the wording is kept out of). Writes nothing."""
+        _no_cascade(cascade)
+        preview = ops._forget_engine().forget(
+            node_id, dry_run=True, everywhere=everywhere)
+        if preview.get("status") in ("not_found", "skipped"):
             raise HTTPException(404, f"Node not found: {node_id}")
+        preview["exists"] = True
         return preview
 
     # ── POST /v1/nodes/{id}/forget ─────────────────────
+    def _no_cascade(value) -> None:
+        if value is not None:
+            raise HTTPException(400, detail={
+                "status": "refused", "reason": "cascade_removed",
+                "message": "cascade was removed: forget names one specific "
+                           "thing. To remove a whole conversation or file, "
+                           "use delete (DELETE /v1/nodes/{id})."})
+
     class ForgetRequest(BaseModel):
-        cascade: bool = False
+        cascade: Optional[bool] = None      # removed: any value is a 400
+        # Also remove the wording from every other unit that holds it (the
+        # default forgets it from this node's source only and names the rest).
+        everywhere: bool = False
+        # Accepted for older clients and never stored: the verb is recorded
+        # by this route, not by free text a caller sends.
         reason: str = ""
         construct_id: str = ""
 
@@ -1159,19 +1220,95 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def forget_node_endpoint(
         node_id: str, request: Optional[ForgetRequest] = None
     ):
-        """Right-to-forget: HARD-delete the node's content (privacy).
+        """The FORGET verb: privacy, for one specific thing (a fact, an
+        entity, a decision, a preference). Removes the node, cuts its wording
+        out of the stored conversation of the source it came from, scrubs
+        every copy, and keeps that wording out of later captures of that
+        source. The response says exactly what was removed, cut back and kept,
+        what it does and does not stop coming back, and what is left behind
+        (docs/FORGET_SPEC.md). A context node is refused: remove a whole
+        conversation with delete. A daemon from before the forget gate on the
+        same database makes this refuse."""
+        from revien.daemon.heartbeat import FORGET_REQUIRES, daemons_lacking
 
-        Distinct from invalidate (which retains). Writes a content-free tombstone
-        audit entry and re-points children's lineage to a tombstone marker.
-        cascade=True forgets the whole DERIVED_FROM subtree.
-        """
         req = request or ForgetRequest()
-        result = ops.forget_node(
-            node_id, cascade=req.cascade, reason=req.reason,
-            construct_id=req.construct_id,
-        )
-        if result.get("status") == "not_found":
+        _no_cascade(req.cascade)
+        old = daemons_lacking(store, FORGET_REQUIRES, exclude_pid=os.getpid())
+        if old:
+            raise HTTPException(409, detail={
+                "status": "refused", "reason": "restart_required",
+                "message": (
+                    f"A daemon (pid {old[0]['pid']}) is serving this database "
+                    "from before forget protection. It would capture the "
+                    "forgotten source again. Restart required: stop it, "
+                    "start it again with 'revien start', then forget again. "
+                    "Nothing was changed.")})
+        result = ops.forget_node(node_id, actor="api:forget",
+                                 everywhere=req.everywhere)
+        status = result.get("status")
+        if status == "not_found":
             raise HTTPException(404, f"Node not found: {node_id}")
+        if status == "refused":
+            raise HTTPException(409, detail=result)
+        if status == "busy":
+            raise HTTPException(503, detail=result)
+        return result
+
+    # ── POST /v1/forget/wording ────────────────────────
+    # FastAPI's own 422 quotes the input it could not parse. For this route
+    # the input IS the secret, so the answer names the fields and the kinds of
+    # problem and nothing the caller sent.
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.exception_handlers import request_validation_exception_handler
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_without_the_secret(request, exc):
+        if request.url.path.rstrip("/") != "/v1/forget/wording":
+            return await request_validation_exception_handler(request, exc)
+        problems = [{"field": ".".join(str(p) for p in e.get("loc", ())[1:]) or "body",
+                     "problem": e.get("type", "invalid")} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={
+            "status": "refused", "reason": "invalid_request",
+            "problems": problems,
+            "message": ("Send a JSON object {\"wording\": \"<the string>\"} "
+                        "(optional \"preview\": true). Nothing was changed, "
+                        "and nothing you sent is repeated here.")})
+
+    class ForgetWordingRequest(BaseModel):
+        wording: str
+        # Only count what the string would cut; change nothing.
+        preview: bool = False
+        # Cut it out of longer words that contain it too ('secret' inside
+        # 'secretary'). Refused otherwise: the preview counts them.
+        allow_inside_words: bool = False
+
+    @app.post("/v1/forget/wording", dependencies=[_mutation_auth])
+    async def forget_wording_endpoint(request: ForgetWordingRequest):
+        """Forget a literal string (a key, a token, a password) everywhere:
+        every node, the audit trail, recall records, training data and
+        snapshots, and keep the same characters out of every later capture.
+        The string is never stored, logged or returned (docs/FORGET_SPEC.md
+        §2a)."""
+        from revien.daemon.heartbeat import FORGET_REQUIRES, daemons_lacking
+
+        old = daemons_lacking(store, FORGET_REQUIRES, exclude_pid=os.getpid())
+        if old:
+            raise HTTPException(409, detail={
+                "status": "refused", "reason": "restart_required",
+                "message": (
+                    f"A daemon (pid {old[0]['pid']}) is serving this database "
+                    "from before forget protection. It would capture the "
+                    "string again. Restart required: stop it, start it "
+                    "again with 'revien start', then forget again. Nothing "
+                    "was changed.")})
+        result = ops.forget_wording(request.wording, actor="api:forget",
+                                    dry_run=request.preview,
+                                    allow_inside_words=request.allow_inside_words)
+        status = result.get("status")
+        if status == "refused":
+            raise HTTPException(400, detail=result)
+        if status == "busy":
+            raise HTTPException(503, detail=result)
         return result
 
     # ── GET /v1/export ─────────────────────────────────

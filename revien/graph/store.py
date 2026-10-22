@@ -7,16 +7,23 @@ import functools
 import json
 import sqlite3
 import threading
+import time
 import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from .forget_store import ForgetStoreMixin
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
     Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
 )
+
+
+class StoreBusy(sqlite3.OperationalError):
+    """Another connection held the write lock for the whole of a bounded
+    wait (see GraphStore.transaction)."""
 
 
 class ImportRefusedError(ValueError):
@@ -44,7 +51,7 @@ def _locked(method):
     return wrapper
 
 
-class GraphStore:
+class GraphStore(ForgetStoreMixin):
     """SQLite-backed graph store. Thread-safe: one shared connection
     (check_same_thread=False) serialized by a reentrant lock."""
 
@@ -58,6 +65,9 @@ class GraphStore:
         self._closed = False
         # Serializes ALL access to the shared connection (see _locked).
         self._lock = threading.RLock()
+        # Held by a capture's write section and by a forget, so a forget and
+        # an ingest of the same unit never interleave inside one process.
+        self._capture_lock = threading.RLock()
         # transaction() nesting depth. >0 means per-method commits are
         # deferred to the outermost transaction's single commit.
         self._txn_depth = 0
@@ -276,13 +286,16 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
-            CREATE INDEX IF NOT EXISTS idx_nodes_confidence ON nodes(confidence);
-            CREATE INDEX IF NOT EXISTS idx_edges_confidence ON edges(confidence);
             CREATE INDEX IF NOT EXISTS idx_audit_node ON audit_log(node_id);
             CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
             CREATE INDEX IF NOT EXISTS idx_candidates_unresolved
                 ON supersession_candidates(resolved_at);
         """)
+        # idx_nodes_confidence / idx_edges_confidence are NOT created here
+        # either: a database from before the confidence layer (v0.2.x) has no
+        # confidence column, and CREATE INDEX on it failed the whole open
+        # ("no such column: confidence"). _migrate_add_confidence_columns
+        # creates both after the ALTERs, for fresh and legacy databases alike.
         # idx_nodes_origin_* are NOT created here: on a legacy DB whose
         # "nodes" table predates the origin columns, CREATE TABLE IF NOT
         # EXISTS is a no-op (the table already exists) but CREATE INDEX ...
@@ -308,6 +321,9 @@ class GraphStore:
         self._migrate_backfill_recorded_at_source(conn)
         # Usage layer (user_version 5): ALL of its DDL lives in one guard.
         self._migrate_add_usage_layer(conn)
+        # Forget layer (user_version 6): ownership, unit registry,
+        # suppression records. Its DDL lives in graph/forget_store.py.
+        self._migrate_add_forget_layer(conn)
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -770,6 +786,9 @@ class GraphStore:
             )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
+            # Freed pages are overwritten with zeros, so deleted text does
+            # not linger in the file (docs/FORGET_SPEC.md §4).
+            self._conn.execute("PRAGMA secure_delete = ON")
         return self._conn
 
     @_locked
@@ -789,10 +808,14 @@ class GraphStore:
     # ── Transactions ──────────────────────────────────────
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, immediate: bool = False, wait: float = 0.0):
         """Everything inside lands in ONE commit; any failure rolls back ALL
         of it. Holds the store lock for the whole span, so no other thread can
         interleave (or commit) mid-transaction on the shared connection.
+
+        ``immediate=True`` opens it with BEGIN IMMEDIATE (see below).
+        ``wait``: seconds to keep trying (with backoff) after SQLite's own
+        busy timeout has run out, before raising StoreBusy.
 
         Nests: an inner transaction() rides the outer one — per-method commits
         (_commit) are no-ops until the outermost level commits. Listener fires
@@ -818,6 +841,28 @@ class GraphStore:
                 return
             self._txn_depth = 1
             try:
+                if immediate:
+                    # Take SQLite's write lock NOW. Two connections (a daemon
+                    # and a CLI forget) then take turns for the whole span, so
+                    # a check made inside it cannot be overtaken by a write
+                    # from the other one.
+                    conn.commit()
+                    deadline = time.monotonic() + max(0.0, wait)
+                    delay = 0.05
+                    while True:
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            break
+                        except sqlite3.OperationalError as e:
+                            if "locked" not in str(e).lower() \
+                                    and "busy" not in str(e).lower():
+                                raise
+                            if time.monotonic() >= deadline:
+                                if wait > 0:
+                                    raise StoreBusy(str(e)) from e
+                                raise
+                            time.sleep(delay)
+                            delay = min(delay * 2, 1.0)
                 yield conn
                 conn.commit()
             except BaseException:
@@ -856,6 +901,9 @@ class GraphStore:
         """
         conn = self._get_conn()
         stamp = (ts or datetime.now(timezone.utc)).isoformat()
+        before = self._cut_secret_metadata(conn, before)
+        after = self._cut_secret_metadata(conn, after)
+        actor, = self._cut_secret_strings(conn, actor or "")
         conn.execute(
             """INSERT INTO audit_log (node_id, op, actor, ts, before_json, after_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -963,18 +1011,37 @@ class GraphStore:
     # ── Node CRUD ─────────────────────────────────────────
 
     @_locked
-    def add_node(self, node: Node) -> Node:
+    def add_node(self, node: Node, owner: Optional[tuple] = None) -> Node:
+        """Insert a node (and its audit row) in one commit.
+
+        ``owner`` is ``(unit_id, label_ok, wording_ok)``: the writer's record
+        of who wrote this node, stored in the same commit as the node
+        (docs/FORGET_SPEC.md §3). A writer with no unit passes nothing and
+        the node has no ownership row, i.e. a forget of another node
+        never removes it."""
         self._check_validity_window(node.valid_from, node.valid_until)
         # Mutation + its audit row land in ONE commit (see transaction()):
         # no crash window where a node exists the trail can't account for.
-        with self.transaction() as conn:
+        # IMMEDIATE: the denylist is read (in _add_node_stmt) with the write
+        # lock already held, so a forget in another process cannot slip in
+        # between the read and the insert.
+        with self.transaction(immediate=True) as conn:
             self._add_node_stmt(conn, node)
             self._enqueue_embed_stmt(conn, node.node_id)
+            if owner is not None:
+                unit_id, label_ok, wording_ok = owner
+                self._record_provenance_stmt(
+                    conn, node.node_id, unit_id, label_ok, wording_ok)
             # Provenance hook: record node creation. Inside the transaction an
             # audit failure rolls the insert back — provenance is required.
+            # The create row records who wrote the node: the confidence setter
+            # if it named one, else the capture (unit) that vouched for it. A
+            # forget uses this to tell a label truncated by the capture that
+            # wrote it from a record that merely looks like one.
             self._record_node_audit(
                 node.node_id, "create",
-                actor=node.confidence_set_by,
+                actor=node.confidence_set_by or (
+                    f"capture:{owner[0]}" if owner is not None else ""),
                 before_node=None, after_node=node,
             )
         return node
@@ -1031,7 +1098,20 @@ class GraphStore:
     @staticmethod
     def _add_node_stmt(conn: sqlite3.Connection, node: Node) -> None:
         """The bare INSERT for one node — no commit, no audit. Callers own
-        the transaction (add_node wraps it; import_graph batches many)."""
+        the transaction (add_node wraps it; import_graph batches many).
+        A secret a ``forget --wording`` named is cut out of the node first
+        (the node object itself, so its audit row quotes the cut text)."""
+        GraphStore._cut_derived(conn, node)
+        (node.label, node.content, node.source_context,
+         node.event_time_text) = GraphStore._cut_secret_strings(
+            conn, node.label, node.content, node.source_context,
+            node.event_time_text)
+        node.metadata = GraphStore._cut_secret_metadata(conn, node.metadata)
+        # identity columns: the same cut as everywhere they are stored
+        (node.source_id, node.origin_source, node.session_key,
+         node.project_key, node.confidence_set_by) = GraphStore._cut_secret_strings(
+            conn, node.source_id, node.origin_source, node.session_key,
+            node.project_key, node.confidence_set_by)
         conn.execute(
             """INSERT INTO nodes
                (node_id, node_type, label, content, source_id,
@@ -1280,23 +1360,25 @@ class GraphStore:
         """Replace all manifest rows for a note (full regen at distill time).
         Each row is a dict: entity_id, anchor_node_id, current_node_id,
         content_hash, section."""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM distill_manifest WHERE note_stem = ?", (note_stem,))
-        for r in rows:
-            conn.execute(
-                """INSERT INTO distill_manifest
-                   (note_stem, entity_id, anchor_node_id, current_node_id,
-                    content_hash, section)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (note_stem, r["entity_id"], r["anchor_node_id"],
-                 r["current_node_id"], r["content_hash"], r.get("section", "")),
-            )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            note_stem, = self._cut_secret_strings(conn, note_stem)
+            conn.execute("DELETE FROM distill_manifest WHERE note_stem = ?", (note_stem,))
+            for r in rows:
+                section, = self._cut_secret_strings(conn, r.get("section", ""))
+                conn.execute(
+                    """INSERT INTO distill_manifest
+                       (note_stem, entity_id, anchor_node_id, current_node_id,
+                        content_hash, section)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (note_stem, r["entity_id"], r["anchor_node_id"],
+                     r["current_node_id"], r["content_hash"], section),
+                )
 
     @_locked
     def get_distill_manifest(self, note_stem: str) -> list:
         """All manifest rows for one note, as dicts."""
         conn = self._get_conn()
+        note_stem, = self._cut_secret_strings(conn, note_stem)
         rows = conn.execute(
             """SELECT entity_id, anchor_node_id, current_node_id, content_hash, section
                FROM distill_manifest WHERE note_stem = ?""",
@@ -1325,13 +1407,13 @@ class GraphStore:
         """After absorbing an edit: point the anchor at its correction and
         record the new text hash, so the next reconcile sees no phantom diff.
         The anchor_node_id (file join key) is never changed."""
-        conn = self._get_conn()
-        conn.execute(
-            """UPDATE distill_manifest SET current_node_id = ?, content_hash = ?
-               WHERE note_stem = ? AND anchor_node_id = ?""",
-            (current_node_id, content_hash, note_stem, anchor_node_id),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            note_stem, = self._cut_secret_strings(conn, note_stem)
+            conn.execute(
+                """UPDATE distill_manifest SET current_node_id = ?, content_hash = ?
+                   WHERE note_stem = ? AND anchor_node_id = ?""",
+                (current_node_id, content_hash, note_stem, anchor_node_id),
+            )
 
     @_locked
     def add_manifest_row(
@@ -1340,21 +1422,22 @@ class GraphStore:
     ) -> None:
         """Record a user-added claim so a later re-add of the same line is a
         no-op, and it round-trips like any other line."""
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT OR REPLACE INTO distill_manifest
-               (note_stem, entity_id, anchor_node_id, current_node_id,
-                content_hash, section)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (note_stem, entity_id, anchor_node_id, current_node_id, content_hash, section),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            note_stem, section = self._cut_secret_strings(conn, note_stem, section)
+            conn.execute(
+                """INSERT OR REPLACE INTO distill_manifest
+                   (note_stem, entity_id, anchor_node_id, current_node_id,
+                    content_hash, section)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (note_stem, entity_id, anchor_node_id, current_node_id, content_hash, section),
+            )
 
     @_locked
     def delete_manifest_row(self, note_stem: str, anchor_node_id: str) -> None:
         """After absorbing a deletion: drop the row so the forgotten claim is
         no longer expected in the note."""
         conn = self._get_conn()
+        note_stem, = self._cut_secret_strings(conn, note_stem)
         conn.execute(
             "DELETE FROM distill_manifest WHERE note_stem = ? AND anchor_node_id = ?",
             (note_stem, anchor_node_id),
@@ -1385,6 +1468,7 @@ class GraphStore:
         """(cursor or None, generation). No row = (None, 0). A reset row
         (blank cursor) = (None, generation). Read this BEFORE fetching and
         pass the generation to ``set_sync_cursor_if_generation``."""
+        adapter_name = self._cut_ident(adapter_name)
         conn = self._get_conn()
         row = conn.execute(
             "SELECT cursor, generation FROM sync_cursors WHERE adapter_name = ?",
@@ -1404,16 +1488,18 @@ class GraphStore:
         """Persist an adapter's sync position (upsert, unfenced; keeps the
         row's generation). For callers that cannot be reset (usage observer).
         The adapter scheduler uses ``set_sync_cursor_if_generation``."""
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(adapter_name) DO UPDATE SET
-                   cursor = excluded.cursor, updated_at = excluded.updated_at""",
-            (adapter_name, cursor.isoformat(),
-             datetime.now(timezone.utc).isoformat()),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True):
+            adapter_name = self._cut_ident(adapter_name)
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT INTO sync_cursors (adapter_name, cursor, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(adapter_name) DO UPDATE SET
+                       cursor = excluded.cursor, updated_at = excluded.updated_at""",
+                (adapter_name, cursor.isoformat(),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            self._commit(conn)
 
     @_locked
     def set_sync_cursor_if_generation(
@@ -1424,25 +1510,27 @@ class GraphStore:
         Returns False, writing nothing, when a reset happened in between.
         Atomic in SQL, so it also fences a reset from another process.
         Absent row is generation 0."""
-        conn = self._get_conn()
-        now = datetime.now(timezone.utc).isoformat()
-        cur = conn.execute(
-            "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
-            "WHERE adapter_name = ? AND generation = ?",
-            (cursor.isoformat(), now, adapter_name, expected_generation),
-        )
-        ok = cur.rowcount > 0
-        if not ok and expected_generation == 0:
-            # No row yet? INSERT OR IGNORE loses to any row that exists.
-            ins = conn.execute(
-                "INSERT OR IGNORE INTO sync_cursors "
-                "(adapter_name, cursor, updated_at, generation) "
-                "VALUES (?, ?, ?, 0)",
-                (adapter_name, cursor.isoformat(), now),
+        with self.transaction(immediate=True):
+            adapter_name = self._cut_ident(adapter_name)
+            conn = self._get_conn()
+            now = datetime.now(timezone.utc).isoformat()
+            cur = conn.execute(
+                "UPDATE sync_cursors SET cursor = ?, updated_at = ? "
+                "WHERE adapter_name = ? AND generation = ?",
+                (cursor.isoformat(), now, adapter_name, expected_generation),
             )
-            ok = ins.rowcount > 0
-        self._commit(conn)
-        return ok
+            ok = cur.rowcount > 0
+            if not ok and expected_generation == 0:
+                # No row yet? INSERT OR IGNORE loses to any row that exists.
+                ins = conn.execute(
+                    "INSERT OR IGNORE INTO sync_cursors "
+                    "(adapter_name, cursor, updated_at, generation) "
+                    "VALUES (?, ?, ?, 0)",
+                    (adapter_name, cursor.isoformat(), now),
+                )
+                ok = ins.rowcount > 0
+            self._commit(conn)
+            return ok
 
     @_locked
     def list_sync_cursor_names(self) -> List[str]:
@@ -1461,21 +1549,23 @@ class GraphStore:
         compare-and-set and cannot write its older position back. Returns
         None if the adapter has no row (nothing recorded, nothing changed),
         else True if it held a real position, False if already blank."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
-            (adapter_name,),
-        ).fetchone()
-        if row is None:
-            return None
-        had_position = bool(row[0])
-        conn.execute(
-            "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
-            "updated_at = ? WHERE adapter_name = ?",
-            (datetime.now(timezone.utc).isoformat(), adapter_name),
-        )
-        self._commit(conn)
-        return had_position
+        with self.transaction(immediate=True):
+            adapter_name = self._cut_ident(adapter_name)
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT cursor FROM sync_cursors WHERE adapter_name = ?",
+                (adapter_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            had_position = bool(row[0])
+            conn.execute(
+                "UPDATE sync_cursors SET cursor = '', generation = generation + 1, "
+                "updated_at = ? WHERE adapter_name = ?",
+                (datetime.now(timezone.utc).isoformat(), adapter_name),
+            )
+            self._commit(conn)
+            return had_position
 
     @_locked
     def delete_sync_cursor(self, adapter_name: str) -> bool:
@@ -1496,12 +1586,12 @@ class GraphStore:
     @_locked
     def set_meta(self, key: str, value: str) -> None:
         """Upsert one ``store_meta`` row (table created by migration 005)."""
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT INTO store_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value))
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            value, = self._cut_secret_strings(conn, value)
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value))
 
     @_locked
     def get_meta(self, key: str) -> Optional[str]:
@@ -1532,6 +1622,7 @@ class GraphStore:
     def has_use_judgment(self, episode_key: str, node_id: str) -> bool:
         """True when this (episode, node) pair has already been judged."""
         conn = self._get_conn()
+        episode_key, = self._cut_secret_strings(conn, episode_key)
         row = conn.execute(
             "SELECT 1 FROM use_judgments WHERE episode_key = ? AND node_id = ?",
             (episode_key, node_id),
@@ -1556,17 +1647,19 @@ class GraphStore:
         pair. Returns True only for the caller whose insert landed — only that
         caller may apply it, so a judgment is counted at most once even across
         processes. Rows are never updated."""
-        conn = self._get_conn()
-        cursor = conn.execute(
-            """INSERT OR IGNORE INTO use_judgments
-               (episode_key, node_id, used, reason, shared_terms, similarity,
-                query, mode, applied, judged_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (episode_key, node_id, int(bool(used)), reason,
-             json.dumps(list(shared_terms)), similarity, query, mode,
-             int(bool(applied)), datetime.now(timezone.utc).isoformat()),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            reason, query, episode_key = self._cut_secret_strings(
+                conn, reason, query, episode_key)
+            terms = [self._cut_secret_strings(conn, t)[0] for t in shared_terms]
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO use_judgments
+                   (episode_key, node_id, used, reason, shared_terms, similarity,
+                    query, mode, applied, judged_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (episode_key, node_id, int(bool(used)), reason,
+                 json.dumps(terms), similarity, query, mode,
+                 int(bool(applied)), datetime.now(timezone.utc).isoformat()),
+            )
         return cursor.rowcount == 1
 
     @_locked
@@ -1574,6 +1667,7 @@ class GraphStore:
         """The ledger row for one (episode, memory) pair, or None. ``applied``
         is 0 (not applied), 2 (an apply is in progress) or 1 (applied)."""
         conn = self._get_conn()
+        episode_key, = self._cut_secret_strings(conn, episode_key)
         r = conn.execute(
             "SELECT used, mode, applied, reason, shared_terms, similarity "
             "FROM use_judgments WHERE episode_key = ? AND node_id = ?",
@@ -1662,14 +1756,14 @@ class GraphStore:
         node_ids: List[str], issued_at: datetime, expires_at: datetime,
     ) -> None:
         """Record one issued receipt (status open)."""
-        conn = self._get_conn()
-        conn.execute(
-            f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
-            (recall_id, runtime, query, json.dumps(list(node_ids)),
-             issued_at.isoformat(), expires_at.isoformat()),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            query, runtime = self._cut_secret_strings(conn, query, runtime)
+            conn.execute(
+                f"INSERT INTO recall_receipts ({self._RECEIPT_COLUMNS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
+                (recall_id, runtime, query, json.dumps(list(node_ids)),
+                 issued_at.isoformat(), expires_at.isoformat()),
+            )
 
     @_locked
     def get_recall_receipt(self, recall_id: str) -> Optional[Dict]:
@@ -1829,7 +1923,110 @@ class GraphStore:
         rows = conn.execute(query, params).fetchall()
         return [self._row_to_node(r) for r in rows]
 
-    @_locked
+    @staticmethod
+    def _named_secrets(conn) -> list:
+        """The keyed entries of every secret string a ``forget --wording``
+        named, read on the connection that is about to write. Read inside the
+        write transaction (BEGIN IMMEDIATE), so a forget committed by another
+        process is either seen here or waits for this write and cuts it."""
+        from revien.forget import gate as forget_gate
+
+        return forget_gate.literals_on(conn)
+
+    @classmethod
+    def _cut_secret_strings(cls, conn, *values):
+        """The values with the named secrets cut out, in order. Strings and
+        JSON text only; anything else is returned as it came."""
+        from revien.forget import gate as forget_gate
+
+        entries = cls._named_secrets(conn)
+        if not entries:
+            return values
+        out = []
+        for v in values:
+            if isinstance(v, str) and v:
+                v, _ = forget_gate.cut_literals(v, entries)
+            out.append(v)
+        return tuple(out)
+
+    def _cut_ident(self, value):
+        """An identity string with the secrets a forget --wording named cut
+        out (the same cut the forget made in the stored identities)."""
+        if not isinstance(value, str) or not value:
+            return value
+        return self._cut_secret_strings(self._get_conn(), value)[0]
+
+    @classmethod
+    def _cut_derived(cls, conn, node) -> None:
+        """A label, a preview or a context line derived from the content
+        (cut off where the text was truncated) keeps the piece of a named
+        secret that came before the cut. Before the content itself is cut:
+        measure each derived string against the occurrence in the content,
+        and cut the piece that stops exactly inside it. The secret is read off
+        the content (the entries hold only keyed hashes)."""
+        from revien.forget import gate as forget_gate
+        from revien.forget import keys as forget_keys
+        from revien.forget import scrub
+
+        entries = cls._named_secrets(conn)
+        content = node.content
+        if not entries or not isinstance(content, str) or not content:
+            return
+        spans = forget_keys.find_literals(content, entries)
+        if not spans:
+            return
+
+        groups = {}
+        for s0, e0 in spans:
+            groups.setdefault(scrub.canonical(content[s0:e0]), []).append((s0, e0))
+
+        def fix(text):
+            if not isinstance(text, str) or not text:
+                return text
+            for part, group in groups.items():
+                piece = scrub.aligned_edge_fragment(text, content, group, part)
+                if piece:
+                    return scrub.cut_edge_fragment(text, part, piece)[0]
+            return text
+
+        node.label = fix(node.label)
+        node.source_context = fix(node.source_context)
+        node.event_time_text = fix(node.event_time_text)
+        if isinstance(node.metadata, dict):
+            def walk(v):
+                if isinstance(v, str):
+                    return fix(v)
+                if isinstance(v, list):
+                    return [walk(x) for x in v]
+                if isinstance(v, dict):
+                    return {k: walk(x) for k, x in v.items()}
+                return v
+            node.metadata = walk(node.metadata)
+
+    @classmethod
+    def _cut_secret_metadata(cls, conn, meta):
+        from revien.forget import gate as forget_gate
+
+        entries = cls._named_secrets(conn)
+        if not entries or not isinstance(meta, dict):
+            return meta
+        raw, n = forget_gate.cut_literals_json(json.dumps(meta), entries)
+        return json.loads(raw) if n else meta
+
+    def _without_named_secrets(self, kwargs: dict, conn=None) -> dict:
+        """An edit (PUT /v1/nodes, a correction, a supersession) cannot write a
+        secret a ``forget --wording`` named back into a node."""
+        conn = conn or self._get_conn()
+        out = dict(kwargs)
+        for key in ("label", "content", "source_context", "event_time_text",
+                    "source_id", "confidence_set_by", "origin_source",
+                    "session_key", "project_key"):
+            if isinstance(out.get(key), str):
+                out[key], = self._cut_secret_strings(conn, out[key])
+        if isinstance(out.get("metadata"), dict):
+            out["metadata"] = self._cut_secret_metadata(conn, out["metadata"])
+        return out
+
     def update_node(
         self, node_id: str, _audit_op: Optional[str] = "update",
         _audit_actor: str = "", **kwargs
@@ -1843,71 +2040,81 @@ class GraphStore:
         decay/invalidate/access) pass ``_audit_op=None`` to suppress this
         generic entry and avoid double-logging.
         """
-        existing = self.get_node(node_id)
-        if existing is None:
-            return None
+        # The write lock is taken BEFORE the denylist is read, so a forget in
+        # another process cannot land between the check and the write.
+        text_edit = any(k in kwargs for k in (
+            "label", "content", "source_context", "event_time_text", "metadata",
+            "source_id", "confidence_set_by", "origin_source", "session_key",
+            "project_key"))
+        with self.transaction(immediate=text_edit) as conn:
+            existing = self.get_node(node_id)
+            if existing is None:
+                return None
 
-        updates = {}
-        allowed_fields = (
-            "label", "content", "source_id", "access_count", "metadata",
-            "last_accessed", "confidence", "pinned", "source_type",
-            "confidence_set_at", "confidence_set_by", "source_context",
-            "last_referenced", "invalidated_at",
-            # Claim Sovereignty Layer (Leg 1): modality fields are mutable so a
-            # later vision pass can flip vision_processed / answerable_by_text.
-            "source_modality", "answerable_by_text", "vision_processed",
-            # Claim Sovereignty Layer (Leg 2): temporal fields, populated by the
-            # resolver at ingest and revisable by a later verify pass.
-            "recorded_at", "event_time_start", "event_time_end",
-            "event_time_granularity", "event_time_confidence", "event_time_text",
-        )
-        for field in allowed_fields:
-            if field in kwargs:
-                updates[field] = kwargs[field]
+            if text_edit:
+                kwargs = self._without_named_secrets(kwargs, conn)
 
-        if not updates:
-            return existing
-
-        conn = self._get_conn()
-        set_clauses = []
-        values = []
-        datetime_fields = (
-            "last_accessed", "confidence_set_at", "last_referenced", "invalidated_at",
-            "recorded_at", "event_time_start", "event_time_end",
-        )
-        for key, val in updates.items():
-            set_clauses.append(f"{key} = ?")
-            if key == "metadata":
-                values.append(json.dumps(val))
-            elif key in datetime_fields:
-                values.append(val.isoformat() if isinstance(val, datetime) else val)
-            elif key in ("source_type", "source_modality", "event_time_granularity"):
-                values.append(val.value if hasattr(val, "value") else val)
-            elif key in ("pinned", "answerable_by_text", "vision_processed"):
-                values.append(1 if val else 0)
-            else:
-                values.append(val)
-        values.append(node_id)
-
-        # Mutation + audit in ONE commit; audit failure rolls the UPDATE back.
-        with self.transaction():
-            conn.execute(
-                f"UPDATE nodes SET {', '.join(set_clauses)} WHERE node_id = ?",
-                values,
+            updates = {}
+            allowed_fields = (
+                "label", "content", "source_id", "access_count", "metadata",
+                "last_accessed", "confidence", "pinned", "source_type",
+                "confidence_set_at", "confidence_set_by", "source_context",
+                "last_referenced", "invalidated_at",
+                # Claim Sovereignty Layer (Leg 1): modality fields are mutable so a
+                # later vision pass can flip vision_processed / answerable_by_text.
+                "source_modality", "answerable_by_text", "vision_processed",
+                # Claim Sovereignty Layer (Leg 2): temporal fields, populated by the
+                # resolver at ingest and revisable by a later verify pass.
+                "recorded_at", "event_time_start", "event_time_end",
+                "event_time_granularity", "event_time_confidence", "event_time_text",
             )
-            updated = self.get_node(node_id)
-            if updated is not None and (
-                updated.label != existing.label
-                or updated.content != existing.content
-            ):
-                self._enqueue_embed_stmt(conn, node_id)
-            # Provenance hook: generic update entry unless a semantic caller
-            # (reinforce/correct/decay/invalidate/access) suppresses it.
-            if _audit_op:
-                self._record_node_audit(
-                    node_id, _audit_op, actor=_audit_actor,
-                    before_node=existing, after_node=updated,
+            for field in allowed_fields:
+                if field in kwargs:
+                    updates[field] = kwargs[field]
+
+            if not updates:
+                return existing
+
+            conn = self._get_conn()
+            set_clauses = []
+            values = []
+            datetime_fields = (
+                "last_accessed", "confidence_set_at", "last_referenced", "invalidated_at",
+                "recorded_at", "event_time_start", "event_time_end",
+            )
+            for key, val in updates.items():
+                set_clauses.append(f"{key} = ?")
+                if key == "metadata":
+                    values.append(json.dumps(val))
+                elif key in datetime_fields:
+                    values.append(val.isoformat() if isinstance(val, datetime) else val)
+                elif key in ("source_type", "source_modality", "event_time_granularity"):
+                    values.append(val.value if hasattr(val, "value") else val)
+                elif key in ("pinned", "answerable_by_text", "vision_processed"):
+                    values.append(1 if val else 0)
+                else:
+                    values.append(val)
+            values.append(node_id)
+
+            # Mutation + audit in ONE commit; audit failure rolls the UPDATE back.
+            if True:                       # (one block with the guard above)
+                conn.execute(
+                    f"UPDATE nodes SET {', '.join(set_clauses)} WHERE node_id = ?",
+                    values,
                 )
+                updated = self.get_node(node_id)
+                if updated is not None and (
+                    updated.label != existing.label
+                    or updated.content != existing.content
+                ):
+                    self._enqueue_embed_stmt(conn, node_id)
+                # Provenance hook: generic update entry unless a semantic caller
+                # (reinforce/correct/decay/invalidate/access) suppresses it.
+                if _audit_op:
+                    self._record_node_audit(
+                        node_id, _audit_op, actor=_audit_actor,
+                        before_node=existing, after_node=updated,
+                    )
         # Content listeners: fire only when the embedded text actually changed,
         # so metadata/access-count updates (the hot path) never trigger a
         # re-embed.
@@ -1956,6 +2163,19 @@ class GraphStore:
             cursor = conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
             deleted = cursor.rowcount > 0
             self._discard_pending_stmt(conn, node_id)
+            # Everything else that points at the node by id goes with it:
+            # ownership, queue entries naming it, the distill manifest rows
+            # that render it. None of them can outlive the node it describes.
+            conn.execute(
+                "DELETE FROM node_provenance WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "DELETE FROM supersession_candidates "
+                "WHERE existing_node_id = ? OR new_node_id = ?",
+                (node_id, node_id))
+            conn.execute(
+                "DELETE FROM distill_manifest WHERE anchor_node_id = ? "
+                "OR current_node_id = ? OR entity_id = ?",
+                (node_id, node_id, node_id))
         if deleted:
             self._fire_delete(node_id)
             if successor is not None:
@@ -2068,15 +2288,15 @@ class GraphStore:
         reason: str = "", trace: str = "",
     ) -> int:
         """Park a contradiction the gate routed to review. Mutates no node."""
-        conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
-        cur = conn.execute(
-            """INSERT INTO supersession_candidates
-               (existing_node_id, new_node_id, action, reason, trace, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (existing_node_id, new_node_id, action, reason, trace, now),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            reason, trace = self._cut_secret_strings(conn, reason, trace)
+            cur = conn.execute(
+                """INSERT INTO supersession_candidates
+                   (existing_node_id, new_node_id, action, reason, trace, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (existing_node_id, new_node_id, action, reason, trace, now),
+            )
         return cur.lastrowid
 
     @_locked
@@ -2094,13 +2314,13 @@ class GraphStore:
     @_locked
     def resolve_candidate(self, candidate_id: int, resolution: str) -> None:
         """Mark a queued candidate adjudicated (resolution is free-text/audit)."""
-        conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE supersession_candidates SET resolved_at = ?, resolution = ? WHERE id = ?",
-            (now, resolution, candidate_id),
-        )
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            resolution, = self._cut_secret_strings(conn, resolution)
+            conn.execute(
+                "UPDATE supersession_candidates SET resolved_at = ?, resolution = ? WHERE id = ?",
+                (now, resolution, candidate_id),
+            )
 
     @_locked
     def count_candidates(self, unresolved_only: bool = True) -> int:
@@ -2262,7 +2482,11 @@ class GraphStore:
     @staticmethod
     def _add_edge_stmt(conn: sqlite3.Connection, edge: Edge) -> None:
         """The bare INSERT for one edge — no commit, no audit. Callers own
-        the transaction (add_edge and add_edge_audited both wrap it)."""
+        the transaction (add_edge and add_edge_audited both wrap it).
+        A secret a ``forget --wording`` named is cut out first."""
+        edge.source_context, edge.confidence_set_by = GraphStore._cut_secret_strings(
+            conn, edge.source_context, edge.confidence_set_by)
+        edge.metadata = GraphStore._cut_secret_metadata(conn, edge.metadata)
         conn.execute(
             """INSERT INTO edges
                (edge_id, edge_type, source_node_id, target_node_id,
@@ -2292,9 +2516,8 @@ class GraphStore:
         callers (mention-linking, connect_nodes, tombstone re-pointing, the
         /v1/edges endpoint, import_graph). See add_edge_audited for the
         provenance-bearing path (alias leg)."""
-        conn = self._get_conn()
-        self._add_edge_stmt(conn, edge)
-        self._commit(conn)
+        with self.transaction(immediate=True) as conn:
+            self._add_edge_stmt(conn, edge)
         return edge
 
     @_locked
@@ -2305,7 +2528,7 @@ class GraphStore:
         trail can't account for. Use this for edges whose provenance matters
         (ALIAS_OF today); add_edge above is UNCHANGED for every other caller.
         """
-        with self.transaction() as conn:
+        with self.transaction(immediate=True) as conn:
             self._add_edge_stmt(conn, edge)
             self._record_edge_audit(
                 edge.edge_id, "create", actor=actor,
@@ -2386,7 +2609,13 @@ class GraphStore:
                 values.append(val)
         values.append(edge_id)
 
-        with self.transaction():
+        with self.transaction(immediate=True):
+            # the denylist is read with the write lock held
+            for i, key in enumerate(updates):
+                if key in ("source_context", "confidence_set_by"):
+                    values[i], = self._cut_secret_strings(conn, values[i])
+                elif key == "metadata":
+                    values[i] = json.dumps(self._cut_secret_metadata(conn, updates[key]))
             conn.execute(
                 f"UPDATE edges SET {', '.join(set_clauses)} WHERE edge_id = ?",
                 values,
@@ -2575,8 +2804,79 @@ class GraphStore:
         else:
             new_nodes, new_edges = list(graph.nodes), list(graph.edges)
 
-        # ── One transaction: wipe (replace only) + inserts + their audits ──
-        with self.transaction():
+        # ── One transaction: gate + wipe (replace only) + inserts + audits ──
+        # The suppression gate (docs/FORGET_SPEC.md §6) decides INSIDE the
+        # write transaction, after it has taken SQLite's write lock (BEGIN
+        # IMMEDIATE): a forget from another connection either committed
+        # before this point, and is seen here, or waits until this import
+        # has committed, and then removes what it wrote.
+        from revien.forget import gate as forget_gate
+        from revien.forget import scrub as forget_scrub
+        owners: dict = {}
+        # A session's record names the id inside the file (and the file) its
+        # other nodes came from: the id is the identity, the file name is not.
+        session_ids: dict = {}
+        for n in graph.nodes:
+            md = n.metadata if isinstance(n.metadata, dict) else {}
+            caller = md.get("caller") if isinstance(md.get("caller"), dict) else {}
+            inner = caller.get("session_id")
+            if (n.node_type.value == "context" and n.origin_runtime == "claude-code"
+                    and n.session_key and isinstance(inner, str) and inner.strip()):
+                session_ids[(n.origin_runtime, n.session_key)] = (
+                    inner.strip(), caller.get("path"))
+        with self.transaction(immediate=True):
+            kept_nodes = []
+            dropped_ids = set()
+            for node in new_nodes:
+                unit_id, label_ok, wording_ok, likely = self.ownership_for_fields(
+                    node.node_type.value, node.origin_runtime, node.session_key,
+                    node.source_id, node.metadata)
+                md = node.metadata if isinstance(node.metadata, dict) else {}
+                path = md.get("path") if isinstance(md.get("path"), str) else None
+                named = session_ids.get((node.origin_runtime, node.session_key))
+                if named is not None and likely:
+                    canonical = f"session:{node.origin_runtime}:{named[0]}"
+                    # the ownership row names the session by the id inside
+                    # the file, not by the file name
+                    unit_id = unit_id.replace(likely, canonical)
+                    likely = canonical
+                    if path is None and isinstance(named[1], str):
+                        path = named[1]
+                ref = forget_gate.UnitRef(likely, path)
+                # A node of a forgotten unit, or whose whole text was
+                # forgotten, is not brought back. Its label alone decides
+                # nothing: a label that equals a forgotten label must not
+                # cost the node its other sentences.
+                if forget_gate.check(self, ref, node.content) is not None:
+                    dropped_ids.add(node.node_id)
+                    continue
+                # The standing denylist: sentences forgotten from this origin
+                # are left out of an imported node; a node
+                # that was only a forgotten sentence is not imported.
+                cleaned, left_out = forget_gate.strip_forgotten(
+                    self, ref, node.content)
+                if left_out:
+                    if node.node_type.value not in ("context", "skill") \
+                            or not cleaned.strip():
+                        dropped_ids.add(node.node_id)
+                        continue
+                    node.content = cleaned
+                new_label, label_out = forget_gate.strip_forgotten(
+                    self, ref, node.label)
+                if label_out:
+                    first = next(iter(forget_scrub.iter_sentences(node.content)), None)
+                    node.label = (new_label.strip()
+                                  or (first[2] if first else "") or "[removed]")[:200]
+                owners[node.node_id] = (unit_id, label_ok, wording_ok)
+                kept_nodes.append(node)
+            new_nodes = kept_nodes
+            kept_edges = [e for e in new_edges
+                          if e.source_node_id not in dropped_ids
+                          and e.target_node_id not in dropped_ids]
+            result["skipped_suppressed"] = len(dropped_ids)
+            result["skipped_suppressed_edges"] = len(new_edges) - len(kept_edges)
+            new_edges = kept_edges
+
             if mode == "replace":
                 removed_node_ids = [
                     r[0] for r in conn.execute("SELECT node_id FROM nodes").fetchall()
@@ -2592,9 +2892,14 @@ class GraphStore:
                 # memories' own words, receipts their ids.
                 conn.execute("DELETE FROM use_judgments")
                 conn.execute("UPDATE recall_receipts SET node_ids = '[]'")
+                conn.execute("DELETE FROM node_provenance")
                 self._discard_pending_stmt(conn)
             for node in new_nodes:
-                self.add_node(node)  # rides this transaction; audit included
+                # rides this transaction; audit included. The graph file
+                # carries no record of who wrote a node, so ownership is
+                # proven only where an ingest key proves it (see
+                # ownership_for_fields); the rest is marked unproven.
+                self.add_node(node, owner=owners[node.node_id])
                 result["nodes_added"] += 1
             for edge in new_edges:
                 self.add_edge(edge)  # rides this transaction

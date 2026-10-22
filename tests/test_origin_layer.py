@@ -969,7 +969,7 @@ class TestOriginBackfillUserVersionMarker:
             conn = sqlite3.connect(path)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             conn.close()
-            assert version == 5  # chain ends at 5 (usage layer, migration 005)
+            assert version == 6  # chain ends at 6 (forget layer, migration 006)
         finally:
             try:
                 os.unlink(path)

@@ -324,6 +324,42 @@ def _existing_derived_targets(store: GraphStore, skill_node_id: str) -> set:
     }
 
 
+def _pattern_suppressed(store: GraphStore, pattern: Dict) -> bool:
+    """True when any step of the pattern is text a forget suppressed."""
+    from revien.forget import gate as forget_gate
+
+    unit = forget_gate.UnitRef(None)
+    for step in list(pattern.get("display_steps") or []) + list(pattern.get("steps") or []):
+        if isinstance(step, str) and step.strip() \
+                and forget_gate.check(store, unit, step) is not None:
+            return True
+    return False
+
+
+def _record_proposal_provenance(store: GraphStore, proposal_id: str, action_ids) -> None:
+    """A proposal is built from the ACTION nodes it was derived from. Each
+    unit that wrote one vouches for the proposal's NAME only (its wording is
+    the engine's own summary of several steps, so a forget cuts it back to the
+    label). An action node whose ownership is unproven makes the proposal's
+    ownership unproven too: kept, never deleted on a guess."""
+    from revien.graph.units import UNPROVEN_PREFIX, is_unproven
+
+    units = set()
+    unproven = False
+    for rows in store.get_provenance_bulk(list(action_ids)).values():
+        if not rows:
+            unproven = True
+        for r in rows:
+            if is_unproven(r["unit_id"]):
+                unproven = True
+            else:
+                units.add(r["unit_id"])
+    for unit_id in sorted(units):
+        store.record_provenance(proposal_id, unit_id, label_ok=True, wording_ok=False)
+    if unproven:
+        store.record_provenance(proposal_id, UNPROVEN_PREFIX, label_ok=False, wording_ok=False)
+
+
 def propose_skills(
     store: GraphStore,
     extractor=None,
@@ -354,7 +390,8 @@ def propose_skills(
     )
     if progress is not None:
         progress(f"patterns found: {len(patterns)}")
-    summary = {"detected": len(patterns), "created": 0, "updated": 0, "edges": 0, "proposals": []}
+    summary = {"detected": len(patterns), "created": 0, "updated": 0, "edges": 0,
+               "suppressed": 0, "proposals": []}
     proposal_index = _load_proposal_index(store)
 
     # G8: ONE commit for the whole run, not one per add_node/record_audit/
@@ -367,8 +404,16 @@ def propose_skills(
     # guarantees, just batched into one disk sync at the end. A failure
     # partway rolls back the WHOLE batch, same all-or-nothing shape
     # import_graph already uses for its bulk writes.
-    with store.transaction():
+    # BEGIN IMMEDIATE: the suppression check below is made after the write
+    # lock is held, so a forget from another connection cannot slip between
+    # the check and the write.
+    with store.transaction(immediate=True):
         for pattern in patterns:
+            if _pattern_suppressed(store, pattern):
+                # A step is wording a forget said must not come back
+                # (docs/FORGET_SPEC.md §6): no proposal is made from it.
+                summary["suppressed"] += 1
+                continue
             body, draft = _draft_body(
                 is_llm,
                 pattern["display_steps"], pattern["occurrences"], pattern["sessions"],
@@ -456,6 +501,7 @@ def propose_skills(
                 )
                 summary["updated"] += 1
 
+            _record_proposal_provenance(store, node.node_id, pattern["node_ids"])
             already = _existing_derived_targets(store, node.node_id)
             for action_node_id in pattern["node_ids"]:
                 if action_node_id in already:

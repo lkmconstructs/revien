@@ -66,6 +66,13 @@ class ClaudeCodeAdapter(RevienAdapter):
                 # Derive project name from directory structure
                 project_name = self._extract_project_name(jsonl_file)
                 source_id = self.source_id_for(jsonl_file)
+                # The session this file belongs to. A sub-agent file carries
+                # its parent's sessionId, so forgetting (or suppressing) a
+                # session covers the files that belong to it.
+                meta_extra = {}
+                session_id = self._session_id(jsonl_file)
+                if session_id:
+                    meta_extra["session_id"] = session_id
 
                 results.append({
                     "content": conversation,
@@ -77,6 +84,7 @@ class ClaudeCodeAdapter(RevienAdapter):
                         "project": project_name,
                         "session_file": jsonl_file.name,
                         "path": str(jsonl_file),
+                        **meta_extra,
                     },
                     "source_id": source_id,
                     # Stable re-ingest identity (R3): the whole session file is
@@ -106,6 +114,26 @@ class ClaudeCodeAdapter(RevienAdapter):
             if jsonl_file.is_file() and jsonl_file.stat().st_mtime > since_ts:
                 files.append(jsonl_file)
         return files
+
+    @staticmethod
+    def _session_id(jsonl_file: Path) -> Optional[str]:
+        """The ``sessionId`` Claude Code writes on every entry, from the first
+        entries of the file; None when the file carries none."""
+        try:
+            with open(jsonl_file, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= 200:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    sid = obj.get("sessionId") if isinstance(obj, dict) else None
+                    if isinstance(sid, str) and sid.strip() and len(sid) <= 200:
+                        return sid.strip()
+        except OSError:
+            return None
+        return None
 
     def source_id_for(self, jsonl_file: Path) -> str:
         """The source_id a session file ingests under:

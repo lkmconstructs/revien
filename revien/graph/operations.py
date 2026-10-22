@@ -319,205 +319,96 @@ class GraphOperations:
 
         return {"node_id": node_id, "ancestors": ancestors, "truncated": truncated}
 
-    # ── Governance Layer (leg 6b): right-to-forget ───────────
+    # ── Three verbs (docs/FORGET_SPEC.md §1) ─────────────────
+    #
+    #   forget   privacy: the node, its wording and every copy are scrubbed,
+    #            a content-free suppression record keeps the source from
+    #            bringing it back (revien/forget/engine.py)
+    #   delete   operational: remove this node now, leave a content-free
+    #            delete audit entry, no suppression record
+    #   cleanup  retention and other unattended maintenance, its own audit
+    #            entry, no suppression record
+    #
+    # The verb is recorded by the code path that ran, as the audit op and a
+    # fixed actor. A caller-supplied reason or construct id is never stored:
+    # it is free text, and free text is where a secret ends up.
 
-    # Tombstone marker representation. When a node is forgotten (hard-deleted for
-    # privacy), any child that was DERIVED_FROM it would otherwise be left with a
-    # dangling lineage edge pointing at a deleted row. Instead we re-point those
-    # edges at a lightweight tombstone MARKER node so the trace reads
-    # "derived from [forgotten node, deleted <ts>]" — no orphaned hole, and NO
-    # forgotten content. The marker is:
-    #   - a CONTEXT node (CONTEXT is structural — engine.recall() skips it, so a
-    #     tombstone never surfaces as a recall result),
-    #   - pinned (immune to decay AND to retention sweeps — a tombstone is a
-    #     permanent gravestone, never itself swept),
-    #   - id-stable: "tombstone:<original_node_id>" so repeated forgets / cascade
-    #     re-point to the same marker and we never spawn duplicates.
     TOMBSTONE_PREFIX = "tombstone:"
 
     @classmethod
     def _tombstone_id(cls, original_node_id: str) -> str:
         return f"{cls.TOMBSTONE_PREFIX}{original_node_id}"
 
-    def _ensure_tombstone(
-        self, original_node_id: str, deleted_at: datetime, reason: str
-    ) -> Node:
-        """Create (or return the existing) tombstone marker for a forgotten node.
+    #: Where training.db lives besides the engine's own; set by the daemon.
+    training_dbs: tuple = ()
+    #: The community detector to rebuild after a forget; set by the daemon.
+    clustering = None
+    #: The semantic index whose vectors a forget must drop; set by the daemon.
+    semantic = None
+    #: Retrains the ranking model after a forget; set by the daemon when
+    #: neural ranking is on. None: nothing retrains it automatically.
+    retrain = None
+    #: Says why the last retrain produced no model (a callable, or None).
+    retrain_reason = None
 
-        Holds NO forgotten content — only the fact that a node once existed here
-        and when it was deleted. Idempotent on the stable tombstone id.
-        """
-        tid = self._tombstone_id(original_node_id)
-        existing = self.store.get_node(tid)
-        if existing is not None:
-            return existing
-        marker = Node(
-            node_id=tid,
-            node_type=NodeType.CONTEXT,  # structural — excluded from recall
-            label="[forgotten node]",
-            content="",  # content is forgotten — the marker carries none
-            pinned=True,  # gravestone: immune to decay and retention sweeps
-            source_type=SourceType.DERIVED,
-            confidence=0.0,
-            source_context="tombstone",
-            metadata={
-                "_tombstone": True,
-                "_original_node_id": original_node_id,
-                "_deleted_at": deleted_at.isoformat(),
-                "_reason": reason,
-            },
-        )
-        return self.store.add_node(marker)
-
-    def _children_derived_from(self, node_id: str) -> List[str]:
-        """IDs of nodes that are DERIVED_FROM ``node_id`` (its direct children).
-
-        A child C records ``DERIVED_FROM`` as an edge with C as SOURCE and the
-        parent as TARGET, so we collect edges where this node is the TARGET.
-        """
-        children: List[str] = []
-        for edge in self.store.get_edges_for_node(node_id):
-            if (
-                edge.edge_type == EdgeType.DERIVED_FROM
-                and edge.target_node_id == node_id
-            ):
-                children.append(edge.source_node_id)
-        return children
+    def _forget_engine(self):
+        from revien.forget.engine import ForgetEngine
+        dbs = list(self.training_dbs)
+        default = os.path.join(os.path.expanduser("~"), ".revien", "training.db")
+        if default not in dbs:
+            dbs.append(default)
+        retrain, reason = self.retrain, self.retrain_reason
+        if retrain is None and os.environ.get("REVIEN_NEURAL", "0").strip().lower() \
+                in ("1", "true", "yes", "on"):
+            # a forget run from the CLI with neural ranking switched on
+            from revien.neural.training import TrainingLoop
+            loop = TrainingLoop(db_path=default)
+            retrain, reason = loop.train, (lambda: loop.last_failure)
+        return ForgetEngine(self.store, semantic=self.semantic,
+                            training_dbs=dbs, clustering=self.clustering,
+                            retrain=retrain, retrain_reason=reason)
 
     def forget_preview(self, node_id: str) -> Dict:
-        """Report what a cascade forget WOULD remove — so cascade is never blind.
-
-        Returns the node itself plus every descendant reachable via DERIVED_FROM
-        (the nodes that would be forgotten under ``cascade=True``). Cycle-safe.
-        """
-        root = self.store.get_node(node_id)
-        if root is None or node_id.startswith(self.TOMBSTONE_PREFIX):
-            return {"node_id": node_id, "exists": False, "count": 0, "node_ids": []}
-
-        to_delete: List[str] = []
-        seen = set()
-        frontier = [node_id]
-        while frontier:
-            current = frontier.pop(0)
-            if current in seen:
-                continue
-            seen.add(current)
-            to_delete.append(current)
-            for child in self._children_derived_from(current):
-                if child not in seen:
-                    frontier.append(child)
-
-        return {
-            "node_id": node_id,
-            "exists": True,
-            "count": len(to_delete),
-            "node_ids": to_delete,
-        }
-
-    def _forget_one(self, node_id: str, reason: str, construct_id: str) -> bool:
-        """Hard-delete ONE node's content + row; tombstone it; re-point children.
-
-        Privacy semantics: the content is actually GONE (row removed). A
-        tombstone audit entry is written recording only {original_node_id,
-        deleted_at, reason} — never the forgotten content. Any child that was
-        DERIVED_FROM this node has its lineage edge re-pointed to a tombstone
-        marker so the trace stays intact with no orphaned hole.
-        """
-        node = self.store.get_node(node_id)
-        if node is None:
-            return False
-
-        now = datetime.now(timezone.utc)
-
-        # 1. Re-point children's DERIVED_FROM edges to the tombstone marker BEFORE
-        #    deleting the node (delete_node cascades edges via FK, so we must move
-        #    the lineage edges off the doomed node first).
-        children = self._children_derived_from(node_id)
-        if children:
-            marker = self._ensure_tombstone(node_id, now, reason)
-            for child_id in children:
-                for edge in self.store.get_edges_for_node(child_id):
-                    if (
-                        edge.edge_type == EdgeType.DERIVED_FROM
-                        and edge.source_node_id == child_id
-                        and edge.target_node_id == node_id
-                    ):
-                        # Re-point: child DERIVED_FROM tombstone(original).
-                        self.store.add_edge(Edge(
-                            edge_type=EdgeType.DERIVED_FROM,
-                            source_node_id=child_id,
-                            target_node_id=marker.node_id,
-                            weight=edge.weight,
-                            source_context="lineage_repointed_to_tombstone",
-                        ))
-                        self.store.delete_edge(edge.edge_id)
-
-        # 2+3. Tombstone audit (content-free) + hard delete in ONE transaction:
-        #    the row can never vanish without its gravestone, and a failed
-        #    audit write aborts the delete instead of losing provenance.
-        with self.store.transaction():
-            self.store.record_audit(
-                node_id, "forget", actor=construct_id,
-                before=None,  # NO content snapshot — it is being forgotten
-                after={
-                    "_tombstone": True,
-                    "original_node_id": node_id,
-                    "deleted_at": now.isoformat(),
-                    "reason": reason,
-                },
-                ts=now,
-            )
-
-            # Hard-delete the node row + its remaining edges. Content is GONE.
-            return self.store.delete_node(node_id)
+        """What a forget WOULD do, so it is never blind. Writes nothing."""
+        out = self._forget_engine().forget(node_id, dry_run=True)
+        out["exists"] = out.get("status") not in ("not_found", "skipped")
+        return out
 
     def forget_node(
-        self, node_id: str, cascade: bool = False, reason: str = "",
-        construct_id: str = "",
+        self, node_id: str, reason: str = "",
+        construct_id: str = "", actor: str = "api:forget",
+        everywhere: bool = False,
     ) -> Dict:
-        """Right-to-forget: hard-delete a node's content (privacy).
+        """The forget verb. ``reason`` and ``construct_id`` are accepted for
+        compatibility and deliberately not stored. See ForgetEngine."""
+        return self._forget_engine().forget(
+            node_id, actor=actor, everywhere=everywhere)
 
-        Distinct from invalidate/archive — those RETAIN content (recoverable).
-        forget actually removes the row; the content is gone. A content-free
-        tombstone audit entry records {original_node_id, deleted_at, reason}, and
-        children's DERIVED_FROM edges are re-pointed to a tombstone marker so
-        lineage has no orphaned hole.
+    def forget_wording(self, wording: str, actor: str = "api:forget",
+                       dry_run: bool = False,
+                       allow_inside_words: bool = False) -> Dict:
+        """Forget a literal string everywhere (see revien/forget/wording.py).
+        The string is never stored, logged or returned."""
+        return self._forget_engine().forget_wording(
+            wording, actor=actor, dry_run=dry_run,
+            allow_inside_words=allow_inside_words)
 
-        cascade=False (default): forget only this node. Children survive and now
-        trace to the tombstone marker.
-        cascade=True: also forget every node DERIVED_FROM this one, recursively
-        (each tombstoned). Use ``forget_preview`` first to see the blast radius.
-        """
-        if node_id.startswith(self.TOMBSTONE_PREFIX):
-            # Refuse to forget a gravestone — that would orphan lineage.
-            return {"status": "skipped", "node_id": node_id,
-                    "forgotten": [], "count": 0, "reason": "is_tombstone"}
-
+    def delete_node(self, node_id: str, actor: str = "api:delete",
+                    op: str = "delete") -> bool:
+        """The delete verb: remove the node and its edges now. Leaves one
+        content-free audit entry (node id, actor, time) and NO suppression
+        record: if its source still holds the content, it can be captured
+        again."""
         if self.store.get_node(node_id) is None:
-            return {"status": "not_found", "node_id": node_id,
-                    "forgotten": [], "count": 0}
-
-        if cascade:
-            # Resolve the full set first (preview), then forget LEAVES-FIRST so a
-            # parent's children are already tombstoned/re-pointed before the
-            # parent goes. Reverse of BFS order = deepest first.
-            order = self.forget_preview(node_id)["node_ids"]
-            targets = list(reversed(order))
-        else:
-            targets = [node_id]
-
-        forgotten: List[str] = []
-        for tid in targets:
-            if self._forget_one(tid, reason=reason, construct_id=construct_id):
-                forgotten.append(tid)
-
-        return {
-            "status": "forgotten",
-            "node_id": node_id,
-            "cascade": cascade,
-            "forgotten": forgotten,
-            "count": len(forgotten),
-        }
+            return False
+        now = datetime.now(timezone.utc)
+        with self.store.transaction():
+            self.store.record_audit(
+                node_id, op, actor=actor, before=None,
+                after={"original_node_id": node_id, "verb": op,
+                       "deleted_at": now.isoformat()},
+                ts=now)
+            return self.store.delete_node(node_id)
 
     # ── Governance Layer (leg 6b): retention sweep ───────────
 
@@ -540,19 +431,32 @@ class GraphOperations:
         days: Optional[int] = None,
         construct_id: str = "",
     ) -> Dict:
+        """A retention sweep a person asked for (POST /v1/retention/sweep).
+        That is the DELETE verb: ``expire`` deletes stale nodes, each with a
+        delete audit entry, and leaves no suppression record."""
+        return self._retention_sweep(mode, days, op="delete",
+                                     actor="api:retention_sweep")
+
+    def run_scheduled_cleanup(
+        self, mode: Optional[str] = None, days: Optional[int] = None,
+    ) -> Dict:
+        """The same sweep run unattended. That is automatic CLEANUP: its own
+        audit op, no suppression record. Nothing schedules it today; a
+        scheduler that does must call this, not apply_retention."""
+        return self._retention_sweep(mode, days, op="cleanup",
+                                     actor="scheduler:retention")
+
+    def _retention_sweep(self, mode, days, op: str, actor: str) -> Dict:
         """Run one retention sweep under the selected storage policy.
 
         "Choose your storage." Resolves mode/window from the environment unless
-        overridden by args (the override exists chiefly for tests and the
-        endpoint body).
+        overridden by args.
 
-          keep    — no-op. Nothing is removed (decay still only demotes).
-          archive — soft-invalidate stale, unpinned, live nodes (REUSES leg-6a
-                    ``invalidate_node``). Recoverable — include_invalidated
-                    surfaces them, and access/reinforce resets the clock.
-          expire  — HARD-delete those same stale nodes (REUSES ``forget_node``
-                    so each gets a content-free tombstone audit + lineage
-                    re-point). The ONLY auto-destructive mode; opt-in.
+          keep    - no-op. Nothing is removed (decay still only demotes).
+          archive - soft-invalidate stale, unpinned, live nodes (REUSES leg-6a
+                    ``invalidate_node``). Recoverable.
+          expire  - HARD-delete those same stale nodes with an audit entry
+                    under ``op``. The ONLY auto-destructive mode; opt-in.
 
         Pinned nodes (and tombstone markers) are ALWAYS immune. Returns counts:
         {"mode", "window_days", "scanned", "archived", "expired"}.
@@ -565,14 +469,11 @@ class GraphOperations:
         result = {"mode": mode, "window_days": window,
                   "scanned": 0, "archived": 0, "expired": 0}
         if mode == RETENTION_KEEP:
-            return result  # no-op sweep — nothing removed
+            return result  # no-op sweep - nothing removed
 
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=window)
 
-        # Snapshot candidate ids up front. archive mutates in place (safe), but
-        # expire DELETES rows + can spawn tombstone markers, so iterate over a
-        # fixed id list rather than a live cursor.
         candidates = self.store.list_nodes(limit=999999)
         result["scanned"] = len(candidates)
 
@@ -583,24 +484,20 @@ class GraphOperations:
             if node.node_id.startswith(self.TOMBSTONE_PREFIX):
                 continue  # belt-and-suspenders: never sweep a gravestone
             if mode == RETENTION_ARCHIVE and node.invalidated_at is not None:
-                continue  # already archived — don't re-touch
+                continue  # already archived - don't re-touch
             if self._is_stale(node, cutoff):
                 stale_ids.append(node.node_id)
 
         if mode == RETENTION_ARCHIVE:
             for nid in stale_ids:
                 updated = self.invalidate_node(
-                    nid, reason="retention_archive", construct_id=construct_id
+                    nid, reason="retention_archive", construct_id=actor
                 )
                 if updated is not None:
                     result["archived"] += 1
         elif mode == RETENTION_EXPIRE:
             for nid in stale_ids:
-                outcome = self.forget_node(
-                    nid, cascade=False, reason="retention_expire",
-                    construct_id=construct_id,
-                )
-                if outcome.get("count", 0) > 0:
+                if self.delete_node(nid, actor=actor, op=op):
                     result["expired"] += 1
 
         return result

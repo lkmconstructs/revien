@@ -109,6 +109,14 @@ class CodexAdapter(RevienAdapter):
                 project = project_name or "unknown"
                 source_id = f"codex:{project}:{jsonl_file.stem}"
 
+                # The id Codex writes in the rollout's session_meta: it
+                # travels with a copy of the file, so a forgotten rollout that
+                # is renamed or moved is still recognised (the unit id stays
+                # the file name, so no existing unit shifts).
+                meta_extra = {}
+                session_id = self._session_id(jsonl_file)
+                if session_id:
+                    meta_extra["session_id"] = session_id
                 results.append({
                     "content": conversation,
                     "content_type": "conversation",
@@ -119,6 +127,7 @@ class CodexAdapter(RevienAdapter):
                         "project": project_name or "",
                         "session_file": jsonl_file.name,
                         "path": str(jsonl_file),
+                        **meta_extra,
                     },
                     "source_id": source_id,
                     # Stable re-ingest identity (R3): the whole rollout file is
@@ -135,6 +144,29 @@ class CodexAdapter(RevienAdapter):
                 })
 
         return results
+
+    @staticmethod
+    def _session_id(jsonl_file: Path) -> Optional[str]:
+        """``payload.id`` of the rollout's ``session_meta`` line (the first
+        entries of the file); None when the file carries none."""
+        try:
+            with open(jsonl_file, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= 50:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(obj, dict) or obj.get("type") != "session_meta":
+                        continue
+                    payload = obj.get("payload")
+                    sid = payload.get("id") if isinstance(payload, dict) else None
+                    if isinstance(sid, str) and sid.strip() and len(sid) <= 200:
+                        return sid.strip()
+        except OSError:
+            return None
+        return None
 
     async def health_check(self) -> bool:
         """Check if the Codex session directory exists."""

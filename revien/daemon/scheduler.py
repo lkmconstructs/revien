@@ -4,6 +4,7 @@ Uses APScheduler to periodically pull new content from connected AI systems.
 """
 
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -134,6 +135,7 @@ class SyncScheduler:
         # Ingest each piece of content
         ingested = 0
         skipped = 0
+        suppressed = 0
         for item in new_content:
             # timestamp was previously dropped here — every synced item
             # ingested with recorded_at=None, so temporal resolution and
@@ -176,9 +178,21 @@ class SyncScheduler:
             # without this the cursor never advances and the adapter re-fetches
             # and re-fails the same item on every sync, forever.
             try:
-                self.pipeline.ingest(input_data)
+                try:
+                    out = self.pipeline.ingest(input_data)
+                except sqlite3.IntegrityError:
+                    # A forget or delete from another connection removed a
+                    # record this capture was building on, between reading it
+                    # and writing. Nothing of this capture landed (it rolled
+                    # back); take it again from the current state, once.
+                    out = self.pipeline.ingest(input_data)
+                if getattr(out, "suppressed", False):
+                    # A forget said this must not come back: not captured,
+                    # and not counted as ingested.
+                    suppressed += 1
+                    continue
                 ingested += 1
-            except ValueError as exc:
+            except (ValueError, sqlite3.IntegrityError) as exc:
                 skipped += 1
                 logger.warning(
                     f"Skipped item from {name} ({input_data.source_id}): {exc}"
@@ -193,6 +207,8 @@ class SyncScheduler:
         result = {"status": "ok", "adapter": name, "items_ingested": ingested}
         if skipped:
             result["items_skipped"] = skipped
+        if suppressed:
+            result["items_suppressed"] = suppressed
         return result
 
     @staticmethod

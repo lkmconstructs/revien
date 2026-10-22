@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from difflib import SequenceMatcher
 
+from revien.forget import gate as forget_gate
 from revien.graph.schema import Edge, EdgeType, Node, NodeType
+from revien.graph.units import item_unit
 from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 
@@ -133,6 +135,7 @@ class OpenAIAdapter:
         total_edges = 0
         conversations_ingested = 0
         conversations_skipped = 0
+        conversations_suppressed = 0
         total_messages = 0
         cross_conv_edges = 0
 
@@ -148,6 +151,10 @@ class OpenAIAdapter:
                 continue
 
             stats = self._ingest_conversation_data(conv_data, f"bulk_conv_{i}")
+            if stats.get("suppressed"):
+                conversations_suppressed += 1
+                self._processed_conversations[conv_id] = True
+                continue
             total_nodes += stats.get("node_count", 0)
             total_edges += stats.get("edge_count", 0)
             total_messages += stats.get("message_count", 0)
@@ -168,6 +175,7 @@ class OpenAIAdapter:
             "total_conversations": len(data),
             "conversations_ingested": conversations_ingested,
             "conversations_skipped": conversations_skipped,
+            "conversations_suppressed": conversations_suppressed,
             "total_nodes": total_nodes,
             "total_edges": total_edges,
             "total_messages": total_messages,
@@ -283,6 +291,17 @@ class OpenAIAdapter:
     def _ingest_conversation_data(
         self, conv_data: Dict, source_prefix: str
     ) -> Dict[str, int]:
+        """One conversation is one write transaction, taken with BEGIN
+        IMMEDIATE: the suppression gate below decides after the write lock is
+        held, so a forget from another connection either committed first (and
+        is seen) or waits until this conversation has landed (and then
+        removes it). A failure rolls the whole conversation back."""
+        with self.store.transaction(immediate=True):
+            return self._ingest_conversation_in_txn(conv_data, source_prefix)
+
+    def _ingest_conversation_in_txn(
+        self, conv_data: Dict, source_prefix: str
+    ) -> Dict[str, int]:
         """
         Internal: Parse a conversation object and ingest all its messages.
 
@@ -307,8 +326,32 @@ class OpenAIAdapter:
                 "skipped_messages": 0,
             }
 
+        # Denylist (docs/FORGET_SPEC.md §6): sentences forgotten from this
+        # conversation (named by its id) are left out of it below, and a
+        # conversation that is exactly a wording banned everywhere is refused.
+        unit = forget_gate.UnitRef(item_unit(source_id))
+        texts = []
+        for nd in (conv_data.get("mapping") or {}).values():
+            if self._is_valid_message_node(nd):
+                parts = (nd.get("message", {}).get("content", {}) or {}).get("parts", [])
+                texts.append("".join(str(p) for p in parts if p))
+        whole = "\n".join(texts)
+        block = forget_gate.check(self.store, unit, whole)
+        if block is not None:
+            logger.info("conversation %s suppressed: %s", conv_id, block.reason)
+            return {
+                "node_count": 0, "edge_count": 0, "conversation_id": conv_id,
+                "message_count": 0, "system_messages": 0, "skipped_messages": 0,
+                "suppressed": True, "suppression_note": block.note,
+            }
+        forget_gate.register(self.store, unit)
+        owner = (unit.owner, 1, 1)
+
         # Extract title and timestamps
         title = conv_data.get("title", "Untitled")
+        # a title is text like any other: named secrets are cut before a label
+        # or a preview is derived from it
+        title = forget_gate.strip_literals(self.store, str(title))[0]
         create_time = self._unix_to_datetime(conv_data.get("create_time"))
         update_time = self._unix_to_datetime(conv_data.get("update_time"))
 
@@ -329,7 +372,7 @@ class OpenAIAdapter:
             origin_source="import",
             session_key=conv_id,
         )
-        self.store.add_node(context_node)
+        self.store.add_node(context_node, owner=owner)
 
         # Build message tree
         mapping = conv_data.get("mapping", {})
@@ -362,6 +405,12 @@ class OpenAIAdapter:
 
             # Handle empty or null content
             content = "".join(str(p) for p in content_parts if p) or ""
+            # Sentences a forget removed stay out (the standing denylist).
+            if content.strip():
+                content, _left_out = forget_gate.strip_forgotten(
+                    self.store, unit, content)
+                if _left_out and not content.strip():
+                    continue
             if not content.strip():
                 content = f"[Empty message from {author_role}]"
 
@@ -384,12 +433,15 @@ class OpenAIAdapter:
                     "content_type": msg.get("content", {}).get("content_type", "text"),
                     "openai_message_id": msg.get("id", ""),
                     "is_system": is_system,
+                    # This node IS the message as it was said: the verbatim
+                    # record a forget cuts wording out of.
+                    "verbatim": True,
                 },
                 origin_runtime="openai",
                 origin_source="import",
                 session_key=conv_id,
             )
-            self.store.add_node(msg_node)
+            self.store.add_node(msg_node, owner=owner)
             node_map[node_id] = msg_node
             message_count += 1
 

@@ -10,8 +10,11 @@ Rules it keeps:
   BEFORE any resolver call, so no name ever leaves the machine and no DNS
   answer can steer the connection. Any other address is refused too.
 * A refused URL is reported as {"rejected": reason}, distinct from None
-  (nothing answered), so the caller can refuse the operation instead of
-  treating it as "no daemon".
+  (nothing is listening), so the caller can refuse the operation instead of
+  treating it as "no daemon". Something that accepted the connection but did
+  not give a current health answer (it hung, answered 500, or answered
+  something that is not Revien's health JSON) is {"unanswered": reason}: a
+  daemon may be running, so the caller refuses too.
 * It never follows a redirect, never reads proxy settings (http.client has
   none), sends nothing but the request line and Host header, and re-checks
   the connected peer.
@@ -29,7 +32,9 @@ def probe_daemon(url):
 
     {"rejected": reason}: the URL is not an http URL on a loopback IP literal
     or `localhost`; nothing was resolved or connected.
-    None: nothing answered, or the answer was not Revien's health JSON.
+    None: nothing is listening there (the connection was refused).
+    {"unanswered": reason}: something accepted the connection and did not
+    give a Revien health answer in time (a hang, an HTTP error, not JSON).
     Otherwise {"features": [str] or None, "version": str or None}; features is
     None when the daemon reports none (code from before fencing)."""
     try:
@@ -63,13 +68,19 @@ def probe_daemon(url):
         if not ok:
             return {"rejected": "address is not loopback"}
         family = socket.AF_INET if ip.version == 4 else socket.AF_INET6
-        sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            return None                # no such address family here
         try:
             sock.settimeout(1.5)
-            sock.connect((str(ip), port))
+            try:
+                sock.connect((str(ip), port))
+            except OSError:
+                return None            # nothing is listening
             peer = ipaddress.ip_address(sock.getpeername()[0].split("%")[0])
             if not peer.is_loopback:
-                return None
+                return {"unanswered": "the peer was not a loopback address"}
             conn = HTTPConnection(str(ip), port, timeout=1.5)
             conn.sock = sock
             sock = None
@@ -83,15 +94,15 @@ def probe_daemon(url):
             if sock is not None:
                 sock.close()
         if resp.status != 200 or len(body) > 65536:
-            return None
+            return {"unanswered": f"HTTP {resp.status}"}
         data = json.loads(body.decode("utf-8", "replace"))
         if not isinstance(data, dict) or "node_count" not in data \
                 or "uptime_seconds" not in data:
-            return None
+            return {"unanswered": "the answer was not Revien's health JSON"}
         feats = data.get("features")
         if not (isinstance(feats, list) and all(isinstance(f, str) for f in feats)):
             feats = None
         ver = data.get("version")
         return {"features": feats, "version": ver if isinstance(ver, str) else None}
-    except Exception:  # noqa: BLE001 - unreachable, refused, not JSON: "none"
-        return None
+    except Exception as exc:  # noqa: BLE001 - it accepted us and then hung or broke
+        return {"unanswered": type(exc).__name__}

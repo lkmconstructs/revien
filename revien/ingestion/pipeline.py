@@ -3,6 +3,7 @@ Revien Ingestion Pipeline — Orchestrates extraction, deduplication, and storag
 The main entry point for feeding content into the graph.
 """
 
+import logging
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
 from revien.graph.origin import derive_origin, validate_origin
 from revien.dates import TIMESTAMP_SOURCES
+from revien.forget import gate as _gate
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -169,6 +171,15 @@ class IngestionInput:
     #   mtime    a file's modification time (NOT said-at; never rendered)
     #   import   carried in from an import
     timestamp_source: str = "content"
+    # An explicit re-import override (docs/FORGET_SPEC.md §7): lifts the
+    # suppression record(s) that would block this unit, audited, and ingests.
+    # Only the CLI import commands set it; the REST and MCP faces never do.
+    override_suppression: bool = False
+    # Several ingests that are ONE capture (a LangChain save_context writes the
+    # question and the answer separately) share a "capture:<uuid>" id, so a
+    # forget of either covers both. It names no stable source: it only groups
+    # what one call wrote. Anything not starting "capture:" is ignored.
+    capture_id: Optional[str] = None
 
     def __post_init__(self):
         if self.timestamp_source not in TIMESTAMP_SOURCES:
@@ -203,6 +214,21 @@ class IngestionOutput:
     # (e.g. re-extraction of edited text produced no NEW claims). The keyed
     # true no-op path (unchanged content hash) leaves this False.
     refreshed: bool = False
+    # True when the suppression gate refused this capture (a forget said it
+    # must not come back). Nothing was written. suppression_note says why.
+    suppressed: bool = False
+    suppression_note: str = ""
+    # Things the caller must be told (forget.key not matching the earlier
+    # forgets, so they stopped applying). Empty when nothing is wrong.
+    warnings: List[str] = field(default_factory=list)
+
+
+_KEY_WARNED: set = set()
+
+
+class _ContextGone(Exception):
+    """The context node a keyed refresh was about to update is gone: a forget
+    (or a delete) from another connection removed it after it was read."""
 
 
 class IngestionPipeline:
@@ -318,7 +344,36 @@ class IngestionPipeline:
         """
         Ingest raw content into the graph.
         Returns a summary of what was created/deduplicated.
+
+        A capture made while forget.key is not the key the earlier forgets
+        were made with still runs (a refusal would be a silent failure inside
+        a hook), but says so: in the output's ``warnings`` and, once per
+        process, in the log. The standing denylist matches nothing then.
         """
+        out = self._ingest(input_data)
+        try:
+            from revien.forget import gate as _g
+            problem = _g.key_problem(self.store)
+        except Exception:  # noqa: BLE001
+            problem = None
+        if problem:
+            text = _g.key_problem_text(problem)
+            out.warnings = [text]
+            if text not in _KEY_WARNED:
+                _KEY_WARNED.add(text)
+                logging.getLogger("revien").error("forget.key mismatch: %s", text)
+        return out
+
+    def _ingest(self, input_data: IngestionInput) -> IngestionOutput:
+        # A source id, a session or a project key can carry a secret (a URL
+        # with ?token=): the same cut forget made in the stored identities is
+        # made here first, so a unit is named the same before and after, and
+        # the identity of a capture never lands the string again.
+        for _name in ("source_id", "ingest_key", "origin_source",
+                      "project_key", "session_key"):
+            _v = getattr(input_data, _name, None)
+            if isinstance(_v, str) and _v:
+                setattr(input_data, _name, _gate.strip_literals(self.store, _v)[0])
         # 0. Per-source ingestion policy (leg 6b). If this source_id is on the
         #    deny list, capture is a clean no-op: nothing is extracted, stored,
         #    or embedded, and the reason is logged. The graph is untouched.
@@ -381,6 +436,31 @@ class IngestionPipeline:
                     fenced_spans=fenced_spans,
                 )
 
+        # 0a2. Suppression gate (docs/FORGET_SPEC.md §6). A forget left a
+        #      content-free record; if it says this must not come back,
+        #      nothing is extracted, stored or embedded. Runs after the fence
+        #      so the fingerprint is of the text that would be stored.
+        _origin, _origin_declared = _resolve_origin(input_data)
+        unit = self._unit_ref(input_data, _origin)
+        blocked = self._gate_check(input_data, unit)
+        if blocked is not None:
+            return self._suppressed_output(blocked, fenced_spans)
+        # A source that changed since a forget is new evidence, but the
+        # sentences that were forgotten from it stay out (same keyed
+        # fingerprint). Mutates the content like the fence does, so the
+        # ingest hash and the extraction both see what will be stored.
+        if not input_data.override_suppression:
+            input_data.content, _left_out = _gate.strip_forgotten(
+                self.store, unit, input_data.content)
+            if _left_out and not input_data.content.strip():
+                return self._suppressed_output(_gate.Block(
+                    {"unit_id": unit.unit_id or "(shared channel)"},
+                    "everything in it was forgotten"), fenced_spans)
+        else:
+            # an override lifts a unit's suppression, never a named secret
+            input_data.content, _ = _gate.strip_literals(
+                self.store, input_data.content)
+
         # 0b. Stable ingestion key (repair leg R3). With a key, look for the
         #     context node a previous ingest of this same unit stamped:
         #     unchanged content is a clean NO-OP; grown/changed content
@@ -416,6 +496,8 @@ class IngestionPipeline:
                     if adopted:
                         # Same bytes, but stamp the key so every future
                         # ingest of this unit finds it directly.
+                        self.store.record_provenance(
+                            existing_ctx.node_id, unit.owner, proves=True)
                         self.store.update_node(
                             existing_ctx.node_id,
                             _audit_op="ingest_adopt",
@@ -436,10 +518,17 @@ class IngestionPipeline:
                         total_edges_in_graph=self.store.count_edges(),
                         fenced_spans=fenced_spans,
                     )
-                return self._refresh_keyed(
-                    input_data, ingest_key, content_hash, existing_ctx,
-                    fenced_spans=fenced_spans,
-                )
+                try:
+                    return self._refresh_keyed(
+                        input_data, ingest_key, content_hash, existing_ctx,
+                        fenced_spans=fenced_spans, unit=unit, origin=_origin,
+                        origin_declared=_origin_declared,
+                    )
+                except _ContextGone:
+                    # The record it would have refreshed was removed while
+                    # this capture waited for the write lock. Nothing was
+                    # written; capture it as new below (the gate decides).
+                    pass
 
         # 1. Extract nodes and edges
         extraction = self.extractor.extract(
@@ -464,7 +553,6 @@ class IngestionPipeline:
         # source_id, keeping a declared project_key/session_key — see
         # _resolve_origin's docstring — never validated (derive_origin only
         # ever returns vocabulary values or None).
-        _origin, _origin_declared = _resolve_origin(input_data)
         for node in extraction.nodes:
             node.source_modality = input_data.source_modality
             node.vision_processed = input_data.vision_processed
@@ -514,125 +602,156 @@ class IngestionPipeline:
                 cn.event_time_confidence = res.confidence
                 cn.event_time_text = res.text
 
-        # 2. Deduplicate and store nodes, building ID mapping
-        id_map = {}  # old_id -> actual_id (may differ if deduplicated)
-        nodes_created = 0
-        nodes_deduped = 0
-        # Track newly-created, non-context nodes for opt-in semantic indexing.
-        newly_created: List[tuple] = []  # (node_id, label, content)
+        # The write section holds the capture lock (the one a forget also
+        # takes) and asks the gate once more first: a forget that landed
+        # while the extractor ran (it can take seconds) must not be written
+        # over. Only the capture lock, not the store lock: semantic dedup may
+        # embed inline, and recall must not wait on that.
+        with self.store._capture_lock:
+            blocked = self._gate_check(input_data, unit)
+            if blocked is not None:
+                return self._suppressed_output(blocked, fenced_spans)
+            _gate.register(self.store, unit)
 
-        for candidate_node in extraction.nodes:
-            old_id = candidate_node.node_id
-            # allow_semantic tracks defer_embed: semantic dedup embeds the
-            # candidate inline, and the capture path's whole contract is
-            # "no model inference before the 200".
-            actual_node, is_new = self.dedup.deduplicate_node(
-                candidate_node, allow_semantic=not input_data.defer_embed
-            )
-            id_map[old_id] = actual_node.node_id
-            if is_new:
-                nodes_created += 1
-                self._register_entity(actual_node)
-                # Index ALL new nodes, INCLUDING CONTEXT (verbatim turns). For
-                # conversational memory the verbatim turn is the answer-bearing
-                # content; excluding context left the only coherent representation
-                # of a turn invisible to semantic search (only the extracted —
-                # and sometimes shredded — nodes were searchable).
-                newly_created.append(
-                    (actual_node.node_id, actual_node.label, actual_node.content)
+            # 2. Deduplicate and store nodes, building ID mapping
+            id_map = {}  # old_id -> actual_id (may differ if deduplicated)
+            nodes_created = 0
+            nodes_deduped = 0
+            # Track newly-created, non-context nodes for opt-in semantic indexing.
+            newly_created: List[tuple] = []  # (node_id, label, content)
+
+            for candidate_node in extraction.nodes:
+                old_id = candidate_node.node_id
+                # allow_semantic tracks defer_embed: semantic dedup embeds the
+                # candidate inline, and the capture path's whole contract is
+                # "no model inference before the 200".
+                actual_node, is_new = self.dedup.deduplicate_node(
+                    candidate_node, allow_semantic=not input_data.defer_embed,
+                    unit_id=unit.owner,
                 )
-            else:
-                nodes_deduped += 1
-
-        # 3. Store edges with remapped IDs
-        edges_created = 0
-        for edge in extraction.edges:
-            remapped_source = id_map.get(edge.source_node_id, edge.source_node_id)
-            remapped_target = id_map.get(edge.target_node_id, edge.target_node_id)
-
-            # Skip self-edges
-            if remapped_source == remapped_target:
-                continue
-
-            # Skip duplicate edges
-            if self._edge_exists(remapped_source, remapped_target, edge.edge_type):
-                continue
-
-            new_edge = Edge(
-                edge_type=edge.edge_type,
-                source_node_id=remapped_source,
-                target_node_id=remapped_target,
-                weight=edge.weight,
-            )
-            self.store.add_edge(new_edge)
-            edges_created += 1
-
-        # 3a2. Declared links (curated-source leg). Each link label becomes an
-        # ENTITY node (found case-insensitively or created) with a strong edge
-        # from this unit's CONTEXT node. This is where a vault's [[wikilinks]]
-        # become graph edges — the author drew them; we transcribe them. The
-        # miss taxonomy's `disconnected` bucket (gold unreachable from any
-        # anchor) is exactly what these edges close for curated content.
-        if input_data.links and extraction.context_node is not None:
-            link_ctx_id = id_map.get(
-                extraction.context_node.node_id, extraction.context_node.node_id
-            )
-            seen_links = set()
-            for raw_label in input_data.links:
-                label = (raw_label or "").strip()
-                if not label or label.lower() in seen_links:
-                    continue
-                seen_links.add(label.lower())
-                target = self.ops.find_node_by_label(label, node_type=NodeType.ENTITY)
-                if target is None:
-                    target = self.store.add_node(Node(
-                        node_type=NodeType.ENTITY,
-                        label=label,
-                        content=label,
-                        source_id=input_data.source_id,
-                        source_type=SourceType.EXTRACTED,
-                        confidence=1.0 if input_data.curated else 0.8,
-                        recorded_at=input_data.timestamp,
-                        metadata={
-                            **({"curated": True} if input_data.curated else {}),
-                            **({"recorded_at_source": input_data.timestamp_source}
-                               if input_data.timestamp is not None else {}),
-                        },
-                        origin_runtime=_origin[0],
-                        origin_source=_origin[1],
-                        project_key=_origin[2],
-                        session_key=_origin[3],
-                    ))
+                id_map[old_id] = actual_node.node_id
+                if is_new:
                     nodes_created += 1
-                    self._register_entity(target)
-                    newly_created.append((target.node_id, target.label, target.content))
-                if target.node_id == link_ctx_id:
-                    continue
-                if not self._edge_exists(link_ctx_id, target.node_id, EdgeType.RELATED_TO):
-                    self.store.add_edge(Edge(
-                        edge_type=EdgeType.RELATED_TO,
-                        source_node_id=link_ctx_id,
-                        target_node_id=target.node_id,
-                        # Author-drawn edges are strong: 0.8 vs the 0.3 the
-                        # extractor gives co-occurrence guesses.
-                        weight=0.8,
-                    ))
-                    edges_created += 1
+                    self._register_entity(actual_node)
+                    # Index ALL new nodes, INCLUDING CONTEXT (verbatim turns). For
+                    # conversational memory the verbatim turn is the answer-bearing
+                    # content; excluding context left the only coherent representation
+                    # of a turn invisible to semantic search (only the extracted —
+                    # and sometimes shredded — nodes were searchable).
+                    newly_created.append(
+                        (actual_node.node_id, actual_node.label, actual_node.content)
+                    )
+                else:
+                    nodes_deduped += 1
 
-        # 3a3. Known-entity mention linking (gazetteer pass). The regex
-        # extractor only catches Capitalized surface forms — a turn saying
-        # "the atlas-server needs a fan" never links to the entity 'Atlas
-        # Server' even though the graph KNOWS that entity. Here: scan the
-        # content's normalized form for every known entity label (word-
-        # boundary, min length guard) and draw the CONTEXT->ENTITY edge the
-        # extractor missed. This is the `disconnected` fix for the miss
-        # taxonomy and the fragile-variant fix for the attachment track.
-        if extraction.context_node is not None:
-            edges_created += self._link_known_mentions(
-                id_map.get(extraction.context_node.node_id,
-                           extraction.context_node.node_id),
-                input_data.content,
-            )
+            # 3. Store edges with remapped IDs
+            edges_created = 0
+            for edge in extraction.edges:
+                remapped_source = id_map.get(edge.source_node_id, edge.source_node_id)
+                remapped_target = id_map.get(edge.target_node_id, edge.target_node_id)
+
+                # Skip self-edges
+                if remapped_source == remapped_target:
+                    continue
+
+                # Skip duplicate edges
+                if self._edge_exists(remapped_source, remapped_target, edge.edge_type):
+                    continue
+
+                new_edge = Edge(
+                    edge_type=edge.edge_type,
+                    source_node_id=remapped_source,
+                    target_node_id=remapped_target,
+                    weight=edge.weight,
+                )
+                self.store.add_edge(new_edge)
+                edges_created += 1
+
+            # 3a2. Declared links (curated-source leg). Each link label becomes an
+            # ENTITY node (found case-insensitively or created) with a strong edge
+            # from this unit's CONTEXT node. This is where a vault's [[wikilinks]]
+            # become graph edges — the author drew them; we transcribe them. The
+            # miss taxonomy's `disconnected` bucket (gold unreachable from any
+            # anchor) is exactly what these edges close for curated content.
+            if input_data.links and extraction.context_node is not None:
+                link_ctx_id = id_map.get(
+                    extraction.context_node.node_id, extraction.context_node.node_id
+                )
+                seen_links = set()
+                for raw_label in input_data.links:
+                    label = (raw_label or "").strip()
+                    if not label or label.lower() in seen_links:
+                        continue
+                    seen_links.add(label.lower())
+                    target = self.ops.find_node_by_label(label, node_type=NodeType.ENTITY)
+                    if target is not None:
+                        self.store.record_provenance(
+                            target.node_id, unit.owner, label_ok=True,
+                            wording_ok=(normalize_text(target.content)
+                                        == normalize_text(label)))
+                    if target is None:
+                        target = self.store.add_node(Node(
+                            node_type=NodeType.ENTITY,
+                            label=label,
+                            content=label,
+                            source_id=input_data.source_id,
+                            source_type=SourceType.EXTRACTED,
+                            confidence=1.0 if input_data.curated else 0.8,
+                            recorded_at=input_data.timestamp,
+                            metadata={
+                                **({"curated": True} if input_data.curated else {}),
+                                **({"recorded_at_source": input_data.timestamp_source}
+                                   if input_data.timestamp is not None else {}),
+                            },
+                            origin_runtime=_origin[0],
+                            origin_source=_origin[1],
+                            project_key=_origin[2],
+                            session_key=_origin[3],
+                        ), owner=(unit.owner, 1, 1))
+                        nodes_created += 1
+                        self._register_entity(target)
+                        newly_created.append((target.node_id, target.label, target.content))
+                    if target.node_id == link_ctx_id:
+                        continue
+                    if not self._edge_exists(link_ctx_id, target.node_id, EdgeType.RELATED_TO):
+                        self.store.add_edge(Edge(
+                            edge_type=EdgeType.RELATED_TO,
+                            source_node_id=link_ctx_id,
+                            target_node_id=target.node_id,
+                            # Author-drawn edges are strong: 0.8 vs the 0.3 the
+                            # extractor gives co-occurrence guesses.
+                            weight=0.8,
+                        ))
+                        edges_created += 1
+
+            # 3a3. Known-entity mention linking (gazetteer pass). The regex
+            # extractor only catches Capitalized surface forms — a turn saying
+            # "the atlas-server needs a fan" never links to the entity 'Atlas
+            # Server' even though the graph KNOWS that entity. Here: scan the
+            # content's normalized form for every known entity label (word-
+            # boundary, min length guard) and draw the CONTEXT->ENTITY edge the
+            # extractor missed. This is the `disconnected` fix for the miss
+            # taxonomy and the fragile-variant fix for the attachment track.
+            if extraction.context_node is not None:
+                edges_created += self._link_known_mentions(
+                    id_map.get(extraction.context_node.node_id,
+                               extraction.context_node.node_id),
+                    input_data.content,
+                )
+
+        # 3a4. Last word under BEGIN IMMEDIATE: a forget that committed its
+        #      denylist after the checks above is honoured here (any order).
+        _undone = _gate.enforce_after_write(
+            self.store, unit, input_data.content,
+            [nid for nid, _l, _c in newly_created],
+            [v for v in id_map.values()
+             if v not in {nid for nid, _l, _c in newly_created}])
+        if _undone is not None:
+            return self._suppressed_output(_undone, fenced_spans)
+        newly_created = [
+            (n.node_id, n.label, n.content)
+            for n in (self.store.get_node(nid) for nid, _l, _c in newly_created)
+            if n is not None]
 
         # 3b. Semantic indexing (opt-in). Embed the newly-created content nodes
         # so keyword-less queries can retrieve them. No-op when the layer is
@@ -684,6 +803,38 @@ class IngestionPipeline:
             refreshed=False,
         )
 
+    def _unit_ref(self, input_data: IngestionInput, origin) -> "_gate.UnitRef":
+        return _gate.unit_for_input(input_data, origin)
+
+    def _suppressed_output(self, block, fenced_spans: int = 0) -> IngestionOutput:
+        print(
+            f"[revien] ingest suppressed for unit={block.record['unit_id']!r} "
+            f"({block.reason}) - nothing captured."
+        )
+        return IngestionOutput(
+            context_node_id="",
+            nodes_created=0,
+            nodes_deduplicated=0,
+            edges_created=0,
+            total_nodes_in_graph=self.store.count_nodes(),
+            total_edges_in_graph=self.store.count_edges(),
+            fenced_spans=fenced_spans,
+            suppressed=True,
+            suppression_note=block.note,
+        )
+
+    def _gate_check(self, input_data: IngestionInput, unit) -> Optional["_gate.Block"]:
+        """Ask the suppression gate. With an explicit override the blocking
+        records are lifted (and audited) instead of refusing."""
+        block = _gate.check(self.store, unit, input_data.content)
+        if block is None or not input_data.override_suppression:
+            return block
+        from revien.forget.restore import lift_for_override
+        while block is not None:
+            lift_for_override(self.store, block.record)
+            block = _gate.check(self.store, unit, input_data.content)
+        return None
+
     def _find_adoptable_context(self, source_id: str) -> Optional[Node]:
         """Adoption fallback for the pre-R3 upgrade path.
 
@@ -718,6 +869,9 @@ class IngestionPipeline:
         content_hash: str,
         existing_ctx: Node,
         fenced_spans: int = 0,
+        unit=None,
+        origin=None,
+        origin_declared: bool = False,
     ) -> IngestionOutput:
         """Refresh path (repair leg R3): this unit was ingested before under
         the same key and its content changed (typically a session that GREW).
@@ -778,7 +932,20 @@ class IngestionPipeline:
         edges_created = 0
         newly_created: List[tuple] = []
 
-        with self.store.transaction():
+        # BEGIN IMMEDIATE: the write lock is taken here, before the first
+        # statement. A deferred transaction would let a forget from another
+        # connection commit between the read of the context node and the
+        # first write, and the refresh would then fail on a foreign key.
+        with self.store._capture_lock, self.store.transaction(immediate=True):
+            blocked = self._gate_check(input_data, unit)
+            if blocked is not None:
+                return self._suppressed_output(blocked, fenced_spans)
+            if self.store.get_node(ctx_id) is None:
+                raise _ContextGone()
+            _gate.register(self.store, unit)
+            # The context node is found by the unit's own ingest key: proof
+            # it is this unit's record, whatever it was marked before.
+            self.store.record_provenance(ctx_id, unit.owner, proves=True)
             # 1. Refresh the existing context node in place. The content
             #    listener fire is deferred to post-commit by the store, so
             #    the re-embed queue only ever sees committed state.
@@ -819,8 +986,8 @@ class IngestionPipeline:
             id_map = {}
             if extraction_ctx_id is not None:
                 id_map[extraction_ctx_id] = ctx_id
-            # Origin Layer (WS0): same resolve-once-per-input rule as ingest().
-            _origin, _origin_declared = _resolve_origin(input_data)
+            # Origin Layer (WS0): resolved once per input by ingest().
+            _origin, _origin_declared = origin, origin_declared
             for candidate_node in extraction.nodes:
                 if candidate_node.node_id == extraction_ctx_id:
                     continue
@@ -851,7 +1018,7 @@ class IngestionPipeline:
                 # merging for refreshed content waits on a consolidation pass
                 # that runs outside any open transaction.
                 actual_node, is_new = self.dedup.deduplicate_node(
-                    candidate_node, allow_semantic=False
+                    candidate_node, allow_semantic=False, unit_id=unit.owner,
                 )
                 id_map[old_id] = actual_node.node_id
                 if is_new:
@@ -889,6 +1056,11 @@ class IngestionPipeline:
                     continue
                 seen_links.add(label.lower())
                 target = self.ops.find_node_by_label(label, node_type=NodeType.ENTITY)
+                if target is not None:
+                    self.store.record_provenance(
+                        target.node_id, unit.owner, label_ok=True,
+                        wording_ok=(normalize_text(target.content)
+                                    == normalize_text(label)))
                 if target is None:
                     target = self.store.add_node(Node(
                         node_type=NodeType.ENTITY,
@@ -907,7 +1079,7 @@ class IngestionPipeline:
                         origin_source=_origin[1],
                         project_key=_origin[2],
                         session_key=_origin[3],
-                    ))
+                    ), owner=(unit.owner, 1, 1))
                     nodes_created += 1
                     self._register_entity(target)
                     newly_created.append(
@@ -926,6 +1098,17 @@ class IngestionPipeline:
 
             # 3c. Known-entity mention linking over the new content.
             edges_created += self._link_known_mentions(ctx_id, input_data.content)
+
+        # Last word under BEGIN IMMEDIATE (see ingest(), 3a4).
+        _undone = _gate.enforce_after_write(
+            self.store, unit, input_data.content,
+            [nid for nid, _l, _c in newly_created], existing_ids=[ctx_id])
+        if _undone is not None:
+            return self._suppressed_output(_undone, fenced_spans)
+        newly_created = [
+            (n.node_id, n.label, n.content)
+            for n in (self.store.get_node(nid) for nid, _l, _c in newly_created)
+            if n is not None]
 
         # Post-commit: semantic indexing for the NEW extracted nodes (the
         # refreshed context node re-embeds via the store's content listener).

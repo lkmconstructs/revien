@@ -307,7 +307,8 @@ class TestCurrentDaemon:
 
             async def fetch_new_content(self, since):
                 # the reset lands while this fetch is in flight
-                r = reset(monkeypatch, db_path)
+                r = reset(monkeypatch, db_path, "--daemon-url",
+                          f"http://127.0.0.1:{free_port()}")
                 assert r.exit_code == 0, r.output
                 return []
 
@@ -331,7 +332,8 @@ class TestHealthEndpoint:
             raw = client.get("/v1/health").text
         assert body["features"] == list(hb.DAEMON_FEATURES)
         assert set(body) == {"status", "node_count", "edge_count",
-                             "uptime_seconds", "version", "features"}
+                             "uptime_seconds", "version", "features",
+                           "forget_key"}
         assert "secret-name" not in raw and str(tmp_path) not in raw
         assert "db_id" not in body
 
