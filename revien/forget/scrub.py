@@ -400,7 +400,10 @@ def aligned_edge_fragment(field: str, content: str, spans, part: str, others=())
     ``others`` are further (content, spans) pairs the field could just as well
     come from (the other records of the same capture): the field's text must
     not stand anywhere in them except inside a cut occurrence, or it is
-    ambiguous and not cut."""
+    ambiguous and not cut. An entry may carry a third element, True, for the
+    record's own other fields: there a copy that runs to the very edge the
+    field itself was cut at (the text ends where the stretch ends) is another
+    truncation of the same text, not a copy that stands alone."""
     t, _marker = split_marker((field or "").strip())
     t = t.strip()
     if not t or not content or not spans:
@@ -413,13 +416,20 @@ def aligned_edge_fragment(field: str, content: str, spans, part: str, others=())
         # may well come from there: ambiguous, so it is reported, not cut.
         found = False
         ok = True
-        for ctx_content, ctx_spans in [(content, spans), *others]:
+        for entry in [(content, spans), *others]:
+            ctx_content, ctx_spans = entry[0], entry[1]
+            edge_neutral = len(entry) > 2 and entry[2]
             # (case-insensitive: a copy that differs only by case is a copy)
             hay, needle = ctx_content or "", t
             if len(hay.lower()) == len(hay) and len(needle.lower()) == len(needle):
                 hay, needle = hay.lower(), needle.lower()
             i = hay.find(needle) if hay else -1
             while i >= 0:
+                if edge_neutral and (
+                        (kind == "end" and i + len(needle) >= len(hay.rstrip()))
+                        or (kind != "end" and i <= len(hay) - len(hay.lstrip()))):
+                    i = hay.find(needle, i + 1)
+                    continue
                 if kind == "end":
                     pos = i + len(t) - k
                     aligned = any(s0 == pos and e0 >= pos + k for s0, e0 in ctx_spans)

@@ -191,9 +191,12 @@ class WordingForget:
                     # removes the occurrence it is measured against)
                     if table == "nodes" and spans and col in (
                             "label", "event_time_text", "source_context"):
+                        mates = [(vals[cols.index(f)], [], True) for f in (
+                            "label", "event_time_text", "source_context")
+                            if f != col and vals[cols.index(f)]]
                         piece = scrub.aligned_edge_fragment(
                             work, orig_content, spans, part,
-                            others=self._evidence(conn, node_id, (), ctx_orig))
+                            others=self._evidence(conn, node_id, (), ctx_orig) + mates)
                         if piece:
                             work, _ = scrub.cut_edge_fragment(work, part, piece)
                             got.append(piece)
@@ -260,7 +263,7 @@ class WordingForget:
                         out["renamed_ids"].append(new_vals[cols.index(c)])
             if hit_rows:
                 out["tables"][table] = hit_rows
-        self._cut_siblings(conn, sources, part, apply, out, fragments, ctx_orig)
+        self._cut_siblings(conn, sources, part, apply, out, fragments, ctx_orig, pat)
         if fragments:
             self._cut_fragments_in_audit(conn, fragments, part, apply, out)
         return out
@@ -293,7 +296,7 @@ class WordingForget:
                 out.append((r[0] if r and r[0] else "", []))
         return out
 
-    def _cut_siblings(self, conn, sources, part, apply, out, fragments, ctx_orig) -> None:
+    def _cut_siblings(self, conn, sources, part, apply, out, fragments, ctx_orig, pat) -> None:
         """Nodes written by the same capture as a node the string was cut from
         (a fact or a topic taken from a conversation) keep a derived stretch of
         it: the first words of the sentence up to where the extractor stopped.
@@ -322,9 +325,18 @@ class WordingForget:
                 new = list(row)
                 got = []
                 mine = self._evidence(conn, sid, units, ctx_orig)
+                # the record's own words are evidence too: its content as it
+                # was before any cut (with the occurrences in it), and its
+                # other text fields. A stretch that also stands alone in them
+                # is ambiguous, wherever else it came from.
+                own_content, own_spans = sources.get(sid) or (
+                    row[1] or "",
+                    [(m.start(), m.end()) for m in pat.finditer(row[1] or "")])
                 for i, text in enumerate(row):
+                    own = [(own_content, own_spans, True) if j == 1 else (other, [], True)
+                           for j, other in enumerate(row) if j != i and other]
                     piece = scrub.aligned_edge_fragment(
-                        text or "", content, spans, part, others=mine)
+                        text or "", content, spans, part, others=mine + own)
                     if piece:
                         new[i], _ = scrub.cut_edge_fragment(text, part, piece)
                         got.append(piece)
