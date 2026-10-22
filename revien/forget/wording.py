@@ -317,6 +317,8 @@ class WordingForget:
                     "SELECT node_id FROM node_provenance WHERE unit_id = ?", (u,)))
             sib.discard(nid)
             for sid in sib:
+                if sid in sources:
+                    continue          # holds the string itself: the cut above judged it
                 row = conn.execute(
                     "SELECT " + ", ".join(fields) + " FROM nodes WHERE node_id = ?",
                     (sid,)).fetchone()
@@ -325,15 +327,22 @@ class WordingForget:
                 new = list(row)
                 got = []
                 mine = self._evidence(conn, sid, units, ctx_orig)
-                # the record's own words are evidence too: its content as it
-                # was before any cut (with the occurrences in it), and its
-                # other text fields. A stretch that also stands alone in them
-                # is ambiguous, wherever else it came from.
-                own_content, own_spans = sources.get(sid) or (
-                    row[1] or "",
-                    [(m.start(), m.end()) for m in pat.finditer(row[1] or "")])
+                # The record's own words are evidence too: its content and its
+                # other text fields. A copy that runs to the very edge the
+                # field was cut at counts as another truncation ONLY if the
+                # capture that wrote this record (its create row) is the one
+                # whose captured text holds the occurrence; a record made any
+                # other way, or whose create row cannot prove it, is judged
+                # by its words alone (a copy that stands alone is ambiguous).
+                made = conn.execute(
+                    "SELECT actor FROM audit_log WHERE node_id = ? AND op = 'create' "
+                    "ORDER BY id LIMIT 1", (sid,)).fetchone()
+                by_capture = bool(made and isinstance(made[0], str)
+                                  and made[0].startswith("capture:")
+                                  and made[0][len("capture:"):] in set(units))
+                own_content = row[1] or ""
                 for i, text in enumerate(row):
-                    own = [(own_content, own_spans, True) if j == 1 else (other, [], True)
+                    own = [(own_content, [], by_capture) if j == 1 else (other, [], by_capture)
                            for j, other in enumerate(row) if j != i and other]
                     piece = scrub.aligned_edge_fragment(
                         text or "", content, spans, part, others=mine + own)

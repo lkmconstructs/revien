@@ -1034,9 +1034,14 @@ class GraphStore(ForgetStoreMixin):
                     conn, node.node_id, unit_id, label_ok, wording_ok)
             # Provenance hook: record node creation. Inside the transaction an
             # audit failure rolls the insert back — provenance is required.
+            # The create row records who wrote the node: the confidence setter
+            # if it named one, else the capture (unit) that vouched for it. A
+            # forget uses this to tell a label truncated by the capture that
+            # wrote it from a record that merely looks like one.
             self._record_node_audit(
                 node.node_id, "create",
-                actor=node.confidence_set_by,
+                actor=node.confidence_set_by or (
+                    f"capture:{owner[0]}" if owner is not None else ""),
                 before_node=None, after_node=node,
             )
         return node
