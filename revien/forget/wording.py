@@ -317,8 +317,6 @@ class WordingForget:
                     "SELECT node_id FROM node_provenance WHERE unit_id = ?", (u,)))
             sib.discard(nid)
             for sid in sib:
-                if sid in sources:
-                    continue          # holds the string itself: the cut above judged it
                 row = conn.execute(
                     "SELECT " + ", ".join(fields) + " FROM nodes WHERE node_id = ?",
                     (sid,)).fetchone()
@@ -340,6 +338,10 @@ class WordingForget:
                 by_capture = bool(made and isinstance(made[0], str)
                                   and made[0].startswith("capture:")
                                   and made[0][len("capture:"):] in set(units))
+                if not by_capture:
+                    # not provably written by the capture that holds the
+                    # occurrence: no field of it is cut (it is reported)
+                    continue
                 own_content = row[1] or ""
                 for i, text in enumerate(row):
                     own = [(own_content, [], by_capture) if j == 1 else (other, [], by_capture)

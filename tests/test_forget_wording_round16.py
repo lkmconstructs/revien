@@ -46,6 +46,7 @@ def test_T3_a_sentence_without_a_period_is_not_a_truncation_once_its_context_is_
     assert d.label == LABEL
     res = forget_wording(db, KEY)
     assert _node(db, d.node_id).label == LABEL
+    assert _node(db, d.node_id).content == f"We decided to {LABEL}"      # no field is cut
     assert res["scope"] != "gone everywhere" and pieces_reported(res)
 
 
@@ -58,7 +59,7 @@ def test_T4_a_record_made_outside_a_capture_is_not_cut(db):
     s.record_provenance(d.node_id, "unitB")                                      # B's capture deduped into it
     s.close()
     res = forget_wording(db, KEY)
-    assert _node(db, d.node_id).label == LABEL
+    assert _node(db, d.node_id).label == LABEL and _node(db, d.node_id).content == LABEL
     assert res["scope"] != "gone everywhere" and pieces_reported(res)
 
 
@@ -75,7 +76,7 @@ def test_T5_a_record_whose_create_row_is_gone_is_not_cut(db):
     conn.commit()
     conn.close()
     res = forget_wording(db, KEY)
-    assert _node(db, d.node_id).label == LABEL
+    assert _node(db, d.node_id).label == LABEL and _node(db, d.node_id).content == LABEL
     assert res["scope"] != "gone everywhere"
 
 
@@ -124,3 +125,37 @@ def test_a_continuation_line_that_starts_with_the_tail_is_cut(db):
     forget_wording(db, key)
     cut = not _node(db, f.node_id).label.startswith(tail[:10])
     assert cut
+
+
+def test_T3_with_a_content_that_is_not_the_label(db):
+    """The content is itself a stretch of the other session's text: it is
+    not cut either unless the create row proves the capture."""
+    s = GraphStore(db_path=db)
+    s.add_node(Node(node_type=NodeType.CONTEXT, label="session B",
+                    content=f"User: We decided to rotate the {KEY} today."),
+               owner=("unitB", 1, 1))
+    d = s.add_node(Node(node_type=NodeType.DECISION, label="a rotation decision",
+                        content=f"We decided to {LABEL}"), owner=("unitA", 1, 1))
+    s.record_provenance(d.node_id, "unitB")
+    s.close()
+    res = forget_wording(db, KEY)
+    assert _node(db, d.node_id).content == f"We decided to {LABEL}"
+    assert res["scope"] != "gone everywhere"
+
+
+def test_a_preview_counts_what_the_forget_cuts(db, tmp_path):
+    """A record that holds the string itself is judged once, by the main cut:
+    the preview and the forget agree on the count."""
+    import shutil
+    s = GraphStore(db_path=db)
+    s.add_node(Node(node_type=NodeType.CONTEXT, label="session B",
+                    content=f"User: We decided to rotate the {KEY} today."),
+               owner=("unitB", 1, 1))
+    s.add_node(Node(node_type=NodeType.DECISION, label=LABEL,
+                    content=f"We decided to rotate the {KEY} today."), owner=("unitB", 1, 1))
+    s.close()
+    copy = str(tmp_path / "copy.db")
+    shutil.copy(db, copy)
+    pre = forget_wording(copy, KEY, dry_run=True)
+    res = forget_wording(db, KEY)
+    assert pre["would_cut_occurrences"] == res["occurrences_cut"], (pre, res["occurrences_cut"])
