@@ -841,7 +841,7 @@ M = [
     ("edge-neutral-everywhere", 1, "revien/forget/scrub.py",
      "            edge_neutral = len(entry) > 2 and entry[2]",
      "            edge_neutral = True",
-     ["tests/test_forget_wording_round16.py -k T6"]),
+     ["tests/test_forget_wording_round16.py -k T6_a_kept"]),
     ("in-node-mates-dropped", 1, "revien/forget/wording.py",
      "                            if f != col and vals[cols.index(f)]]",
      "                            if False]",

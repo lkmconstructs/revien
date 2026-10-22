@@ -46,8 +46,8 @@ def _two_sessions(db, a_text):
     # (its own words do not repeat the stretch: only the sessions' texts do)
     d = s.add_node(Node(node_type=NodeType.DECISION, label="rotate the staging-credentials",
                         content="A rotation decision was recorded."),
-                   owner=("unitA", 1, 1))
-    s.record_provenance(d.node_id, "unitB")
+                   owner=("unitB", 1, 1))            # written by B's capture ...
+    s.record_provenance(d.node_id, "unitA")          # ... and later vouched for by A
     s.close()
     return d.node_id
 

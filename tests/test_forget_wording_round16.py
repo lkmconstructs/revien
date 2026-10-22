@@ -159,3 +159,19 @@ def test_a_preview_counts_what_the_forget_cuts(db, tmp_path):
     pre = forget_wording(copy, KEY, dry_run=True)
     res = forget_wording(db, KEY)
     assert pre["would_cut_occurrences"] == res["occurrences_cut"], (pre, res["occurrences_cut"])
+
+
+def test_T6_a_kept_context_without_a_period_blocks_the_cut_of_a_capture_made_record(db):
+    s = GraphStore(db_path=db)
+    s.add_node(Node(node_type=NodeType.CONTEXT, label="session A",
+                    content=f"User: We decided to {LABEL}"), owner=("unitA", 1, 1))
+    s.add_node(Node(node_type=NodeType.CONTEXT, label="session B",
+                    content=f"User: We decided to rotate the {KEY} today."),
+               owner=("unitB", 1, 1))
+    d = s.add_node(Node(node_type=NodeType.DECISION, label="a rotation decision",
+                        content=f"We decided to {LABEL}"), owner=("unitB", 1, 1))
+    s.record_provenance(d.node_id, "unitA")
+    s.close()
+    res = forget_wording(db, KEY)
+    assert _node(db, d.node_id).content == f"We decided to {LABEL}"
+    assert res["scope"] != "gone everywhere"
