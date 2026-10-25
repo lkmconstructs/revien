@@ -803,3 +803,14 @@ def test_a_write_during_the_file_copy_falls_back_to_sqlite(tmp_path, monkeypatch
     dst = str(tmp_path / "copy.db")
     assert ab_exact.copy_database(db, dst) == "sqlite_backup"
     assert _label(dst, nid) == "Gamma"
+
+
+def test_a_long_question_reports_the_cut(world):
+    db, qpath, ids, _ = world
+    q = "lorem ipsum " * 400 + "who is Dana Reyes"
+    rep = ab_exact.run_ab(db, [{"text": q, "gold": [ids["dana"]], "category": "exact"}],
+                          semantic_factory=factory)
+    det = rep["queries"][0]["exact_detected"]
+    assert det["truncated"] is True and det["query_chars"] == len(q)
+    assert det["scanned_chars"] <= 4096
+    assert [n["text"] for n in det["names"]] == ["Dana Reyes"]

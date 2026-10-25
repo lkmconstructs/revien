@@ -53,7 +53,8 @@ DETECTION RULES (deterministic; no model; every rule is here)
         ("3/10/2026"; any M/D/Y is a date); or it follows ON, BY, BEFORE,
         AFTER, SINCE, UNTIL, TILL or THROUGH (SLASH_DATE_PREPOSITIONS,
         optionally with "the" between: "on 3/10", "by the 3/10"), is not
-        followed by "of" ("through 3/4 of the book"), and, after BY, does not
+        followed by "of" or a hyphenated unit ("through 3/4 of the book",
+        "on 3/4-inch pipe"), and, after BY, does not
         follow a verb of quantity ("reduced by 1/2", FRACTION_VERBS). No other
         word marks one: "of", "from", "between", "during", "in", "out of",
         "score of" do not ("a score of 8/10", "the ratio of 3/4", "between
@@ -64,6 +65,16 @@ DETECTION RULES (deterministic; no model; every rule is here)
         after "on".
       * a date's characters are blanked once it is read, and the text on
         either side of a blanked date never joins into another date.
+      * edges. No date reads across a slash, a hyphen or a dot into another
+        number: a number at either end of a match touches no digit, "/" or
+        "-", nor a "." or "-" with a digit beyond it, and a month word at
+        either end touches no "/" and no "-" joined to a digit (_NUM_L,
+        _NUM_R, _MON_L, _MON_R). "21 September 3/4" is Sept 21, not Sept 3;
+        "the 3/4 May meeting" and "on 9/21 Mar" hold no May 4 and no Mar 21;
+        "1-3/4 cups", "v1.5 May", "Apr/May 2026" and "September 2026/27"
+        hold no date. A range written with a hyphen is not read either
+        ("May 5-10", "9/21-9/23", "9/21/2026-9/23/2026"): write "from 9/21
+        to 9/23". "mid-May 2026" is still May 2026.
       * versions. Dotted numbers are never dates ("release 2024.1.5",
         "v2024.01.05"): the year-first form accepts "-" and "/" only.
       * words. "march", "mar", "may" and "jan" are ordinary words or names as
@@ -109,18 +120,29 @@ DETECTION RULES (deterministic; no model; every rule is here)
     ALL CAPS or has a digit ("REV-FIX"), or a run of 5+ digits. Ordinals and
     clock/size shorthand ("21st", "3pm", "10:30", "5k") and plain years are
     not IDs. Tokens consumed by a date or quote are not IDs. Matching is a
-    label equal to the token, a label containing the token as a whole token
-    (the first MAX_CONTAINED_CODES (16) codes of 4+ characters only: that
-    lookup reads the label column once per code), or a node id equal to the
-    token. Never node content.
- 5. How much of a query is read. The lane reads at most the first
-    SCAN_CHARS (4,096, REVIEN_EXACT_SCAN_CHARS) characters of a query, cut
-    back to the last whitespace so no token is split; the rest is not
-    searched for signals, and a query that was cut has no whole-query label
-    (rule 3). Diagnostics say "scanned_chars" when a query was cut. Detection
-    is a single left-to-right pass per rule (linear in what it reads). The
-    bound is the lane's own: the rest of recall sees the whole query, and
-    with the lane off none of this runs.
+    label equal to the token, a label containing the token as a whole token,
+    or a node id equal to the token. Never node content. The containment
+    lookup reads the label column once per code, so it is made for at most
+    MAX_CONTAINED_CODES (16, REVIEN_EXACT_MAX_CONTAINED_CODES; 0 turns it
+    off) codes of 4+ characters per query, the most distinctive first:
+    longest first, ties in query order. Equality and node-id matching still
+    run for every code. A code left out is reported, never silently
+    unmatched: its ids entry says "contained_search": "skipped_by_cap", and
+    detected["ids_capped"] gives {"capped": true, "searched", "skipped",
+    "skipped_codes", "max_contained_codes"}.
+ 5. How much of a query is read. The lane reads at most SCAN_CHARS (4,096,
+    REVIEN_EXACT_SCAN_CHARS) characters of a query. A longer query is read
+    at both ends, since the question often comes last: the first half of
+    the budget (2,048) and the last half (2,048), each cut at whitespace so
+    no token is split. The middle is not searched for signals; the two ends
+    are read apart (nothing joins across the gap, and the tail starts a
+    sentence), and a query that was cut has no whole-query label (rule 3).
+    A cut is always reported, signal or not: detected["truncated"] is true,
+    with "scanned_chars" and "query_chars" (build returns a result with no
+    boost instead of None, so debug diagnostics show it). Detection is a
+    single left-to-right pass per rule (linear in what it reads). The bound
+    is the lane's own: the rest of recall sees the whole query, and with the
+    lane off none of this runs.
 
 THE BOOST (bounded, not a promotion)
 
@@ -285,17 +307,31 @@ _ORD = r"(?:st|nd|rd|th)?"
 _RE_QUOTE = re.compile(
     r"\"([^\"]{2,80})\"|“([^”]{2,80})”|"
     r"(?<![A-Za-z0-9])'([^']{2,80})'(?![A-Za-z0-9])")
+# The edges of a date (rule 2): a date never reads across a slash, a hyphen
+# or a dot into another number ("21 September 3/4" is not Sept 3, "the 3/4
+# May meeting" is not May 4, "on 9/21 Mar" is not Mar 21, "May 5-10" and
+# "1-3/4" are not dates). A number at either end of a match touches no digit,
+# no "/" and no "-"; nor a "." or "-" with a digit beyond it. A month word at
+# either end touches no "/" and no "-" joined to a digit ("mid-May 2026" is
+# still May 2026).
+_NUM_L = r"(?<![\d/\-])(?<!\d\.)"
+_NUM_R = r"(?!\d)(?![/\-.]\d)"
+_MON_L = r"(?<!/)(?<!\d-)"
+_MON_R = r"(?!/)(?!-\d)"
 # Year-first accepts "-" and "/" only: dotted numbers are versions ("2024.1.5").
-_RE_ISO = re.compile(r"(?<![\d/.-])(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?!\d|[/.]\d)")
-_RE_SLASH_Y = re.compile(r"(?<![\d/.])(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})(?![\d/])")
+_RE_ISO = re.compile(r"(?<![\d/.-])(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?!\d|[/.\-]\d)")
+_RE_SLASH_Y = re.compile(
+    r"(?<![\d/.\-])(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})(?![\d/])(?![\-.]\d)")
 _RE_DMY = re.compile(
-    rf"\b(\d{{1,2}}){_ORD}\s+(?:of\s+)?{_MON}\b\.?,?\s+(\d{{4}})\b", re.I)
+    rf"{_NUM_L}\b(\d{{1,2}}){_ORD}\s+(?:of\s+)?{_MON}\b\.?,?\s+(\d{{4}})\b{_NUM_R}",
+    re.I)
 _RE_MDY = re.compile(
-    rf"\b{_MON}\b\.?\s+(\d{{1,2}}){_ORD}\b,?\s+(\d{{4}})\b", re.I)
-_RE_MD = re.compile(rf"\b{_MON}\b\.?\s+(\d{{1,2}}){_ORD}\b", re.I)
-_RE_DM = re.compile(rf"\b(\d{{1,2}}){_ORD}\s+(?:of\s+)?{_MON}\b", re.I)
-_RE_SLASH = re.compile(r"(?<![\d/.])(\d{1,2})/(\d{1,2})(?![\d/])")
-_RE_MY = re.compile(rf"\b{_MON}\b\.?,?\s+(\d{{4}})\b", re.I)
+    rf"{_MON_L}\b{_MON}\b\.?\s+(\d{{1,2}}){_ORD}\b,?\s+(\d{{4}})\b{_NUM_R}", re.I)
+_RE_MD = re.compile(rf"{_MON_L}\b{_MON}\b\.?\s+(\d{{1,2}}){_ORD}\b{_NUM_R}", re.I)
+_RE_DM = re.compile(
+    rf"{_NUM_L}\b(\d{{1,2}}){_ORD}\s+(?:of\s+)?{_MON}\b{_MON_R}", re.I)
+_RE_SLASH = re.compile(r"(?<![\d/.\-])(\d{1,2})/(\d{1,2})(?![\d/])(?![\-.]\d)")
+_RE_MY = re.compile(rf"{_MON_L}\b{_MON}\b\.?,?\s+(\d{{4}})\b{_NUM_R}", re.I)
 
 _RE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_'’.\-/:]*[A-Za-z0-9]|[A-Za-z0-9]")
 _RE_ORDINAL_OR_UNIT = re.compile(
@@ -327,7 +363,9 @@ FRACTION_VERBS = frozenset({
 # A taken date is blanked with this in the text the date rules read, so the
 # text either side of it can never be joined into another date by "\s+".
 _GONE = "\x00"
-_RE_OF_NEXT = re.compile(r"\s+of\b", re.I)
+# After a ratio-shaped a/b: "of" ("3/4 of the book") or a hyphenated unit
+# ("3/4-inch") makes it a fraction.
+_RE_OF_NEXT = re.compile(r"\s+of\b|-[A-Za-z]", re.I)
 _RE_ALPHA_RUN = re.compile(r"[A-Za-z]+")
 
 
@@ -372,6 +410,7 @@ class ExactConfig:
     neighbor_max: int = NEIGHBOR_MAX
     bm25_label_scale: float = BM25_LABEL_SCALE
     scan_chars: int = SCAN_CHARS
+    max_contained_codes: int = MAX_CONTAINED_CODES
     common_words: Set[str] = field(default_factory=lambda: set(COMMON_WORDS))
     framing_words: Set[str] = field(default_factory=lambda: set(FRAMING_WORDS))
 
@@ -396,6 +435,8 @@ class ExactConfig:
                 "REVIEN_EXACT_BM25_LABEL_SCALE", BM25_LABEL_SCALE))),
             scan_chars=max(1, int(_env_float(
                 "REVIEN_EXACT_SCAN_CHARS", SCAN_CHARS))),
+            max_contained_codes=max(0, int(_env_float(
+                "REVIEN_EXACT_MAX_CONTAINED_CODES", MAX_CONTAINED_CODES))),
             common_words=cls._words_from_env(
                 "REVIEN_EXACT_COMMON_WORDS", COMMON_WORDS),
             framing_words=cls._words_from_env(
@@ -453,9 +494,14 @@ class ExactSignals:
     # Every word left once dates and quotes are blanked, lowercased, trimmed,
     # possessive dropped; indexed like NameSpan.start/end.
     words: List[str] = field(default_factory=list)
-    # Characters read when the query was longer than the scan bound (rule 5);
-    # None when the whole query was read.
+    # Characters read when the query was longer than the scan bound (rule 5),
+    # and the query's length; both None when the whole query was read.
     scanned_chars: Optional[int] = None
+    query_chars: Optional[int] = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.scanned_chars is not None
 
     @property
     def needs_lookup(self) -> bool:
@@ -512,8 +558,9 @@ def _preceding(words: List[str]) -> Tuple[str, str]:
 def _slash_marked_as_date(m, prev: str, prev2: str, after: str) -> bool:
     """A bare a/b the ratio rule would drop is still a date when it is
     zero-padded ("03/10"), or when it follows a SLASH_DATE_PREPOSITIONS word
-    ("on 3/10"), is not a fraction OF something ("through 3/4 of the book"),
-    and is not an amount after a verb of quantity ("reduced by 1/2")."""
+    ("on 3/10"), is not a fraction of something or of a unit ("through 3/4
+    of the book", "on 3/4-inch pipe"), and is not an amount after a verb of
+    quantity ("reduced by 1/2")."""
     if any(len(g) == 2 and g[0] == "0" for g in (m[1], m[2])):
         return True
     if prev not in SLASH_DATE_PREPOSITIONS:
@@ -683,15 +730,25 @@ def _is_id_token(tok: str) -> bool:
     return False
 
 
-def _scan_prefix(text: str, max_chars: int) -> str:
-    """The first ``max_chars`` characters of ``text``, cut back to the last
-    whitespace when the cut would split a token (rule 5)."""
-    head = text[:max_chars]
-    if len(text) > max_chars and not text[max_chars].isspace():
-        k = max(head.rfind(c) for c in " \t\n\r\f\v")
-        if k > 0:
-            head = head[:k]
-    return head
+_WS = " \t\n\r\f\v"
+
+
+def _scan_ends(text: str, max_chars: int) -> Tuple[str, str]:
+    """(head, tail) of a query longer than ``max_chars`` (rule 5): the first
+    half of the budget from the start, the rest from the end, each cut at
+    whitespace so no token is split (a part that is one split token is
+    dropped)."""
+    h = max_chars // 2
+    head = text[:h]
+    if h < len(text) and head and not text[h].isspace():
+        k = max(head.rfind(c) for c in _WS)
+        head = head[:k] if k >= 0 else ""
+    start = len(text) - (max_chars - h)
+    tail = text[start:] if start < len(text) else ""
+    if tail and start > 0 and not text[start - 1].isspace():
+        ks = [k for k in (tail.find(c) for c in _WS) if k >= 0]
+        tail = tail[min(ks) + 1:] if ks else ""
+    return head, tail
 
 
 _RE_EDGE_JUNK = re.compile(r"[\W_]*")
@@ -712,16 +769,44 @@ def parse_signals(query: str, common_words: Optional[Set[str]] = None,
                   max_chars: int = SCAN_CHARS) -> ExactSignals:
     """Pure, deterministic detection (rules in the module docstring).
     ``common_words`` is the set a sentence-initial single word is dropped on
-    (default COMMON_WORDS; the lane passes its configured set). Only the
-    first ``max_chars`` characters are read (rule 5; the lane passes its
+    (default COMMON_WORDS; the lane passes its configured set). At most
+    ``max_chars`` characters are read: a longer query is read at its start
+    and its end, half the budget each (rule 5; the lane passes its
     configured bound)."""
     common = COMMON_WORDS if common_words is None else common_words
-    sig = ExactSignals()
-    work = query or ""
-    if len(work) > max_chars:
-        work = _scan_prefix(work, max_chars)
-        sig.scanned_chars = len(work)
+    text = query or ""
+    if len(text) <= max_chars:
+        sig = _parse_text(text, common)
+        # Whole-query label (lowercase single tokens like "harbor"); only
+        # when the whole query was read.
+        whole = re.sub(r"\s+", " ", _trim_edges(text)).strip()
+        whole = _RE_POSSESSIVE.sub("", whole)
+        if whole and len(whole.split()) <= MAX_SPAN_TOKENS:
+            sig.whole_query = whole
+        return sig
+    # Head and tail are read apart, so nothing in one can join anything in
+    # the other (a quote, a date, a name); the tail's first token counts as
+    # the start of a sentence.
+    head, tail = _scan_ends(text, max_chars)
+    sig = _parse_text(head, common)
+    rest = _parse_text(tail, common)
+    off = len(sig.words)
+    sig.quoted += rest.quoted
+    sig.dates += rest.dates
+    seen = {x.lower() for x in sig.ids}
+    sig.ids += [x for x in rest.ids if x.lower() not in seen]
+    sig.spans += [NameSpan(s.text, s.start + off, s.end + off, s.sentence_start)
+                  for s in rest.spans]
+    sig.words += rest.words
+    sig.scanned_chars = len(head) + len(tail)
+    sig.query_chars = len(text)
+    return sig
 
+
+def _parse_text(work: str, common: Set[str]) -> ExactSignals:
+    """Quotes, dates, codes and names in ``work`` (no bound, no whole-query
+    label: parse_signals adds those)."""
+    sig = ExactSignals()
     for m in _RE_QUOTE.finditer(work):
         phrase = next(g for g in m.groups() if g is not None)
         if phrase.strip():
@@ -791,14 +876,6 @@ def parse_signals(query: str, common_words: Optional[Set[str]] = None,
                     continue
                 sig.spans.append(NameSpan(text, a, b, starts))
         i = j
-
-    # Whole-query label (lowercase single tokens like "harbor"); only when the
-    # whole query was read.
-    if sig.scanned_chars is None:
-        whole = re.sub(r"\s+", " ", _trim_edges(query or "")).strip()
-        whole = _RE_POSSESSIVE.sub("", whole)
-        if whole and len(whole.split()) <= MAX_SPAN_TOKENS:
-            sig.whole_query = whole
     return sig
 
 
@@ -956,7 +1033,11 @@ class ExactLane:
         label_scale: float = 1.0,
     ) -> Optional[ExactResult]:
         """None when the query carries no exact signal (the caller then does
-        nothing and recall is byte-identical to the lane being off).
+        nothing and recall is byte-identical to the lane being off), except
+        for a query longer than the scan bound: that returns a result with
+        no boost and no injection, whose diagnostics report the cut (results
+        and scores are then the same as with the lane off; only
+        diagnostics["exact"] is added).
 
         ``label_scale`` multiplies every boost that comes from label text
         (name, quote, id, whole-query); the engine passes
@@ -964,7 +1045,7 @@ class ExactLane:
         is on, and 1.0 otherwise."""
         cfg = self.config
         sig = self.parse(query)
-        if not sig.needs_lookup:
+        if not sig.needs_lookup and not sig.truncated:
             return None
         ls = label_scale
         scope = dict(origin_runtime=origin_runtime,
@@ -1111,14 +1192,21 @@ class ExactLane:
         if sig.ids:
             id_rows = self.store.exact_node_ids(sig.ids, **scope)
             id_hit = {r[0] for r in id_rows}
-            long_ids = [t for t in sig.ids
-                        if len(t) >= 4][:MAX_CONTAINED_CODES]
-            contain_set = set(long_ids)
-            # ONE pass over the label column for every code in the query.
+            # Codes of 4+ characters are also looked for INSIDE labels, at
+            # most max_contained_codes of them, the most distinctive first:
+            # longest first (a longer code is contained in fewer labels),
+            # ties in query order. The rest are reported as skipped.
+            long_ids = [t for t in sig.ids if len(t) >= 4]
+            ranked = sorted(range(len(long_ids)),
+                            key=lambda i: (-len(long_ids[i]), i))
+            searched = [long_ids[i] for i in ranked[:cfg.max_contained_codes]]
+            skipped = [long_ids[i] for i in ranked[cfg.max_contained_codes:]]
+            contain_set, skipped_set = set(searched), set(skipped)
+            # ONE pass over the label column for every searched code.
             contain_rows = (
                 self.store.exact_label_contains(
-                    [ascii_lower(t) for t in long_ids], **scope)
-                if long_ids else [])
+                    [ascii_lower(t) for t in searched], **scope)
+                if searched else [])
             for t in sig.ids:
                 label_equal: Set[str] = {nid for nid, _t in by_key.get(_sql_key(t), [])}
                 node_id_equal: Set[str] = {nid for nid in id_hit if nid == t}
@@ -1152,7 +1240,10 @@ class ExactLane:
                         if scale != 1.0:
                             ent["label_scale"] = scale
                         add(nid, ent, cfg.boost_max * strength * weight * scale)
-                ids_report.append({"text": t, "matched": rep_matched})
+                entry = {"text": t, "matched": rep_matched}
+                if t in skipped_set:
+                    entry["contained_search"] = "skipped_by_cap"
+                ids_report.append(entry)
 
         # ---- whole-query label (lowercase titles such as "harbor") -----------------
         whole_report = None
@@ -1221,12 +1312,21 @@ class ExactLane:
             "whole_query": whole_report,
             "entity_anchors": list(entity_anchor_ids or []),
         }
-        if sig.scanned_chars is not None:
+        if sig.truncated:
+            # Reported whether or not a signal was found (build then returns
+            # a result with no boost rather than None).
+            detected["truncated"] = True
             detected["scanned_chars"] = sig.scanned_chars
+            detected["query_chars"] = sig.query_chars
+        if sig.ids and skipped:
+            detected["ids_capped"] = {
+                "capped": True, "max_contained_codes": cfg.max_contained_codes,
+                "searched": len(searched), "skipped": len(skipped),
+                "skipped_codes": skipped}
         has_signal = bool(
             quoted_report or dates_report or ids_report or accepted_names
             or unmatched_names or whole_report)
-        if not has_signal:
+        if not has_signal and not sig.truncated:
             return None
         return ExactResult(detected=detected, matches=matches, boost=boost,
                            inject_ids=inject)

@@ -151,8 +151,16 @@ anything on.
   cannot see.
 - A bare `3/4`-style date needs a marker to be read as one (`on 3/4`,
   `03/04`, `3/4/2026`; see `exact.py`): "the week of 3/10" or "from 3/4 to
-  3/8" are read as ratios, not dates. Write date questions the way your
-  users would, and check the report's detected dates.
+  3/8" are read as ratios, not dates, and no date reads across a slash or a
+  hyphen into another number ("May 5-10", "21 September 3/4" is September
+  21). Write date questions the way your users would, and check the
+  report's detected dates.
+- The lane reads at most 4,096 characters of a question: a longer one is
+  read at its first and last 2,048 (cut at whitespace), and its
+  `exact_detected` says `truncated` with `scanned_chars` and `query_chars`.
+  At most 16 codes per question are looked for inside labels, longest
+  first; when more were asked, `exact_detected.ids_capped` lists the ones
+  left out (`REVIEN_EXACT_MAX_CONTAINED_CODES` raises the cap).
 - The reranker is on by default in production. It re-sorts the top 20
   candidates by its own score, on a scale of its own. With it on the lane
   works twice: before reranking its boost decides which nodes enter that head,

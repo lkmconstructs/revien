@@ -763,30 +763,83 @@ class TestDetectionIsLinear:
         dates, _ = parse_dates("on 3/4 " * 20000)
         assert len(dates) == 20000
 
-    def test_the_lane_reads_only_the_first_scan_chars(self, store, monkeypatch):
+    def test_a_long_query_is_read_at_both_ends(self, store, monkeypatch):
         from revien.retrieval.exact import SCAN_CHARS
         k = add(store, "Project Kestrel", "k")
+        d = add(store, "Dana Reyes", "d")
         filler = "x " * 3000                       # 6000 characters
-        q = filler + "Project Kestrel"
+        assert len(filler) > SCAN_CHARS
+        # the question comes last: the tail is read
+        r = ExactLane(store, ExactConfig()).build(filler + "Project Kestrel", [])
+        assert k.node_id in r.matches
+        assert r.detected["truncated"] is True
+        assert r.detected["scanned_chars"] <= SCAN_CHARS
+        assert r.detected["query_chars"] == len(filler) + len("Project Kestrel")
+        # and the head is read too
+        r = ExactLane(store, ExactConfig()).build("Who is Dana Reyes? " + filler, [])
+        assert d.node_id in r.matches
+        # the middle is not
+        q = filler + "Project Kestrel " + filler
         assert parse_signals(q).spans == []
-        assert ExactLane(store, ExactConfig()).build(q, []) is None
+        r = ExactLane(store, ExactConfig()).build(q, [])
+        assert r is not None and r.boost == {} and r.inject_ids == []
+        assert r.detected["truncated"] is True
         monkeypatch.setenv("REVIEN_EXACT_SCAN_CHARS", "100000")
         cfg = ExactConfig.from_env()
         assert cfg.scan_chars == 100000
         r = ExactLane(store, cfg).build(q, [])
-        assert k.node_id in r.matches and "scanned_chars" not in r.detected
-        # inside the bound: read as before, and no "scanned_chars"
+        assert k.node_id in r.matches and "truncated" not in r.detected
+        # inside the bound: read as before, and no cut reported
         r = ExactLane(store, ExactConfig()).build("who is Project Kestrel", [])
-        assert "scanned_chars" not in r.detected
-        assert len(filler) > SCAN_CHARS
+        assert "truncated" not in r.detected and "scanned_chars" not in r.detected
+
+    def test_the_verifiers_case_question_last(self, store, dated):
+        # 4.6 KB of filler, then the question: it used to be dropped silently
+        d = add(store, "Dana Reyes", "d")
+        q = "lorem ipsum " * 384 + "Who is Dana Reyes? ... on 9/21"
+        assert len(q) > 4600
+        r = ExactLane(store, ExactConfig()).build(q, [])
+        assert r.detected["truncated"] is True
+        dana = [x for x in r.detected["names"] if x["text"] == "Dana Reyes"]
+        assert dana and dana[0]["matched"] == [d.node_id]
+        assert r.detected["dates"][0]["text"] == "9/21"
+        assert dated["day"].node_id in r.boost
+
+    def test_a_cut_is_reported_even_with_no_signal(self, store):
+        q = "lorem ipsum " * 600
+        r = ExactLane(store, ExactConfig()).build(q, [])
+        assert r is not None and r.boost == {} and r.matches == {}
+        assert r.detected["truncated"] is True
+        assert r.detected["query_chars"] == len(q)
+        assert ExactLane(store, ExactConfig()).build("lorem ipsum", []) is None
 
     def test_the_cut_never_splits_a_token(self):
         from revien.retrieval.exact import SCAN_CHARS
+        half = SCAN_CHARS - SCAN_CHARS // 2
+        # a head that is one split token is dropped; the tail is read whole
         q = "a" * (SCAN_CHARS - 6) + " PR-123456 tail"
         sig = parse_signals(q)
-        assert sig.ids == [] and sig.scanned_chars == SCAN_CHARS - 6
-        q2 = "y " * (SCAN_CHARS // 2 - 3) + "on 2026-09-21 more"
-        assert parse_signals(q2).dates == []       # cut before the date
+        assert sig.ids == ["PR-123456"] and sig.truncated
+        # the tail would start inside "QQ-123456": it starts after it instead
+        q = "y " * 2000 + "QQ-123456" + " w" * (half // 2 - 4)
+        sig = parse_signals(q)
+        assert sig.ids == [] and sig.truncated
+        assert len(" w" * (half // 2 - 4)) < half < len(" w" * (half // 2 - 4)) + 9
+        # a date in the middle is not read
+        q2 = "y " * 1500 + "on 2026-09-21 " + "y " * 1500
+        assert parse_signals(q2).dates == []
+
+    def test_head_and_tail_never_join(self):
+        from revien.retrieval.exact import SCAN_CHARS
+        h = SCAN_CHARS // 2
+        # "Sept" ends the head and "21" starts the tail: not Sept 21
+        head = "z " * ((h - 5) // 2) + "Sept"
+        q = head + " " + "m " * 3000 + "21 " + "w " * ((SCAN_CHARS - h - 3) // 2 - 1)
+        sig = parse_signals(q)
+        assert sig.truncated and sig.dates == []
+        # a quote opened in the head and closed in the tail is not a quote
+        q = "z " * ((h - 9) // 2) + '"Project' + " m" * 3000 + ' Atlas"' + " w" * 1000
+        assert parse_signals(q).quoted == []
 
     def test_a_cut_query_has_no_whole_query_label(self, store):
         add(store, "harbor", "h")
@@ -794,16 +847,23 @@ class TestDetectionIsLinear:
         assert parse_signals(q, max_chars=10 ** 9).whole_query == "harbor"
         assert parse_signals(q).whole_query is None
 
-    def test_past_the_bound_the_lane_is_silent_and_recall_is_unchanged(self, store):
+    def test_past_the_bound_the_lane_adds_only_its_report(self, store):
         # The bound is the lane's own: recall still reads the whole query
-        # (keyword recall finds the node), and a signal past the bound is not
-        # read by the lane, so recall with it on is the same as with it off.
+        # (keyword recall finds the node). A signal in the middle of a long
+        # query is not read by the lane, so results and scores are the same
+        # as with it off; only diagnostics["exact"] says where it cut.
         k = add(store, "Project Kestrel", "kestrel notes")
-        q = "kestrel " * 1000 + "Project Kestrel"
+        q = "kestrel " * 500 + "Project Kestrel " + "kestrel " * 500
         off = strip(engine_for(store, exact=False).recall(q, top_n=5, debug=True))
         on = strip(engine_for(store, exact=True).recall(q, top_n=5, debug=True))
-        assert on == off and "exact" not in on["diagnostics"]
+        exact = on["diagnostics"].pop("exact")
+        assert on == off and "exact" not in off["diagnostics"]
+        assert exact["detected"]["truncated"] is True and exact["boost"] == {}
         assert k.node_id in [r["node_id"] for r in off["results"]]
+        # without debug there is no diagnostics at all: identical
+        off = strip(engine_for(store, exact=False).recall(q, top_n=5))
+        on = strip(engine_for(store, exact=True).recall(q, top_n=5))
+        assert on == off
 
     def test_a_blanked_date_never_joins_its_neighbours(self):
         # "Sept" and "5" sit either side of an ISO date: not "Sept 5"
@@ -813,15 +873,104 @@ class TestDetectionIsLinear:
         # before the next one ("on May 5 may 6": "may 6" follows "on")
         assert _dates("on May 5 may 6") == [(5, 5, None), (5, 6, None)]
 
-    def test_codes_searched_inside_labels_are_bounded(self, store):
+
+class TestCodeCap:
+    """Codes are looked for inside labels for at most MAX_CONTAINED_CODES per
+    query, the longest first; the rest are reported, never silently empty."""
+
+    def test_the_cap_keeps_the_most_distinctive_codes(self, store):
         from revien.retrieval.exact import MAX_CONTAINED_CODES
-        hit = add(store, "Fix for ABC-77 regression", "x")
-        many = " ".join("ZZ-%d" % i for i in range(40))
-        r = ExactLane(store, ExactConfig()).build(f"ABC-77 {many}", [])
-        assert hit.node_id in r.boost             # the first code is looked for
-        r = ExactLane(store, ExactConfig()).build(f"{many} ABC-77", [])
-        assert r is not None and hit.node_id not in r.boost
         assert MAX_CONTAINED_CODES == 16
+        hit = add(store, "Fix for ABC-777 regression", "x")
+        short = " ".join("Z-%d" % i for i in range(10, 50))    # 4 characters
+        for q in (f"ABC-777 {short}", f"{short} ABC-777"):
+            r = ExactLane(store, ExactConfig()).build(q, [])
+            assert hit.node_id in r.boost, q                    # 7 chars: kept
+            cap = r.detected["ids_capped"]
+            assert cap["capped"] is True and cap["searched"] == 16
+            assert cap["skipped"] == 41 - 16 == len(cap["skipped_codes"])
+            assert "ABC-777" not in cap["skipped_codes"]
+
+    def test_a_skipped_code_is_reported_as_skipped(self, store):
+        hit = add(store, "Fix for ABC-77 regression", "x")
+        longer = " ".join("ZZZZ-%d" % i for i in range(1000, 1016))   # 16 longer
+        r = ExactLane(store, ExactConfig()).build(f"ABC-77 {longer}", [])
+        assert hit.node_id not in r.boost
+        entry = [x for x in r.detected["ids"] if x["text"] == "ABC-77"][0]
+        assert entry["matched"] == [] and entry["contained_search"] == "skipped_by_cap"
+        cap = r.detected["ids_capped"]
+        assert cap == {"capped": True, "max_contained_codes": 16, "searched": 16,
+                       "skipped": 1, "skipped_codes": ["ABC-77"]}
+        searched = [x for x in r.detected["ids"] if x["text"] != "ABC-77"]
+        assert all("contained_search" not in x for x in searched)
+
+    def test_ties_keep_query_order(self, store):
+        codes = ["QA-%02d" % i for i in range(20)]               # all 5 chars
+        r = ExactLane(store, ExactConfig()).build(" ".join(codes), [])
+        assert r.detected["ids_capped"]["skipped_codes"] == codes[16:]
+
+    def test_the_cap_is_configurable(self, store, monkeypatch):
+        hit = add(store, "Fix for ABC-77 regression", "x")
+        longer = " ".join("ZZZZ-%d" % i for i in range(1000, 1016))
+        monkeypatch.setenv("REVIEN_EXACT_MAX_CONTAINED_CODES", "64")
+        cfg = ExactConfig.from_env()
+        assert cfg.max_contained_codes == 64
+        r = ExactLane(store, cfg).build(f"ABC-77 {longer}", [])
+        assert hit.node_id in r.boost and "ids_capped" not in r.detected
+        monkeypatch.setenv("REVIEN_EXACT_MAX_CONTAINED_CODES", "0")
+        r = ExactLane(store, ExactConfig.from_env()).build("ABC-77", [])
+        assert hit.node_id not in r.boost
+        assert r.detected["ids_capped"]["skipped_codes"] == ["ABC-77"]
+
+    def test_a_short_query_reports_no_cap(self, store):
+        add(store, "Fix for ABC-77 regression", "x")
+        r = ExactLane(store, ExactConfig()).build("ABC-77 and PR-1234", [])
+        assert "ids_capped" not in r.detected
+        assert all("contained_search" not in x for x in r.detected["ids"])
+
+
+class TestDateEdges:
+    """No date pattern reads across a slash, a hyphen or a dot into another
+    number, at either end of the match."""
+
+    @pytest.mark.parametrize("q,want", [
+        # the verifier's three
+        ("21 September 3/4", [(9, 21, None)]),
+        ("the 3/4 May meeting", []),
+        ("on 9/21 Mar", [(9, 21, None)]),
+        # month day / day month against a slash, hyphen or dot
+        ("September 3/4", []), ("May 5/6", []), ("May 5-10", []),
+        ("May 5th-6th", []), ("May 5.5", []), ("4-5 May", []),
+        ("v1.5 May release", []), ("21 September/October", []),
+        ("Apr/May 5", []), ("3-May 5", []),
+        # month year and the full forms
+        ("Apr/May 2026", []), ("3-May 2026", []), ("September 2026/27", []),
+        ("September 2026-27", []), ("21 Sept 2026/27", [(9, 21, None)]),
+        ("Sept 21, 2026-2027", [(9, 21, None)]), ("5 May-2026", []),
+        # slash pairs and slash dates
+        ("1-3/4 cups", []), ("on 1-3/4", []), ("on 3/4.5", []),
+        ("on 3/4-inch pipe", []), ("on 9/21-9/23", []), ("9/21-9/23", []),
+        ("9/21/2026-9/23/2026", []), ("1-3/4/2026", []),
+        ("2026-09-21-3", []), ("notes-2026-09-21", []),
+    ])
+    def test_no_date_across_an_edge(self, q, want):
+        assert _dates(q) == want, q
+
+    @pytest.mark.parametrize("q,want", [
+        ("mid-May 2026", [(5, None, 2026)]), ("on 9/21-ish", [(9, 21, None)]),
+        ("May 5.", [(5, 5, None)]), ("on May 5, 2026.", [(5, 5, 2026)]),
+        ("(May 5)", [(5, 5, None)]), ("[9/21]", [(9, 21, None)]),
+        ("2026-09-21T10:00", [(9, 21, 2026)]), ("on 1/2/2026.", [(1, 2, 2026)]),
+        ("21 May, 2026", [(5, 21, 2026)]), ("May, 2026", [(5, None, 2026)]),
+        ("from 9/21 to 9/23", [(9, 21, None), (9, 23, None)]),
+        ("September 21, 2026", [(9, 21, 2026)]), ("21 September 2026", [(9, 21, 2026)]),
+        ("Sept 21st", [(9, 21, None)]), ("21st of September", [(9, 21, None)]),
+        ("Sep. 21st 2026", [(9, 21, 2026)]), ("9/21/26", [(9, 21, 2026)]),
+        ("2026/09/21", [(9, 21, 2026)]), ("12/25", [(12, 25, None)]),
+        ("September 2026", [(9, None, 2026)]),
+    ])
+    def test_dates_with_clean_edges_still_parse(self, q, want):
+        assert _dates(q) == want, q
 
 
 class TestOrdinaryWords:
