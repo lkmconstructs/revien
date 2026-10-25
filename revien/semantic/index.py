@@ -78,7 +78,7 @@ except ImportError:  # pragma: no cover - exercised only without the extra
 # inside FastEmbedProvider._ensure_model, under offline-first control.
 import importlib.util
 
-from ._ort import ort_telemetry_state
+from ._ort import ort_telemetry_problem, ort_telemetry_state
 
 _FASTEMBED_AVAILABLE = importlib.util.find_spec("fastembed") is not None
 
@@ -468,8 +468,12 @@ class SemanticIndex:
             # Open-time warnings (mixed recipe / embedder swapped since the
             # vectors were built). Empty list = none.
             "warnings": list(self._open_warnings),
-            # True/False/None (None = onnxruntime not installed).
+            # True/False/None (None = onnxruntime not installed). False means
+            # ONNX Runtime telemetry is NOT off in this process (onnxruntime
+            # imported before revien without ORT_DISABLE_TELEMETRY, or a value
+            # ORT does not treat as off); the problem says why and the fix.
             "ort_telemetry_disabled": ort_telemetry_state(),
+            "ort_telemetry_problem": ort_telemetry_problem(),
         }
 
     def inactive_reason(self) -> Optional[str]:

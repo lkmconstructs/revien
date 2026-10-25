@@ -99,5 +99,10 @@ Scope: v0.4 delivers the origin layer, --source filter, pairing token, thin skil
   EXPECT: truth rates verification passed
   EVIDENCE: pending
 
+- [ ] G21: the default path makes no request, native code included: ONNX Runtime telemetry is off before onnxruntime is first imported, watched from outside the process (negative control, import revien first, real ingest + recall kept alive)
+  CHECK: python scripts/gates/check_native_egress.py
+  EXPECT: native egress verification passed
+  EVIDENCE: pending
+
 - [ ] G12: merge to main is the repository owner's call, never an agent's
   EVIDENCE: pending

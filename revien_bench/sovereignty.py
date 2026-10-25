@@ -18,7 +18,9 @@ Checks
    off-device backend(s) if any sends data to a cloud API. The decision is made
    from the run config (env + answerer spec), NOT by intercepting HTTP — a cloud
    run must never be able to claim zero egress. The measured cloud-call counter
-   is folded in as a secondary signal. The headline path makes no outbound calls.
+   is folded in as a secondary signal, and the check also FAILS when ONNX
+   Runtime's own telemetry is not off in the run's process
+   (ort_telemetry_disabled False). The headline path makes no outbound calls.
 4. consent — two sub-tests:
      a. REVIEN_INGEST_DENY -> denied source_id produces 0 nodes.
      b. soft-invalidate -> an invalidated node is EXCLUDED from default recall
@@ -40,7 +42,7 @@ from revien.ingestion.extractor_llm import (
     CLOUD_BACKENDS as CLOUD_EXTRACTORS,
     DEFAULT_EXTRACTOR,
 )
-from revien.semantic._ort import ort_telemetry_state
+from revien.semantic._ort import ort_telemetry_problem, ort_telemetry_state
 from revien.semantic.index import (
     CLOUD_EMBEDDERS,
     DEFAULT_EMBEDDER,
@@ -212,10 +214,17 @@ def network_egress_zero(
         cloud_backends.append(f"decompose={reason}")
 
     all_local = not cloud_backends
-    # PASS requires every backend local AND no observed cloud call. A cloud
-    # backend in config fails even if cloud_calls==0; a positive counter fails
-    # even if config somehow looked local.
-    passed = all_local and cloud_calls == 0
+    # ONNX Runtime 1.29.0 and later (Linux, macOS) posts its own telemetry,
+    # from the import alone, unless ORT_DISABLE_TELEMETRY was set before
+    # onnxruntime was first imported.
+    # False = it was not off in this run's process: that is egress, whatever
+    # the backends are. None = onnxruntime not installed.
+    ort_off = ort_telemetry_state()
+    # PASS requires every backend local AND no observed cloud call AND ONNX
+    # Runtime telemetry not on. A cloud backend in config fails even if
+    # cloud_calls==0; a positive counter fails even if config somehow looked
+    # local.
+    passed = all_local and cloud_calls == 0 and ort_off is not False
     return Check(
         name="network_egress_zero",
         passed=passed,
@@ -233,8 +242,10 @@ def network_egress_zero(
             "all_backends_local": all_local,
             "cloud_backends": cloud_backends,
             "cloud_calls": cloud_calls,
-            # True/False, or None when onnxruntime is not installed.
-            "ort_telemetry_disabled": ort_telemetry_state(),
+            # True/False, or None when onnxruntime is not installed. False
+            # fails the check; the problem says why and names the fix.
+            "ort_telemetry_disabled": ort_off,
+            "ort_telemetry_problem": ort_telemetry_problem(),
         },
     )
 
