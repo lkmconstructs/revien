@@ -53,11 +53,21 @@ DETECTION RULES (deterministic; no model; every rule is here)
                                         year written once belongs to the end it
                                         is written at). The ratio rule applies
                                         to the start ("1/2-3/4 cup" is two
-                                        fractions). A range shape that breaks a
-                                        rule ("May 10-5", "May 1 - June 15",
-                                        "Sept 21-45") gives NO date: no part of
-                                        it is read again as a shorter date or
-                                        as a code. Ranges are read first.
+                                        fractions). A range that breaks a rule
+                                        is not a range; its parts are read only
+                                        as single dates can be, edges included:
+                                        "May 10-5" and "Sept 21-45" give no
+                                        date, "May 1 - June 15" gives May 1 and
+                                        June 15, "May 5 to 3 pm" gives May 5.
+                                        Ranges are read first. A month word
+                                        that has a day of its own on the other
+                                        side is that day's, never the range's:
+                                        "10-11 Sept 21" is Sept 21 (not Sept
+                                        10-11), "ages 5-10 May 3" is May 3, "3
+                                        May 5-10" is 3 May, "May 5 - 10 June"
+                                        is not May 5-10 (_RE_DM_RANGE's
+                                        lookahead, _RE_DAY_BEFORE,
+                                        _RE_MONTH_BEFORE, _RE_MONTH_AFTER).
     A date with no year ("September 21", "9/21") matches that day in ANY year
     the graph has a dated node for. Relative dates ("next Friday", "last
     week") are out of scope. A month alone ("in September") is not a date
@@ -91,6 +101,12 @@ DETECTION RULES (deterministic; no model; every rule is here)
         "1-3/4 cups", "v1.5 May", "Apr/May 2026" and "September 2026/27"
         hold no date. A range is read only whole, as a range (above): "May
         5-10" is never "May 5". "mid-May 2026" is still May 2026.
+      * a month word with a standalone day on EACH side is ambiguous, and
+        neither pairing is read: "on 5 March 3 people came", "page 3 March
+        5" give no date (the end of a number range is not a standalone day:
+        "ages 5-10 May 3" is May 3; a time is not a day: "5 May 3:00" is 5
+        May). A month after an impossible day ("31 Sept 2026") is not read
+        as the month either.
       * versions. Dotted numbers are never dates ("release 2024.1.5",
         "v2024.01.05"): the year-first form accepts "-" and "/" only.
       * words. "march", "mar", "may" and "jan" are ordinary words or names as
@@ -136,8 +152,10 @@ DETECTION RULES (deterministic; no model; every rule is here)
     ALL CAPS or has a digit ("REV-FIX"), or a run of 5+ digits. Ordinals and
     clock/size shorthand ("21st", "3pm", "10:30", "5k") and plain years are
     not IDs, and neither is a token made only of digits and "/", "-", en or
-    em dashes ("5-10", "21-23", "9/21-9/23", "555-1234"): a range, a score
-    or a fraction, which would otherwise lift a label such as "Ages 5-10". Tokens consumed by a date or quote are not IDs. Matching is a
+    em dashes ("5-10", "21-23", "9/21-9/23", "555-1234"), alone or with a
+    time or unit after it ("5-6pm", "10:30-11:30", "10-20%"): a range, a
+    score or a fraction, which would otherwise lift a label such as "Ages
+    5-10". Tokens consumed by a date or quote are not IDs. Matching is a
     label equal to the token, a label containing the token as a whole token,
     or a node id equal to the token. Never node content. The containment
     lookup reads the label column once per code, so it is made for at most
@@ -223,7 +241,13 @@ CANDIDATE ENTRY (bounded)
     A matched node with boost > 0 that is not already an anchor is added to
     the anchor set, at most MAX_INJECT (default 5, REVIEN_EXACT_MAX_INJECT)
     per recall, best boost first (ties by node id). A node that is boosted
-    only as a neighbour of a named entity is not admitted.
+    only as a neighbour of a named entity is not admitted. Nor is a node
+    matched only by a CROWDED date, one with more matches than
+    DATE_MAX_MATCHES ("Sept 1-30" on a dense graph): it cannot say which of
+    its nodes is meant, so it lifts the ones already candidates (scaled by
+    DATE_MAX_MATCHES / matches) and admits none. Its entry in
+    detected["dates"] says "crowded": true, with "matches_total" (each date
+    lookup reads at most 400 rows, the store's bound).
 """
 
 from __future__ import annotations
@@ -394,12 +418,28 @@ _RE_DM_RANGE = re.compile(
     rf"{_NUM_L}\b(?P<d1>\d{{1,2}}){_ORD}"
     rf"(?:\s+(?:of\s+)?{_mon('m1')}\b\.?(?:,?\s+(?P<y1>\d{{4}})\b)?)?{_SEP}"
     rf"(?P<d2>\d{{1,2}}){_ORD}\s+(?:of\s+)?{_mon('m2')}\b"
-    rf"(?:\.?,?\s+(?P<y2>\d{{4}})\b{_NUM_R}|{_MON_R})", re.I)
+    rf"(?:\.?,?\s+(?P<y2>\d{{4}})\b{_NUM_R}|{_MON_R}(?!\.?,?\s+\d{{1,2}}(?!\d)))",
+    re.I)
 # The longest range read, first day to last inclusive.
 MAX_RANGE_DAYS = 31
-# A range shape that breaks the range rules: taken (no part of it is read
-# again, as a shorter date or as a code) and gives no date.
-_NO_DATE = object()
+# Month-stealing guards for ranges (rule 2): a month word that has a day of
+# its own on the other side belongs to that day, not to the range's numbers.
+# "10-11 Sept 21" is Sept 21 (not Sept 10-11), "3 May 5-10" is 3 May (not
+# May 5-10), "May 5 - 10 June" is not May 5-10, "May 10-11 June" not June
+# 10-11.
+# (a standalone day: not the end of "5-10", "3/4" or "1.5")
+_RE_DAY_BEFORE = re.compile(
+    r"(?<![\d/.\-\u2013\u2014])\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?$", re.I)
+_RE_MONTH_BEFORE = re.compile(rf"\b{_MON}\b\.?\s+$", re.I)
+_RE_MONTH_AFTER = re.compile(rf"\.?,?\s+(?:of\s+)?{_MON}\b", re.I)
+# a day of its own: a standalone 1-2 digit number (not "12/24", "1.5" or
+# "2026"; a time after it is fine: "5 May 3:00" is 5 May)
+_RE_OWN_DAY = re.compile(
+    r"\.?,?\s+\d{1,2}(?:st|nd|rd|th)?"
+    r"(?![\w/:]|\.\d|\s*(?:[-\u2013\u2014]|to\b)\s*\d)", re.I)
+# ...and one that is the end of a number range ("5-10 May 3", "3 to 21 Dec
+# 30") is not a day of the month that follows it
+_RE_RANGE_END_BEFORE = re.compile(r"\d\s*(?:[-\u2013\u2014]|to)\s*$", re.I)
 
 _RE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_'’.\-/:]*[A-Za-z0-9]|[A-Za-z0-9]")
 _RE_ORDINAL_OR_UNIT = re.compile(
@@ -607,6 +647,9 @@ class DateMatch:
     recorded: List[Tuple[str, float]]
     # the DATE_MAX_MATCHES guard: min(1, date_max_matches / total)
     scale: float
+    # more matches than the guard allows: boosts nodes that are already
+    # candidates (scaled), admits none to the anchor set
+    crowded: bool = False
 
     @property
     def total(self) -> int:
@@ -735,11 +778,26 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
                 window = "".join(chars)
             return _preceding(_RE_ALPHA_RUN.findall(window))
 
+        def window(pos: int, n: int = 16) -> str:
+            # the n characters before ``pos``, this pass's earlier dates blanked
+            lo = max(0, pos - n)
+            w = work[lo:pos]
+            k = len(taken) - 1
+            if k >= 0 and taken[k][1] > lo:
+                chars = list(w)
+                while k >= 0 and taken[k][1] > lo:
+                    s, e = taken[k]
+                    for i in range(max(s, lo), min(e, pos)):
+                        chars[i - lo] = _GONE
+                    k -= 1
+                w = "".join(chars)
+            return w
+
+        before.window = window
         for m in rx.finditer(work):
             sig = fn(m, before)
             if sig is not None:
-                if sig is not _NO_DATE:
-                    out.append(sig)
+                out.append(sig)
                 taken.append(m.span())
         if taken:
             work = _blank(work, taken, _GONE)
@@ -757,8 +815,12 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     def strong_dm(m) -> bool:
         return bool(re.search(r"^\d{1,2}(?:st|nd|rd|th)|\bof\b", m[0], re.I))
 
+    # A month word with a day on each side ("on 5 March 3 people", "page 3
+    # March 5") is ambiguous: neither pairing is read (rule 2, edges).
     def dmy(m, before):
         if not _month_ok(m[2], lambda: before(m.start())[0], strong_dm(m)):
+            return None
+        if month_before(m, before):
             return None
         d, mo, y = int(m[1]), _MONTH_NAMES[m[2].lower()], int(m[3])
         return DateSignal(m[0], "day", mo, d, y) if _valid_md(mo, d, y) else None
@@ -766,17 +828,23 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     def mdy(m, before):
         if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
+        if day_before(m, before):
+            return None
         mo, d, y = _MONTH_NAMES[m[1].lower()], int(m[2]), int(m[3])
         return DateSignal(m[0], "day", mo, d, y) if _valid_md(mo, d, y) else None
 
     def md(m, before):
         if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
+        if day_before(m, before) or month_word_after(m):
+            return None
         mo, d = _MONTH_NAMES[m[1].lower()], int(m[2])
         return DateSignal(m[0], "day", mo, d) if _valid_md(mo, d) else None
 
     def dm(m, before):
         if not _month_ok(m[2], lambda: before(m.start())[0], strong_dm(m)):
+            return None
+        if month_before(m, before) or own_day_after(m):
             return None
         d, mo = int(m[1]), _MONTH_NAMES[m[2].lower()]
         return DateSignal(m[0], "day", mo, d) if _valid_md(mo, d) else None
@@ -794,11 +862,51 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     def my(m, before):
         if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
+        if day_before(m, before):     # "31 Sept 2026": a day that is no date
+            return None
         return DateSignal(m[0], "month", _MONTH_NAMES[m[1].lower()], None,
                           int(m[2]))
 
     def range_of(m, mo1, d1, y1, mo2, d2, y2):
-        return _range_signal(m[0], mo1, d1, y1, mo2, d2, y2) or _NO_DATE
+        # A range that breaks the rules is not taken: its parts are read
+        # only as the single-date rules (and their edges) allow.
+        return _range_signal(m[0], mo1, d1, y1, mo2, d2, y2)
+
+    def day_before(m, before) -> bool:
+        """A standalone day right before this match's month word (not the end
+        of a number range: "5-10 May 3" is May 3)."""
+        w = before.window(m.start(), 20)
+        d = _RE_DAY_BEFORE.search(w)
+        return bool(d) and not _RE_RANGE_END_BEFORE.search(w, 0, d.start())
+
+    def is_month_word(word: str, text_before: str) -> bool:
+        """The _month_ok rule for a month word next to a match: "may" /
+        "march" in lower case are words unless a date preposition comes
+        right before them ("of march 3")."""
+        if word.lower() not in AMBIGUOUS_MONTHS or word[:1].isupper():
+            return True
+        return _preceding(_RE_ALPHA_RUN.findall(text_before))[0] in DATE_PREPOSITIONS
+
+    def month_before(m, before) -> bool:
+        """A month word right before this match's first day."""
+        w = before.window(m.start(), 40)
+        b = _RE_MONTH_BEFORE.search(w)
+        return bool(b) and is_month_word(b[1], w[:b.start(1)])
+
+    def own_day_after(m) -> bool:
+        """This match ends in a month word that has a day of its own after it."""
+        return bool(_RE_OWN_DAY.match(work, m.end()))
+
+    def month_word_after(m) -> bool:
+        """Is the range's end day followed by a month that would claim it
+        ("May 5 - 10 June")? Not when that month has a day of its own
+        ("Sept 21-23 May 5"), and not for "may" / "march" as words."""
+        a = _RE_MONTH_AFTER.match(work, m.end())
+        if not a:
+            return False
+        if not is_month_word(a[1], work[max(0, a.start(1) - 40):a.start(1)]):
+            return False
+        return not _RE_OWN_DAY.match(work, a.end())
 
     def iso_range(m, before):
         return range_of(m, int(m["m1"]), int(m["d1"]), int(m["y1"]),
@@ -813,7 +921,7 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
             prev, prev2 = before(m.start())
             if not _slash_marked_as_date(
                     m, prev, prev2, work[m.end():m.end() + 40]):
-                return _NO_DATE
+                return None
         # day-first only with a year, as for one date
         mo1, d1 = (b1, a1) if y1 is not None and a1 > 12 and b1 <= 12 else (a1, b1)
         mo2, d2 = (b2, a2) if y2 is not None and a2 > 12 and b2 <= 12 else (a2, b2)
@@ -821,6 +929,12 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
 
     def md_range(m, before):
         if not _month_ok(m["m1"], lambda: before(m.start())[0]):
+            return None
+        # the month belongs to a day before it ("3 May 5-10"), or the end
+        # day to a month after it ("May 5 - 10 June")
+        if day_before(m, before):
+            return None
+        if not m["y2"] and month_word_after(m):
             return None
         mo1 = _MONTH_NAMES[m["m1"].lower()]
         mo2 = _MONTH_NAMES[m["m2"].lower()] if m["m2"] else mo1
@@ -832,13 +946,17 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         strong = bool(re.search(r"\d(?:st|nd|rd|th)\b|\bof\b", m[0], re.I))
         if not _month_ok(m["m2"], lambda: before(m.start())[0], strong):
             return None
+        # the first day belongs to a month before it ("May 10-11 June");
+        # "may" / "march" in lower case are words
+        if month_before(m, before):
+            return None
         mo2 = _MONTH_NAMES[m["m2"].lower()]
         mo1 = _MONTH_NAMES[m["m1"].lower()] if m["m1"] else mo2
         y1 = int(m["y1"]) if m["y1"] else None
         y2 = int(m["y2"]) if m["y2"] else None
         return range_of(m, mo1, int(m["d1"]), y1, mo2, int(m["d2"]), y2)
 
-    # Ranges first: a range is read whole or not at all (rule 2).
+    # Ranges first: a range is read whole, or not as a range (rule 2).
     each(_RE_ISO_RANGE, iso_range)
     each(_RE_SLASH_RANGE, slash_range)
     each(_RE_MDY_RANGE, md_range)
@@ -877,13 +995,19 @@ def _is_possessive(tok: str) -> bool:
 # Separators that, with digits alone, make a range, a score or a fraction
 # ("5-10", "21-23", "9/21-9/23", "1-3/4"), never a code.
 _NUMERIC_SEPARATORS = frozenset("/-\u2013\u2014")
+# ... also with a time or unit after it ("5-6pm", "10:30-11:30", "10-20%").
+_RE_NUMERIC_RANGE_TOKEN = re.compile(
+    r"[\d/:\-\u2013\u2014]+(?:st|nd|rd|th|am|pm|k|m|s|x|ms|kb|mb|gb|hz|%)?", re.I)
 
 
 def _is_id_token(tok: str) -> bool:
     t = _strip_token(tok)
     if len(t) < 3 or _RE_ORDINAL_OR_UNIT.match(t):
         return False
-    if not t.isdigit() and all(c.isdigit() or c in _NUMERIC_SEPARATORS for c in t):
+    if not t.isdigit() and (
+            all(c.isdigit() or c in _NUMERIC_SEPARATORS for c in t)
+            or (_RE_NUMERIC_RANGE_TOKEN.fullmatch(t)
+                and any(c in _NUMERIC_SEPARATORS or c == ":" for c in t))):
         return False
     has_digit = any(c.isdigit() for c in t)
     has_alpha = any(c.isalpha() for c in t)
@@ -1215,7 +1339,8 @@ class ExactLane:
             out.append(DateMatch(
                 signal=d, event=event, recorded=recorded,
                 scale=(min(1.0, self.config.date_max_matches / total)
-                       if total else 0.0)))
+                       if total else 0.0),
+                crowded=total > self.config.date_max_matches))
         return out
 
     # -- main ----------------------------------------------------------------
@@ -1470,26 +1595,33 @@ class ExactLane:
         dates_report = []
         for dm in self.match_dates(sig.dates, **scope):
             d, scale = dm.signal, dm.scale
+            # A crowded date (more matches than DATE_MAX_MATCHES) cannot say
+            # which of its nodes is meant: it still lifts the ones that are
+            # already candidates (scaled), and admits none of them.
+            admissible = not dm.crowded
             hit_ids = []
             for nid, g, strength in dm.event:
                 hit_ids.append(nid)
                 add(nid, {"signal": "date", "text": d.text,
                           "field": "event_time", "node_granularity": g,
                           "strength": strength, "weight": scale},
-                    cfg.boost_max * strength * scale)
+                    cfg.boost_max * strength * scale, admissible)
             for nid, strength in dm.recorded:
                 hit_ids.append(nid)
                 add(nid, {"signal": "date", "text": d.text,
                           "field": "recorded_at", "strength": strength,
                           "weight": scale},
-                    cfg.boost_max * strength * scale)
-            dates_report.append({**d.describe(), "matched": hit_ids,
-                                 "matched_by_event_time": sorted(
-                                     nid for nid, _g, _s in dm.event),
-                                 "matched_by_recorded_at": sorted(
-                                     nid for nid, _s in dm.recorded),
-                                 "matches_total": dm.total,
-                                 "scale": round(scale, 4)})
+                    cfg.boost_max * strength * scale, admissible)
+            entry = {**d.describe(), "matched": hit_ids,
+                     "matched_by_event_time": sorted(
+                         nid for nid, _g, _s in dm.event),
+                     "matched_by_recorded_at": sorted(
+                         nid for nid, _s in dm.recorded),
+                     "matches_total": dm.total,
+                     "scale": round(scale, 4)}
+            if dm.crowded:
+                entry["crowded"] = True
+            dates_report.append(entry)
 
         # ---- boosts, capped; injection, bounded -------------------------------------
         boost = {nid: min(cfg.boost_max, parts)

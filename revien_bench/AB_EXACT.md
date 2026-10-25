@@ -154,7 +154,10 @@ anything on.
   3/8" are read as ratios, not dates, and no date reads across a slash or a
   hyphen into another number ("21 September 3/4" is September 21). A range
   ("May 5-10", "9/21-9/23", "Sept 28 - Oct 3") is one date signal covering
-  every day in it, read whole or not at all (in order, 31 days at most).
+  every day in it (in order, 31 days at most); a month word with a day of
+  its own on the other side is never taken into a range ("meeting 10-11
+  Sept 21" is September 21). A date that matches more than 25 nodes is
+  `crowded` in the detected dates and admits none of them.
   Write date questions the way your users would, and check the report's
   detected dates (a range shows its `range_end`).
 - The lane reads at most 4,096 characters of a question: a longer one is

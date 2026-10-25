@@ -1026,19 +1026,53 @@ class TestRanges:
     def test_a_range(self, q, want):
         assert _dates(q) == want, q
 
-    @pytest.mark.parametrize("q", [
-        # reversed, empty, too long, impossible
-        "May 10-5", "May 5-5", "May 1 - June 15", "Jan 1 - Feb 1",
-        "Sept 21-45", "Feb 30 - Mar 2", "9/23-9/21", "21/9-23/9",
-        "9/21/2026-9/23/2027",
+    @pytest.mark.parametrize("q,want", [
+        # a range that breaks a rule is not a range; its parts are read only
+        # as single dates can be (a hyphen joined to a digit still blocks)
+        ("May 10-5", []), ("May 5-5", []), ("Sept 21-45", []),
+        ("9/23-9/21", []), ("21/9-23/9", []), ("9/21/2026-9/23/2027", []),
+        ("May 1 - June 15", [(5, 1, None), (6, 15, None)]),
+        ("Jan 1 - Feb 1", [(1, 1, None), (2, 1, None)]),
+        ("Feb 30 - Mar 2", [(3, 2, None)]),
+        ("May 5 to 3 pm", [(5, 5, None)]),
+        ("May 5 - 3 people came", [(5, 5, None)]),
         # the ratio rule on the start
-        "1/2-3/4 cup", "from 3/4 to 3/8", "3/4-3/8", "rated it 9/10 - 10/10",
-        "1/2 to 3/4 cup", "3/4-inch",
-        # no range shape: no partial date either
-        "9/21-26", "1-3/4 cups",
+        ("1/2-3/4 cup", []), ("from 3/4 to 3/8", []), ("3/4-3/8", []),
+        ("rated it 9/10 - 10/10", []), ("1/2 to 3/4 cup", []), ("3/4-inch", []),
+        ("rated 8/10-9/10", []), ("through 1/2-3/4 of the book", []),
+        # no range shape
+        ("9/21-26", []), ("1-3/4 cups", []),
     ])
-    def test_no_date_not_a_partial_one(self, q):
-        assert _dates(q) == [], q
+    def test_a_failed_range_is_no_range(self, q, want):
+        assert _dates(q) == want, q
+
+    # the verifier's month-stealing rows: a month with a day of its own on
+    # the other side is that day's
+    @pytest.mark.parametrize("q,want", [
+        ("meeting 10-11 Sept 21", [(9, 21, None)]),
+        ("ages 5-10 May 3", [(5, 3, None)]),
+        ("3 to 21 Dec 30", [(12, 30, None)]),
+        ("May 5 to 3 pm", [(5, 5, None)]),
+        ("won 3-1 May 5", [(5, 5, None)]),
+        ("hours 9-5 May 1st", [(5, 1, None)]),
+        ("10-11 Sept 21st", [(9, 21, None)]),
+        # the other direction
+        ("Sept 21 10-11", [(9, 21, None)]),
+        ("May 3 ages 5-10", [(5, 3, None)]),
+        ("3 May 5-10", [(5, 3, None)]),
+        ("May 5 - 10 June", [(5, 5, None), (6, 10, None)]),
+        ("Sept 28 - 3 Oct", [(9, 28, None), (10, 3, None)]),
+        ("May 10-11 June", []),
+        # a month with its own day, or "may" as a word, takes nothing
+        ("Sept 21-23 May 5", [("range", (9, 21, None), (9, 23, None)), (5, 5, None)]),
+        ("May 5-10 may I ask", [("range", (5, 5, None), (5, 10, None))]),
+        ("10-11 Sept 2026", [("range", (9, 10, 2026), (9, 11, 2026))]),
+        ("on May 5 from 2-4", [(5, 5, None)]),
+        ("10-12 May", [("range", (5, 10, None), (5, 12, None))]),
+        ("Dec 30 - Jan 2", [("range", (12, 30, None), (1, 2, None))]),
+    ])
+    def test_no_month_is_stolen(self, q, want):
+        assert _dates(q) == want, q
 
     def test_a_failed_range_leaves_no_code_behind(self):
         for q in ["Sept 21-45", "May 10-5", "the 9/23-9/21 trip", "ages 5-10",
@@ -1099,6 +1133,87 @@ class TestRanges:
         assert r.detected["ids"] == []
         if "Sept" in q or "9/2" in q:
             assert trip.node_id in r.boost
+
+
+class TestAMonthBetweenTwoDays:
+    """A month word with a standalone day on each side is ambiguous: neither
+    pairing is read (found by fuzzing single dates the way ranges were)."""
+
+    @pytest.mark.parametrize("q,want", [
+        ("on 5 March 3 people came", []), ("page 3 March 5", []),
+        ("10 March 3rd", []), ("21st Sept 31 5", []), ("31 Sept 2026", []),
+        ("May 5 June", []),
+        # one side is not a day: read as before
+        ("5 May 3:00", [(5, 5, None)]), ("5 May 3pm", [(5, 5, None)]),
+        ("March 5 3 people", [(3, 5, None)]), ("May 5 3 people", [(5, 5, None)]),
+        ("on 21 Sept 2026", [(9, 21, 2026)]), ("5 Sept 2026", [(9, 5, 2026)]),
+        ("May 5 June 3", [(5, 5, None), (6, 3, None)]),
+        ("on May 5 may 6", [(5, 5, None), (5, 6, None)]),
+        ("of the 2026/9/21 march 3 September", [(9, 21, 2026)]),
+        ("Sept 5 May 2026", []),
+    ])
+    def test_ambiguous_or_not(self, q, want):
+        assert _dates(q) == want, q
+
+
+class TestCrowdedDates:
+    """A date with more matches than DATE_MAX_MATCHES lifts the nodes that
+    are already candidates (scaled) and admits none to the anchor set."""
+
+    def test_a_crowded_date_admits_nothing(self, store):
+        ids = [add(store, f"Import {i}", "x", **day(2026, 9, 21)).node_id
+               for i in range(30)]
+        r = ExactLane(store, ExactConfig()).build("on 2026-09-21", [])
+        d = r.detected["dates"][0]
+        assert d["crowded"] is True and d["matches_total"] == 30
+        assert r.inject_ids == []
+        assert all(r.boost[i] == pytest.approx(BOOST_MAX * 25 / 30) for i in ids)
+
+    def test_a_crowded_range_admits_nothing(self, store):
+        for dd in range(1, 31):
+            add(store, f"Day {dd}", "x", **day(2026, 9, dd))
+        r = ExactLane(store, ExactConfig()).build("Sept 1-30", [])
+        assert r.detected["dates"][0]["crowded"] is True and r.inject_ids == []
+
+    def test_an_uncrowded_date_still_admits(self, store):
+        ids = [add(store, f"Visit {i}", "x", **day(2026, 9, 21)).node_id
+               for i in range(25)]
+        r = ExactLane(store, ExactConfig()).build("on 2026-09-21", [])
+        assert "crowded" not in r.detected["dates"][0]
+        assert len(r.inject_ids) == 5 and set(r.inject_ids) <= set(ids)
+
+    def test_another_signal_still_admits_its_node(self, store):
+        for i in range(30):
+            add(store, f"Import {i}", "x", **day(2026, 9, 21))
+        k = add(store, "PR-4242 fix", "x", **day(2026, 9, 21))
+        r = ExactLane(store, ExactConfig()).build("PR-4242 on 2026-09-21", [])
+        assert r.inject_ids == [k.node_id]
+
+    def test_in_recall_a_crowded_date_adds_no_anchor(self, store):
+        for i in range(30):
+            add(store, f"Import {i}", f"imported row {i}", **day(2026, 9, 21))
+        q = "on 2026-09-21"
+        on = engine_for(store, exact=True).recall(q, top_n=10, debug=True)
+        off = engine_for(store, exact=False).recall(q, top_n=10, debug=True)
+        assert on.diagnostics["exact"]["injected"] == []
+        assert on.diagnostics["anchors"] == off.diagnostics["anchors"]
+
+
+class TestNumericTokensAreNotCodes:
+    @pytest.mark.parametrize("q", [
+        "May 5-6pm", "10:30-11:30 standup", "a 10-20% drop", "5-10", "21-23",
+        "9/21-9/23", "call 555-1234", "1-3/4 cups", "3\u20135 pm",
+    ])
+    def test_not_a_code(self, q):
+        assert parse_signals(q).ids == [], q
+
+    @pytest.mark.parametrize("q,want", [
+        ("PR-1234", ["PR-1234"]), ("INC-20931", ["INC-20931"]),
+        ("build 4471923", ["4471923"]), ("v0.3.0", ["v0.3.0"]),
+        ("REV-FIX steps", ["REV-FIX"]), ("3/4-inch pipe", ["3/4-inch"]),
+    ])
+    def test_still_a_code(self, q, want):
+        assert parse_signals(q).ids == want, q
 
 
 class TestQuoteAwareCut:
