@@ -95,6 +95,15 @@ class TemporalGranularity(str, Enum):
     FUZZY = "fuzzy"
 
 
+# Metadata key the pipeline sets on an entity made from a declared name (a
+# note or book title, a [[link]]) longer than a label holds: the label is the
+# first 200 characters and the content is the whole name, whose length this
+# records. A forget takes the whole name as the entity's wording while the
+# content is still that name (revien/forget/engine.py: stated); a content
+# edit drops the mark (GraphStore.update_node). Nothing else sets it.
+LABEL_CUT_KEY = "label_cut_from_len"
+
+
 class Node(BaseModel):
     node_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     node_type: NodeType

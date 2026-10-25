@@ -17,7 +17,8 @@ from typing import Dict, List, Optional, Union
 from .forget_store import ForgetStoreMixin
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
-    Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
+    LABEL_CUT_KEY, Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType,
+    TemporalGranularity,
 )
 
 
@@ -2071,6 +2072,18 @@ class GraphStore(ForgetStoreMixin):
             for field in allowed_fields:
                 if field in kwargs:
                     updates[field] = kwargs[field]
+
+            # The cut-label mark (LABEL_CUT_KEY) says the content is the whole
+            # name the label was cut from. An edit cannot add or change it,
+            # and an edit of the content drops it: the content is no longer
+            # that name.
+            had = (existing.metadata or {}).get(LABEL_CUT_KEY)
+            md = updates.get("metadata", existing.metadata) or {}
+            if isinstance(md, dict) and LABEL_CUT_KEY in md and (
+                    md[LABEL_CUT_KEY] != had
+                    or updates.get("content", existing.content) != existing.content):
+                updates["metadata"] = {
+                    k: v for k, v in md.items() if k != LABEL_CUT_KEY}
 
             if not updates:
                 return existing
