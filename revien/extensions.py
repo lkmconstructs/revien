@@ -45,15 +45,18 @@ Only what is configured, and only by name:
 
 Nothing else is imported: no scan of ``sys.path``, no guessing from names. They
 are loaded once per process by ``load_extensions()``, which ``GraphStore`` calls
-when it opens (so every surface gets them) and the CLI calls at start. An
-extension that cannot be imported, is not callable, or raises is an
+when it opens (so every surface gets them) and ``revien import`` calls before it
+reads its file. An extension that cannot be imported, is not callable, raises,
+or calls ``sys.exit()`` (any ``BaseException`` but ``KeyboardInterrupt``) is an
 ``ExtensionLoadError`` naming it and the cause. It is never skipped, and it is
 raised again on the next call until it works. Registrations are kept in memory
 only: nothing here writes to the database, the network or the disk.
 
 A database that holds a type nobody registered is refused at open with
-``UnknownTypeError`` (see ``check_known_types``): nothing is read as another
-type, dropped or rewritten.
+``UnknownTypeError`` (see ``check_known_types``). The check reads only the two
+type columns, before the store opens its own connection, switches it to WAL,
+creates a table or runs a migration; nothing is read as another type, dropped
+or rewritten.
 """
 from __future__ import annotations
 
@@ -83,10 +86,12 @@ _SPEC_RE = re.compile(
 )
 
 _HOW_TO_REGISTER = (
-    "A type that is not built in comes from an extension: install the package "
-    f"that defines it (it declares the '{ENTRY_POINT_GROUP}' entry point "
-    f"group) or set {ENV_VAR}=package.module:function, then retry. See "
-    "docs/EXTENSIONS.md."
+    "Either an extension that registers such types is not installed or not "
+    "loaded, or the data came from a newer Revien than this one. For an "
+    "extension, install the package that defines it (it declares the "
+    f"'{ENTRY_POINT_GROUP}' entry point group) or set "
+    f"{ENV_VAR}=package.module:function; for a newer Revien, upgrade it. Then "
+    "retry. See docs/EXTENSIONS.md."
 )
 
 
@@ -109,7 +114,9 @@ class ExtensionLoadError(ExtensionError, RuntimeError):
     def __init__(self, failures: List[Tuple[str, str, BaseException]]):
         self.failures = list(failures)
         lines = [
-            f"  - {spec} ({where}): {type(exc).__name__}: {exc}"
+            f"  - {spec} ({where}): "
+            + (f"called sys.exit({exc.code!r})" if isinstance(exc, SystemExit)
+               else f"{type(exc).__name__}: {exc}")
             for spec, where, exc in self.failures
         ]
         noun = "extension" if len(lines) == 1 else "extensions"
@@ -350,7 +357,7 @@ def check_known_types(node_counts: Mapping[str, int],
     """Raise ``UnknownTypeError`` if any stored type is neither built in nor
     registered. ``node_counts`` / ``edge_counts`` map each distinct stored type
     value to its row count. This is the store-open check: a graph is never
-    opened half-understood, and nothing is read, converted or dropped."""
+    opened half-understood, and no row is converted or dropped."""
     known_nodes = set(all_node_type_values())
     known_edges = set(all_edge_type_values())
     bad_nodes = {v: c for v, c in node_counts.items() if v not in known_nodes}
@@ -473,12 +480,16 @@ def load_extensions() -> Dict[str, str]:
     ``{spec: where configured}`` for all that are.
 
     Idempotent and thread-safe: each extension runs once per process, however
-    many stores open. If any fail, the rest still run, then one
-    ``ExtensionLoadError`` names every failure; a failed extension is not
-    marked loaded, so the next call raises again instead of carrying on
-    without it. Registrations an extension made before it failed stay (the
-    registry only grows). A call made from inside an extension while it loads
-    returns at once.
+    many stores open. REVIEN_EXTENSIONS is read on every call: an item added
+    after an earlier load is loaded now, one that was already loaded is not run
+    again, and one removed stays loaded (the registry only grows). If any fail,
+    the rest still run, then one ``ExtensionLoadError`` names every failure; a
+    failed extension is not marked loaded, so the next call raises again
+    instead of carrying on without it. A ``SystemExit`` (``sys.exit()``) or any
+    other ``BaseException`` an extension raises counts as a failure, so it
+    cannot end the process quietly; ``KeyboardInterrupt`` propagates.
+    Registrations an extension made before it failed stay. A call made from
+    inside an extension while it loads returns at once.
     """
     global _last_env
     env = os.environ.get(ENV_VAR, "")
@@ -495,7 +506,9 @@ def load_extensions() -> Dict[str, str]:
                     continue
                 try:
                     _run(spec, entry_point)
-                except Exception as exc:       # noqa: BLE001 - reported, never skipped
+                except KeyboardInterrupt:
+                    raise
+                except BaseException as exc:   # noqa: BLE001 - incl. sys.exit(); reported, never skipped
                     failures.append((spec, where, exc))
                 else:
                     _LOADED[spec] = where

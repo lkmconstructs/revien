@@ -7,11 +7,14 @@ The surfaces (store, REST, MCP, CLI, export/import, TOON, recall, forget) are
 in tests/test_extensions_surfaces.py.
 """
 import copy
+import hashlib
 import json
 import pickle
 import sqlite3
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -145,6 +148,40 @@ class TestRegistration:
             EdgeType("pairs_with")
         register_edge_type("pairs_with")
         assert NodeType("pairs_with") is not EdgeType("pairs_with")
+
+    def test_a_value_registered_only_as_an_edge_type_is_not_a_node_type(self):
+        register_edge_type("pairs_with")
+        assert EdgeType("pairs_with").value == "pairs_with"
+        with pytest.raises(ValueError, match="'pairs_with' is not a valid NodeType"):
+            NodeType("pairs_with")
+        with pytest.raises(ValidationError):
+            Node(node_type="pairs_with", label="l", content="c")
+        assert extensions.all_node_type_values() == BUILTIN_NODE_TYPES
+
+    def test_a_value_registered_only_as_a_node_type_is_not_an_edge_type(self):
+        register_node_type("recipe")
+        assert NodeType("recipe").value == "recipe"
+        with pytest.raises(ValueError, match="'recipe' is not a valid EdgeType"):
+            EdgeType("recipe")
+        with pytest.raises(ValidationError):
+            Edge(edge_type="recipe", source_node_id="a", target_node_id="b")
+        assert extensions.all_edge_type_values() == BUILTIN_EDGE_TYPES
+
+    def test_containment_in_the_enum_is_documented_as_unreliable(self):
+        """docs/EXTENSIONS.md says what `x in NodeType` does for an extension
+        value on each Python version; this is that sentence."""
+        member = register_node_type("recipe")
+        if sys.version_info >= (3, 12):
+            assert (member in NodeType) is True
+            assert ("recipe" in NodeType) is False
+            assert ("fact" in NodeType) is True
+        else:
+            assert (member in NodeType) is False
+            with pytest.raises(TypeError):
+                "recipe" in NodeType
+            with pytest.raises(TypeError):
+                "fact" in NodeType
+        assert "recipe" in extensions.all_node_type_values()
 
     def test_introspection(self):
         assert extensions.all_node_type_values() == BUILTIN_NODE_TYPES
@@ -414,6 +451,68 @@ class TestEnvDiscovery:
         assert len(sys.modules[a].CALLS) == 1
         assert NodeType("meal_plan").value == "meal_plan"
 
+    def test_a_failing_item_added_after_a_load_is_an_error_at_the_next_call(
+            self, monkeypatch, make_ext, tmp_path):
+        good = make_ext(TOY)
+        monkeypatch.setenv(extensions.ENV_VAR, f"{good}:register")
+        load_extensions()
+        monkeypatch.setenv(extensions.ENV_VAR, f"{good}:register,no_such_module_xyz:go")
+        with pytest.raises(ExtensionLoadError, match="no_such_module_xyz:go"):
+            load_extensions()
+        with pytest.raises(ExtensionLoadError):
+            GraphStore(str(tmp_path / "s.db"))
+        assert NodeType("recipe").value == "recipe"            # the good one stays
+
+    def test_an_item_removed_after_a_load_stays_loaded_and_is_not_run_again(
+            self, monkeypatch, make_ext):
+        a = make_ext(TOY)
+        b = make_ext('''
+            from revien.extensions import register_node_type
+            CALLS = []
+            def go():
+                CALLS.append(1)
+                register_node_type("meal_plan")
+        ''')
+        monkeypatch.setenv(extensions.ENV_VAR, f"{a}:register,{b}:go")
+        load_extensions()
+        monkeypatch.setenv(extensions.ENV_VAR, f"{a}:register")
+        assert set(load_extensions()) == {f"{a}:register", f"{b}:go"}
+        monkeypatch.delenv(extensions.ENV_VAR)
+        assert set(load_extensions()) == {f"{a}:register", f"{b}:go"}
+        assert NodeType("meal_plan").value == "meal_plan"
+        assert len(sys.modules[b].CALLS) == 1
+
+    def test_a_refused_database_opens_once_the_env_names_the_extension(
+            self, monkeypatch, make_ext, tmp_path):
+        """The same process: refused, then configured, then open."""
+        db = str(tmp_path / "s.db")
+        seed_with_extension_types(db)
+        with pytest.raises(UnknownTypeError):
+            GraphStore(db)
+        mod = make_ext()
+        monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
+        s = GraphStore(db)
+        try:
+            assert sorted(n.node_type.value for n in s.list_nodes()) == [
+                "fact", "recipe", "recipe"]
+        finally:
+            s.close()
+
+    def test_a_second_store_picks_up_an_item_added_since_the_first(
+            self, monkeypatch, make_ext, tmp_path):
+        a = make_ext(TOY)
+        b = make_ext('''
+            from revien.extensions import register_node_type
+            def go():
+                register_node_type("meal_plan")
+        ''')
+        monkeypatch.setenv(extensions.ENV_VAR, f"{a}:register")
+        GraphStore(str(tmp_path / "one.db")).close()
+        assert "meal_plan" not in extensions.registered_node_types()
+        monkeypatch.setenv(extensions.ENV_VAR, f"{a}:register,{b}:go")
+        GraphStore(str(tmp_path / "two.db")).close()
+        assert "meal_plan" in extensions.registered_node_types()
+
     def test_concurrent_loads_run_the_extension_once(self, monkeypatch, make_ext):
         import sys
         mod = make_ext('''
@@ -456,6 +555,89 @@ class TestEnvDiscovery:
         monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
         load_extensions()
         assert len(sys.modules[mod].CALLS) == 1
+
+
+@pytest.fixture
+def real_scan(monkeypatch, tmp_path):
+    """The real entry-point scanner over an empty site directory. The autouse
+    fixture replaces the scanner with one that always answers "nothing", which
+    leaves the scan cache cold, so the loader's warm path (the one every store
+    open after the first takes in a real process) never runs under it."""
+    site = tmp_path / "empty_site"
+    site.mkdir()
+    scan_only(monkeypatch, site)
+    return site
+
+
+class TestAWarmLoader:
+    """After the first load the scan is cached and a call with an unchanged
+    REVIEN_EXTENSIONS returns at once. Every change to the variable after
+    that must still be seen."""
+
+    def warm(self, monkeypatch, make_ext, spec_body=TOY):
+        mod = make_ext(spec_body)
+        monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
+        load_extensions()
+        assert extensions._entry_points_cache is not None, "the cache is warm"
+        return mod
+
+    def test_later_calls_scan_nothing_and_run_nothing_again(self, real_scan, monkeypatch, make_ext, tmp_path):
+        mod = self.warm(monkeypatch, make_ext)
+        scans = []
+        real = extensions._metadata.entry_points
+
+        def counting(**params):
+            scans.append(params)
+            return real(**params)
+
+        monkeypatch.setattr(extensions._metadata, "entry_points", counting)
+        for i in range(3):
+            load_extensions()
+            GraphStore(str(tmp_path / f"s{i}.db")).close()
+        assert scans == []
+        assert len(sys.modules[mod].CALLS) == 1
+
+    def test_an_item_added_after_the_load_is_loaded(self, real_scan, monkeypatch, make_ext):
+        first = self.warm(monkeypatch, make_ext)
+        second = make_ext('''
+            from revien.extensions import register_node_type
+            def go():
+                register_node_type("meal_plan")
+        ''')
+        monkeypatch.setenv(extensions.ENV_VAR, f"{first}:register,{second}:go")
+        assert set(load_extensions()) == {f"{first}:register", f"{second}:go"}
+        assert NodeType("meal_plan").value == "meal_plan"
+        assert len(sys.modules[first].CALLS) == 1
+
+    def test_a_failing_item_added_after_the_load_is_an_error(self, real_scan, monkeypatch, make_ext, tmp_path):
+        first = self.warm(monkeypatch, make_ext)
+        monkeypatch.setenv(extensions.ENV_VAR, f"{first}:register,no_such_module_xyz:go")
+        with pytest.raises(ExtensionLoadError, match="no_such_module_xyz:go"):
+            load_extensions()
+        with pytest.raises(ExtensionLoadError):
+            GraphStore(str(tmp_path / "s.db"))
+        monkeypatch.setenv(extensions.ENV_VAR, f"{first}:register")      # fixed again
+        load_extensions()
+        GraphStore(str(tmp_path / "s.db")).close()
+
+    def test_an_item_removed_after_the_load_stays_loaded(self, real_scan, monkeypatch, make_ext):
+        first = self.warm(monkeypatch, make_ext)
+        monkeypatch.delenv(extensions.ENV_VAR)
+        assert list(load_extensions()) == [f"{first}:register"]
+        assert NodeType("recipe").value == "recipe"
+        assert len(sys.modules[first].CALLS) == 1
+
+    def test_a_refused_database_opens_once_the_env_names_the_extension(
+            self, real_scan, monkeypatch, make_ext, tmp_path):
+        load_extensions()                                    # warm, nothing configured
+        db = str(tmp_path / "s.db")
+        seed_with_extension_types(db)
+        load_extensions()
+        with pytest.raises(UnknownTypeError):
+            GraphStore(db)
+        mod = make_ext()
+        monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
+        GraphStore(db).close()
 
 
 class TestEntryPointDiscovery:
@@ -690,6 +872,79 @@ class TestFailingExtensions:
         assert "no_such_module_xyz:go" in str(err) and "also_missing_abc:go" in str(err)
         assert NodeType("recipe").value == "recipe"           # the good one ran
 
+    def test_an_extension_that_calls_sys_exit_is_a_load_error_not_a_quiet_exit(
+            self, monkeypatch, make_ext):
+        mod = make_ext('''
+            import sys
+            def register():
+                sys.exit(0)
+        ''')
+        err = self.fail(monkeypatch, f"{mod}:register")
+        assert f"{mod}:register" in str(err) and "called sys.exit(0)" in str(err)
+        assert isinstance(err.failures[0][2], SystemExit)
+        assert isinstance(err.__cause__, SystemExit)
+
+    def test_sys_exit_while_importing_and_with_other_codes_and_none(self, monkeypatch, make_ext):
+        importing = make_ext("import sys\nsys.exit('giving up')\n")
+        silent = make_ext("import sys\ndef register():\n    sys.exit()\n")
+        err = self.fail(monkeypatch, f"{importing}:register,{silent}:register")
+        text = str(err)
+        assert "called sys.exit('giving up')" in text and "called sys.exit(None)" in text
+        assert len(err.failures) == 2
+
+    def test_any_other_base_exception_is_a_load_error(self, monkeypatch, make_ext):
+        mod = make_ext('''
+            class Stop(BaseException):
+                pass
+            def register():
+                raise Stop("not an Exception")
+        ''')
+        err = self.fail(monkeypatch, f"{mod}:register")
+        assert "Stop: not an Exception" in str(err)
+
+    def test_the_others_still_load_when_one_exits(self, monkeypatch, make_ext):
+        quitter = make_ext("import sys\ndef register():\n    sys.exit(2)\n")
+        good = make_ext(TOY)
+        err = self.fail(monkeypatch, f"{quitter}:register,{good}:register")
+        assert [spec for spec, _, _ in err.failures] == [f"{quitter}:register"]
+        assert NodeType("recipe").value == "recipe"
+
+    def test_a_store_does_not_open_when_an_extension_exits(self, monkeypatch, make_ext, tmp_path):
+        mod = make_ext("import sys\ndef register():\n    sys.exit(0)\n")
+        monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
+        db = tmp_path / "s.db"
+        with pytest.raises(ExtensionLoadError):
+            GraphStore(str(db))
+        assert not db.exists()
+
+    def test_the_cli_exits_1_with_the_error_when_an_extension_exits_0(
+            self, monkeypatch, make_ext, tmp_path):
+        from click.testing import CliRunner
+        from revien.cli import main
+        mod = make_ext("import sys\ndef register():\n    sys.exit(0)\n")
+        db = str(tmp_path / "s.db")
+        GraphStore(db).close()
+        monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
+        res = CliRunner().invoke(main, ["status", "--db", db])
+        assert res.exit_code == 1
+        assert res.output.startswith("Error: ") and "called sys.exit(0)" in res.output
+        assert f"{mod}:register" in res.output
+
+    def test_a_keyboard_interrupt_is_not_swallowed(self, monkeypatch, make_ext):
+        mod = make_ext('''
+            def register():
+                raise KeyboardInterrupt()
+        ''')
+        monkeypatch.setenv(extensions.ENV_VAR, f"{mod}:register")
+        with pytest.raises(KeyboardInterrupt):
+            load_extensions()
+        # nothing is stuck: it was not marked loaded, and a fixed config loads
+        assert extensions.loaded_extensions() == {}
+        good = make_ext(TOY)
+        monkeypatch.setenv(extensions.ENV_VAR, f"{good}:register")
+        assert f"{good}:register" in load_extensions()
+        assert NodeType("recipe").value == "recipe"
+
     def test_types_registered_before_the_failure_stay_registered(self, monkeypatch, make_ext):
         mod = make_ext('''
             from revien.extensions import register_node_type
@@ -798,6 +1053,8 @@ class TestUnknownTypesAtOpen:
         assert "edge types 'pairs_with' (1 edge)" in text
         assert "REVIEN_EXTENSIONS" in text and "revien.extensions" in text
         assert "docs/EXTENSIONS.md" in text
+        # both causes are named, and neither is picked
+        assert "not installed or not loaded" in text and "newer Revien" in text
         assert e.value.node_types == {"recipe": 2}
         assert e.value.edge_types == {"pairs_with": 1}
         assert isinstance(e.value, ValueError)                    # old handlers still catch it
@@ -836,20 +1093,60 @@ class TestUnknownTypesAtOpen:
             s.close()
         assert raw_rows(db, "nodes") == before
 
-    def test_the_refused_open_releases_the_database(self, tmp_path, monkeypatch):
+    def test_the_refused_open_leaves_no_connection_open(self, tmp_path, monkeypatch):
         db = str(tmp_path / "s.db")
         seed_with_extension_types(db)
-        closed = []
-        real = GraphStore.close
+        opened = []
+        real = sqlite3.connect
 
-        def spy(self):
-            closed.append(self.db_path)
-            return real(self)
+        def spy(*args, **kwargs):
+            conn = real(*args, **kwargs)
+            opened.append(conn)
+            return conn
 
-        monkeypatch.setattr(GraphStore, "close", spy)
+        monkeypatch.setattr(sqlite3, "connect", spy)
         with pytest.raises(UnknownTypeError):
             GraphStore(db)
-        assert closed == [db]
+        assert opened, "the check looked at the database"
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError):         # closed
+                conn.execute("SELECT 1")
+
+    @pytest.mark.parametrize("fixture", [
+        "db_v02x_schema.sql",            # hand-built, before the confidence layer
+        "db_v030_7757085.sql",           # v0.3.0: migrations 002 to 006 all still to run
+        "db_main_03217f4.sql",           # main at user_version 4: 005 and 006 still to run
+    ])
+    def test_the_refusal_comes_before_any_ddl_migration_or_wal_switch(
+            self, fixture, tmp_path):
+        """A refused open leaves the file byte for byte as it was: no table or
+        column added, user_version unchanged, and a database that is not in WAL
+        yet is not switched to it (that rewrites its header)."""
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db)
+        conn.executescript((Path(__file__).parent / "fixtures" / fixture).read_text())
+        conn.execute("UPDATE nodes SET node_type = 'recipe' "
+                     "WHERE rowid = (SELECT MIN(rowid) FROM nodes)")
+        conn.commit()
+        conn.close()
+        data = db.read_bytes()
+        assert data[18:20] == b"\x01\x01"                           # format 1: not WAL
+        before = hashlib.sha256(data).hexdigest()
+        files = sorted(p.name for p in tmp_path.iterdir())
+
+        for _ in range(2):
+            with pytest.raises(UnknownTypeError) as e:
+                GraphStore(str(db))
+            assert e.value.node_types == {"recipe": 1}
+        assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+        assert sorted(p.name for p in tmp_path.iterdir()) == files    # no side files
+
+        # and it was only the refusal that kept it so: registered, the same
+        # file is migrated and switched to WAL
+        register_node_type("recipe")
+        GraphStore(str(db)).close()
+        assert hashlib.sha256(db.read_bytes()).hexdigest() != before
+        assert db.read_bytes()[18:20] == b"\x02\x02"
 
     def test_a_hostile_type_string_cannot_flood_or_break_the_message(self, tmp_path):
         db = str(tmp_path / "s.db")
@@ -928,6 +1225,7 @@ class TestUnknownTypeInARowReadLater:
                 s.get_node("late-node")
             assert "'late-node'" in str(e.value) and "'recipe'" in str(e.value)
             assert "REVIEN_EXTENSIONS" in str(e.value)
+            assert "not installed or not loaded" in str(e.value) and "newer Revien" in str(e.value)
             assert e.value.node_types == {"recipe": 1}
             with pytest.raises(ValueError):
                 s.list_nodes()
@@ -970,6 +1268,7 @@ class TestDescribeUnregistered:
         assert "node types 'recipe' (2 nodes)" in text
         assert "edge types 'pairs_with' (1 edge)" in text
         assert "REVIEN_EXTENSIONS" in text
+        assert "not installed or not loaded" in text and "newer Revien" in text
 
     def test_empty_when_everything_is_known(self):
         register_toy()

@@ -21,6 +21,14 @@ How it holds:
 * Every other changed revien/**/*.py is scanned by AST against the base
   (origin/main when it exists, else main); any network-client use that is new
   there fails.
+* Loading an entry point imports a module by name, so a zero-argument
+  `.load()` call (or `EntryPoint.load(x)`) is reported like a dynamic import.
+  The one allowed site is `_run` in revien/extensions.py, which imports only
+  what REVIEN_EXTENSIONS or an installed package's `revien.extensions` entry
+  point names (ENTRY_POINT_SITES: that file, that function, that statement,
+  once). The file itself is not pinned; a second load there, in another
+  function or in another file, fails. Discovery by `entry_points(...)` only
+  reads metadata files and imports nothing, so it is not reported.
 
 The scanners are heuristics and cannot see everything. EVASIONS and
 PROBE_EVASIONS list the shapes shown to evade them (each has a snippet the
@@ -73,6 +81,14 @@ DYNAMIC_ROOTS = ("importlib", "builtins", "sys")
 # `import http` then `http.client.HTTPConnection(...)`.
 _PARENTS = {m.split(".")[0] for m in NETWORK_MODULES if "." in m}
 DYNAMIC = "<dynamic-import>"
+# `entry_point.load()` imports the module an entry point names.
+ENTRY_POINT_LOAD = "<entry-point-load>"
+# The one reviewed place that may do it: (file, function, tag, statement) ->
+# how many times. The statement is part of the key, so a different or a second
+# load in the same function is still reported.
+ENTRY_POINT_SITES = {
+    ("revien/extensions.py", "_run", ENTRY_POINT_LOAD, "entry_point.load()"): 1,
+}
 
 
 def _matches(name: str):
@@ -232,6 +248,10 @@ class _Scan(ast.NodeVisitor):
         self._call_funcs.add(id(f))
         name = (f.id if isinstance(f, ast.Name)
                 else f.attr if isinstance(f, ast.Attribute) else "")
+        if isinstance(f, ast.Attribute) and f.attr == "load" and (
+                (not node.args and not node.keywords)
+                or (self._resolve(f) or "").endswith("EntryPoint.load")):
+            self._add(ENTRY_POINT_LOAD, node)
         if name in ("getattr", "vars", "setattr", "delattr") and node.args:
             root = self._resolve(node.args[0])
             if root and root.split(".")[0] in DYNAMIC_ROOTS:
@@ -319,8 +339,15 @@ def violations_in(rel_path: str, head_src: str, base_src: str):
     (`pin_problem`), not by the scanner: its whole content is the review."""
     if rel_path in PINNED:
         return []
-    return [(rel_path, func, module, stmt)
-            for func, module, stmt in new_network_uses(head_src, base_src)]
+    left = dict(ENTRY_POINT_SITES)
+    out = []
+    for func, module, stmt in new_network_uses(head_src, base_src):
+        key = (rel_path, func, module, stmt)
+        if left.get(key, 0) > 0:
+            left[key] -= 1            # the one reviewed entry-point load
+            continue
+        out.append((rel_path, func, module, stmt))
+    return out
 
 
 # Attribute names that reach into a function's or module's internals.
@@ -557,6 +584,21 @@ CONTROLS = (
      "import sys\nsys.modules['json']\n", set()),
     ("negative: asyncio.sleep",
      "import asyncio\nasync def f():\n    await asyncio.sleep(1)\n", set()),
+    ("E8 entry point load", "def f(ep):\n    return ep.load()\n",
+     {ENTRY_POINT_LOAD}),
+    ("E8b EntryPoint.load(ep)",
+     "import importlib.metadata as md\ndef f(ep):\n    return md.EntryPoint.load(ep)\n",
+     {ENTRY_POINT_LOAD}),
+    ("E8c from importlib.metadata import EntryPoint",
+     "from importlib.metadata import EntryPoint\nEntryPoint.load(x)\n",
+     {ENTRY_POINT_LOAD}),
+    ("E8d pkg_resources entry point",
+     "import pkg_resources\nfor ep in pkg_resources.iter_entry_points('g'):\n    ep.load()\n",
+     {ENTRY_POINT_LOAD}),
+    ("negative: json.load(f)", "import json\njson.load(f)\n", set()),
+    ("negative: entry_points() alone imports nothing",
+     "import importlib.metadata\nimportlib.metadata.entry_points(group='g')\n",
+     set()),
 )
 
 # What the scanner provably does NOT report. Each snippet is run by the
@@ -585,6 +627,10 @@ EVASIONS = (
     ("a module that is not imported where it is used, reached through a "
      "variable set elsewhere",
      "def f(client):\n    return client.get('https://x.example')\n"),
+    ("an entry point loaded through getattr",
+     "def f(ep):\n    return getattr(ep, 'load')()\n"),
+    ("an entry point loaded through operator.methodcaller",
+     "import operator\ndef f(ep):\n    return operator.methodcaller('load')(ep)\n"),
 )
 # Self-tests for the probe-reach scan: (name, source, must it be reported).
 PROBE_CONTROLS = (
@@ -725,6 +771,33 @@ def _controls():
                       ("other function", "def _probe_daemon():\n    import http.client\n")):
         if not violations_in("revien/cli.py", src, ""):
             fail(f"control {name!r}: not reported as a violation")
+    # the one entry-point load: allowed where it is, and only there
+    ext = REPO_ROOT / "revien" / "extensions.py"
+    if ext.exists():
+        real_ext = ext.read_text(encoding="utf-8")
+        if [u for u in network_uses(real_ext) if u[1] == ENTRY_POINT_LOAD] != [
+                ("_run", ENTRY_POINT_LOAD, "entry_point.load()")]:
+            fail("revien/extensions.py no longer has exactly one entry-point "
+                 "load, in _run, as `entry_point.load()`")
+        if violations_in("revien/extensions.py", real_ext, ""):
+            fail("the reviewed entry-point load in revien/extensions.py is "
+                 f"reported: {violations_in('revien/extensions.py', real_ext, '')}")
+        for name, rel, src in (
+                ("a second load in another function", "revien/extensions.py",
+                 real_ext + "\ndef other(ep):\n    return ep.load()\n"),
+                ("the same statement twice in _run", "revien/extensions.py",
+                 real_ext.replace("    func = entry_point.load()",
+                                  "    func = entry_point.load()\n    func = entry_point.load()")),
+                ("a different load in place of the reviewed one", "revien/extensions.py",
+                 real_ext.replace("    func = entry_point.load()",
+                                  "    func = other_point.load()")),
+                ("a load of something else in _run", "revien/extensions.py",
+                 real_ext.replace("    func = entry_point.load()",
+                                  "    func = entry_point.load()\n    other = other_point.load()")),
+                ("the same function in another file", "revien/cli.py",
+                 "def _run(spec, entry_point):\n    return entry_point.load()\n")):
+            if src == real_ext or not violations_in(rel, src, ""):
+                fail(f"entry-point control {name!r}: not reported as a violation")
 
 
 def main():

@@ -89,3 +89,10 @@ def test_the_refusal_the_doc_quotes_is_the_one_raised(tmp_path, monkeypatch):
     assert res.exit_code == 1
     actual = " ".join(res.output.replace(db, "/path/memory.db").split())
     assert actual == " ".join(quoted.group(1).split())
+
+
+def test_the_doc_says_not_to_use_in_on_the_enum():
+    text = " ".join(doc_text().split())
+    assert "`x in NodeType` is not a reliable test for an extension value" in text
+    assert "differs across Python versions" in text
+    assert "`x in all_node_type_values()`" in text

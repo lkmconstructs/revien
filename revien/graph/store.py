@@ -86,13 +86,10 @@ class GraphStore(ForgetStoreMixin):
         # configured extension that fails raises here, before a connection
         # is opened.
         _extensions.load_extensions()
-        try:
-            self._ensure_db()
-        except _extensions.UnknownTypeError:
-            # A refused open must not leave the connection, and so the db
-            # file, held.
-            self.close()
-            raise
+        # A database holding a type nobody registered is refused before this
+        # store has a connection: no WAL switch, DDL or migration.
+        self._refuse_unknown_types()
+        self._ensure_db()
 
     def register_content_listener(
         self, name: str, on_content_change=None, on_delete=None,
@@ -177,9 +174,6 @@ class GraphStore(ForgetStoreMixin):
         """
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
-        # Before any DDL or migration: a database that holds a type nobody
-        # registered is refused untouched (see _check_stored_types).
-        self._check_stored_types(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
@@ -353,6 +347,21 @@ class GraphStore(ForgetStoreMixin):
             "SELECT v FROM d WHERE v IS NOT NULL")
         return {r[0] for r in rows}
 
+    def _refuse_unknown_types(self) -> None:
+        """Run ``_check_stored_types`` on a brief connection of its own,
+        opened with no pragma and closed before this store opens its
+        connection. That is what makes the refusal precede everything the
+        store's own open does: the switch to WAL (which rewrites the header of a
+        database that is not in WAL yet), the DDL, and every migration.
+        A file that does not exist yet has nothing to check."""
+        if not Path(self.db_path).is_file():
+            return
+        probe = sqlite3.connect(self.db_path)
+        try:
+            self._check_stored_types(probe)
+        finally:
+            probe.close()
+
     def _check_stored_types(self, conn: sqlite3.Connection) -> None:
         """Refuse to open a database whose node or edge types are not all
         known: built in, or registered by a loaded extension.
@@ -362,9 +371,9 @@ class GraphStore(ForgetStoreMixin):
         recall, dedup, supersession and forget act on a row nobody can
         classify; skipping it makes memory vanish without a word. So the open
         fails with ``UnknownTypeError``, naming each type, how many rows hold
-        it and how to register it, before anything is read or written. The
+        it and what to do, having read nothing but the two type columns. The
         check probes the two type indexes once per distinct type; a database
-        that does not have the tables yet (a new file) has nothing to check.
+        that does not have the tables yet has nothing to check.
         """
         have = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "

@@ -108,6 +108,9 @@ Revien imports only the modules that two sources name, and reads nothing else:
    colon, no spaces and no extras; blank items are ignored).
 
 An entry point and an environment item that name the same function run it once.
+Loading an entry point imports a module by name, so the egress gate
+(`scripts/gates/check_egress.py`) reports a `.load()` call like a dynamic import
+and allows exactly one: the statement in `_run` in `revien/extensions.py`.
 Revien scans installed packages' metadata files for the group and reads the
 environment; it makes no network call to find or load an extension. Loading
 runs the extension's code with your privileges, so install only packages you
@@ -122,10 +125,15 @@ loads them before it reads the file, because it parses the file before it
 opens a store. Library code that builds a `Node` or an `Edge` of an extension
 type before any store is open calls `revien.extensions.load_extensions()`
 first, or registers directly. A call made from inside an extension while it is
-loading returns at once.
+loading returns at once. `REVIEN_EXTENSIONS` is read on every call: an item
+added after an earlier load is loaded at the next call (a store opening, or
+`load_extensions()`), an item already loaded is not run again, and an item
+removed stays loaded, because a registered type is never unregistered.
 
 **When one fails.** An extension that cannot be imported, is not callable,
-raises, or has a malformed `REVIEN_EXTENSIONS` item is an `ExtensionLoadError`.
+raises, calls `sys.exit()` (or raises any other `BaseException` but
+`KeyboardInterrupt`, which propagates), or has a malformed `REVIEN_EXTENSIONS`
+item is an `ExtensionLoadError`.
 It names every failing extension, where it was configured, and the cause. It is
 not skipped: the other extensions still load, then the error is raised, and it
 is raised again on every later attempt until the cause is fixed. The store does
@@ -157,6 +165,12 @@ What it means in practice:
   `NodeType.__members__` still list only the built-ins, and so do the JSON
   schema pydantic generates and the OpenAPI document. Use
   `all_node_type_values()`. `NodeType["RECIPE"]` fails; use `NodeType("recipe")`.
+- `x in NodeType` is not a reliable test for an extension value, and it differs
+  across Python versions. For the registered member it is `False` on 3.10 and
+  3.11 and `True` on 3.12 and later. For the plain string `"recipe"` it raises
+  `TypeError` on 3.10 and 3.11 and is `False` on 3.12 and later (for a built-in
+  string such as `"fact"`: `TypeError`, then `True`). Test membership with
+  `x in all_node_type_values()` instead.
 - The mechanism was exercised on Python 3.10, 3.11, 3.12 and 3.13, and on
   pydantic 2.0.3 through 2.14.1.
 
@@ -187,16 +201,23 @@ extractor (`REVIEN_EXTRACTOR`).
 ## A database that holds a type nobody registered
 
 Opening a database whose node or edge types are not all built in or registered
-fails with `UnknownTypeError` (a `ValueError`), before anything is read:
+fails with `UnknownTypeError` (a `ValueError`). The check reads only the two
+type columns, on a connection of its own, before the store opens its connection,
+switches the database to WAL, creates a table or runs a migration, so the file is
+left exactly as it was:
 
 ```
 Error: Cannot open the database /path/memory.db: it holds node types 'recipe'
 (12 nodes); edge types 'pairs_with' (4 edges), which no loaded extension
-registers. No row was changed or dropped. A type that is not built in comes
-from an extension: install the package that defines it (it declares the
-'revien.extensions' entry point group) or set
-REVIEN_EXTENSIONS=package.module:function, then retry. See docs/EXTENSIONS.md.
+registers. No row was changed or dropped. Either an extension that registers
+such types is not installed or not loaded, or the data came from a newer Revien
+than this one. For an extension, install the package that defines it (it
+declares the 'revien.extensions' entry point group) or set
+REVIEN_EXTENSIONS=package.module:function; for a newer Revien, upgrade it. Then
+retry. See docs/EXTENSIONS.md.
 ```
+
+The message names both causes and does not guess which one applies.
 
 This is deliberate. Reading such a row as some other type would change what it
 means. Passing it through as an "unknown" type would let recall, dedup,
