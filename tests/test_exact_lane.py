@@ -642,7 +642,16 @@ class TestFalseDates:
 # ── a slash pair is a date only when something marks it as one ────────────────
 
 def _dates(q):
-    return [(d.month, d.day, d.year) for d in parse_signals(q).dates]
+    """(month, day, year) per date; a range is ("range", start, end)."""
+    out = []
+    for d in parse_signals(q).dates:
+        if d.is_range:
+            end_year = None if d.year is None else d.year + d.end_year_offset
+            out.append(("range", (d.month, d.day, d.year),
+                        (d.end_month, d.end_day, end_year)))
+        else:
+            out.append((d.month, d.day, d.year))
+    return out
 
 
 class TestSlashPairsNeedAMarker:
@@ -679,10 +688,10 @@ class TestSlashPairsNeedAMarker:
         ("what happened on 3/4?", [(3, 4, None)]),
         # zero-padded or with a year: a date whatever comes before
         ("03/04", [(3, 4, None)]), ("by 03/04", [(3, 4, None)]),
-        ("from 03/04 to 03/08", [(3, 4, None), (3, 8, None)]),
+        ("from 03/04 to 03/08", [("range", (3, 4, None), (3, 8, None))]),
         ("the week of 03/10", [(3, 10, None)]),
         ("3/4/2025", [(3, 4, 2025)]),
-        ("from 3/4/2026 to 3/8/2026", [(3, 4, 2026), (3, 8, 2026)]),
+        ("from 3/4/2026 to 3/8/2026", [("range", (3, 4, 2026), (3, 8, 2026))]),
         ("between 1/2/2026 and 3/4/2026", [(1, 2, 2026), (3, 4, 2026)]),
         # not ratio-shaped: read with no marker, as before
         ("12/25", [(12, 25, None)]), ("between 3/10 and 3/12", [(3, 12, None)]),
@@ -939,8 +948,7 @@ class TestDateEdges:
         ("the 3/4 May meeting", []),
         ("on 9/21 Mar", [(9, 21, None)]),
         # month day / day month against a slash, hyphen or dot
-        ("September 3/4", []), ("May 5/6", []), ("May 5-10", []),
-        ("May 5th-6th", []), ("May 5.5", []), ("4-5 May", []),
+        ("September 3/4", []), ("May 5/6", []), ("May 5.5", []),
         ("v1.5 May release", []), ("21 September/October", []),
         ("Apr/May 5", []), ("3-May 5", []),
         # month year and the full forms
@@ -949,8 +957,7 @@ class TestDateEdges:
         ("Sept 21, 2026-2027", [(9, 21, None)]), ("5 May-2026", []),
         # slash pairs and slash dates
         ("1-3/4 cups", []), ("on 1-3/4", []), ("on 3/4.5", []),
-        ("on 3/4-inch pipe", []), ("on 9/21-9/23", []), ("9/21-9/23", []),
-        ("9/21/2026-9/23/2026", []), ("1-3/4/2026", []),
+        ("on 3/4-inch pipe", []), ("1-3/4/2026", []), ("9/21-26", []),
         ("2026-09-21-3", []), ("notes-2026-09-21", []),
     ])
     def test_no_date_across_an_edge(self, q, want):
@@ -962,7 +969,7 @@ class TestDateEdges:
         ("(May 5)", [(5, 5, None)]), ("[9/21]", [(9, 21, None)]),
         ("2026-09-21T10:00", [(9, 21, 2026)]), ("on 1/2/2026.", [(1, 2, 2026)]),
         ("21 May, 2026", [(5, 21, 2026)]), ("May, 2026", [(5, None, 2026)]),
-        ("from 9/21 to 9/23", [(9, 21, None), (9, 23, None)]),
+        ("from 9/21 to 9/23", [("range", (9, 21, None), (9, 23, None))]),
         ("September 21, 2026", [(9, 21, 2026)]), ("21 September 2026", [(9, 21, 2026)]),
         ("Sept 21st", [(9, 21, None)]), ("21st of September", [(9, 21, None)]),
         ("Sep. 21st 2026", [(9, 21, 2026)]), ("9/21/26", [(9, 21, 2026)]),
@@ -971,6 +978,174 @@ class TestDateEdges:
     ])
     def test_dates_with_clean_edges_still_parse(self, q, want):
         assert _dates(q) == want, q
+
+
+# ── ranges: one signal for the whole span, read whole or not at all ──────────
+
+def R(start, end):
+    return [("range", start, end)]
+
+
+class TestRanges:
+    @pytest.mark.parametrize("q,want", [
+        # what 2c40df5 / 11db52d read in part, now read whole
+        ("what happened May 5-10", R((5, 5, None), (5, 10, None))),
+        ("the Sept 21-23 trip", R((9, 21, None), (9, 23, None))),
+        ("the 9/21-9/23 trip", R((9, 21, None), (9, 23, None))),
+        ("12/24-12/26", R((12, 24, None), (12, 26, None))),
+        ("9/21/2026-9/23/2026", R((9, 21, 2026), (9, 23, 2026))),
+        ("21-23 September 2026", R((9, 21, 2026), (9, 23, 2026))),
+        # hyphen, en dash, em dash and "to", spaced or not, all the same
+        ("May 5 - 10", R((5, 5, None), (5, 10, None))),
+        ("May 5–10", R((5, 5, None), (5, 10, None))),
+        ("May 5 — 10", R((5, 5, None), (5, 10, None))),
+        ("May 5 to 10", R((5, 5, None), (5, 10, None))),
+        ("May 5 to May 10", R((5, 5, None), (5, 10, None))),
+        ("9/21–9/23", R((9, 21, None), (9, 23, None))),
+        ("9/21 to 9/23", R((9, 21, None), (9, 23, None))),
+        ("from 9/21 to 9/23", R((9, 21, None), (9, 23, None))),
+        ("2026-09-21 to 2026-09-23", R((9, 21, 2026), (9, 23, 2026))),
+        ("May 5th-6th", R((5, 5, None), (5, 6, None))),
+        ("21st to 23rd September", R((9, 21, None), (9, 23, None))),
+        ("the 3-5 May meeting", R((5, 3, None), (5, 5, None))),
+        ("4-5 May", R((5, 4, None), (5, 5, None))),
+        # across a month and across a year
+        ("Sept 28 - Oct 3", R((9, 28, None), (10, 3, None))),
+        ("28 Sept - 3 Oct 2026", R((9, 28, 2026), (10, 3, 2026))),
+        ("Dec 28 - Jan 3", R((12, 28, None), (1, 3, None))),
+        ("Dec 28 - Jan 3, 2027", R((12, 28, 2026), (1, 3, 2027))),
+        ("Dec 28, 2026 - Jan 3, 2027", R((12, 28, 2026), (1, 3, 2027))),
+        ("Sept 21-23, 2026", R((9, 21, 2026), (9, 23, 2026))),
+        ("21/09/2026-23/09/2026", R((9, 21, 2026), (9, 23, 2026))),
+        ("Jan 1-31", R((1, 1, None), (1, 31, None))),
+        ("Feb 28 - Mar 1", R((2, 28, None), (3, 1, None))),
+        # a marked or padded ratio-shaped start
+        ("on 3/4-3/8", R((3, 4, None), (3, 8, None))),
+        ("from 03/04 to 03/08", R((3, 4, None), (3, 8, None))),
+    ])
+    def test_a_range(self, q, want):
+        assert _dates(q) == want, q
+
+    @pytest.mark.parametrize("q", [
+        # reversed, empty, too long, impossible
+        "May 10-5", "May 5-5", "May 1 - June 15", "Jan 1 - Feb 1",
+        "Sept 21-45", "Feb 30 - Mar 2", "9/23-9/21", "21/9-23/9",
+        "9/21/2026-9/23/2027",
+        # the ratio rule on the start
+        "1/2-3/4 cup", "from 3/4 to 3/8", "3/4-3/8", "rated it 9/10 - 10/10",
+        "1/2 to 3/4 cup", "3/4-inch",
+        # no range shape: no partial date either
+        "9/21-26", "1-3/4 cups",
+    ])
+    def test_no_date_not_a_partial_one(self, q):
+        assert _dates(q) == [], q
+
+    def test_a_failed_range_leaves_no_code_behind(self):
+        for q in ["Sept 21-45", "May 10-5", "the 9/23-9/21 trip", "ages 5-10",
+                  "rooms 21-23", "call 555-1234", "1-3/4 cups", "9/21-26"]:
+            assert parse_signals(q).ids == [], q
+
+    def test_ranges_do_not_disturb_single_dates(self):
+        assert _dates("on 9/21 and 9/23") == [(9, 21, None), (9, 23, None)]
+        assert _dates("between 3/10 and 3/12") == [(3, 12, None)]
+        assert _dates("May 5, 10 people") == [(5, 5, None)]
+        assert _dates("Sept 21, 2026-27") == [(9, 21, None)]
+
+    def test_the_span_is_a_store_range(self):
+        from revien.retrieval.exact import parse_dates
+        d = parse_dates("Dec 28 - Jan 3")[0][0]
+        assert d.ranges_for_year(2026) == ("2026-12-28", "2027-01-03")
+        d = parse_dates("Feb 28 - Feb 29")[0][0]
+        assert d.ranges_for_year(2024) == ("2024-02-28", "2024-02-29")
+        assert d.ranges_for_year(2025) is None
+        assert parse_dates("Sept 21-23")[0][0].describe()["range_end"] == {
+            "year": None, "month": 9, "day": 23}
+
+    def test_a_day_inside_the_span_matches_like_a_day(self, store):
+        inside = add(store, "Trip day two", "x", **day(2026, 9, 22))
+        start = add(store, "Trip day one", "x", **day(2026, 9, 21))
+        outside = add(store, "Day after", "x", **day(2026, 9, 24))
+        mon = add(store, "September plans", "x", **month(2026, 9))
+        r = ExactLane(store, ExactConfig()).build("the Sept 21-23 trip", [])
+        assert r.boost[inside.node_id] == pytest.approx(BOOST_MAX)
+        assert r.boost[start.node_id] == pytest.approx(BOOST_MAX)
+        assert outside.node_id not in r.boost
+        assert r.boost[mon.node_id] == pytest.approx(BOOST_MAX * 0.4)
+        # one signal: never more than one exact day gives, however wide
+        wide = ExactLane(store, ExactConfig()).build("Sept 1-30", [])
+        exact = ExactLane(store, ExactConfig()).build("on 2026-09-22", [])
+        assert wide.boost[inside.node_id] == exact.boost[inside.node_id]
+        assert len(wide.detected["dates"]) == 1
+        assert wide.matches[inside.node_id] == [
+            m for m in wide.matches[inside.node_id] if m["signal"] == "date"]
+        assert len(wide.matches[inside.node_id]) == 1
+
+    def test_a_cross_year_range_matches_both_years(self, store):
+        a = add(store, "New year eve", "x", **day(2026, 12, 31))
+        b = add(store, "New year day", "x", **day(2027, 1, 1))
+        r = ExactLane(store, ExactConfig()).build("Dec 28 - Jan 3", [])
+        assert a.node_id in r.boost and b.node_id in r.boost
+
+    @pytest.mark.parametrize("q,label", [
+        ("what happened May 5-10", "Ages 5-10 swim class"),
+        ("the Sept 21-23 trip", "Rooms 21-23 booking"),
+        ("the 9/21-9/23 trip", "Seats 9/21-9/23"),
+    ])
+    def test_a_range_never_lifts_a_label_that_contains_its_numbers(self, store, q, label):
+        hijack = add(store, label, "unrelated")
+        trip = add(store, "Trip", "x", **day(2026, 9, 22))
+        r = ExactLane(store, ExactConfig()).build(q, [])
+        assert hijack.node_id not in r.boost and hijack.node_id not in r.inject_ids
+        assert r.detected["ids"] == []
+        if "Sept" in q or "9/2" in q:
+            assert trip.node_id in r.boost
+
+
+class TestQuoteAwareCut:
+    """A cut never lands inside a quoted phrase: the text between two quotes
+    is never read as one."""
+
+    TAIL = '"Dentist appointment" Ridge hike "Garden planting season"'
+
+    def _cut_at(self, shift, tail=None):
+        from revien.retrieval.exact import SCAN_CHARS
+        tail = tail or self.TAIL
+        half = SCAN_CHARS - SCAN_CHARS // 2
+        pad = half - (len(tail) - shift)
+        return "lorem ipsum " * 400 + tail + " x" * (pad // 2) + " " * (pad % 2)
+
+    @pytest.mark.parametrize("shift", [1, 3, 8, 15, 20])
+    def test_a_tail_starting_inside_a_quote(self, store, shift):
+        ridge = add(store, "Ridge hike", "x")
+        garden = add(store, "Garden planting season", "x")
+        q = self._cut_at(shift)
+        sig = parse_signals(q)
+        assert sig.truncated and sig.quoted == ["Garden planting season"]
+        r = ExactLane(store, ExactConfig()).build(q, [])
+        assert ridge.node_id not in r.boost and garden.node_id in r.boost
+
+    def test_a_tail_starting_at_the_quote_reads_both(self):
+        assert parse_signals(self._cut_at(0)).quoted == [
+            "Dentist appointment", "Garden planting season"]
+
+    @pytest.mark.parametrize("o,c", [("“", "”"), ("'", "'")])
+    def test_curly_and_single_quotes_too(self, o, c):
+        tail = f"{o}Dentist appointment{c} Ridge hike {o}Garden planting season{c}"
+        assert parse_signals(self._cut_at(4, tail)).quoted == ["Garden planting season"]
+
+    def test_the_head_cut_mirror(self):
+        from revien.retrieval.exact import SCAN_CHARS, _scan_ends
+        h = SCAN_CHARS // 2
+        q = "y " * ((h - 10) // 2) + self.TAIL + " " + "m " * 3000
+        head, _tail = _scan_ends(q, SCAN_CHARS)
+        assert '"' not in head and len(head) < h
+        assert parse_signals(q).quoted == []
+
+    def test_a_stray_inch_mark_does_not_flip_the_quotes(self):
+        # counting quote marks would be thrown by the 27" here; the lane's
+        # own quote rule is not
+        q = 'a 27" screen ' + "lorem ipsum " * 400 + '"Garden planting season" end'
+        assert parse_signals(q).quoted == ["Garden planting season"]
 
 
 class TestOrdinaryWords:

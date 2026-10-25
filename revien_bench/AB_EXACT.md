@@ -152,11 +152,14 @@ anything on.
 - A bare `3/4`-style date needs a marker to be read as one (`on 3/4`,
   `03/04`, `3/4/2026`; see `exact.py`): "the week of 3/10" or "from 3/4 to
   3/8" are read as ratios, not dates, and no date reads across a slash or a
-  hyphen into another number ("May 5-10", "21 September 3/4" is September
-  21). Write date questions the way your users would, and check the
-  report's detected dates.
+  hyphen into another number ("21 September 3/4" is September 21). A range
+  ("May 5-10", "9/21-9/23", "Sept 28 - Oct 3") is one date signal covering
+  every day in it, read whole or not at all (in order, 31 days at most).
+  Write date questions the way your users would, and check the report's
+  detected dates (a range shows its `range_end`).
 - The lane reads at most 4,096 characters of a question: a longer one is
-  read at its first and last 2,048 (cut at whitespace), and its
+  read at its first and last 2,048 (cut at whitespace, never inside a
+  quoted phrase), and its
   `exact_detected` says `truncated` with `scanned_chars` and `query_chars`.
   At most 16 codes per question are looked for inside labels, longest
   first; when more were asked, `exact_detected.ids_capped` lists the ones

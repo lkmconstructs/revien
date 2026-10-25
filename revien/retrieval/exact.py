@@ -41,6 +41,23 @@ DETECTION RULES (deterministic; no model; every rule is here)
       September 21, 2026   Sep 21st 2026
       21 September 2026   21st of September   day + month name
       September 2026                    a whole month
+      May 5-10   Sept 28 - Oct 3   9/21-9/23   12/24 to 12/26
+      21-23 September 2026   9/21/2026-9/23/2026   2026-09-21 to 2026-09-23
+                                        a RANGE: two dates joined by a hyphen,
+                                        an en or em dash, or "to", spaced or
+                                        not, read as ONE signal for the whole
+                                        span, first day to last. Both ends must
+                                        be real dates, in order, at most
+                                        MAX_RANGE_DAYS (31) days first to last
+                                        ("Dec 28 - Jan 3" crosses the year; a
+                                        year written once belongs to the end it
+                                        is written at). The ratio rule applies
+                                        to the start ("1/2-3/4 cup" is two
+                                        fractions). A range shape that breaks a
+                                        rule ("May 10-5", "May 1 - June 15",
+                                        "Sept 21-45") gives NO date: no part of
+                                        it is read again as a shorter date or
+                                        as a code. Ranges are read first.
     A date with no year ("September 21", "9/21") matches that day in ANY year
     the graph has a dated node for. Relative dates ("next Friday", "last
     week") are out of scope. A month alone ("in September") is not a date
@@ -72,9 +89,8 @@ DETECTION RULES (deterministic; no model; every rule is here)
         _NUM_R, _MON_L, _MON_R). "21 September 3/4" is Sept 21, not Sept 3;
         "the 3/4 May meeting" and "on 9/21 Mar" hold no May 4 and no Mar 21;
         "1-3/4 cups", "v1.5 May", "Apr/May 2026" and "September 2026/27"
-        hold no date. A range written with a hyphen is not read either
-        ("May 5-10", "9/21-9/23", "9/21/2026-9/23/2026"): write "from 9/21
-        to 9/23". "mid-May 2026" is still May 2026.
+        hold no date. A range is read only whole, as a range (above): "May
+        5-10" is never "May 5". "mid-May 2026" is still May 2026.
       * versions. Dotted numbers are never dates ("release 2024.1.5",
         "v2024.01.05"): the year-first form accepts "-" and "/" only.
       * words. "march", "mar", "may" and "jan" are ordinary words or names as
@@ -119,7 +135,9 @@ DETECTION RULES (deterministic; no model; every rule is here)
     between alphanumerics ("user_id_map"), or a hyphen join where one side is
     ALL CAPS or has a digit ("REV-FIX"), or a run of 5+ digits. Ordinals and
     clock/size shorthand ("21st", "3pm", "10:30", "5k") and plain years are
-    not IDs. Tokens consumed by a date or quote are not IDs. Matching is a
+    not IDs, and neither is a token made only of digits and "/", "-", en or
+    em dashes ("5-10", "21-23", "9/21-9/23", "555-1234"): a range, a score
+    or a fraction, which would otherwise lift a label such as "Ages 5-10". Tokens consumed by a date or quote are not IDs. Matching is a
     label equal to the token, a label containing the token as a whole token,
     or a node id equal to the token. Never node content. The containment
     lookup reads the label column once per code, so it is made for at most
@@ -134,7 +152,9 @@ DETECTION RULES (deterministic; no model; every rule is here)
     REVIEN_EXACT_SCAN_CHARS) characters of a query. A longer query is read
     at both ends, since the question often comes last: the first half of
     the budget (2,048) and the last half (2,048), each cut at whitespace so
-    no token is split. The middle is not searched for signals; the two ends
+    no token is split, and never inside a quoted phrase: the quote rule is
+    run over the whole query and a phrase a cut would land in is left out of
+    that part, so the text between two quotes is never read as one. The middle is not searched for signals; the two ends
     are read apart (nothing joins across the gap, and the tail starts a
     sentence), and a query that was cut has no whole-query label (rule 3).
     A cut is always reported, signal or not: detected["truncated"] is true,
@@ -154,6 +174,13 @@ THE BOOST (bounded, not a promotion)
               neighbour of a named entity: the name's strength * NEIGHBOR_STRENGTH (0.5)
               date on event_time: min(node granularity, query granularity)
                     with day 1.0, week 0.6, month 0.4, year 0.15, fuzzy 0.1
+                    A RANGE is one signal at day granularity: a node whose
+                    event_time falls in the span matches as it would match
+                    one exact day (a day node 1.0, a month node 0.4), once,
+                    never once per day, so a span can lift a node no more
+                    than one exact day would. A wide span matches more nodes,
+                    and the DATE_MAX_MATCHES guard scales it down as one
+                    signal over all of them.
               date on recorded_at (only for a node event_time did not
                     match): 0.5 * the query granularity weight
     weight    generic guard, below. 1.0 for an unshared title.
@@ -201,6 +228,7 @@ CANDIDATE ENTRY (bounded)
 
 from __future__ import annotations
 
+import bisect
 import calendar
 import os
 import re
@@ -333,6 +361,46 @@ _RE_DM = re.compile(
 _RE_SLASH = re.compile(r"(?<![\d/.\-])(\d{1,2})/(\d{1,2})(?![\d/])(?![\-.]\d)")
 _RE_MY = re.compile(rf"{_MON_L}\b{_MON}\b\.?,?\s+(\d{{4}})\b{_NUM_R}", re.I)
 
+# Ranges (rule 2): two dates joined by a hyphen, an en dash, an em dash or
+# "to", spaced or not. Read before the single dates, and whole or not at all.
+_SEP = r"\s*(?:[-\u2013\u2014]|to)\s*"
+
+
+def _mon(name: str) -> str:
+    return (rf"(?P<{name}>"
+            + "|".join(sorted(_MONTH_NAMES, key=len, reverse=True)) + ")")
+
+
+_RE_ISO_RANGE = re.compile(
+    r"(?<![\d/.\-])(?P<y1>\d{4})[-/](?P<m1>\d{1,2})[-/](?P<d1>\d{1,2})" + _SEP
+    + r"(?P<y2>\d{4})[-/](?P<m2>\d{1,2})[-/](?P<d2>\d{1,2})(?!\d|[/.\-]\d)")
+_RE_SLASH_RANGE = re.compile(
+    r"(?<![\d/.\-])(?P<m1>\d{1,2})/(?P<d1>\d{1,2})(?:/(?P<y1>\d{4}|\d{2}))?" + _SEP
+    + r"(?P<m2>\d{1,2})/(?P<d2>\d{1,2})(?:/(?P<y2>\d{4}|\d{2}))?"
+    + r"(?![\d/])(?![\-.]\d)")
+# month day - [month] day [, year]   ("May 5-10", "Sept 28 - Oct 3, 2026")
+_RE_MD_RANGE = re.compile(
+    rf"{_MON_L}\b{_mon('m1')}\b\.?\s+(?P<d1>\d{{1,2}}){_ORD}\b{_SEP}"
+    rf"(?:{_mon('m2')}\b\.?\s+)?(?P<d2>\d{{1,2}}){_ORD}\b"
+    rf"(?:,?\s+(?P<y2>\d{{4}})\b)?{_NUM_R}", re.I)
+# month day, year - month day [, year]: after a year the end names its month
+# ("Sept 21, 2026-27" is not Sept 21-27)
+_RE_MDY_RANGE = re.compile(
+    rf"{_MON_L}\b{_mon('m1')}\b\.?\s+(?P<d1>\d{{1,2}}){_ORD}\b,?\s+"
+    rf"(?P<y1>\d{{4}})\b{_SEP}{_mon('m2')}\b\.?\s+(?P<d2>\d{{1,2}}){_ORD}\b"
+    rf"(?:,?\s+(?P<y2>\d{{4}})\b)?{_NUM_R}", re.I)
+# day [month [year]] - day month [year]   ("21-23 September 2026", "28 Dec - 3 Jan")
+_RE_DM_RANGE = re.compile(
+    rf"{_NUM_L}\b(?P<d1>\d{{1,2}}){_ORD}"
+    rf"(?:\s+(?:of\s+)?{_mon('m1')}\b\.?(?:,?\s+(?P<y1>\d{{4}})\b)?)?{_SEP}"
+    rf"(?P<d2>\d{{1,2}}){_ORD}\s+(?:of\s+)?{_mon('m2')}\b"
+    rf"(?:\.?,?\s+(?P<y2>\d{{4}})\b{_NUM_R}|{_MON_R})", re.I)
+# The longest range read, first day to last inclusive.
+MAX_RANGE_DAYS = 31
+# A range shape that breaks the range rules: taken (no part of it is read
+# again, as a shorter date or as a code) and gives no date.
+_NO_DATE = object()
+
 _RE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_'’.\-/:]*[A-Za-z0-9]|[A-Za-z0-9]")
 _RE_ORDINAL_OR_UNIT = re.compile(
     r"^\d+(?:st|nd|rd|th|am|pm|k|m|s|x|ms|kb|mb|gb|hz|%)$|^\d{1,2}:\d{2}(?::\d{2})?(?:am|pm)?$",
@@ -448,15 +516,29 @@ class ExactConfig:
 @dataclass
 class DateSignal:
     text: str
-    granularity: str            # "day" | "month"
+    granularity: str            # "day" | "month" (a range is "day")
     month: int
     day: Optional[int] = None   # None for a whole month
     year: Optional[int] = None  # None: matches any year
+    # A range ("May 5-10", "9/21-9/23", "Dec 28 - Jan 3"): its last day, in
+    # the start's year (end_year_offset 0) or the next one (1).
+    end_month: Optional[int] = None
+    end_day: Optional[int] = None
+    end_year_offset: int = 0
+
+    @property
+    def is_range(self) -> bool:
+        return self.end_day is not None
 
     def ranges_for_year(self, year: int) -> Optional[Tuple[str, str]]:
-        """Inclusive ('YYYY-MM-DD', 'YYYY-MM-DD') for ``year``, or None when
-        the date does not exist in that year (Feb 29)."""
+        """Inclusive ('YYYY-MM-DD', 'YYYY-MM-DD') for ``year`` (a range: its
+        whole span, first day to last), or None when the date does not exist
+        in that year (Feb 29)."""
         try:
+            if self.is_range:
+                return (date(year, self.month, self.day).isoformat(),
+                        date(year + self.end_year_offset, self.end_month,
+                             self.end_day).isoformat())
             if self.day is None:
                 last = calendar.monthrange(year, self.month)[1]
                 return (date(year, self.month, 1).isoformat(),
@@ -467,9 +549,15 @@ class DateSignal:
             return None
 
     def describe(self) -> Dict[str, Any]:
-        return {"text": self.text, "granularity": self.granularity,
-                "year": self.year, "month": self.month, "day": self.day,
-                "any_year": self.year is None}
+        out = {"text": self.text, "granularity": self.granularity,
+               "year": self.year, "month": self.month, "day": self.day,
+               "any_year": self.year is None}
+        if self.is_range:
+            out["range_end"] = {
+                "year": (None if self.year is None
+                         else self.year + self.end_year_offset),
+                "month": self.end_month, "day": self.end_day}
+        return out
 
 
 @dataclass
@@ -586,6 +674,35 @@ def _two_digit_year(y: int) -> int:
     return 2000 + y if y < 100 else y
 
 
+def _range_signal(text: str, mo1: int, d1: int, y1: Optional[int],
+                  mo2: int, d2: int, y2: Optional[int]) -> Optional[DateSignal]:
+    """A range signal, or None when the range breaks the rules: both ends
+    must be real dates, the end after the start, at most MAX_RANGE_DAYS days
+    first to last. A year written once belongs to the end it is written at
+    ("Sept 21-23, 2026"; "Dec 28 - Jan 3, 2027" starts in 2026); with no year
+    the range is checked in a leap year and matches every year it exists in."""
+    if y1 is not None and y2 is not None:
+        cands = [(y1, y2)]
+    elif y2 is not None:
+        cands = [(y2, y2), (y2 - 1, y2)]
+    elif y1 is not None:
+        cands = [(y1, y1), (y1, y1 + 1)]
+    else:
+        cands = [(2000, 2000), (2000, 2001)]
+    for ys, ye in cands:
+        if ye - ys not in (0, 1):
+            continue
+        try:
+            s, e = date(ys, mo1, d1), date(ye, mo2, d2)
+        except ValueError:
+            continue
+        if s < e and (e - s).days < MAX_RANGE_DAYS:
+            year = None if y1 is None and y2 is None else ys
+            return DateSignal(text, "day", mo1, d1, year, end_month=mo2,
+                              end_day=d2, end_year_offset=ye - ys)
+    return None
+
+
 def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     """Return (date signals, query with each date's characters blanked).
 
@@ -621,7 +738,8 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         for m in rx.finditer(work):
             sig = fn(m, before)
             if sig is not None:
-                out.append(sig)
+                if sig is not _NO_DATE:
+                    out.append(sig)
                 taken.append(m.span())
         if taken:
             work = _blank(work, taken, _GONE)
@@ -679,6 +797,53 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         return DateSignal(m[0], "month", _MONTH_NAMES[m[1].lower()], None,
                           int(m[2]))
 
+    def range_of(m, mo1, d1, y1, mo2, d2, y2):
+        return _range_signal(m[0], mo1, d1, y1, mo2, d2, y2) or _NO_DATE
+
+    def iso_range(m, before):
+        return range_of(m, int(m["m1"]), int(m["d1"]), int(m["y1"]),
+                        int(m["m2"]), int(m["d2"]), int(m["y2"]))
+
+    def slash_range(m, before):
+        a1, b1, a2, b2 = (int(m[k]) for k in ("m1", "d1", "m2", "d2"))
+        y1 = _two_digit_year(int(m["y1"])) if m["y1"] else None
+        y2 = _two_digit_year(int(m["y2"])) if m["y2"] else None
+        if y1 is None and a1 <= b1 and b1 in RATIO_DENOMS:
+            # the ratio rule, on the start: "1/2-3/4 cup" is two fractions
+            prev, prev2 = before(m.start())
+            if not _slash_marked_as_date(
+                    m, prev, prev2, work[m.end():m.end() + 40]):
+                return _NO_DATE
+        # day-first only with a year, as for one date
+        mo1, d1 = (b1, a1) if y1 is not None and a1 > 12 and b1 <= 12 else (a1, b1)
+        mo2, d2 = (b2, a2) if y2 is not None and a2 > 12 and b2 <= 12 else (a2, b2)
+        return range_of(m, mo1, d1, y1, mo2, d2, y2)
+
+    def md_range(m, before):
+        if not _month_ok(m["m1"], lambda: before(m.start())[0]):
+            return None
+        mo1 = _MONTH_NAMES[m["m1"].lower()]
+        mo2 = _MONTH_NAMES[m["m2"].lower()] if m["m2"] else mo1
+        y1 = int(m["y1"]) if "y1" in m.re.groupindex and m["y1"] else None
+        y2 = int(m["y2"]) if m["y2"] else None
+        return range_of(m, mo1, int(m["d1"]), y1, mo2, int(m["d2"]), y2)
+
+    def dm_range(m, before):
+        strong = bool(re.search(r"\d(?:st|nd|rd|th)\b|\bof\b", m[0], re.I))
+        if not _month_ok(m["m2"], lambda: before(m.start())[0], strong):
+            return None
+        mo2 = _MONTH_NAMES[m["m2"].lower()]
+        mo1 = _MONTH_NAMES[m["m1"].lower()] if m["m1"] else mo2
+        y1 = int(m["y1"]) if m["y1"] else None
+        y2 = int(m["y2"]) if m["y2"] else None
+        return range_of(m, mo1, int(m["d1"]), y1, mo2, int(m["d2"]), y2)
+
+    # Ranges first: a range is read whole or not at all (rule 2).
+    each(_RE_ISO_RANGE, iso_range)
+    each(_RE_SLASH_RANGE, slash_range)
+    each(_RE_MDY_RANGE, md_range)
+    each(_RE_MD_RANGE, md_range)
+    each(_RE_DM_RANGE, dm_range)
     each(_RE_ISO, iso)
     each(_RE_SLASH_Y, slash_y)
     each(_RE_DMY, dmy)
@@ -709,9 +874,16 @@ def _is_possessive(tok: str) -> bool:
     return bool(_RE_POSSESSIVE.search(tok.strip(_TRIM)))
 
 
+# Separators that, with digits alone, make a range, a score or a fraction
+# ("5-10", "21-23", "9/21-9/23", "1-3/4"), never a code.
+_NUMERIC_SEPARATORS = frozenset("/-\u2013\u2014")
+
+
 def _is_id_token(tok: str) -> bool:
     t = _strip_token(tok)
     if len(t) < 3 or _RE_ORDINAL_OR_UNIT.match(t):
+        return False
+    if not t.isdigit() and all(c.isdigit() or c in _NUMERIC_SEPARATORS for c in t):
         return False
     has_digit = any(c.isdigit() for c in t)
     has_alpha = any(c.isalpha() for c in t)
@@ -735,20 +907,45 @@ _WS = " \t\n\r\f\v"
 
 def _scan_ends(text: str, max_chars: int) -> Tuple[str, str]:
     """(head, tail) of a query longer than ``max_chars`` (rule 5): the first
-    half of the budget from the start, the rest from the end, each cut at
-    whitespace so no token is split (a part that is one split token is
-    dropped)."""
+    half of the budget from the start, the rest from the end. Neither cut
+    splits a token (it moves to whitespace; a part that is one split token
+    is dropped) or a quoted phrase: the lane's own quote rule (_RE_QUOTE) is
+    run over the whole query, and a phrase the cut would land inside is left
+    out of the part, so the text between two quotes can never be read as
+    one. That is the lane's pairing, not a count of quote marks (a stray
+    inch mark would flip a count for the rest of the query). Linear."""
     h = max_chars // 2
-    head = text[:h]
-    if h < len(text) and head and not text[h].isspace():
-        k = max(head.rfind(c) for c in _WS)
-        head = head[:k] if k >= 0 else ""
-    start = len(text) - (max_chars - h)
-    tail = text[start:] if start < len(text) else ""
-    if tail and start > 0 and not text[start - 1].isspace():
-        ks = [k for k in (tail.find(c) for c in _WS) if k >= 0]
-        tail = tail[min(ks) + 1:] if ks else ""
-    return head, tail
+    quotes = [m.span() for m in _RE_QUOTE.finditer(text)]
+    starts = [s for s, _e in quotes]
+
+    def inside(pos: int) -> Optional[Tuple[int, int]]:
+        i = bisect.bisect_left(starts, pos) - 1
+        if i >= 0 and quotes[i][0] < pos < quotes[i][1]:
+            return quotes[i]
+        return None
+
+    def splits(pos: int) -> bool:
+        return (0 < pos < len(text) and not text[pos].isspace()
+                and not text[pos - 1].isspace())
+
+    end = h                         # head = text[:end]; only moves left
+    while True:
+        if splits(end):
+            end = max(max(text.rfind(c, 0, end) for c in _WS), 0)
+        elif inside(end):
+            end = inside(end)[0]
+        else:
+            break
+    start = len(text) - (max_chars - h)   # tail = text[start:]; only moves right
+    while True:
+        if splits(start):
+            ks = [k for k in (text.find(c, start) for c in _WS) if k >= 0]
+            start = min(ks) + 1 if ks else len(text)
+        elif inside(start):
+            start = inside(start)[1]
+        else:
+            break
+    return text[:end], text[start:]
 
 
 _RE_EDGE_JUNK = re.compile(r"[\W_]*")
