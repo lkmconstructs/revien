@@ -84,7 +84,21 @@ def _save_config(config: dict) -> None:
     config_path.write_text(json.dumps(config, indent=2))
 
 
-@click.group()
+class _RevienGroup(click.Group):
+    """The `revien` command group. An extension that fails to load, or a
+    database holding a type no extension registered (revien/extensions.py),
+    ends the command with a one-line error and exit code 1, not a traceback."""
+
+    def invoke(self, ctx):
+        from revien.extensions import ExtensionError
+
+        try:
+            return super().invoke(ctx)
+        except ExtensionError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+
+@click.group(cls=_RevienGroup)
 @click.version_option(version=__version__, prog_name="revien")
 def main():
     """Revien — Memory that returns. Graph-based memory engine for AI systems."""
@@ -1156,6 +1170,7 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
     target database unless --merge or --replace — an import must never
     silently eat an existing graph.
     """
+    from revien.extensions import describe_unregistered, load_extensions
     from revien.graph.schema import Graph
     from revien.graph.store import (
         GraphStore, ImportRefusedError, ImportValidationError,
@@ -1169,6 +1184,10 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
     config = _load_config()
     db_path = db or config.get("db_path", _default_db_path())
 
+    # The file is parsed before a store is opened, so an extension's types
+    # have to be registered first.
+    load_extensions()
+    data = None
     try:
         data = json.loads(Path(file).read_text(encoding="utf-8-sig"))
         graph = Graph.model_validate(data)
@@ -1177,6 +1196,11 @@ def import_(file: str, db: Optional[str], merge: bool, replace: bool):
         sys.exit(1)
     except Exception as e:  # pydantic ValidationError — schema mismatch
         click.echo(f"Invalid graph data: {e}")
+        # The validator lists only the built-in types; say when the cause is
+        # a type no extension registered.
+        hint = describe_unregistered(data)
+        if hint:
+            click.echo(hint)
         sys.exit(1)
 
     mode = "replace" if replace else ("merge" if merge else "refuse")

@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from revien import extensions as _extensions
+
 
 class NodeType(str, Enum):
     ENTITY = "entity"
@@ -30,6 +32,13 @@ class NodeType(str, Enum):
     # is the skill body verbatim; metadata carries description/triggers/
     # version/origin/status/scope/path. Participates in recall like any node.
     SKILL = "skill"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Types registered through revien.extensions. Python calls this for
+        # a value that is not a built-in member; None keeps the usual
+        # "'x' is not a valid NodeType" error. Built-in lookups never get here.
+        return _extensions.node_type_member(value)
 
 
 class EdgeType(str, Enum):
@@ -54,6 +63,11 @@ class EdgeType(str, Enum):
     # it undirected. Deliberately NEVER a merge: both nodes stay live, distinct,
     # independently correctable — this edge only widens what recall reaches.
     ALIAS_OF = "alias_of"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Types registered through revien.extensions; see NodeType._missing_.
+        return _extensions.edge_type_member(value)
 
 
 class SourceType(str, Enum):

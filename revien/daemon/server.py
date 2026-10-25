@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from revien import __version__, pairing
+from revien import __version__, extensions, pairing
 from revien.daemon.heartbeat import (
     DAEMON_FEATURES, HEARTBEAT_INTERVAL, clear_heartbeat, write_heartbeat)
 from revien.graph.schema import Edge, EdgeType, Graph, Node, NodeType
@@ -814,7 +814,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         try:
             edge_type = EdgeType(request.edge_type)
         except ValueError:
-            valid = ", ".join(e.value for e in EdgeType)
+            valid = ", ".join(extensions.all_edge_type_values())
             raise HTTPException(400, f"Invalid edge_type: {request.edge_type}. Valid: {valid}")
 
         if store.get_node(request.source_node_id) is None:
@@ -907,7 +907,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         try:
             graph = Graph.model_validate(graph_data)
         except Exception as e:
-            raise HTTPException(400, f"Invalid graph data: {str(e)}")
+            # Say so when the cause is a type no extension registered: the
+            # validator's own list of valid types only names the built-ins.
+            hint = extensions.describe_unregistered(graph_data)
+            raise HTTPException(
+                400, f"Invalid graph data: {str(e)}" + (f"\n{hint}" if hint else ""))
         try:
             result = store.import_graph(graph, mode=mode, semantic=semantic)
         except ImportRefusedError as e:

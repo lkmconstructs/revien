@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from revien import extensions as _extensions
+
 from .forget_store import ForgetStoreMixin
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
@@ -79,7 +81,18 @@ class GraphStore(ForgetStoreMixin):
         # layer (e.g. the semantic index) registering twice replaces itself
         # instead of firing twice. Listener errors never break store writes.
         self._content_listeners: dict = {}
-        self._ensure_db()
+        # Extension types (revien/extensions.py) must be registered before
+        # any row is read, so every surface that opens a store gets them. A
+        # configured extension that fails raises here, before a connection
+        # is opened.
+        _extensions.load_extensions()
+        try:
+            self._ensure_db()
+        except _extensions.UnknownTypeError:
+            # A refused open must not leave the connection, and so the db
+            # file, held.
+            self.close()
+            raise
 
     def register_content_listener(
         self, name: str, on_content_change=None, on_delete=None,
@@ -164,6 +177,9 @@ class GraphStore(ForgetStoreMixin):
         """
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
+        # Before any DDL or migration: a database that holds a type nobody
+        # registered is refused untouched (see _check_stored_types).
+        self._check_stored_types(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
@@ -324,6 +340,49 @@ class GraphStore(ForgetStoreMixin):
         # Forget layer (user_version 6): ownership, unit registry,
         # suppression records. Its DDL lives in graph/forget_store.py.
         self._migrate_add_forget_layer(conn)
+
+    @staticmethod
+    def _distinct_values(conn: sqlite3.Connection, table: str, column: str) -> set:
+        """Every distinct value of an indexed column, in about one index
+        probe per value instead of a scan of every row (a "loose index scan":
+        the next value is the smallest one above the last)."""
+        rows = conn.execute(
+            f"WITH RECURSIVE d(v) AS (SELECT MIN({column}) FROM {table} "
+            f"UNION ALL SELECT (SELECT MIN({column}) FROM {table} "
+            f"WHERE {column} > d.v) FROM d WHERE d.v IS NOT NULL) "
+            "SELECT v FROM d WHERE v IS NOT NULL")
+        return {r[0] for r in rows}
+
+    def _check_stored_types(self, conn: sqlite3.Connection) -> None:
+        """Refuse to open a database whose node or edge types are not all
+        known: built in, or registered by a loaded extension.
+
+        The alternatives are worse. Reading such a row as some other type
+        changes what it means; passing it through as an "unknown" type lets
+        recall, dedup, supersession and forget act on a row nobody can
+        classify; skipping it makes memory vanish without a word. So the open
+        fails with ``UnknownTypeError``, naming each type, how many rows hold
+        it and how to register it, before anything is read or written. The
+        check probes the two type indexes once per distinct type; a database
+        that does not have the tables yet (a new file) has nothing to check.
+        """
+        have = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('nodes', 'edges')")}
+        unknown = {"nodes": {}, "edges": {}}
+        for table, column, known in (
+                ("nodes", "node_type", set(_extensions.all_node_type_values())),
+                ("edges", "edge_type", set(_extensions.all_edge_type_values()))):
+            if table not in have:
+                continue
+            for value in self._distinct_values(conn, table, column) - known:
+                unknown[table][value] = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {column} = ?",
+                    (value,)).fetchone()[0]
+        if unknown["nodes"] or unknown["edges"]:
+            _extensions.check_known_types(
+                unknown["nodes"], unknown["edges"],
+                where=f"the database {self.db_path}")
 
     def _migrate_add_confidence_columns(self, conn: sqlite3.Connection) -> None:
         """Add confidence-layer columns to existing nodes/edges tables.
@@ -2949,9 +3008,15 @@ class GraphStore(ForgetStoreMixin):
     # ── Internal Helpers ──────────────────────────────────
 
     def _row_to_node(self, row: tuple) -> Node:
+        try:
+            node_type = NodeType(row[1])
+        except ValueError:
+            # A type nobody registered, written after this store opened (the
+            # open-time check cannot see rows that do not exist yet).
+            raise _extensions.unknown_row_error("node", row[1], row[0]) from None
         return Node(
             node_id=row[0],
-            node_type=NodeType(row[1]),
+            node_type=node_type,
             label=row[2],
             content=row[3],
             source_id=row[4],
@@ -2996,9 +3061,13 @@ class GraphStore(ForgetStoreMixin):
         )
 
     def _row_to_edge(self, row: tuple) -> Edge:
+        try:
+            edge_type = EdgeType(row[1])
+        except ValueError:
+            raise _extensions.unknown_row_error("edge", row[1], row[0]) from None
         return Edge(
             edge_id=row[0],
-            edge_type=EdgeType(row[1]),
+            edge_type=edge_type,
             source_node_id=row[2],
             target_node_id=row[3],
             weight=row[4],

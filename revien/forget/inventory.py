@@ -30,6 +30,9 @@ _ID = "an id Revien generates"
 _TIME = "a time Revien writes from a datetime"
 _ENUM = "a value from a fixed set of names"
 _HASH = "a keyed digest or hash, never the text"
+_TYPE = ("a built-in type name or one an extension registered in code "
+         "(lowercase snake_case, checked at registration); no other value "
+         "is written, and a database holding any other is refused at open")
 
 #: (table, column) -> why it can hold nothing a person typed.
 EXCLUDED: Dict[Tuple[str, str], str] = {
@@ -41,12 +44,12 @@ EXCLUDED: Dict[Tuple[str, str], str] = {
     ("distill_manifest", "anchor_node_id"): _ID,
     ("distill_manifest", "current_node_id"): _ID,
     ("distill_manifest", "content_hash"): _HASH,
-    ("edges", "edge_id"): _ID, ("edges", "edge_type"): _ENUM,
+    ("edges", "edge_id"): _ID, ("edges", "edge_type"): _TYPE,
     ("edges", "source_node_id"): _ID, ("edges", "target_node_id"): _ID,
     ("edges", "created_at"): _TIME, ("edges", "confidence_set_at"): _TIME,
     ("edges", "invalidated_at"): _TIME,
     ("node_provenance", "node_id"): _ID,
-    ("nodes", "node_id"): _ID, ("nodes", "node_type"): _ENUM,
+    ("nodes", "node_id"): _ID, ("nodes", "node_type"): _TYPE,
     ("nodes", "created_at"): _TIME, ("nodes", "last_accessed"): _TIME,
     ("nodes", "source_type"): _ENUM, ("nodes", "confidence_set_at"): _TIME,
     ("nodes", "last_referenced"): _TIME, ("nodes", "invalidated_at"): _TIME,
