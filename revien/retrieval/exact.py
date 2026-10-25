@@ -60,14 +60,10 @@ DETECTION RULES (deterministic; no model; every rule is here)
                                         date, "May 1 - June 15" gives May 1 and
                                         June 15, "May 5 to 3 pm" gives May 5.
                                         Ranges are read first. A month word
-                                        that has a day of its own on the other
-                                        side is that day's, never the range's:
-                                        "10-11 Sept 21" is Sept 21 (not Sept
-                                        10-11), "ages 5-10 May 3" is May 3, "3
-                                        May 5-10" is 3 May, "May 5 - 10 June"
-                                        is not May 5-10 (_RE_DM_RANGE's
-                                        lookahead, _RE_DAY_BEFORE,
-                                        _RE_MONTH_BEFORE, _RE_MONTH_AFTER).
+                                        is never taken into a range when it
+                                        is contested (below) or when its day
+                                        belongs to another month ("May 5 - 10
+                                        June" is not May 5-10).
     A date with no year ("September 21", "9/21") matches that day in ANY year
     the graph has a dated node for. Relative dates ("next Friday", "last
     week") are out of scope. A month alone ("in September") is not a date
@@ -91,7 +87,9 @@ DETECTION RULES (deterministic; no model; every rule is here)
         the 366 bare M/D forms, 316 parse with no preposition and all 366
         after "on".
       * a date's characters are blanked once it is read, and the text on
-        either side of a blanked date never joins into another date.
+        either side of a blanked date never joins into another date; a date
+        preposition marks only the date right after it ("on Sept 21 the 3/4
+        mark" reads no 3/4).
       * edges. No date reads across a slash, a hyphen or a dot into another
         number: a number at either end of a match touches no digit, "/" or
         "-", nor a "." or "-" with a digit beyond it, and a month word at
@@ -101,12 +99,26 @@ DETECTION RULES (deterministic; no model; every rule is here)
         "1-3/4 cups", "v1.5 May", "Apr/May 2026" and "September 2026/27"
         hold no date. A range is read only whole, as a range (above): "May
         5-10" is never "May 5". "mid-May 2026" is still May 2026.
-      * a month word with a standalone day on EACH side is ambiguous, and
-        neither pairing is read: "on 5 March 3 people came", "page 3 March
-        5" give no date (the end of a number range is not a standalone day:
-        "ages 5-10 May 3" is May 3; a time is not a day: "5 May 3:00" is 5
-        May). A month after an impossible day ("31 Sept 2026") is not read
-        as the month either.
+      * a CONTESTED month word, one with a day claim on each side, gives
+        no date at all, and neither claim is read with another month: "on 5
+        March 3 people came", "page 3 March 5", "room 21 Jun 19-23", "top 10
+        May 4-7", "ages 5-10 May 3", "10-11 Sept 21", "3 May 5-10", "15-16
+        June 3" and "28 Sept 10 June" give none. A claim BEFORE the month is
+        a standalone day ("5 ", "5th of ") or the end of an ORDERED number
+        range ("5-10 ", "3 to 21 "); not a time ("10:30", "3:00"), money
+        ("$20"), a decimal, a code ("PR-12", "Q3"), a slash number, an
+        unordered pair ("won 3-1 May 5", "hours 9-5 May 1st" keep May 5 and
+        May 1), nor the possible day of a month right before it ("May 5
+        June 3" is May 5 and June 3; that month contested, the number counts
+        for both). A claim AFTER the month is a day or a range start ("May
+        3", "May 5-10", "Sept. 21"), never after a comma ("5 May, 3 people"
+        is 5 May), and not a year, a time or a unit ("May 2 pm", "17-20 Oct
+        3:00", "15-16 June 5 km" and "4 of us 6-7 May 2 pm" keep their
+        range). An ordinal and "of" decide ("the 5th of May 2 tickets" is 5
+        May). Contested months are found (_RE_CLAIM_BEFORE, _RE_CLAIM_AFTER)
+        and blanked, with their claims, before any month-name form is read.
+        A month after a number it cannot be the day of ("31 Sept 2026") is
+        not read as the month either.
       * versions. Dotted numbers are never dates ("release 2024.1.5",
         "v2024.01.05"): the year-first form accepts "-" and "/" only.
       * words. "march", "mar", "may" and "jan" are ordinary words or names as
@@ -367,7 +379,7 @@ _RE_QUOTE = re.compile(
 # either end touches no "/" and no "-" joined to a digit ("mid-May 2026" is
 # still May 2026).
 _NUM_L = r"(?<![\d/\-])(?<!\d\.)"
-_NUM_R = r"(?!\d)(?![/\-.]\d)"
+_NUM_R = r"(?!\d)(?![/\-.:]\d)"
 _MON_L = r"(?<!/)(?<!\d-)"
 _MON_R = r"(?!/)(?!-\d)"
 # Year-first accepts "-" and "/" only: dotted numbers are versions ("2024.1.5").
@@ -418,28 +430,35 @@ _RE_DM_RANGE = re.compile(
     rf"{_NUM_L}\b(?P<d1>\d{{1,2}}){_ORD}"
     rf"(?:\s+(?:of\s+)?{_mon('m1')}\b\.?(?:,?\s+(?P<y1>\d{{4}})\b)?)?{_SEP}"
     rf"(?P<d2>\d{{1,2}}){_ORD}\s+(?:of\s+)?{_mon('m2')}\b"
-    rf"(?:\.?,?\s+(?P<y2>\d{{4}})\b{_NUM_R}|{_MON_R}(?!\.?,?\s+\d{{1,2}}(?!\d)))",
-    re.I)
+    rf"(?:\.?,?\s+(?P<y2>\d{{4}})\b{_NUM_R}|{_MON_R})", re.I)
 # The longest range read, first day to last inclusive.
 MAX_RANGE_DAYS = 31
-# Month-stealing guards for ranges (rule 2): a month word that has a day of
-# its own on the other side belongs to that day, not to the range's numbers.
-# "10-11 Sept 21" is Sept 21 (not Sept 10-11), "3 May 5-10" is 3 May (not
-# May 5-10), "May 5 - 10 June" is not May 5-10, "May 10-11 June" not June
-# 10-11.
-# (a standalone day: not the end of "5-10", "3/4" or "1.5")
-_RE_DAY_BEFORE = re.compile(
-    r"(?<![\d/.\-\u2013\u2014])\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?$", re.I)
-_RE_MONTH_BEFORE = re.compile(rf"\b{_MON}\b\.?\s+$", re.I)
+# Which day a month word has (rule 2, "a month between two days"). A month
+# word with a DAY CLAIM on each side is contested and gives no date at all
+# ("on 5 March 3 people", "room 21 Jun 19-23", "15-16 June 5 km"); with a
+# claim on one side only, that side is its day. Claims:
+#   before: a standalone day ("5 ", "5th of ", "21 ") or the end of a number
+#     range ("5-10 ", "3 to 21 "; only an ordered one: "won 3-1 May 5" and
+#     "hours 9-5 May 1st" are a score and hours); not a time ("10:30"), money ("$20"), a
+#     decimal ("1.5"), part of a code ("PR-12", "Q3"), a slash number, nor a
+#     number that is itself the day of a month right before it ("May 5 June").
+#   after: a day or the start of a range ("May 3", "May 5-10", "Sept. 21");
+#     not a year, a time or a unit ("May 2 pm", "Oct 3:00", "June 5 km"),
+#     a slash number, a percent; and never after a comma ("5 May, 3 people":
+#     a comma after the month closes a day-first date).
+# A left claim with an ordinal and "of" ("the 5th of May") is decisive:
+# nothing after it is a claim ("10 of June 1" is still contested).
+_RE_CLAIM_BEFORE = re.compile(
+    r"(?:(?<![\w/.:$])(?P<a>\d{1,2})(?:st|nd|rd|th)?\s*(?:[-\u2013\u2014]|to)\s*"
+    r"|(?<![\w/.:$\-\u2013\u2014]))"
+    r"(?P<d>\d{1,2})(?P<ord>st|nd|rd|th)?\s+(?P<of>of\s+)?\Z", re.I)
+_TIME_OR_UNIT = (r"(?:am|pm|a\.m\.|p\.m\.|o'?clock|h|hrs?|hours?|mins?|minutes?"
+                 r"|km|mi|kg|lbs?)\b")
+_RE_CLAIM_AFTER = re.compile(
+    rf"\.?\s+\d{{1,2}}(?:st|nd|rd|th)?(?![\w/:%]|\.\d|\s*{_TIME_OR_UNIT})", re.I)
+_RE_MONTH_WORD = re.compile(rf"\b{_MON}\b", re.I)
+_RE_MONTH_BEFORE = re.compile(rf"\b{_MON}\b\.?\s+\Z", re.I)
 _RE_MONTH_AFTER = re.compile(rf"\.?,?\s+(?:of\s+)?{_MON}\b", re.I)
-# a day of its own: a standalone 1-2 digit number (not "12/24", "1.5" or
-# "2026"; a time after it is fine: "5 May 3:00" is 5 May)
-_RE_OWN_DAY = re.compile(
-    r"\.?,?\s+\d{1,2}(?:st|nd|rd|th)?"
-    r"(?![\w/:]|\.\d|\s*(?:[-\u2013\u2014]|to\b)\s*\d)", re.I)
-# ...and one that is the end of a number range ("5-10 May 3", "3 to 21 Dec
-# 30") is not a day of the month that follows it
-_RE_RANGE_END_BEFORE = re.compile(r"\d\s*(?:[-\u2013\u2014]|to)\s*$", re.I)
 
 _RE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_'’.\-/:]*[A-Za-z0-9]|[A-Za-z0-9]")
 _RE_ORDINAL_OR_UNIT = re.compile(
@@ -474,7 +493,13 @@ _GONE = "\x00"
 # After a ratio-shaped a/b: "of" ("3/4 of the book") or a hyphenated unit
 # ("3/4-inch") makes it a fraction.
 _RE_OF_NEXT = re.compile(r"\s+of\b|-[A-Za-z]", re.I)
-_RE_ALPHA_RUN = re.compile(r"[A-Za-z]+")
+# A contested month phrase is blanked with _CONTESTED. A blanked date or
+# contested phrase counts as a word for "the word before": a date
+# preposition marks the date right after it and nothing past it ("on Sept 21
+# the 3/4 mark", "due on 9/21 the 1/2 payment", "on 5 may 5 4/5" read no 3/4,
+# 1/2 or 4/5).
+_CONTESTED = "\x01"
+_RE_ALPHA_RUN = re.compile(r"[A-Za-z]+|[\x00\x01]+")
 
 
 def _norm_ws(text: str) -> str:
@@ -844,7 +869,7 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     def dm(m, before):
         if not _month_ok(m[2], lambda: before(m.start())[0], strong_dm(m)):
             return None
-        if month_before(m, before) or own_day_after(m):
+        if month_before(m, before) or (own_day_after(m) and not _of(m)):
             return None
         d, mo = int(m[1]), _MONTH_NAMES[m[2].lower()]
         return DateSignal(m[0], "day", mo, d) if _valid_md(mo, d) else None
@@ -862,7 +887,7 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     def my(m, before):
         if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
-        if day_before(m, before):     # "31 Sept 2026": a day that is no date
+        if number_before(m, before):  # "31 Sept 2026": a day that is no date
             return None
         return DateSignal(m[0], "month", _MONTH_NAMES[m[1].lower()], None,
                           int(m[2]))
@@ -872,18 +897,83 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         # only as the single-date rules (and their edges) allow.
         return _range_signal(m[0], mo1, d1, y1, mo2, d2, y2)
 
-    def day_before(m, before) -> bool:
-        """A standalone day right before this match's month word (not the end
-        of a number range: "5-10 May 3" is May 3)."""
-        w = before.window(m.start(), 20)
-        d = _RE_DAY_BEFORE.search(w)
-        return bool(d) and not _RE_RANGE_END_BEFORE.search(w, 0, d.start())
+    def claim_before(text: str, free_month_end: int = -1,
+                     any_month: bool = False) -> Tuple[bool, bool]:
+        """(``text`` ends in a day claim for a month word after it, the claim
+        is decisive: an ordinal and "of"). A number that is the (possible)
+        day of a month right before it ("May 5 June") claims nothing for the
+        next one, unless that month is contested itself (its month word
+        ends at ``free_month_end`` in ``text``): then the number is the next
+        month's claim too."""
+        c = _RE_CLAIM_BEFORE.search(text)
+        if not c:
+            return False, False
+        if c["a"] is not None and not (
+                1 <= int(c["a"]) < int(c["d"]) <= 31
+                and int(c["d"]) - int(c["a"]) < MAX_RANGE_DAYS):
+            return False, False          # "3-1", "9-5": not a range of days
+        b = _RE_MONTH_BEFORE.search(text, 0, c.start())
+        if (not any_month and b and is_month_word(b[1], text[:b.start(1)])
+                and b.end(1) != free_month_end
+                and _valid_md(_MONTH_NAMES[b[1].lower()], int(c["a"] or c["d"]))):
+            return False, False
+        return True, bool(c["of"] and c["ord"])
 
-    def is_month_word(word: str, text_before: str) -> bool:
+    def claim_after(pos: int) -> bool:
+        """A day claim right after a month word that ends at ``pos``."""
+        return bool(_RE_CLAIM_AFTER.match(work, pos))
+
+    def contested() -> None:
+        """Blank, in the text the date patterns read, every month word with
+        a day claim on each side, and both claims: no reading may use the
+        month or either number ("28 Sept 10 June" reads neither Sept 10
+        nor 10 June)."""
+        nonlocal work
+        spans = []
+        last_contested_end = -1          # where the last contested month word ends
+        for mm in _RE_MONTH_WORD.finditer(work):
+            s, e = mm.span()
+            lo = max(0, s - 40)
+            text_before = work[lo:s]
+            if not is_month_word(mm[1], text_before):
+                continue
+            left, strong = claim_before(text_before, last_contested_end - lo)
+            r = _RE_CLAIM_AFTER.match(work, e) if left and not strong else None
+            if r:
+                c = _RE_CLAIM_BEFORE.search(text_before)
+                spans.append((lo + c.start(), r.end()))
+                last_contested_end = e
+        if spans:
+            merged: List[Tuple[int, int]] = []
+            for a, b in sorted(spans):
+                if merged and a <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+                else:
+                    merged.append((a, b))
+            work = _blank(work, merged, _CONTESTED)
+
+    def _of(m) -> bool:
+        """An ordinal day and "of" decide ("the 5th of May 2 tickets")."""
+        return bool(re.search(r"\d(?:st|nd|rd|th)\s+of\b", m[0], re.I))
+
+    def day_before(m, before) -> bool:
+        """A day claim right before this match's month word."""
+        return claim_before(before.window(m.start(), 40))[0]
+
+    def number_before(m, before) -> bool:
+        """Any day-like number right before this match's month word, even one
+        that a month before it may own ("Sept 31 May 2026")."""
+        return claim_before(before.window(m.start(), 40), any_month=True)[0]
+
+    def is_month_word(word: str, text_before: str, strong: bool = True) -> bool:
         """The _month_ok rule for a month word next to a match: "may" /
         "march" in lower case are words unless a date preposition comes
-        right before them ("of march 3")."""
+        right before them ("of march 3") or (``strong``) an ordinal day or
+        "of" does ("the 5th of may", "3rd march")."""
         if word.lower() not in AMBIGUOUS_MONTHS or word[:1].isupper():
+            return True
+        if strong and re.search(r"\d(?:st|nd|rd|th)\s+(?:of\s+)?\Z|\bof\s+\Z",
+                                text_before, re.I):
             return True
         return _preceding(_RE_ALPHA_RUN.findall(text_before))[0] in DATE_PREPOSITIONS
 
@@ -894,8 +984,8 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         return bool(b) and is_month_word(b[1], w[:b.start(1)])
 
     def own_day_after(m) -> bool:
-        """This match ends in a month word that has a day of its own after it."""
-        return bool(_RE_OWN_DAY.match(work, m.end()))
+        """This match ends in a month word that has a day claim after it."""
+        return claim_after(m.end())
 
     def month_word_after(m) -> bool:
         """Is the range's end day followed by a month that would claim it
@@ -904,9 +994,11 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         a = _RE_MONTH_AFTER.match(work, m.end())
         if not a:
             return False
-        if not is_month_word(a[1], work[max(0, a.start(1) - 40):a.start(1)]):
+        # the ordinal before it is this match's own ("June 1st may be")
+        if not is_month_word(a[1], work[max(0, a.start(1) - 40):a.start(1)],
+                             strong=False):
             return False
-        return not _RE_OWN_DAY.match(work, a.end())
+        return not claim_after(a.end())
 
     def iso_range(m, before):
         return range_of(m, int(m["m1"]), int(m["d1"]), int(m["y1"]),
@@ -947,8 +1039,10 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         if not _month_ok(m["m2"], lambda: before(m.start())[0], strong):
             return None
         # the first day belongs to a month before it ("May 10-11 June");
-        # "may" / "march" in lower case are words
-        if month_before(m, before):
+        # "may" / "march" in lower case are words; the month has a day of
+        # its own after it ("10-11 Sept 21")
+        if month_before(m, before) or (
+                not m["y2"] and own_day_after(m) and not _of(m)):
             return None
         mo2 = _MONTH_NAMES[m["m2"].lower()]
         mo1 = _MONTH_NAMES[m["m1"].lower()] if m["m1"] else mo2
@@ -956,14 +1050,17 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
         y2 = int(m["y2"]) if m["y2"] else None
         return range_of(m, mo1, int(m["d1"]), y1, mo2, int(m["d2"]), y2)
 
-    # Ranges first: a range is read whole, or not as a range (rule 2).
+    # Ranges first: a range is read whole, or not as a range (rule 2). The
+    # forms with no month word go first; then contested month words are
+    # blanked; then the month-name forms.
     each(_RE_ISO_RANGE, iso_range)
     each(_RE_SLASH_RANGE, slash_range)
+    each(_RE_ISO, iso)
+    each(_RE_SLASH_Y, slash_y)
+    contested()
     each(_RE_MDY_RANGE, md_range)
     each(_RE_MD_RANGE, md_range)
     each(_RE_DM_RANGE, dm_range)
-    each(_RE_ISO, iso)
-    each(_RE_SLASH_Y, slash_y)
     each(_RE_DMY, dmy)
     each(_RE_MDY, mdy)
     each(_RE_MD, md)

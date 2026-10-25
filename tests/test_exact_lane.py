@@ -878,9 +878,11 @@ class TestDetectionIsLinear:
         # "Sept" and "5" sit either side of an ISO date: not "Sept 5"
         assert _dates("Sept 2026-09-21 5") == [(9, 21, 2026)]
         assert _dates("on Jan 2026-01-02 3") == [(1, 2, 2026)]
-        # within one pattern, a date read earlier still reads as blank
-        # before the next one ("on May 5 may 6": "may 6" follows "on")
-        assert _dates("on May 5 may 6") == [(5, 5, None), (5, 6, None)]
+        # a preposition marks the date right after it, not one past a date
+        # already read: in "on May 5 may 6", "may" is a word
+        assert _dates("on May 5 may 6") == [(5, 5, None)]
+        assert _dates("on Sept 21 the 3/4 mark") == [(9, 21, None)]
+        assert _dates("due on 9/21 the 1/2 payment") == [(9, 21, None)]
 
 
 class TestCodeCap:
@@ -1046,30 +1048,47 @@ class TestRanges:
     def test_a_failed_range_is_no_range(self, q, want):
         assert _dates(q) == want, q
 
-    # the verifier's month-stealing rows: a month with a day of its own on
-    # the other side is that day's
+    # A month word with a day claim on each side gives no date; a claim is a
+    # standalone day or an ORDERED range end before it, a day or a range
+    # start after it (not a time, a unit, money, a code or a slash number).
     @pytest.mark.parametrize("q,want", [
-        ("meeting 10-11 Sept 21", [(9, 21, None)]),
-        ("ages 5-10 May 3", [(5, 3, None)]),
-        ("3 to 21 Dec 30", [(12, 30, None)]),
+        # contested: no date (8c1d8f0 read Sept 10-11, May 5-10, Dec 3-21)
+        ("meeting 10-11 Sept 21", []), ("ages 5-10 May 3", []),
+        ("3 to 21 Dec 30", []), ("10-11 Sept 21st", []), ("3 May 5-10", []),
+        # the verifier's round-6 rows (3829081 read Jun 21, May 10, Jul 3,
+        # Jun 4, Sept 4; June 5, Apr 2, Oct 3)
+        ("booked room 21 Jun 19-23", []), ("top 10 May 4-7", []),
+        ("meet at 3 July 11-15", []), ("page 4 June 5 to 6", []),
+        ("we were 4 Sept 21-23", []), ("12-15 Apr 2 tickets", []),
+        ("paid $20 Apr 4 to 6", [("range", (4, 4, None), (4, 6, None))]),
+        ("booked 15-16 June 5 km", [("range", (6, 15, None), (6, 16, None))]),
+        ("17-20 Oct 3:00", [("range", (10, 17, None), (10, 20, None))]),
+        ("4 of us 6-7 May 2 pm", [("range", (5, 6, None), (5, 7, None))]),
+        ("2 pm 17-20 Oct", [("range", (10, 17, None), (10, 20, None))]),
+        # times before the month are not days
+        ("at 10:30 Sept 21", [(9, 21, None)]), ("meeting at 3:00 May 6", [(5, 6, None)]),
+        ("the call 3:00 May 6", [(5, 6, None)]),
+        # an unordered pair is a score or hours, not a range end
+        ("won 3-1 May 5", [(5, 5, None)]), ("hours 9-5 May 1st", [(5, 1, None)]),
         ("May 5 to 3 pm", [(5, 5, None)]),
-        ("won 3-1 May 5", [(5, 5, None)]),
-        ("hours 9-5 May 1st", [(5, 1, None)]),
-        ("10-11 Sept 21st", [(9, 21, None)]),
-        # the other direction
-        ("Sept 21 10-11", [(9, 21, None)]),
-        ("May 3 ages 5-10", [(5, 3, None)]),
-        ("3 May 5-10", [(5, 3, None)]),
+        # a comma after the month closes a day-first date; times after it
+        ("5 May, 3 people", [(5, 5, None)]),
+        ("the 5 May 3 o'clock call", [(5, 5, None)]), ("21 Sept 4 pm", [(9, 21, None)]),
+        # "of" decides
+        ("the 5th of May 2 tickets", [(5, 5, None)]),
+        # the other direction and chains
+        ("Sept 21 10-11", [(9, 21, None)]), ("May 3 ages 5-10", [(5, 3, None)]),
         ("May 5 - 10 June", [(5, 5, None), (6, 10, None)]),
         ("Sept 28 - 3 Oct", [(9, 28, None), (10, 3, None)]),
-        ("May 10-11 June", []),
-        # a month with its own day, or "may" as a word, takes nothing
+        ("May 10-11 June", []), ("28 Sept 10 June meeting", []),
+        ("May 5 June 3", [(5, 5, None), (6, 3, None)]),
         ("Sept 21-23 May 5", [("range", (9, 21, None), (9, 23, None)), (5, 5, None)]),
         ("May 5-10 may I ask", [("range", (5, 5, None), (5, 10, None))]),
         ("10-11 Sept 2026", [("range", (9, 10, 2026), (9, 11, 2026))]),
         ("on May 5 from 2-4", [(5, 5, None)]),
         ("10-12 May", [("range", (5, 10, None), (5, 12, None))]),
         ("Dec 30 - Jan 2", [("range", (12, 30, None), (1, 2, None))]),
+        ("Sept 28 - Oct 3", [("range", (9, 28, None), (10, 3, None))]),
     ])
     def test_no_month_is_stolen(self, q, want):
         assert _dates(q) == want, q
@@ -1148,8 +1167,9 @@ class TestAMonthBetweenTwoDays:
         ("March 5 3 people", [(3, 5, None)]), ("May 5 3 people", [(5, 5, None)]),
         ("on 21 Sept 2026", [(9, 21, 2026)]), ("5 Sept 2026", [(9, 5, 2026)]),
         ("May 5 June 3", [(5, 5, None), (6, 3, None)]),
-        ("on May 5 may 6", [(5, 5, None), (5, 6, None)]),
-        ("of the 2026/9/21 march 3 September", [(9, 21, 2026)]),
+        ("on May 5 may 6", [(5, 5, None)]),
+        ("of the 2026/9/21 march 3 September", [(9, 21, 2026), (9, 3, None)]),
+        ("June 1st may be late", [(6, 1, None)]),
         ("Sept 5 May 2026", []),
     ])
     def test_ambiguous_or_not(self, q, want):
