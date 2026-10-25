@@ -7,7 +7,7 @@ import pytest
 from revien.graph.schema import Node, NodeType
 from revien.graph.store import GraphStore
 from tests.test_forget_wording import cc, forget_wording
-from tests.test_forget_wording_ash2 import fake_key, pieces_reported
+from tests.test_forget_wording_verify2 import fake_key, pieces_reported
 
 KEY = "staging-credentials-77x1"
 LABEL = "rotate the staging-credentials"

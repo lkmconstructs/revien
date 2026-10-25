@@ -133,7 +133,7 @@ def build_readwise_csv(tmpdir: Path) -> Path:
         },
         {
             # Optional columns missing (Note, Author, Tags, Location, Document tags).
-            "Highlight": "Sovereignty of Choice matters most in the sanctum.",
+            "Highlight": "Sovereignty of Choice matters most on the home server.",
             "Book Title": "Fernweh-Core Field Notes",
             "Book Author": "",
             "Note": "",
