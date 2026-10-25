@@ -357,7 +357,7 @@ class GraphStore(ForgetStoreMixin):
         event-date range query; ``idx_nodes_recorded_at`` serves the
         said-at (recorded_at) range query. Indexes only: no row is read or rewritten.
         Idempotent and cheap on every connect: once ``PRAGMA user_version``
-        is >= 7 AND both indexes really exist it returns after one catalogue
+        is >= 7 AND all three indexes exist it returns after one catalogue
         read (a marker never overrides the schema: an index dropped
         out-of-band is recreated). Upgrade-safe from v6 and older: the
         temporal columns it indexes are added by the guards that run before
@@ -1992,8 +1992,11 @@ class GraphStore(ForgetStoreMixin):
 
     # ── Exact lane lookups (REVIEN_EXACT) ─────────────────────────────────
     # Narrow projections, no Node construction: the lane needs ids, labels,
-    # types and event ranges, not whole rows. All three are indexed reads
-    # (idx_nodes_label_lower, idx_nodes_event_time, the node_id primary key).
+    # types and event ranges, not whole rows. Label equality, the event-time
+    # and recorded_at ranges, node ids and neighbours are indexed reads
+    # (idx_nodes_label_lower, idx_nodes_event_time, idx_nodes_recorded_at,
+    # the node_id primary key, the edge indexes); exact_label_contains is one
+    # pass over the label column (bounded by the lane: exact.MAX_CONTAINED_CODES).
 
     @staticmethod
     def _exact_scope_sql(origin_runtime, include_context, live_only):

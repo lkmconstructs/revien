@@ -48,13 +48,22 @@ DETECTION RULES (deterministic; no model; every rule is here)
       * ratios and scores. A bare a/b (no year, no month name) with b in
         RATIO_DENOMS (2 3 4 5 6 8 10 20) and a <= b is a ratio or a score:
         "1/2 cup", "3/4", "8/10", "rated 9/10", "10/20", "5/5", UNLESS it is
-        marked as a date: it follows ON, BY, SINCE, UNTIL, TILL, FROM, BEFORE,
-        AFTER, DURING, THROUGH, BETWEEN or OF (optionally with "the" between:
-        "on 3/10", "from 6/20"), or it is zero-padded ("03/10", "05/05"), or
-        it has a year ("3/10/2026"; any M/D/Y is a date). "in" does not mark a
-        date ("in 8/10 cases"). A bare a/b with a > 12 has no month ("24/7",
-        "16/9") and is not a date even after a preposition. Of the 366 bare
-        M/D forms, 316 parse with no preposition and all 366 after "on".
+        marked as a date. A wrong date is worse than none, so only three
+        things mark one: it is zero-padded ("03/10", "05/05"); it has a year
+        ("3/10/2026"; any M/D/Y is a date); or it follows ON, BY, BEFORE,
+        AFTER, SINCE, UNTIL, TILL or THROUGH (SLASH_DATE_PREPOSITIONS,
+        optionally with "the" between: "on 3/10", "by the 3/10"), is not
+        followed by "of" ("through 3/4 of the book"), and, after BY, does not
+        follow a verb of quantity ("reduced by 1/2", FRACTION_VERBS). No other
+        word marks one: "of", "from", "between", "during", "in", "out of",
+        "score of" do not ("a score of 8/10", "the ratio of 3/4", "between
+        1/2 and 3/4 cup", "in 8/10 cases"), and "from 3/4 to 3/8" is two
+        ratios unless padded or given a year. A bare a/b with a > 12 has no
+        month ("24/7", "16/9") and is not a date even after a preposition. Of
+        the 366 bare M/D forms, 316 parse with no preposition and all 366
+        after "on".
+      * a date's characters are blanked once it is read, and the text on
+        either side of a blanked date never joins into another date.
       * versions. Dotted numbers are never dates ("release 2024.1.5",
         "v2024.01.05"): the year-first form accepts "-" and "/" only.
       * words. "march", "mar", "may" and "jan" are ordinary words or names as
@@ -100,8 +109,18 @@ DETECTION RULES (deterministic; no model; every rule is here)
     ALL CAPS or has a digit ("REV-FIX"), or a run of 5+ digits. Ordinals and
     clock/size shorthand ("21st", "3pm", "10:30", "5k") and plain years are
     not IDs. Tokens consumed by a date or quote are not IDs. Matching is a
-    label equal to the token, a label containing the token as a whole token,
-    or a node id equal to the token. Never node content.
+    label equal to the token, a label containing the token as a whole token
+    (the first MAX_CONTAINED_CODES (16) codes of 4+ characters only: that
+    lookup reads the label column once per code), or a node id equal to the
+    token. Never node content.
+ 5. How much of a query is read. The lane reads at most the first
+    SCAN_CHARS (4,096, REVIEN_EXACT_SCAN_CHARS) characters of a query, cut
+    back to the last whitespace so no token is split; the rest is not
+    searched for signals, and a query that was cut has no whole-query label
+    (rule 3). Diagnostics say "scanned_chars" when a query was cut. Detection
+    is a single left-to-right pass per rule (linear in what it reads). The
+    bound is the lane's own: the rest of recall sees the whole query, and
+    with the lane off none of this runs.
 
 THE BOOST (bounded, not a promotion)
 
@@ -194,6 +213,11 @@ RECORDED_AT_STRENGTH = 0.5
 ID_CONTAINED_STRENGTH = 0.7
 MAX_SPAN_TOKENS = 6
 MAX_YEARS = 120
+# The lane reads at most this many characters of a query (rule 5).
+SCAN_CHARS = 4096
+# Codes looked for INSIDE labels per query (rule 4): each one costs a pass
+# over the label column.
+MAX_CONTAINED_CODES = 16
 
 _QUESTION_START = {
     "what", "whats", "who", "whom", "whose", "when", "where", "why", "how",
@@ -286,8 +310,25 @@ DATE_PREPOSITIONS = frozenset({
     "on", "by", "since", "until", "till", "from", "before", "after", "during",
     "through", "between", "of", "in",
 })
-# "in" marks a month word ("in march 2026") but not a slash pair ("in 8/10 cases").
-SLASH_DATE_PREPOSITIONS = DATE_PREPOSITIONS - {"in"}
+# The words that mark a ratio-shaped a/b as a date. "of", "from", "between",
+# "during" and "in" mark a month word ("from may 5", "in march 2026") but not
+# a slash pair: "a score of 8/10", "between 1/2 and 3/4 cup", "in 8/10 cases".
+SLASH_DATE_PREPOSITIONS = frozenset({
+    "on", "by", "before", "after", "since", "until", "till", "through",
+})
+# "by" after one of these is an amount, not a deadline: "reduced by 1/2".
+FRACTION_VERBS = frozenset({
+    "reduce", "reduced", "reduces", "increase", "increased", "increases",
+    "decrease", "decreased", "decreases", "cut", "divide", "divided",
+    "divides", "multiply", "multiplied", "multiplies", "scale", "scaled",
+    "scales", "grow", "grows", "grew", "shrink", "shrinks", "shrank", "rose",
+    "fell", "lowered", "raised",
+})
+# A taken date is blanked with this in the text the date rules read, so the
+# text either side of it can never be joined into another date by "\s+".
+_GONE = "\x00"
+_RE_OF_NEXT = re.compile(r"\s+of\b", re.I)
+_RE_ALPHA_RUN = re.compile(r"[A-Za-z]+")
 
 
 def _norm_ws(text: str) -> str:
@@ -330,6 +371,7 @@ class ExactConfig:
     max_inject: int = MAX_INJECT
     neighbor_max: int = NEIGHBOR_MAX
     bm25_label_scale: float = BM25_LABEL_SCALE
+    scan_chars: int = SCAN_CHARS
     common_words: Set[str] = field(default_factory=lambda: set(COMMON_WORDS))
     framing_words: Set[str] = field(default_factory=lambda: set(FRAMING_WORDS))
 
@@ -352,6 +394,8 @@ class ExactConfig:
                 "REVIEN_EXACT_NEIGHBOR_MAX", NEIGHBOR_MAX))),
             bm25_label_scale=min(1.0, max(0.0, _env_float(
                 "REVIEN_EXACT_BM25_LABEL_SCALE", BM25_LABEL_SCALE))),
+            scan_chars=max(1, int(_env_float(
+                "REVIEN_EXACT_SCAN_CHARS", SCAN_CHARS))),
             common_words=cls._words_from_env(
                 "REVIEN_EXACT_COMMON_WORDS", COMMON_WORDS),
             framing_words=cls._words_from_env(
@@ -409,11 +453,30 @@ class ExactSignals:
     # Every word left once dates and quotes are blanked, lowercased, trimmed,
     # possessive dropped; indexed like NameSpan.start/end.
     words: List[str] = field(default_factory=list)
+    # Characters read when the query was longer than the scan bound (rule 5);
+    # None when the whole query was read.
+    scanned_chars: Optional[int] = None
 
     @property
     def needs_lookup(self) -> bool:
         return bool(self.quoted or self.ids or self.spans
                     or self.whole_query or self.dates)
+
+
+@dataclass
+class DateMatch:
+    """What one date signal matched (ExactLane.match_dates)."""
+    signal: DateSignal
+    # (node_id, node's event_time granularity, strength), store order
+    event: List[Tuple[str, str, float]]
+    # (node_id, strength): trusted recorded_at, nodes event_time did not match
+    recorded: List[Tuple[str, float]]
+    # the DATE_MAX_MATCHES guard: min(1, date_max_matches / total)
+    scale: float
+
+    @property
+    def total(self) -> int:
+        return len(self.event) + len(self.recorded)
 
 
 def _valid_md(m: int, d: int, year: Optional[int] = None) -> bool:
@@ -426,34 +489,50 @@ def _valid_md(m: int, d: int, year: Optional[int] = None) -> bool:
         return False
 
 
-def _mask(text: str, span: Tuple[int, int]) -> str:
-    return text[:span[0]] + " " * (span[1] - span[0]) + text[span[1]:]
+def _blank(text: str, spans: List[Tuple[int, int]], ch: str) -> str:
+    """``text`` with every (sorted, non-overlapping) span replaced by ``ch``."""
+    parts, last = [], 0
+    for s, e in spans:
+        parts.append(text[last:s])
+        parts.append(ch * (e - s))
+        last = e
+    parts.append(text[last:])
+    return "".join(parts)
 
 
-def _prev_word(text: str, pos: int) -> str:
-    """The lowercase word before ``pos`` (skipping one "the"), or ''."""
-    words = re.findall(r"[A-Za-z]+", text[max(0, pos - 40):pos])
-    if words and words[-1].lower() == "the":
-        words = words[:-1]
-    return words[-1].lower() if words else ""
+def _preceding(words: List[str]) -> Tuple[str, str]:
+    """(the word before, the word before that), lowercase, skipping one
+    "the" right before: "on the 3/10" -> ("on", ...)."""
+    w = [x.lower() for x in words[-3:]]
+    if w and w[-1] == "the":
+        w = w[:-1]
+    return (w[-1] if w else "", w[-2] if len(w) > 1 else "")
 
 
-def _slash_marked_as_date(m, text: str) -> bool:
-    """A bare a/b the ratio rule would drop is still a date when it follows a
-    date preposition or is zero-padded ("on 3/10", "03/10")."""
-    padded = any(len(g) == 2 and g[0] == "0" for g in (m[1], m[2]))
-    return padded or _prev_word(text, m.start()) in SLASH_DATE_PREPOSITIONS
+def _slash_marked_as_date(m, prev: str, prev2: str, after: str) -> bool:
+    """A bare a/b the ratio rule would drop is still a date when it is
+    zero-padded ("03/10"), or when it follows a SLASH_DATE_PREPOSITIONS word
+    ("on 3/10"), is not a fraction OF something ("through 3/4 of the book"),
+    and is not an amount after a verb of quantity ("reduced by 1/2")."""
+    if any(len(g) == 2 and g[0] == "0" for g in (m[1], m[2])):
+        return True
+    if prev not in SLASH_DATE_PREPOSITIONS:
+        return False
+    if _RE_OF_NEXT.match(after):
+        return False
+    return not (prev == "by" and prev2 in FRACTION_VERBS)
 
 
-def _month_ok(word: str, m, text: str, strong: bool = False) -> bool:
+def _month_ok(word: str, prev, strong: bool = False) -> bool:
     """May this month word be read as a month? Unambiguous names always;
     AMBIGUOUS_MONTHS (march, mar, may, jan) only when capitalized, after a
-    date preposition, or when ``strong`` (an ordinal day or "of" in the match)."""
+    date preposition, or when ``strong`` (an ordinal day or "of" in the
+    match). ``prev`` returns the word before (only called when needed)."""
     if word.lower() not in AMBIGUOUS_MONTHS:
         return True
     if word[:1].isupper() or strong:
         return True
-    return _prev_word(text, m.start()) in DATE_PREPOSITIONS
+    return prev() in DATE_PREPOSITIONS
 
 
 def _two_digit_year(y: int) -> int:
@@ -461,34 +540,51 @@ def _two_digit_year(y: int) -> int:
 
 
 def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
-    """Return (date signals, query with each date's characters blanked)."""
-    work = query
+    """Return (date signals, query with each date's characters blanked).
+
+    One left-to-right pass per pattern, in a fixed order (ISO, M/D/Y, day
+    month year, month day year, month day, day month, M/D, month year): each
+    pass reads the text left by the passes before it, and every date it takes
+    is blanked once, at the end of the pass. Linear in the length of
+    ``query``."""
+    work = query      # what the patterns read; a taken date becomes _GONE
+    shown = query     # what is returned; a taken date becomes spaces
     out: List[DateSignal] = []
 
-    def take(m, sig):
-        nonlocal work
-        out.append(sig)
-        work = _mask(work, m.span())
-
     def each(rx, fn):
-        # Re-scan after masking so spans never overlap.
-        pos = 0
-        while True:
-            m = rx.search(work, pos)
-            if not m:
-                return
-            sig = fn(m)
-            if sig is None:
-                pos = m.end()
-                continue
-            take(m, sig)
-            pos = 0
+        nonlocal work, shown
+        taken: List[Tuple[int, int]] = []
 
-    def iso(m):
+        def before(pos: int) -> Tuple[str, str]:
+            # The words before ``pos`` as the text reads with this pass's
+            # earlier dates blanked (bounded window: at most 40 characters).
+            lo = max(0, pos - 40)
+            window = work[lo:pos]
+            k = len(taken) - 1
+            if k >= 0 and taken[k][1] > lo:
+                chars = list(window)
+                while k >= 0 and taken[k][1] > lo:
+                    s, e = taken[k]
+                    for i in range(max(s, lo), min(e, pos)):
+                        chars[i - lo] = _GONE
+                    k -= 1
+                window = "".join(chars)
+            return _preceding(_RE_ALPHA_RUN.findall(window))
+
+        for m in rx.finditer(work):
+            sig = fn(m, before)
+            if sig is not None:
+                out.append(sig)
+                taken.append(m.span())
+        if taken:
+            work = _blank(work, taken, _GONE)
+            shown = _blank(shown, taken, " ")
+
+    def iso(m, before):
         y, mo, d = int(m[1]), int(m[2]), int(m[3])
         return DateSignal(m[0], "day", mo, d, y) if _valid_md(mo, d, y) else None
 
-    def slash_y(m):
+    def slash_y(m, before):
         a, b, y = int(m[1]), int(m[2]), _two_digit_year(int(m[3]))
         mo, d = (b, a) if a > 12 and b <= 12 else (a, b)
         return DateSignal(m[0], "day", mo, d, y) if _valid_md(mo, d, y) else None
@@ -496,40 +592,42 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     def strong_dm(m) -> bool:
         return bool(re.search(r"^\d{1,2}(?:st|nd|rd|th)|\bof\b", m[0], re.I))
 
-    def dmy(m):
-        if not _month_ok(m[2], m, work, strong_dm(m)):
+    def dmy(m, before):
+        if not _month_ok(m[2], lambda: before(m.start())[0], strong_dm(m)):
             return None
         d, mo, y = int(m[1]), _MONTH_NAMES[m[2].lower()], int(m[3])
         return DateSignal(m[0], "day", mo, d, y) if _valid_md(mo, d, y) else None
 
-    def mdy(m):
-        if not _month_ok(m[1], m, work):
+    def mdy(m, before):
+        if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
         mo, d, y = _MONTH_NAMES[m[1].lower()], int(m[2]), int(m[3])
         return DateSignal(m[0], "day", mo, d, y) if _valid_md(mo, d, y) else None
 
-    def md(m):
-        if not _month_ok(m[1], m, work):
+    def md(m, before):
+        if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
         mo, d = _MONTH_NAMES[m[1].lower()], int(m[2])
         return DateSignal(m[0], "day", mo, d) if _valid_md(mo, d) else None
 
-    def dm(m):
-        if not _month_ok(m[2], m, work, strong_dm(m)):
+    def dm(m, before):
+        if not _month_ok(m[2], lambda: before(m.start())[0], strong_dm(m)):
             return None
         d, mo = int(m[1]), _MONTH_NAMES[m[2].lower()]
         return DateSignal(m[0], "day", mo, d) if _valid_md(mo, d) else None
 
-    def slash(m):
+    def slash(m, before):
         a, b = int(m[1]), int(m[2])
-        if (a <= b and b in RATIO_DENOMS
-                and not _slash_marked_as_date(m, work)):
-            return None          # a ratio or a score ("3/4", "8/10"), not a date
+        if a <= b and b in RATIO_DENOMS:
+            prev, prev2 = before(m.start())
+            if not _slash_marked_as_date(
+                    m, prev, prev2, work[m.end():m.end() + 40]):
+                return None      # a ratio or a score ("3/4", "8/10"), not a date
         # month/day only: with no year, "24/7" and "16/9" have no month
         return DateSignal(m[0], "day", a, b) if _valid_md(a, b) else None
 
-    def my(m):
-        if not _month_ok(m[1], m, work):
+    def my(m, before):
+        if not _month_ok(m[1], lambda: before(m.start())[0]):
             return None
         return DateSignal(m[0], "month", _MONTH_NAMES[m[1].lower()], None,
                           int(m[2]))
@@ -542,7 +640,7 @@ def parse_dates(query: str) -> Tuple[List[DateSignal], str]:
     each(_RE_DM, dm)
     each(_RE_SLASH, slash)
     each(_RE_MY, my)
-    return out, work
+    return out, shown
 
 
 def _is_capitalized(tok: str) -> bool:
@@ -585,13 +683,44 @@ def _is_id_token(tok: str) -> bool:
     return False
 
 
-def parse_signals(query: str, common_words: Optional[Set[str]] = None) -> ExactSignals:
+def _scan_prefix(text: str, max_chars: int) -> str:
+    """The first ``max_chars`` characters of ``text``, cut back to the last
+    whitespace when the cut would split a token (rule 5)."""
+    head = text[:max_chars]
+    if len(text) > max_chars and not text[max_chars].isspace():
+        k = max(head.rfind(c) for c in " \t\n\r\f\v")
+        if k > 0:
+            head = head[:k]
+    return head
+
+
+_RE_EDGE_JUNK = re.compile(r"[\W_]*")
+
+
+def _trim_edges(text: str) -> str:
+    """``text`` without its leading and trailing non-alphanumeric runs: what
+    ``re.sub(r"^[\\W_]+|[\\W_]+$", "", text)`` returns, in linear time (that
+    pattern retries a long inner run of punctuation from every position)."""
+    lead = _RE_EDGE_JUNK.match(text).end()
+    if lead == len(text):
+        return ""
+    trail = _RE_EDGE_JUNK.match(text[::-1]).end()
+    return text[lead:len(text) - trail]
+
+
+def parse_signals(query: str, common_words: Optional[Set[str]] = None,
+                  max_chars: int = SCAN_CHARS) -> ExactSignals:
     """Pure, deterministic detection (rules in the module docstring).
     ``common_words`` is the set a sentence-initial single word is dropped on
-    (default COMMON_WORDS; the lane passes its configured set)."""
+    (default COMMON_WORDS; the lane passes its configured set). Only the
+    first ``max_chars`` characters are read (rule 5; the lane passes its
+    configured bound)."""
     common = COMMON_WORDS if common_words is None else common_words
     sig = ExactSignals()
     work = query or ""
+    if len(work) > max_chars:
+        work = _scan_prefix(work, max_chars)
+        sig.scanned_chars = len(work)
 
     for m in _RE_QUOTE.finditer(work):
         phrase = next(g for g in m.groups() if g is not None)
@@ -663,11 +792,13 @@ def parse_signals(query: str, common_words: Optional[Set[str]] = None) -> ExactS
                 sig.spans.append(NameSpan(text, a, b, starts))
         i = j
 
-    # Whole-query label (lowercase single tokens like "harbor").
-    whole = re.sub(r"\s+", " ", re.sub(r"^[\W_]+|[\W_]+$", "", query or "")).strip()
-    whole = _RE_POSSESSIVE.sub("", whole)
-    if whole and len(whole.split()) <= MAX_SPAN_TOKENS:
-        sig.whole_query = whole
+    # Whole-query label (lowercase single tokens like "harbor"); only when the
+    # whole query was read.
+    if sig.scanned_chars is None:
+        whole = re.sub(r"\s+", " ", _trim_edges(query or "")).strip()
+        whole = _RE_POSSESSIVE.sub("", whole)
+        if whole and len(whole.split()) <= MAX_SPAN_TOKENS:
+            sig.whole_query = whole
     return sig
 
 
@@ -751,6 +882,68 @@ class ExactLane:
             return 0.0, "hub_%d_neighbors" % degree
         return min(1.0, cap / max(degree, 1)), None
 
+    # -- detection, and the date rule on its own ---------------------------
+    def parse(self, query: str) -> ExactSignals:
+        """``parse_signals`` with this lane's configured word list and scan
+        bound: exactly what ``build`` reads from a query."""
+        return parse_signals(query, self.config.common_words,
+                             self.config.scan_chars)
+
+    def match_dates(
+        self,
+        dates: List[DateSignal],
+        origin_runtime: Optional[List[str]] = None,
+        include_context: bool = False,
+        live_only: bool = True,
+    ) -> List[DateMatch]:
+        """The lane's whole date rule, one DateMatch per date signal, in order.
+
+        A date with a year is that day (or month); one without is that day in
+        every year the graph has a dated node for (either field). Nodes are
+        matched on event_time first (overlap with the date, strength
+        min(node granularity, query granularity) from GRAN_WEIGHT), then on
+        recorded_at (trusted sources only, RECORDED_AT_STRENGTH times the
+        query granularity) for nodes event_time did not match; never on
+        created_at or text. ``build`` boosts from this, and anything that
+        reports what the lane can see by date (revien_bench.ab_exact) calls
+        it too, so the two cannot disagree."""
+        if not dates:
+            return []
+        scope = dict(origin_runtime=origin_runtime,
+                     include_context=include_context, live_only=live_only)
+        years: Set[int] = set(self.store.recorded_year_list())
+        for a, b in self.store.event_time_year_spans():
+            if b >= a and b - a <= MAX_YEARS:
+                years.update(range(a, b + 1))
+        out: List[DateMatch] = []
+        for d in dates:
+            if d.year is not None:
+                ranges = [r for r in [d.ranges_for_year(d.year)] if r]
+            else:
+                ranges = [r for y in sorted(years)
+                          for r in [d.ranges_for_year(y)] if r]
+            ev_rows = (self.store.exact_event_matches(ranges, **scope)
+                       if ranges else [])
+            rec_rows = (self.store.exact_recorded_matches(ranges, **scope)
+                        if ranges else [])
+            # event_time is the strongest source; recorded_at (when it was
+            # SAID) counts for a node only if event_time did not.
+            ev_ids = {r[0] for r in ev_rows}
+            rec_rows = [r for r in rec_rows if r[0] not in ev_ids]
+            total = len(ev_rows) + len(rec_rows)
+            event = []
+            for nid, _ntype, _s, _e, gran in ev_rows:
+                g = (gran or "fuzzy")
+                event.append((nid, g, min(GRAN_WEIGHT.get(g, GRAN_WEIGHT["fuzzy"]),
+                                          GRAN_WEIGHT[d.granularity])))
+            recorded = [(nid, RECORDED_AT_STRENGTH * GRAN_WEIGHT[d.granularity])
+                        for nid, _ntype, _rec in rec_rows]
+            out.append(DateMatch(
+                signal=d, event=event, recorded=recorded,
+                scale=(min(1.0, self.config.date_max_matches / total)
+                       if total else 0.0)))
+        return out
+
     # -- main ----------------------------------------------------------------
     def build(
         self,
@@ -770,7 +963,7 @@ class ExactLane:
         ``config.bm25_label_scale`` when the BM25 lane, which indexes labels,
         is on, and 1.0 otherwise."""
         cfg = self.config
-        sig = parse_signals(query, cfg.common_words)
+        sig = self.parse(query)
         if not sig.needs_lookup:
             return None
         ls = label_scale
@@ -918,7 +1111,9 @@ class ExactLane:
         if sig.ids:
             id_rows = self.store.exact_node_ids(sig.ids, **scope)
             id_hit = {r[0] for r in id_rows}
-            long_ids = [t for t in sig.ids if len(t) >= 4]
+            long_ids = [t for t in sig.ids
+                        if len(t) >= 4][:MAX_CONTAINED_CODES]
+            contain_set = set(long_ids)
             # ONE pass over the label column for every code in the query.
             contain_rows = (
                 self.store.exact_label_contains(
@@ -929,7 +1124,7 @@ class ExactLane:
                 node_id_equal: Set[str] = {nid for nid in id_hit if nid == t}
                 equal = label_equal | node_id_equal
                 contained: Set[str] = set()
-                if len(t) >= 4:
+                if t in contain_set:
                     rx = re.compile(
                         r"(?<![A-Za-z0-9])" + re.escape(t) + r"(?![A-Za-z0-9])",
                         re.I)
@@ -985,51 +1180,28 @@ class ExactLane:
 
         # ---- dates -----------------------------------------------------------------------
         dates_report = []
-        if sig.dates:
-            spans = self.store.event_time_year_spans()
-            years: Set[int] = set(self.store.recorded_year_list())
-            for a, b in spans:
-                if b >= a and b - a <= MAX_YEARS:
-                    years.update(range(a, b + 1))
-            for d in sig.dates:
-                if d.year is not None:
-                    ranges = [r for r in [d.ranges_for_year(d.year)] if r]
-                else:
-                    ranges = [r for y in sorted(years)
-                              for r in [d.ranges_for_year(y)] if r]
-                ev_rows = (self.store.exact_event_matches(ranges, **scope)
-                           if ranges else [])
-                rec_rows = (self.store.exact_recorded_matches(ranges, **scope)
-                            if ranges else [])
-                # event_time is the strongest source; recorded_at (when it
-                # was SAID) counts for a node only if event_time did not.
-                ev_ids = {r[0] for r in ev_rows}
-                rec_rows = [r for r in rec_rows if r[0] not in ev_ids]
-                m_total = len(ev_rows) + len(rec_rows)
-                scale = min(1.0, cfg.date_max_matches / m_total) if m_total else 0.0
-                hit_ids = []
-                for nid, _ntype, _s, _e, gran in ev_rows:
-                    g = (gran or "fuzzy")
-                    strength = min(GRAN_WEIGHT.get(g, GRAN_WEIGHT["fuzzy"]),
-                                   GRAN_WEIGHT[d.granularity])
-                    hit_ids.append(nid)
-                    add(nid, {"signal": "date", "text": d.text,
-                              "field": "event_time", "node_granularity": g,
-                              "strength": strength, "weight": scale},
-                        cfg.boost_max * strength * scale)
-                for nid, _ntype, _rec in rec_rows:
-                    strength = RECORDED_AT_STRENGTH * GRAN_WEIGHT[d.granularity]
-                    hit_ids.append(nid)
-                    add(nid, {"signal": "date", "text": d.text,
-                              "field": "recorded_at", "strength": strength,
-                              "weight": scale},
-                        cfg.boost_max * strength * scale)
-                dates_report.append({**d.describe(), "matched": hit_ids,
-                                     "matched_by_event_time": sorted(ev_ids),
-                                     "matched_by_recorded_at": sorted(
-                                         r[0] for r in rec_rows),
-                                     "matches_total": m_total,
-                                     "scale": round(scale, 4)})
+        for dm in self.match_dates(sig.dates, **scope):
+            d, scale = dm.signal, dm.scale
+            hit_ids = []
+            for nid, g, strength in dm.event:
+                hit_ids.append(nid)
+                add(nid, {"signal": "date", "text": d.text,
+                          "field": "event_time", "node_granularity": g,
+                          "strength": strength, "weight": scale},
+                    cfg.boost_max * strength * scale)
+            for nid, strength in dm.recorded:
+                hit_ids.append(nid)
+                add(nid, {"signal": "date", "text": d.text,
+                          "field": "recorded_at", "strength": strength,
+                          "weight": scale},
+                    cfg.boost_max * strength * scale)
+            dates_report.append({**d.describe(), "matched": hit_ids,
+                                 "matched_by_event_time": sorted(
+                                     nid for nid, _g, _s in dm.event),
+                                 "matched_by_recorded_at": sorted(
+                                     nid for nid, _s in dm.recorded),
+                                 "matches_total": dm.total,
+                                 "scale": round(scale, 4)})
 
         # ---- boosts, capped; injection, bounded -------------------------------------
         boost = {nid: min(cfg.boost_max, parts)
@@ -1049,6 +1221,8 @@ class ExactLane:
             "whole_query": whole_report,
             "entity_anchors": list(entity_anchor_ids or []),
         }
+        if sig.scanned_chars is not None:
+            detected["scanned_chars"] = sig.scanned_chars
         has_signal = bool(
             quoted_report or dates_report or ids_report or accepted_names
             or unmatched_names or whole_report)

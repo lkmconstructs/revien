@@ -579,11 +579,9 @@ class TestFalseDates:
     @pytest.mark.parametrize("q,want", [
         ("on 3/10", (3, 10)), ("by 8/10", (8, 10)), ("since 5/5", (5, 5)),
         ("until 10/10", (10, 10)), ("till 4/20", (4, 20)),
-        ("from 6/20", (6, 20)), ("before 3/10", (3, 10)),
-        ("after 2/2", (2, 2)), ("during 6/6", (6, 6)),
-        ("through 5/5", (5, 5)), ("between 3/10 and 3/12", (3, 10)),
-        ("of 10/20", (10, 20)), ("on the 3/10", (3, 10)),
-        ("what happened on 3/10?", (3, 10)),
+        ("before 3/10", (3, 10)), ("after 2/2", (2, 2)),
+        ("through 5/5", (5, 5)), ("on the 3/10", (3, 10)),
+        ("by the 3/10", (3, 10)), ("what happened on 3/10?", (3, 10)),
     ])
     def test_a_slash_pair_after_a_date_preposition_is_a_date(self, q, want):
         d = parse_signals(q).dates
@@ -625,17 +623,205 @@ class TestFalseDates:
         ok = lambda q: len(parse_signals(q).dates) == 1
         # 50 of them read as ratios or scores with nothing to mark them
         assert sum(ok(f"{m}/{d}") for m, d in forms) == 316
-        # a preposition rescues every one
-        for prep in ["on", "by", "since", "until", "till", "from", "before",
-                     "after", "during", "through", "between", "of"]:
+        # a date preposition rescues every one
+        for prep in ["on", "by", "since", "until", "till", "before", "after",
+                     "through"]:
             assert all(ok(f"{prep} {m}/{d}") for m, d in forms), prep
-        assert sum(ok(f"in {m}/{d}") for m, d in forms) == 316   # "in" does not
+        # these words do not ("a score of 8/10", "between 1/2 and 3/4")
+        for word in ["in", "of", "from", "between", "during", "and", "to",
+                     "score of", "out of"]:
+            assert sum(ok(f"{word} {m}/{d}") for m, d in forms) == 316, word
         # zero-padding rescues all but the four with nothing to pad
         assert sum(ok(f"{m:02d}/{d:02d}") for m, d in forms) == 362
 
     def test_a_false_date_does_not_hide_a_real_one(self):
         d = parse_signals("we march 3 miles and then Sept 21 at 24/7 for 8/10")
         assert [(x.month, x.day) for x in d.dates] == [(9, 21)]
+
+
+# ── a slash pair is a date only when something marks it as one ────────────────
+
+def _dates(q):
+    return [(d.month, d.day, d.year) for d in parse_signals(q).dates]
+
+
+class TestSlashPairsNeedAMarker:
+    """A wrong date is worse than none: a ratio-shaped a/b is a date only
+    after a date preposition (on by before after since until till through),
+    zero-padded, or with a year. Nothing else marks one."""
+
+    @pytest.mark.parametrize("q", [
+        # "of", "out of", "score of", "ratio of"
+        "a score of 8/10", "a score of 8/10 on the quiz", "the ratio of 3/4",
+        "out of 3/4", "of 4/5", "of 10/20", "the week of 3/10",
+        # "between", "from", "during", "and", "to"
+        "between 1/2 and 3/4 cup", "from 3/4 to 3/8", "from 1/2 to 3/4",
+        "from 6/20", "during 6/6", "3/4 and 1/2",
+        # a fraction OF something, even after a date preposition
+        "3/4 of the team", "through 3/4 of the book", "on 1/2 of the days",
+        "after 3/4 of the votes were counted", "by 2/3 of the members",
+        # "by" an amount
+        "reduced by 1/2", "cut by 1/3", "the price increased by 1/4",
+        "we grew by 2/3", "multiply 3 by 3/4", "divided by 2/3",
+        # no marker at all
+        "in 2/3 cases", "rated 9/10", "8/10", "1/2 cup flour", "3/4",
+    ])
+    def test_not_a_date(self, q):
+        assert _dates(q) == [], q
+
+    @pytest.mark.parametrize("q,want", [
+        ("on 3/4", [(3, 4, None)]), ("by 3/4", [(3, 4, None)]),
+        ("before 3/4", [(3, 4, None)]), ("after 3/4", [(3, 4, None)]),
+        ("since 3/4", [(3, 4, None)]), ("until 3/4", [(3, 4, None)]),
+        ("till 3/4", [(3, 4, None)]), ("through 3/4", [(3, 4, None)]),
+        ("On 3/4 we met", [(3, 4, None)]), ("due by the 3/10", [(3, 10, None)]),
+        ("finished by 3/4", [(3, 4, None)]),
+        ("what happened on 3/4?", [(3, 4, None)]),
+        # zero-padded or with a year: a date whatever comes before
+        ("03/04", [(3, 4, None)]), ("by 03/04", [(3, 4, None)]),
+        ("from 03/04 to 03/08", [(3, 4, None), (3, 8, None)]),
+        ("the week of 03/10", [(3, 10, None)]),
+        ("3/4/2025", [(3, 4, 2025)]),
+        ("from 3/4/2026 to 3/8/2026", [(3, 4, 2026), (3, 8, 2026)]),
+        ("between 1/2/2026 and 3/4/2026", [(1, 2, 2026), (3, 4, 2026)]),
+        # not ratio-shaped: read with no marker, as before
+        ("12/25", [(12, 25, None)]), ("between 3/10 and 3/12", [(3, 12, None)]),
+        # a score next to a real date: only the date
+        ("a score of 8/10 on 3/4", [(3, 4, None)]),
+    ])
+    def test_a_date(self, q, want):
+        assert _dates(q) == want, q
+
+    @pytest.mark.parametrize("q,want", [
+        ("Q3", []), ("Q3 2026 plan", []), ("the 90s", []),
+        ("music from the 90s", []), ("2026-09-21", [(9, 21, 2026)]),
+        ("what happened on 2026-09-21?", [(9, 21, 2026)]),
+        ("May 5", [(5, 5, None)]), ("may 5", []), ("it may 5 times", []),
+        ("May", []), ("March is coming", []), ("Did March call?", []),
+        ("on march 3", [(3, 3, None)]), ("the 5th of may", [(5, 5, None)]),
+        ("in march 2026", [(3, None, 2026)]), ("24/7 support", []),
+        ("16/9 screen", []), ("Dana's notes", []),
+    ])
+    def test_unchanged_cases(self, q, want):
+        assert _dates(q) == want, q
+
+    def test_march_is_still_a_name_and_possessives_still_drop(self):
+        assert "March" in {s.text for s in parse_signals("Did March call?").spans}
+        assert {s.text for s in parse_signals("Dana's notes").spans} == {"Dana"}
+        assert {s.text for s in parse_signals("Dana’s notes").spans} == {"Dana"}
+
+
+class TestDetectionIsLinear:
+    """Each date pattern is read in one left-to-right pass (the old reader
+    restarted from the start after every date: "on 3/4 " * 20000 took 48.8 s),
+    and the lane reads at most SCAN_CHARS characters of a query."""
+
+    HOSTILE = {
+        "slash dates": "on 3/4 " * 30000,
+        "ratios": "3/4 " * 50000,
+        "iso dates": "2026-09-21 " * 20000,
+        "month days": "September 21 " * 16000,
+        "ambiguous months": "on May 5 may 6 " * 14000,
+        "quotes": '"Project Atlas" ' * 13000,
+        "unbalanced quotes": '"' * 200000,
+        "single quotes": "'a' 'bb' " * 23000,
+        "names": " ".join(["Alpha", "Beta", "Gamma", "Delta"] * 9000),
+        "codes": " ".join("PR-%d" % i for i in range(25000)),
+        "possessives": "Dana's " * 29000,
+        "dots": "a" + "." * 200000 + "a",
+        "slashes": "1/" * 100000,
+    }
+
+    @pytest.mark.parametrize("name", sorted(HOSTILE))
+    def test_a_200kb_hostile_query_builds_well_under_a_second(self, store, dated, name):
+        import time
+        from revien.retrieval.exact import SCAN_CHARS
+        q = self.HOSTILE[name]
+        assert len(q) >= 140_000
+        lane = ExactLane(store, ExactConfig())
+        t0 = time.perf_counter()
+        r = lane.build(q, [])
+        assert time.perf_counter() - t0 < 1.0, name
+        if r is not None:
+            assert r.detected["scanned_chars"] <= SCAN_CHARS
+
+    @pytest.mark.parametrize("name", sorted(HOSTILE))
+    def test_detection_without_the_bound_is_linear(self, name):
+        # The bound is not what keeps detection fast: read in full, 200 KB of
+        # any of these takes well under a second or two (quadratic took 48.8 s
+        # at 140 KB). Generous threshold for a slow machine.
+        import time
+        from revien.retrieval.exact import parse_dates
+        q = self.HOSTILE[name]
+        t0 = time.perf_counter()
+        parse_dates(q)
+        parse_signals(q, max_chars=10 ** 9)
+        assert time.perf_counter() - t0 < 6.0, name
+
+    def test_every_date_in_a_long_query_is_read_without_the_bound(self):
+        from revien.retrieval.exact import parse_dates
+        dates, _ = parse_dates("on 3/4 " * 20000)
+        assert len(dates) == 20000
+
+    def test_the_lane_reads_only_the_first_scan_chars(self, store, monkeypatch):
+        from revien.retrieval.exact import SCAN_CHARS
+        k = add(store, "Project Kestrel", "k")
+        filler = "x " * 3000                       # 6000 characters
+        q = filler + "Project Kestrel"
+        assert parse_signals(q).spans == []
+        assert ExactLane(store, ExactConfig()).build(q, []) is None
+        monkeypatch.setenv("REVIEN_EXACT_SCAN_CHARS", "100000")
+        cfg = ExactConfig.from_env()
+        assert cfg.scan_chars == 100000
+        r = ExactLane(store, cfg).build(q, [])
+        assert k.node_id in r.matches and "scanned_chars" not in r.detected
+        # inside the bound: read as before, and no "scanned_chars"
+        r = ExactLane(store, ExactConfig()).build("who is Project Kestrel", [])
+        assert "scanned_chars" not in r.detected
+        assert len(filler) > SCAN_CHARS
+
+    def test_the_cut_never_splits_a_token(self):
+        from revien.retrieval.exact import SCAN_CHARS
+        q = "a" * (SCAN_CHARS - 6) + " PR-123456 tail"
+        sig = parse_signals(q)
+        assert sig.ids == [] and sig.scanned_chars == SCAN_CHARS - 6
+        q2 = "y " * (SCAN_CHARS // 2 - 3) + "on 2026-09-21 more"
+        assert parse_signals(q2).dates == []       # cut before the date
+
+    def test_a_cut_query_has_no_whole_query_label(self, store):
+        add(store, "harbor", "h")
+        q = "harbor" + " " * 5000 + "!"
+        assert parse_signals(q, max_chars=10 ** 9).whole_query == "harbor"
+        assert parse_signals(q).whole_query is None
+
+    def test_past_the_bound_the_lane_is_silent_and_recall_is_unchanged(self, store):
+        # The bound is the lane's own: recall still reads the whole query
+        # (keyword recall finds the node), and a signal past the bound is not
+        # read by the lane, so recall with it on is the same as with it off.
+        k = add(store, "Project Kestrel", "kestrel notes")
+        q = "kestrel " * 1000 + "Project Kestrel"
+        off = strip(engine_for(store, exact=False).recall(q, top_n=5, debug=True))
+        on = strip(engine_for(store, exact=True).recall(q, top_n=5, debug=True))
+        assert on == off and "exact" not in on["diagnostics"]
+        assert k.node_id in [r["node_id"] for r in off["results"]]
+
+    def test_a_blanked_date_never_joins_its_neighbours(self):
+        # "Sept" and "5" sit either side of an ISO date: not "Sept 5"
+        assert _dates("Sept 2026-09-21 5") == [(9, 21, 2026)]
+        assert _dates("on Jan 2026-01-02 3") == [(1, 2, 2026)]
+        # within one pattern, a date read earlier still reads as blank
+        # before the next one ("on May 5 may 6": "may 6" follows "on")
+        assert _dates("on May 5 may 6") == [(5, 5, None), (5, 6, None)]
+
+    def test_codes_searched_inside_labels_are_bounded(self, store):
+        from revien.retrieval.exact import MAX_CONTAINED_CODES
+        hit = add(store, "Fix for ABC-77 regression", "x")
+        many = " ".join("ZZ-%d" % i for i in range(40))
+        r = ExactLane(store, ExactConfig()).build(f"ABC-77 {many}", [])
+        assert hit.node_id in r.boost             # the first code is looked for
+        r = ExactLane(store, ExactConfig()).build(f"{many} ABC-77", [])
+        assert r is not None and hit.node_id not in r.boost
+        assert MAX_CONTAINED_CODES == 16
 
 
 class TestOrdinaryWords:
