@@ -32,7 +32,7 @@ from typing import Dict, Iterable, List, Optional, Set
 from revien.forget import gate, keys as forget_keys, scrub
 from revien.forget.wording import WordingForget
 from revien.forget.keys import fingerprints
-from revien.graph.schema import Edge, EdgeType, Node, NodeType, SourceType
+from revien.graph.schema import LABEL_CUT_KEY, Edge, EdgeType, Node, NodeType, SourceType
 from revien.graph.store import StoreBusy
 from revien.graph.units import (
     describe, identity_keys, is_file_backed, is_real_file, is_shared_channel,
@@ -85,10 +85,27 @@ def _word_in(needle: str, haystack: str) -> bool:
         r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack, re.IGNORECASE))
 
 
+def cut_for_its_label(node: Node) -> bool:
+    """An entity made from a declared name (a note or book title, a [[link]])
+    longer than a label holds: the pipeline cuts its label to the first 200
+    characters, keeps the whole name in its content, and marks the cut
+    (LABEL_CUT_KEY, the whole name's length). The whole name is what was
+    said, so it is the wording, not the cut. Only the mark says so, and only
+    while the content is still the name the label was cut from; a node
+    without the mark is its label, as it always was."""
+    md = node.metadata if isinstance(node.metadata, dict) else {}
+    whole = md.get(LABEL_CUT_KEY)
+    content = node.content or ""
+    return (node.node_type == NodeType.ENTITY and whole == len(content)
+            and content.startswith(node.label or ""))
+
+
 def stated(node: Node) -> List[str]:
     """The exact wording of a node: what would be said in a conversation. An
     entity or a topic is its label; the content string the extractor gives it
     ('Entity: Brigitte Vandermeer') is Revien's own, never said by anyone."""
+    if cut_for_its_label(node):
+        return [node.content]
     if node.node_type in (NodeType.ENTITY, NodeType.TOPIC):
         return [node.label]
     return [node.content]

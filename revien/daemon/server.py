@@ -16,6 +16,7 @@ import secrets
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from pydantic import ValidationError as SchemaValidationError
 
 from revien import __version__, pairing
 from revien.daemon.heartbeat import (
@@ -472,6 +473,24 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # A Node or Edge that does not fit the schema (a label over 200
+    # characters, say) is a refusal of what the request carried, not a crash:
+    # 422, naming the field and the kind of problem only. pydantic's own text
+    # quotes the value, and the value is the caller's text. Any other model
+    # failing is a server bug and stays a 500.
+    @app.exception_handler(SchemaValidationError)
+    async def _schema_limit_without_the_text(request, exc):
+        if exc.title not in ("Node", "Edge"):
+            raise exc
+        problems = [{"field": ".".join(str(p) for p in e.get("loc", ())) or exc.title,
+                     "problem": e.get("type", "invalid")} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": {
+            "status": "refused", "reason": "schema_limit",
+            "problems": problems,
+            "message": (f"This request produced a {exc.title.lower()} the memory "
+                        "schema does not accept. Nothing you sent is repeated "
+                        "here.")}})
+
     if mcp_server is not None:
         from starlette.routing import Route as _StarletteRoute
 
@@ -558,6 +577,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         )
         try:
             result = pipeline.ingest(input_data)
+        except SchemaValidationError:
+            raise  # a ValueError too; answered above without the text
         except ValueError as e:
             # Origin Layer (WS0): an unknown declared origin_runtime/
             # origin_source is a client error, not a 500.

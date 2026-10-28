@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from revien.graph.schema import Edge, EdgeType, Modality, Node, NodeType, SourceType
+from revien.graph.schema import (
+    LABEL_CUT_KEY, Edge, EdgeType, Modality, Node, NodeType, SourceType)
 from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_label, normalize_text
 from revien.graph.operations import GraphOperations
@@ -679,7 +680,12 @@ class IngestionPipeline:
                 )
                 seen_links = set()
                 for raw_label in input_data.links:
-                    label = (raw_label or "").strip()
+                    name = (raw_label or "").strip()
+                    # A label holds 200 characters. A longer note title,
+                    # [[link]] or book title is cut there, as context labels
+                    # and imported titles are, kept whole in content, and
+                    # the cut is marked (LABEL_CUT_KEY) for a forget.
+                    label = name[:200]
                     if not label or label.lower() in seen_links:
                         continue
                     seen_links.add(label.lower())
@@ -688,12 +694,12 @@ class IngestionPipeline:
                         self.store.record_provenance(
                             target.node_id, unit.owner, label_ok=True,
                             wording_ok=(normalize_text(target.content)
-                                        == normalize_text(label)))
+                                        == normalize_text(name)))
                     if target is None:
                         target = self.store.add_node(Node(
                             node_type=NodeType.ENTITY,
                             label=label,
-                            content=label,
+                            content=name,
                             source_id=input_data.source_id,
                             source_type=SourceType.EXTRACTED,
                             confidence=1.0 if input_data.curated else 0.8,
@@ -702,6 +708,7 @@ class IngestionPipeline:
                                 **({"curated": True} if input_data.curated else {}),
                                 **({"recorded_at_source": input_data.timestamp_source}
                                    if input_data.timestamp is not None else {}),
+                                **({LABEL_CUT_KEY: len(name)} if label != name else {}),
                             },
                             origin_runtime=_origin[0],
                             origin_source=_origin[1],
@@ -1051,7 +1058,8 @@ class IngestionPipeline:
             #     keeps re-ingested links idempotent).
             seen_links = set()
             for raw_label in input_data.links or []:
-                label = (raw_label or "").strip()
+                name = (raw_label or "").strip()
+                label = name[:200]  # cut as in ingest(), whole in content
                 if not label or label.lower() in seen_links:
                     continue
                 seen_links.add(label.lower())
@@ -1060,12 +1068,12 @@ class IngestionPipeline:
                     self.store.record_provenance(
                         target.node_id, unit.owner, label_ok=True,
                         wording_ok=(normalize_text(target.content)
-                                    == normalize_text(label)))
+                                    == normalize_text(name)))
                 if target is None:
                     target = self.store.add_node(Node(
                         node_type=NodeType.ENTITY,
                         label=label,
-                        content=label,
+                        content=name,
                         source_id=input_data.source_id,
                         source_type=SourceType.EXTRACTED,
                         confidence=1.0 if input_data.curated else 0.8,
@@ -1074,6 +1082,7 @@ class IngestionPipeline:
                             **({"curated": True} if input_data.curated else {}),
                             **({"recorded_at_source": ts_source}
                                if ts is not None and ts_source else {}),
+                            **({LABEL_CUT_KEY: len(name)} if label != name else {}),
                         },
                         origin_runtime=_origin[0],
                         origin_source=_origin[1],
