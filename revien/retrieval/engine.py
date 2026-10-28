@@ -44,7 +44,7 @@ from revien.semantic.index import SemanticIndex
 from revien.semantic.rerank import CrossEncoderReranker
 from revien.skills.ingest import skill_index_row
 from revien.skills.proposals import matching_proposals
-from .bm25 import bm25_rank
+from .bm25 import bm25_rank, tokenize as bm25_tokenize
 from .exact import (
     ExactConfig, ExactLane, ExactResult, exact_enabled_by_env, lift_after_rerank,
 )
@@ -210,6 +210,10 @@ class RetrievalEngine:
     # (cosine = 2 - 1/sim), where 0.30 actually gates what may union into
     # the candidate set. See the 2a block in recall().
     SEMANTIC_SIM_FLOOR = 0.30
+    # Word bonus cap (arm 6, active only under REVIEN_HYBRID=bonus): the most
+    # a node can gain for holding every query term. REVIEN_WORD_BONUS overrides.
+    WORD_BONUS = 0.10
+
     # RRF fusion constant (LEG P1, active only under REVIEN_HYBRID=rrf).
     # Canonical default 60; REVIEN_RRF_K overrides for the sweep.
     RRF_K = 60.0
@@ -345,6 +349,19 @@ class RetrievalEngine:
         self.exact_lane = (
             ExactLane(store, ExactConfig.from_env()) if self.exact_enabled else None
         )
+        # Word bonus (arm 6, EXPERIMENTAL, default off): REVIEN_HYBRID=bonus.
+        # Anchors are chosen exactly as with the switch unset (no RRF). Every
+        # scored node then gains cap * (share of the query's distinct terms
+        # that its label and content hold), BM25's tokenizer and stopwords,
+        # added on top of the finished score and again after the reranker, as
+        # the exact boost is. Bounded and additive: a node rises by at most the
+        # cap and is never pushed down by its own score. A malformed, negative
+        # or non-finite REVIEN_WORD_BONUS falls back to WORD_BONUS. Any other
+        # REVIEN_HYBRID value: 0.0, and nothing below runs.
+        _requested_bonus = _env_float("REVIEN_WORD_BONUS", self.WORD_BONUS)
+        if not (math.isfinite(_requested_bonus) and _requested_bonus >= 0.0):
+            _requested_bonus = self.WORD_BONUS
+        self.word_bonus = _requested_bonus if self.hybrid_mode == "bonus" else 0.0
         # Frequency feedback-loop gate — DEFAULT OFF (sweep-shipped July 2026):
         # recall() touching its own results made access_count a popularity
         # prior contaminated by the engine's own behavior (being returned →
@@ -716,6 +733,12 @@ class RetrievalEngine:
                     if _nid not in anchor_ids:
                         anchor_ids.append(_nid)
 
+        # 2a''. Word bonus terms (REVIEN_HYBRID=bonus). Empty when the switch
+        # is off or the query holds only stopwords: no node gets a bonus.
+        bonus_terms = set(bm25_tokenize(query)) if self.word_bonus > 0.0 else set()
+        word_bonuses: Dict[str, float] = {}
+        word_bonus_moves: Dict[str, Tuple[int, int]] = {}
+
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
         if anchor_ids and self.clustering and self.clustering.is_clustered:
@@ -893,6 +916,16 @@ class RetrievalEngine:
             if exact_boost > 0.0:
                 final_score += exact_boost
 
+            # Word bonus: same seam and same additive shape as the exact boost.
+            word_bonus = 0.0
+            if bonus_terms:
+                node_terms = set(bm25_tokenize(f"{node.label} {node.content or ''}"))
+                word_bonus = (self.word_bonus * len(bonus_terms & node_terms)
+                              / len(bonus_terms))
+                if word_bonus > 0.0:
+                    final_score += word_bonus
+                    word_bonuses[node_id] = word_bonus
+
             if debug:
                 diag_scores[node_id] = final_score
 
@@ -960,6 +993,8 @@ class RetrievalEngine:
                 score_breakdown["prefer_boost"] = self.prefer_boost
             if exact_boost > 0.0:
                 score_breakdown["exact_boost"] = round(exact_boost, 6)
+            if word_bonus > 0.0:
+                score_breakdown["word_bonus"] = round(word_bonus, 6)
 
             scored_results.append(RetrievalResult(
                 node_id=node.node_id,
@@ -996,7 +1031,19 @@ class RetrievalEngine:
             # boost added above cannot act. Re-apply it, capped, on the
             # engine's scale (exact.lift_after_rerank). Nothing boosted, or
             # the rerank did not run: this is a no-op.
-            if exact_state is not None and exact_state.boost:
+            if word_bonuses:
+                # Both additive terms are lifted together, each node by the
+                # sum it was given before the reranker.
+                lift = dict(exact_state.boost) if exact_state is not None else {}
+                for _nid, _bonus in word_bonuses.items():
+                    lift[_nid] = lift.get(_nid, 0.0) + _bonus
+                scored_results, word_bonus_moves = lift_after_rerank(
+                    scored_results, rerank_head, lift)
+                if exact_state is not None and exact_state.boost:
+                    exact_state.rerank_moves = {
+                        nid: move for nid, move in word_bonus_moves.items()
+                        if nid in exact_state.boost}
+            elif exact_state is not None and exact_state.boost:
                 scored_results, exact_state.rerank_moves = lift_after_rerank(
                     scored_results, rerank_head, exact_state.boost)
         top_results = scored_results[:top_n]
@@ -1060,6 +1107,14 @@ class RetrievalEngine:
             }
             if exact_state is not None:
                 diagnostics["exact"] = exact_state.diagnostics()
+            if self.word_bonus > 0.0:
+                diagnostics["word_bonus"] = {
+                    "cap": self.word_bonus,
+                    "query_terms": sorted(bonus_terms),
+                    "bonuses": {nid: round(b, 6) for nid, b in word_bonuses.items()},
+                    "after_rerank": {nid: list(move) for nid, move
+                                     in word_bonus_moves.items()},
+                }
 
         return RetrievalResponse(
             query=query,
