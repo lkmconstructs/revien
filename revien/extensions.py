@@ -329,6 +329,79 @@ def node_type_dedups(node_type: Any) -> bool:
     return True if spec is None else spec.dedup
 
 
+# ── behaviour sets ────────────────────────────────────────────────────────
+#
+# Three sets of type *values* (plain strings; compare with ``.value``, never
+# the enum member: an Enum hashes by name). All empty by default, so stock
+# behaviour is unchanged. They only grow, in place, so a module that imported
+# one keeps seeing it. Fill them from an extension (``register_leaf_node_type``
+# and friends) or the REVIEN_*_TYPES variables.
+
+#: Node types a walk may reach but never expands through.
+LEAF_NODE_TYPES: set = set()
+#: Edge types followed source -> target only.
+ASYMMETRIC_EDGE_TYPES: set = set()
+#: Node types whose ``metadata`` rides in recall results.
+RECALL_METADATA_NODE_TYPES: set = set()
+
+ENV_LEAF_NODE_TYPES = "REVIEN_LEAF_NODE_TYPES"
+ENV_ASYMMETRIC_EDGE_TYPES = "REVIEN_ASYMMETRIC_EDGE_TYPES"
+ENV_RECALL_METADATA_NODE_TYPES = "REVIEN_RECALL_METADATA_NODE_TYPES"
+
+
+def _add_to_set(kind: str, target: set, known: List[str], value: Any) -> str:
+    _check_value(kind, value)
+    if value not in known:
+        raise ExtensionRegistrationError(
+            f"{kind} {value!r} is not a built-in or registered type; register "
+            "it first")
+    with _LOCK:
+        target.add(value)
+    return value
+
+
+def register_leaf_node_type(value: str) -> str:
+    """Mark a node type as a leaf: recall may return it, but the graph walk
+    never expands through it (its neighbours are not visited from it). The
+    type must be built in or already registered. Idempotent."""
+    return _add_to_set("leaf node type", LEAF_NODE_TYPES,
+                       all_node_type_values(), value)
+
+
+def register_asymmetric_edge_type(value: str) -> str:
+    """Mark an edge type as one-way: neighbour lookups follow it from source
+    to target only, never back. The type must be built in or already
+    registered. Idempotent."""
+    return _add_to_set("asymmetric edge type", ASYMMETRIC_EDGE_TYPES,
+                       all_edge_type_values(), value)
+
+
+def register_recall_metadata_node_type(value: str) -> str:
+    """Include a node type's ``metadata`` in recall results (REST ``/v1/recall``).
+    Other types keep the stock shape. The type must be built in or already
+    registered. Idempotent."""
+    return _add_to_set("recall metadata node type", RECALL_METADATA_NODE_TYPES,
+                       all_node_type_values(), value)
+
+
+def _apply_env_sets() -> None:
+    """Read the REVIEN_*_TYPES variables (comma lists) into the sets. Called by
+    ``load_extensions`` after the extensions ran, so a listed type may be one
+    an extension registers. A name that is not a known type is an error."""
+    for env, register in ((ENV_LEAF_NODE_TYPES, register_leaf_node_type),
+                          (ENV_ASYMMETRIC_EDGE_TYPES, register_asymmetric_edge_type),
+                          (ENV_RECALL_METADATA_NODE_TYPES,
+                           register_recall_metadata_node_type)):
+        for item in os.environ.get(env, "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                register(item)
+            except ExtensionRegistrationError as exc:
+                raise ExtensionRegistrationError(f"{env}: {exc}") from exc
+
+
 # ── unknown types ─────────────────────────────────────────────────────────
 
 
@@ -494,6 +567,7 @@ def load_extensions() -> Dict[str, str]:
     global _last_env
     env = os.environ.get(ENV_VAR, "")
     if _entry_points_cache is not None and env == _last_env:
+        _apply_env_sets()
         return dict(_LOADED)                   # nothing new to look at
     if getattr(_loading, "active", False):
         return dict(_LOADED)
@@ -514,6 +588,7 @@ def load_extensions() -> Dict[str, str]:
                     _LOADED[spec] = where
             if failures:
                 raise ExtensionLoadError(failures) from failures[0][2]
+            _apply_env_sets()
             _last_env = env
             return dict(_LOADED)
         finally:
@@ -535,16 +610,22 @@ def _reset_for_tests() -> None:
         _EDGE_SPECS.clear()
         _NODE_MEMBERS.clear()
         _EDGE_MEMBERS.clear()
+        LEAF_NODE_TYPES.clear()
+        ASYMMETRIC_EDGE_TYPES.clear()
+        RECALL_METADATA_NODE_TYPES.clear()
         _LOADED.clear()
         _entry_points_cache = None
         _last_env = None
 
 
 __all__ = [
-    "ENTRY_POINT_GROUP", "ENV_VAR", "EdgeTypeSpec", "ExtensionError",
+    "ASYMMETRIC_EDGE_TYPES", "ENTRY_POINT_GROUP", "ENV_ASYMMETRIC_EDGE_TYPES",
+    "ENV_LEAF_NODE_TYPES", "ENV_RECALL_METADATA_NODE_TYPES", "ENV_VAR",
+    "EdgeTypeSpec", "LEAF_NODE_TYPES", "RECALL_METADATA_NODE_TYPES", "ExtensionError",
     "ExtensionLoadError", "ExtensionRegistrationError", "NodeTypeSpec",
     "UnknownTypeError", "all_edge_type_values", "all_node_type_values",
     "check_known_types", "describe_unregistered", "load_extensions",
-    "loaded_extensions", "register_edge_type", "register_node_type",
-    "registered_edge_types", "registered_node_types",
+    "loaded_extensions", "register_asymmetric_edge_type", "register_edge_type",
+    "register_leaf_node_type", "register_node_type",
+    "register_recall_metadata_node_type", "registered_edge_types", "registered_node_types",
 ]
