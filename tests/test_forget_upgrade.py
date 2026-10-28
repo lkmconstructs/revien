@@ -64,7 +64,7 @@ class TestUpgrade:
         assert audit >= before[2]
         conn = sqlite3.connect(path)
         try:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
             names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
         finally:
             conn.close()
@@ -145,7 +145,7 @@ class TestUpgrade:
         assert again["created"] == [] and again["backfilled"] == 0
         conn = sqlite3.connect(path)
         try:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
         finally:
             conn.close()
 

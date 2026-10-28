@@ -45,6 +45,9 @@ from revien.semantic.rerank import CrossEncoderReranker
 from revien.skills.ingest import skill_index_row
 from revien.skills.proposals import matching_proposals
 from .bm25 import bm25_rank
+from .exact import (
+    ExactConfig, ExactLane, ExactResult, exact_enabled_by_env, lift_after_rerank,
+)
 from .scorer import ScoreBreakdown, ScoringConfig, ThreeFactorScorer, _env_float
 from .walker import GraphWalker
 
@@ -239,6 +242,7 @@ class RetrievalEngine:
         training_db: Optional[str] = None,
         semantic: Optional[SemanticIndex] = None,
         reranker: Optional[CrossEncoderReranker] = None,
+        exact: Optional[bool] = None,
     ):
         self.store = store
         self.ops = GraphOperations(store)
@@ -331,6 +335,15 @@ class RetrievalEngine:
             _requested_rrf_k
             if math.isfinite(_requested_rrf_k) and _requested_rrf_k > 0
             else self.RRF_K
+        )
+        # Exact lane (EXPERIMENTAL, default off): REVIEN_EXACT=on, or exact=True
+        # here (explicit argument wins over env, for A/B harnesses that run
+        # both modes in one process). Read once at init, like hybrid_mode.
+        # Off -> nothing below runs and recall is byte-identical. Rules, boost
+        # formula and knobs: revien/retrieval/exact.py.
+        self.exact_enabled = exact_enabled_by_env() if exact is None else bool(exact)
+        self.exact_lane = (
+            ExactLane(store, ExactConfig.from_env()) if self.exact_enabled else None
         )
         # Frequency feedback-loop gate — DEFAULT OFF (sweep-shipped July 2026):
         # recall() touching its own results made access_count a popularity
@@ -670,23 +683,74 @@ class RetrievalEngine:
                             anchor_ids.append(node_id)
                         non_ctx_admitted += 1
 
+        # 2a'. Exact lane (REVIEN_EXACT, default off). Runs after every anchor
+        # source (entity anchors from _find_anchors, keyword/BM25, semantic,
+        # RRF) and only ADDS: a few exactly-matched nodes may join the anchor
+        # set (bounded) and matched nodes get a capped additive boost in the
+        # scoring loop (and again after the reranker, step 5). Returns None
+        # when the query holds no exact signal, in which case nothing here
+        # changes anything.
+        exact_state: Optional[ExactResult] = None
+        if self.exact_lane is not None:
+            try:
+                exact_state = self.exact_lane.build(
+                    query,
+                    anchor_ids,
+                    origin_runtime=source_filter,
+                    include_context=include_context,
+                    live_only=(not include_invalidated and as_of is None),
+                    entity_anchor_ids=entity_anchor_ids,
+                    # BM25 indexes label + content: its score already counted
+                    # the label words a name/quote/id boost would count again.
+                    label_scale=(self.exact_lane.config.bm25_label_scale
+                                 if self.lexical_mode == "bm25" else 1.0),
+                )
+            except Exception as exc:  # degrade loudly, never break recall
+                exact_state = None
+                sys.stderr.write(
+                    f"[revien.exact] lane failed for this query ({exc!r}); "
+                    f"recall continues without it.\n")
+                sys.stderr.flush()
+        # The lane's injected anchors ADMIT nodes; they never re-score one.
+        # They are walked apart from the other anchors (step 3), so a node the
+        # other anchors already reach keeps its distance, path and strength,
+        # and they choose no community (2b). Otherwise an injected node would
+        # sit at distance 0 and lift its own proximity, and its neighbours',
+        # beyond the capped boost. Empty when the lane is off or injects nothing.
+        base_anchor_ids = list(anchor_ids)
+        injected_ids: List[str] = []
+        if exact_state is not None:
+            for _nid in exact_state.inject_ids:
+                if _nid not in anchor_ids:
+                    anchor_ids.append(_nid)
+                    injected_ids.append(_nid)
+
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
-        if anchor_ids and self.clustering and self.clustering.is_clustered:
+        if base_anchor_ids and self.clustering and self.clustering.is_clustered:
             relevant_communities = set(
-                self.clustering.get_communities_for_anchors(anchor_ids)
+                self.clustering.get_communities_for_anchors(base_anchor_ids)
             )
 
         # 3. Walk graph from anchors — ONE traversal yields distances, paths,
         # and path strengths (this used to be two full BFS passes per recall).
-        if anchor_ids:
+        if base_anchor_ids:
             node_distances, node_paths, node_strengths = self.walker.walk_full(
-                anchor_ids
+                base_anchor_ids
             )
         else:
             node_distances = {}
             node_paths = {}
             node_strengths = {}
+        # Injected anchors the walk did not reach add only what is new to it.
+        unreached = [nid for nid in injected_ids if nid not in node_distances]
+        if unreached:
+            more_d, more_p, more_s = self.walker.walk_full(unreached)
+            for nid, dist in more_d.items():
+                if nid not in node_distances:
+                    node_distances[nid] = dist
+                    node_paths[nid] = more_p[nid]
+                    node_strengths[nid] = more_s[nid]
 
         # 4. Score all reachable nodes. One bulk fetch for the whole walked
         # frontier — a SELECT per node here was a measured latency driver.
@@ -839,6 +903,14 @@ class RetrievalEngine:
             if prefer_boosted:
                 final_score *= self.prefer_boost
 
+            # Exact lane: bounded ADDITIVE boost on top of the finished score
+            # (never a multiplier, never a promotion; capped in exact.py).
+            exact_boost = (
+                exact_state.boost.get(node_id, 0.0) if exact_state is not None else 0.0
+            )
+            if exact_boost > 0.0:
+                final_score += exact_boost
+
             if debug:
                 diag_scores[node_id] = final_score
 
@@ -904,6 +976,8 @@ class RetrievalEngine:
                 score_breakdown["type_weight"] = type_weight
             if prefer_boosted:
                 score_breakdown["prefer_boost"] = self.prefer_boost
+            if exact_boost > 0.0:
+                score_breakdown["exact_boost"] = round(exact_boost, 6)
 
             scored_results.append(RetrievalResult(
                 node_id=node.node_id,
@@ -932,7 +1006,17 @@ class RetrievalEngine:
         # be pulled into a top-10 (the outranked bucket's median lives there).
         scored_results.sort(key=lambda r: r.score, reverse=True)
         if self.reranker.is_enabled:
+            rerank_head = min(
+                len(scored_results),
+                getattr(self.reranker, "top_k", len(scored_results)))
             scored_results = self.reranker.rerank(query, scored_results)
+            # The cross-encoder re-sorted its head on its own scale, where the
+            # boost added above cannot act. Re-apply it, capped, on the
+            # engine's scale (exact.lift_after_rerank). Nothing boosted, or
+            # the rerank did not run: this is a no-op.
+            if exact_state is not None and exact_state.boost:
+                scored_results, exact_state.rerank_moves = lift_after_rerank(
+                    scored_results, rerank_head, exact_state.boost)
         top_results = scored_results[:top_n]
 
         # 5b. B1 tension surfacing (opt-in): attach the LIVE other side of any
@@ -992,6 +1076,8 @@ class RetrievalEngine:
                 "filtered": diag_filtered,
                 "max_depth": self.max_depth,
             }
+            if exact_state is not None:
+                diagnostics["exact"] = exact_state.diagnostics()
 
         return RetrievalResponse(
             query=query,

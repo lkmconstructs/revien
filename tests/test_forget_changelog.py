@@ -76,7 +76,7 @@ def test_the_tables_fields_and_functions_named_exist(tmp_path):
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
         cols = [r[1] for r in conn.execute("PRAGMA table_info(node_provenance)")]
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert conn.execute("PRAGMA user_version").fetchone()[0] >= 6  # 007 (exact lane indexes) raises it to 7
     finally:
         conn.close()
     assert {"node_provenance", "capture_units", "suppressions"} <= tables

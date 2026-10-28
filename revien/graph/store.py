@@ -24,6 +24,12 @@ from .schema import (
 )
 
 
+def _next_day(day: str) -> str:
+    """'YYYY-MM-DD' -> the following calendar day, same format."""
+    from datetime import date, timedelta
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+
+
 class StoreBusy(sqlite3.OperationalError):
     """Another connection held the write lock for the whole of a bounded
     wait (see GraphStore.transaction)."""
@@ -335,6 +341,45 @@ class GraphStore(ForgetStoreMixin):
         # Forget layer (user_version 6): ownership, unit registry,
         # suppression records. Its DDL lives in graph/forget_store.py.
         self._migrate_add_forget_layer(conn)
+        # Exact lane indexes (user_version 7): label lookup + event-time range.
+        self._migrate_add_exact_lane_indexes(conn)
+
+    _EXACT_LANE_INDEXES = (
+        ("idx_nodes_label_lower", "nodes(lower(label))"),
+        ("idx_nodes_event_time", "nodes(event_time_start, event_time_end)"),
+        ("idx_nodes_recorded_at", "nodes(recorded_at)"),
+    )
+
+    def _migrate_add_exact_lane_indexes(self, conn: sqlite3.Connection) -> None:
+        """Migration 007: three indexes for the opt-in exact lane (REVIEN_EXACT).
+
+        ``idx_nodes_label_lower`` serves case-insensitive exact label lookup
+        (``WHERE lower(label) IN (...)``); ``idx_nodes_event_time`` serves the
+        event-date range query; ``idx_nodes_recorded_at`` serves the
+        said-at (recorded_at) range query. Indexes only: no row is read or rewritten.
+        Idempotent and cheap on every connect: once ``PRAGMA user_version``
+        is >= 7 AND all three indexes exist it returns after one catalogue
+        read (a marker never overrides the schema: an index dropped
+        out-of-band is recreated). Upgrade-safe from v6 and older: the
+        temporal columns it indexes are added by the guards that run before
+        this one."""
+        try:
+            have = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?,?)",
+                [n for n, _ in self._EXACT_LANE_INDEXES])}
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= 7 and len(have) == len(self._EXACT_LANE_INDEXES):
+                return
+            for name, target in self._EXACT_LANE_INDEXES:
+                conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {target}")
+            if version < 7:
+                conn.execute("PRAGMA user_version = 7")
+            self._commit(conn)
+        except sqlite3.OperationalError as e:
+            if "already exists" in str(e):
+                print(f"Migration note: {e}")
+            else:
+                raise
 
     @staticmethod
     def _distinct_values(conn: sqlite3.Connection, table: str, column: str) -> set:
@@ -1945,6 +1990,254 @@ class GraphStore(ForgetStoreMixin):
             if (node.metadata or {}).get("ingest_key") == ingest_key:
                 return node
         return None
+
+    # ── Exact lane lookups (REVIEN_EXACT) ─────────────────────────────────
+    # Narrow projections, no Node construction: the lane needs ids, labels,
+    # types and event ranges, not whole rows. Label equality, the event-time
+    # and recorded_at ranges, node ids and neighbours are indexed reads
+    # (idx_nodes_label_lower, idx_nodes_event_time, idx_nodes_recorded_at,
+    # the node_id primary key, the edge indexes); exact_label_contains is one
+    # pass over the label column (bounded by the lane: exact.MAX_CONTAINED_CODES).
+
+    @staticmethod
+    def _exact_scope_sql(origin_runtime, include_context, live_only):
+        sql, params = "", []
+        if not include_context:
+            sql += " AND node_type != 'context'"
+        if live_only:
+            sql += " AND invalidated_at IS NULL"
+        if origin_runtime is not None:
+            runtimes = (
+                [origin_runtime] if isinstance(origin_runtime, str)
+                else list(origin_runtime)
+            )
+            sql += f" AND origin_runtime IN ({', '.join('?' * len(runtimes))})"
+            params.extend(runtimes)
+        return sql, params
+
+    @_locked
+    def exact_label_matches(
+        self, labels_lower, origin_runtime=None, include_context=False,
+        live_only=True, limit: int = 500,
+    ) -> list:
+        """[(node_id, lower(label), node_type)] for nodes whose label equals
+        one of ``labels_lower`` (SQLite lower(): ASCII case folding). Index
+        lookup, not a scan."""
+        labels = sorted({l for l in labels_lower if l})
+        out: list = []
+        if not labels:
+            return out
+        scope, sparams = self._exact_scope_sql(
+            origin_runtime, include_context, live_only)
+        conn = self._get_conn()
+        for i in range(0, len(labels), 400):
+            chunk = labels[i:i + 400]
+            rows = conn.execute(
+                "SELECT node_id, lower(label), node_type FROM nodes "
+                f"WHERE lower(label) IN ({','.join('?' * len(chunk))})"
+                f"{scope} ORDER BY node_id LIMIT ?",
+                chunk + sparams + [limit],
+            ).fetchall()
+            out.extend((r[0], r[1], r[2]) for r in rows)
+        return out
+
+    @_locked
+    def exact_label_contains(
+        self, needles_lower, origin_runtime=None, include_context=False,
+        live_only=True, limit: int = 400,
+    ) -> list:
+        """[(node_id, label, node_type)] whose label contains ANY of
+        ``needles_lower`` as a substring (the caller verifies token
+        boundaries). One pass over the label column for all needles, never
+        content; used for code-like tokens only."""
+        needles = [n for n in needles_lower if n]
+        if not needles:
+            return []
+        scope, sparams = self._exact_scope_sql(
+            origin_runtime, include_context, live_only)
+        cond = " OR ".join(["instr(lower(label), ?) > 0"] * len(needles))
+        rows = self._get_conn().execute(
+            "SELECT node_id, label, node_type FROM nodes "
+            f"WHERE ({cond}){scope} ORDER BY node_id LIMIT ?",
+            needles + sparams + [limit],
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    @_locked
+    def exact_node_ids(
+        self, node_ids, origin_runtime=None, include_context=False,
+        live_only=True,
+    ) -> list:
+        """[(node_id, label, node_type)] for ids that exist (primary key)."""
+        ids = sorted({i for i in node_ids if i})
+        if not ids:
+            return []
+        scope, sparams = self._exact_scope_sql(
+            origin_runtime, include_context, live_only)
+        rows = self._get_conn().execute(
+            "SELECT node_id, label, node_type FROM nodes "
+            f"WHERE node_id IN ({','.join('?' * len(ids))}){scope}",
+            ids + sparams,
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    @_locked
+    def exact_neighbors(
+        self, node_ids, origin_runtime=None, include_context=False,
+        live_only=True, limit: int = 1000,
+    ) -> dict:
+        """{node_id: [neighbor ids]} one hop through LIVE edges, either
+        direction, for each requested id. Two indexed reads (idx_edges_source /
+        idx_edges_target, then the node primary key for the scope check).
+        An alias edge (ALIAS_OF) is not a neighbour: it joins two names of the
+        SAME thing. A neighbour must be in scope (live, not context unless
+        asked, origin filter). The node itself is never its own neighbour.
+        ``limit`` bounds the edge rows read per direction, per call."""
+        ids = sorted({i for i in node_ids if i})
+        out: dict = {i: [] for i in ids}
+        if not ids:
+            return out
+        conn = self._get_conn()
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT source_node_id, target_node_id FROM edges "
+            f"WHERE source_node_id IN ({marks}) AND invalidated_at IS NULL "
+            f"AND edge_type != 'alias_of' ORDER BY edge_id LIMIT ?",
+            ids + [limit],
+        ).fetchall()
+        rows += [(b, a) for a, b in conn.execute(
+            f"SELECT source_node_id, target_node_id FROM edges "
+            f"WHERE target_node_id IN ({marks}) AND invalidated_at IS NULL "
+            f"AND edge_type != 'alias_of' ORDER BY edge_id LIMIT ?",
+            ids + [limit],
+        ).fetchall()]
+        pairs: dict = {}
+        for ent, other in rows:
+            if other != ent:
+                pairs.setdefault(ent, set()).add(other)
+        wanted = sorted({o for s in pairs.values() for o in s})
+        if not wanted:
+            return out
+        scope, sparams = self._exact_scope_sql(
+            origin_runtime, include_context, live_only)
+        in_scope: set = set()
+        for i in range(0, len(wanted), self._IN_CHUNK):
+            chunk = wanted[i:i + self._IN_CHUNK]
+            in_scope.update(r[0] for r in conn.execute(
+                f"SELECT node_id FROM nodes WHERE node_id IN "
+                f"({','.join('?' * len(chunk))}){scope}",
+                chunk + sparams,
+            ).fetchall())
+        for ent, others in pairs.items():
+            out[ent] = sorted(o for o in others if o in in_scope)
+        return out
+
+    @_locked
+    def event_time_year_spans(self) -> list:
+        """Distinct (start_year, end_year) pairs over dated nodes, from the
+        covering event-time index. Lets a year-less date ("9/21") expand to
+        the years the graph actually has."""
+        rows = self._get_conn().execute(
+            "SELECT DISTINCT substr(event_time_start, 1, 4), "
+            "substr(COALESCE(event_time_end, event_time_start), 1, 4) "
+            "FROM nodes WHERE event_time_start IS NOT NULL"
+        ).fetchall()
+        out = []
+        for a, b in rows:
+            try:
+                out.append((int(a), int(b)))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @_locked
+    def recorded_year_list(self) -> list:
+        """Distinct years of recorded_at (index scan), for year-less dates."""
+        out = []
+        for (y,) in self._get_conn().execute(
+                "SELECT DISTINCT substr(recorded_at, 1, 4) FROM nodes "
+                "WHERE recorded_at IS NOT NULL"):
+            try:
+                out.append(int(y))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @_locked
+    def exact_recorded_matches(
+        self, day_ranges, origin_runtime=None, include_context=False,
+        live_only=True, limit: int = 400,
+    ) -> list:
+        """[(node_id, node_type, recorded_at)] whose recorded_at (WHEN THE
+        CONTENT WAS SAID, in the speaker's own offset: the first ten characters
+        are the local calendar day) falls in an inclusive ('YYYY-MM-DD',
+        'YYYY-MM-DD') range, and ONLY where metadata.recorded_at_source is
+        content, capture or import (the sources the renderers trust, see
+        revien/dates.py). A file mtime, an unlabeled row, and created_at
+        (ingest time) are never matched."""
+        ranges = list(day_ranges)
+        if not ranges:
+            return []
+        scope, sparams = self._exact_scope_sql(
+            origin_runtime, include_context, live_only)
+        conn = self._get_conn()
+        seen: dict = {}
+        for i in range(0, len(ranges), 100):
+            chunk = ranges[i:i + 100]
+            terms, params = [], []
+            for lo, hi in chunk:
+                terms.append("(recorded_at >= ? AND recorded_at < ?)")
+                params.extend([lo, _next_day(hi)])
+            rows = conn.execute(
+                "SELECT node_id, node_type, recorded_at FROM nodes "
+                f"WHERE recorded_at IS NOT NULL AND ({' OR '.join(terms)}) "
+                "AND json_extract(metadata, '$.recorded_at_source') "
+                f"IN ('content', 'capture', 'import'){scope} "
+                "ORDER BY node_id LIMIT ?",
+                params + sparams + [limit],
+            ).fetchall()
+            for r in rows:
+                seen[r[0]] = (r[0], r[1], r[2])
+        return list(seen.values())
+
+    @_locked
+    def exact_event_matches(
+        self, day_ranges, origin_runtime=None, include_context=False,
+        live_only=True, limit: int = 400,
+    ) -> list:
+        """[(node_id, node_type, start, end, granularity)] for dated nodes
+        whose [event_time_start, event_time_end] overlaps any inclusive
+        ('YYYY-MM-DD', 'YYYY-MM-DD') range in ``day_ranges``. Comparison is on
+        the stored ISO text (the speaker's own calendar day, see
+        engine._iso_utc); a node with no event_time_start is never returned.
+        Content text is never consulted."""
+        ranges = list(day_ranges)
+        if not ranges:
+            return []
+        scope, sparams = self._exact_scope_sql(
+            origin_runtime, include_context, live_only)
+        conn = self._get_conn()
+        seen: dict = {}
+        for i in range(0, len(ranges), 100):
+            chunk = ranges[i:i + 100]
+            terms, params = [], []
+            for lo, hi in chunk:
+                # [start, end] overlaps day range [lo, hi]  <=>
+                #   start < day-after-hi  AND  end >= lo   (text order)
+                terms.append(
+                    "(event_time_start < ? AND "
+                    "COALESCE(event_time_end, event_time_start) >= ?)")
+                params.extend([_next_day(hi), lo])
+            rows = conn.execute(
+                "SELECT node_id, node_type, event_time_start, event_time_end, "
+                "event_time_granularity FROM nodes "
+                f"WHERE event_time_start IS NOT NULL AND ({' OR '.join(terms)})"
+                f"{scope} ORDER BY node_id LIMIT ?",
+                params + sparams + [limit],
+            ).fetchall()
+            for r in rows:
+                seen[r[0]] = (r[0], r[1], r[2], r[3], r[4])
+        return list(seen.values())
 
     @_locked
     def search_nodes_keyword(
