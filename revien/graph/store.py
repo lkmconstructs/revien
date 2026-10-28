@@ -1406,17 +1406,19 @@ class GraphStore(ForgetStoreMixin):
             chunk = ids[i:i + self._IN_CHUNK]
             placeholders = ",".join("?" * len(chunk))
             rows = conn.execute(
-                f"SELECT source_node_id, target_node_id FROM edges "
+                f"SELECT source_node_id, target_node_id, edge_type FROM edges "
                 f"WHERE (source_node_id IN ({placeholders}) "
                 f"OR target_node_id IN ({placeholders})) "
                 f"AND invalidated_at IS NULL",
                 chunk + chunk,
             ).fetchall()
             wanted = set(chunk)
-            for src, tgt in rows:
+            for src, tgt, etype in rows:
                 if src in wanted:
                     out[src].append(tgt)
-                if tgt in wanted:
+                # Asymmetric edge types (extension-declared, none by default)
+                # are followed source -> target only.
+                if tgt in wanted and etype not in _extensions.ASYMMETRIC_EDGE_TYPES:
                     out[tgt].append(src)
         # De-duplicate while keeping it a plain list per node.
         return {nid: list(dict.fromkeys(neigh)) for nid, neigh in out.items()}
@@ -1446,15 +1448,15 @@ class GraphStore(ForgetStoreMixin):
             chunk = ids[i:i + self._IN_CHUNK]
             placeholders = ",".join("?" * len(chunk))
             rows = conn.execute(
-                f"SELECT source_node_id, target_node_id, weight, confidence "
-                f"FROM edges "
+                f"SELECT source_node_id, target_node_id, weight, confidence, "
+                f"edge_type FROM edges "
                 f"WHERE (source_node_id IN ({placeholders}) "
                 f"OR target_node_id IN ({placeholders})) "
                 f"AND invalidated_at IS NULL",
                 chunk + chunk,
             ).fetchall()
             wanted = set(chunk)
-            for src, tgt, weight, confidence in rows:
+            for src, tgt, weight, confidence, etype in rows:
                 strength = weight if weight is not None else 0.5
                 if use_confidence:
                     strength *= confidence if confidence is not None else 0.5
@@ -1462,7 +1464,7 @@ class GraphStore(ForgetStoreMixin):
                     prev = out[src].get(tgt)
                     if prev is None or strength > prev:
                         out[src][tgt] = strength
-                if tgt in wanted:
+                if tgt in wanted and etype not in _extensions.ASYMMETRIC_EDGE_TYPES:
                     prev = out[tgt].get(src)
                     if prev is None or strength > prev:
                         out[tgt][src] = strength
@@ -2105,12 +2107,29 @@ class GraphStore(ForgetStoreMixin):
             f"AND edge_type != 'alias_of' ORDER BY edge_id LIMIT ?",
             ids + [limit],
         ).fetchall()
+        # Asymmetric edge types (extension-declared, none by default) are
+        # followed source -> target only: not read from the target side.
+        one_way = sorted(_extensions.ASYMMETRIC_EDGE_TYPES)
+        one_way_sql = (f" AND edge_type NOT IN ({','.join('?' * len(one_way))})"
+                       if one_way else "")
         rows += [(b, a) for a, b in conn.execute(
             f"SELECT source_node_id, target_node_id FROM edges "
             f"WHERE target_node_id IN ({marks}) AND invalidated_at IS NULL "
-            f"AND edge_type != 'alias_of' ORDER BY edge_id LIMIT ?",
-            ids + [limit],
+            f"AND edge_type != 'alias_of'{one_way_sql} ORDER BY edge_id LIMIT ?",
+            ids + one_way + [limit],
         ).fetchall()]
+        # Leaf node types (extension-declared, none by default) do not expand:
+        # their neighbours are not read from them.
+        if _extensions.LEAF_NODE_TYPES:
+            leaf = sorted(_extensions.LEAF_NODE_TYPES)
+            leaf_ids = set()
+            for i in range(0, len(ids), self._IN_CHUNK):
+                chunk = ids[i:i + self._IN_CHUNK]
+                leaf_ids.update(r[0] for r in conn.execute(
+                    f"SELECT node_id FROM nodes WHERE node_id IN "
+                    f"({','.join('?' * len(chunk))}) AND node_type IN "
+                    f"({','.join('?' * len(leaf))})", chunk + leaf).fetchall())
+            rows = [(ent, other) for ent, other in rows if ent not in leaf_ids]
         pairs: dict = {}
         for ent, other in rows:
             if other != ent:
@@ -3024,13 +3043,14 @@ class GraphStore(ForgetStoreMixin):
 
     @_locked
     def get_neighbors(self, node_id: str) -> list[str]:
-        """Get IDs of all nodes directly connected to the given node."""
+        """Get IDs of all nodes directly connected to the given node
+        (asymmetric edge types are followed source -> target only)."""
         edges = self.get_edges_for_node(node_id)
         neighbors = set()
         for e in edges:
             if e.source_node_id == node_id:
                 neighbors.add(e.target_node_id)
-            else:
+            elif e.edge_type.value not in _extensions.ASYMMETRIC_EDGE_TYPES:
                 neighbors.add(e.source_node_id)
         return list(neighbors)
 
