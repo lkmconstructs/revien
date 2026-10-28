@@ -2073,3 +2073,78 @@ def _catalogue(path):
             c.execute("PRAGMA user_version").fetchone()[0])
     finally:
         c.close()
+
+
+# ── injected anchors admit, never re-score ───────────────────────────────────
+
+class TestInjectionAdmitsOnly:
+    """A node the lane injects as an anchor is walked apart from the other
+    anchors: a node they already reach keeps its distance, path and score, so
+    the lane moves any node by its own capped boost and no more."""
+
+    Q = "what did Alpha Project do on September 21 2026"
+
+    def _world(self, store):
+        alpha = add(store, "Alpha Project", "the alpha project")
+        sync = add(store, "Weekly sync", "the weekly sync")
+        dinner = add(store, "Harbor dinner", "dinner at the harbor",
+                     **day(2026, 9, 21))
+        after = add(store, "Follow up notes", "notes after the dinner")
+        far = add(store, "Venue booking", "booked the venue",
+                  **day(2026, 9, 21))
+        lone = add(store, "Lone neighbour", "only next to the venue")
+        link(store, alpha, sync)
+        link(store, sync, dinner)
+        link(store, dinner, after)
+        link(store, far, lone)
+        return alpha, sync, dinner, after, far, lone
+
+    def _run(self, store, exact):
+        eng = engine_for(store, exact=exact)
+        return eng.recall(self.Q, top_n=20, debug=True)
+
+    def test_a_reached_node_keeps_its_distance_and_moves_by_its_boost_only(
+            self, store):
+        alpha, sync, dinner, after, far, lone = self._world(store)
+        off, on = self._run(store, False), self._run(store, True)
+        assert dinner.node_id in on.diagnostics["exact"]["injected"]
+        d_off = off.diagnostics["node_distances"]
+        d_on = on.diagnostics["node_distances"]
+        assert d_off[dinner.node_id] == 2
+        for nid in d_off:
+            assert d_on[nid] == d_off[nid]
+        s_off = {r.node_id: r.score for r in off.results}
+        s_on = {r.node_id: r for r in on.results}
+        for nid, score in s_off.items():
+            boost = s_on[nid].score_breakdown.get("exact_boost", 0.0)
+            assert s_on[nid].score == pytest.approx(score + boost, abs=1e-6)
+
+    def test_an_unreached_injected_node_is_still_admitted(self, store):
+        alpha, sync, dinner, after, far, lone = self._world(store)
+        off, on = self._run(store, False), self._run(store, True)
+        assert far.node_id not in off.diagnostics["node_distances"]
+        assert on.diagnostics["node_distances"][far.node_id] == 0
+        assert on.diagnostics["node_distances"][lone.node_id] == 1
+        assert far.node_id in ids_of(on)
+
+    def test_an_injected_anchor_chooses_no_community(self, store):
+        alpha, sync, dinner, after, far, lone = self._world(store)
+
+        class _Clusters:
+            is_clustered = True
+            asked: list = []
+
+            def get_communities_for_anchors(self, ids):
+                self.asked.append(list(ids))
+                return []
+
+            def get_community(self, node_id):
+                return None
+
+        eng = engine_for(store, exact=True)
+        eng.clustering = _Clusters()
+        resp = eng.recall(self.Q, top_n=20, debug=True)
+        injected = set(resp.diagnostics["exact"]["injected"])
+        assert injected
+        assert eng.clustering.asked and not (
+            set(eng.clustering.asked[0]) & injected)

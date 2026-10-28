@@ -6,9 +6,10 @@ and otherwise does nothing at all. It is not a text-scoring lane: it never
 looks at node content. It matches three structured things:
 
   * quoted phrases, names/titles and code-like tokens against node LABELS
-    (exact, case-insensitive, whitespace-normalized), and, when a query names
-    an entity but asks about something else, the nodes CONNECTED to that
-    entity by an edge (one hop);
+    (exact, case-insensitive; whitespace is collapsed in the query only, so a
+    stored label with a tab or repeated spaces between words does not match),
+    and, when a query names an entity but asks about something else, the
+    nodes CONNECTED to that entity by an edge (one hop);
   * dates against the structured event-time fields (event_time_start /
     event_time_end / event_time_granularity) at full weight, then against
     recorded_at (when the content was SAID, local date in its own offset) at

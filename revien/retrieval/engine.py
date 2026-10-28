@@ -711,28 +711,46 @@ class RetrievalEngine:
                     f"[revien.exact] lane failed for this query ({exc!r}); "
                     f"recall continues without it.\n")
                 sys.stderr.flush()
-            if exact_state is not None:
-                for _nid in exact_state.inject_ids:
-                    if _nid not in anchor_ids:
-                        anchor_ids.append(_nid)
+        # The lane's injected anchors ADMIT nodes; they never re-score one.
+        # They are walked apart from the other anchors (step 3), so a node the
+        # other anchors already reach keeps its distance, path and strength,
+        # and they choose no community (2b). Otherwise an injected node would
+        # sit at distance 0 and lift its own proximity, and its neighbours',
+        # beyond the capped boost. Empty when the lane is off or injects nothing.
+        base_anchor_ids = list(anchor_ids)
+        injected_ids: List[str] = []
+        if exact_state is not None:
+            for _nid in exact_state.inject_ids:
+                if _nid not in anchor_ids:
+                    anchor_ids.append(_nid)
+                    injected_ids.append(_nid)
 
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
-        if anchor_ids and self.clustering and self.clustering.is_clustered:
+        if base_anchor_ids and self.clustering and self.clustering.is_clustered:
             relevant_communities = set(
-                self.clustering.get_communities_for_anchors(anchor_ids)
+                self.clustering.get_communities_for_anchors(base_anchor_ids)
             )
 
         # 3. Walk graph from anchors — ONE traversal yields distances, paths,
         # and path strengths (this used to be two full BFS passes per recall).
-        if anchor_ids:
+        if base_anchor_ids:
             node_distances, node_paths, node_strengths = self.walker.walk_full(
-                anchor_ids
+                base_anchor_ids
             )
         else:
             node_distances = {}
             node_paths = {}
             node_strengths = {}
+        # Injected anchors the walk did not reach add only what is new to it.
+        unreached = [nid for nid in injected_ids if nid not in node_distances]
+        if unreached:
+            more_d, more_p, more_s = self.walker.walk_full(unreached)
+            for nid, dist in more_d.items():
+                if nid not in node_distances:
+                    node_distances[nid] = dist
+                    node_paths[nid] = more_p[nid]
+                    node_strengths[nid] = more_s[nid]
 
         # 4. Score all reachable nodes. One bulk fetch for the whole walked
         # frontier — a SELECT per node here was a measured latency driver.
