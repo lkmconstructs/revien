@@ -1,4 +1,4 @@
-"""Asher's second verification card (PR #6 @ ab6e78e), rebuilt as tests.
+"""Second independent verification card for forget --wording, rebuilt as tests.
 
 Every case ends at zero across EVERY table, the raw db / -wal / -shm and both
 kinds of `revien watch` snapshot (.db and .db.gz, tables and raw bytes), or at
@@ -29,7 +29,7 @@ def fake_key(n=40, prefix="ghp_", seed=None):
 
 @pytest.fixture
 def db(tmp_path):
-    return str(tmp_path / "ash2.db")
+    return str(tmp_path / "verify2.db")
 
 
 def snapshots(db):

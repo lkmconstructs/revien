@@ -2,7 +2,7 @@
 
 Status: **approved by the owner**, narrowed by the owner's ruling of 2026-10-20: forget is for **one specific thing**, not a whole conversation. §8's old-daemon detection design is also approved, and it is already built on `main` (the first PR). Code is built once against this document and verified against the invariants in §9.
 
-Sources: owner rulings (Lissa, with Ash's reads, 2026-10-16), and the findings of seven independent verification rounds on branch `claude/project-mnemosyne-2eevt2`.
+Sources: owner rulings (2026-10-16) and the findings of seven independent verification rounds.
 
 ---
 

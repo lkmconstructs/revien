@@ -1,6 +1,6 @@
 """Claim Sovereignty Layer — interim distrust tripwire (Leg 3 safety net).
 
-A "distrust trigger" (Ash's framing): when a claim's raw/normalized CONTENT names
+A "distrust trigger": when a claim's raw/normalized CONTENT names
 a sensitive domain, the system DISTRUSTS its own classifier's type and routes the
 claim to human review — even though the type came out non-protected. This covers
 the confidently-misnamed manifestation of the sensitive-recognition gap ("I love
