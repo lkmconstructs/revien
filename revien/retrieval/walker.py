@@ -19,6 +19,7 @@ where strength bites); among same-level parents the strongest path wins.
 
 from typing import Dict, List, Tuple
 
+from revien.extensions import LEAF_NODE_TYPES
 from revien.graph.store import GraphStore
 
 
@@ -70,8 +71,19 @@ class GraphWalker:
 
         depth = 0
         while frontier and depth < self.max_depth:
+            # Leaf node types (extension-declared, none by default) are
+            # reachable but never expanded through.
+            if LEAF_NODE_TYPES:
+                level_nodes = self.store.get_nodes_bulk(frontier)
+                expand = [
+                    nid for nid in frontier
+                    if nid in level_nodes
+                    and level_nodes[nid].node_type.value not in LEAF_NODE_TYPES
+                ]
+            else:
+                expand = frontier
             neighbor_map = self.store.get_neighbors_weighted_bulk(
-                frontier, use_confidence=self.use_edge_confidence
+                expand, use_confidence=self.use_edge_confidence
             )
             next_frontier: List[str] = []
             next_dist = depth + 1

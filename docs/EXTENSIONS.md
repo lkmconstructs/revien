@@ -97,6 +97,52 @@ Reading the registry:
 | `all_node_type_values()`, `all_edge_type_values()` | every valid value: built-ins, then registered |
 | `loaded_extensions()` | `{spec: where it was configured}` for what has loaded |
 
+## Behaviour sets: leaf, one-way and metadata types
+
+Three more calls choose how a type behaves in recall. Each takes a type that is
+built in or already registered (register it first, in the same function), and
+each set is empty by default, so stock behaviour is unchanged.
+
+| Call | Environment variable | Effect |
+|---|---|---|
+| `register_leaf_node_type(value)` | `REVIEN_LEAF_NODE_TYPES` | recall can return the node, but the graph walk never expands through it |
+| `register_asymmetric_edge_type(value)` | `REVIEN_ASYMMETRIC_EDGE_TYPES` | the edge is followed source to target only; from the target side it is not a neighbour |
+| `register_recall_metadata_node_type(value)` | `REVIEN_RECALL_METADATA_NODE_TYPES` | `/v1/recall` results of this type carry the node's `metadata`; other types keep the stock shape |
+
+The variables are comma lists, read when extensions load (after them, so a
+list may name a type an extension registers); a name that is not a known type
+is an `ExtensionRegistrationError`. The sets only grow, like the registry, and
+are readable as `extensions.LEAF_NODE_TYPES`, `ASYMMETRIC_EDGE_TYPES` and
+`RECALL_METADATA_NODE_TYPES` (sets of type values).
+
+`POST /v1/recall` and `RetrievalEngine.recall()` also take
+`exclude_node_types`, a list of node type values to leave out of the results.
+It is not an extension setting: any caller can send it, and it works for
+built-in types. An unknown value is a 422 on the REST route and a `ValueError`
+in the engine and the MCP tool. Omitted or empty: no filtering.
+
+A leaf-type node also does not choose a community for the community boost, and
+its `alias_of` neighbours are not added as anchors: a leaf node is reachable,
+never a starting point.
+
+### Where the guard applies
+
+`metadata` for listed types (one shared helper, `extensions.recall_metadata_field`)
+is on `POST /v1/recall`, the MCP `revien_recall` tool, `revien recall` (JSON and
+TOON output) and the Hermes `revien_recall` tool. `exclude_node_types` is on the
+REST route, the MCP tool and the engine. It is not on the `revien recall` CLI,
+the Hermes tool or the prefetch, or the LangChain adapter (which renders text
+and carries no `metadata`); callers of those use the engine's parameter
+directly. Leaf, one-way and community behaviour live in the engine, so they
+apply everywhere.
+
+### Exact lane
+
+With `REVIEN_EXACT=on`, the lane's own neighbour walk (the one-hop boost of
+nodes joined to a named entity) honours the same sets: it does not expand
+through a leaf node and follows a one-way edge source to target only. Injected
+nodes are still anchors of their own walk, so the leaf rule applies to them too.
+
 ## How extensions are found and loaded
 
 Revien imports only the modules that two sources name, and reads nothing else:

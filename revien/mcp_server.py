@@ -18,8 +18,9 @@ langchain peer-dependency pattern in revien/adapters/__init__.py.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from revien.extensions import recall_metadata_field
 from revien.validation import validate_ingest, validate_recall
 
 # Peer-dependency guard: the core install stays lean; everything below that
@@ -143,6 +144,7 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
         top_n: int = 5,
         include_context: bool = False,
         as_of: Optional[str] = None,
+        exclude_node_types: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Search the user's persistent memory graph.
 
@@ -163,6 +165,8 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             as_of: ISO-8601 timestamp for bi-temporal queries — "what was
                 true AT this time". Superseded facts whose validity window
                 covers the moment come back. Leave unset for current truth.
+            exclude_node_types: Node type values to leave out of the results
+                (e.g. ["topic"]). An unknown type is an error.
 
         Returns ranked results with content, score, and provenance path,
         plus semantic_note explaining if retrieval ran degraded.
@@ -183,6 +187,7 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
             top_n=top_n,
             include_context=include_context,
             as_of=as_of_dt,
+            exclude_node_types=exclude_node_types,
         )
         # Mirror of POST /v1/recall's serialization (daemon/server.py) with
         # include_tensions off — the MCP face must not invent a new shape.
@@ -204,6 +209,7 @@ def _build_server(engine: Any, pipeline: Any) -> "FastMCP":
                     "project_key": r.project_key,
                     "recorded_at": r.recorded_at,
                     "recorded_at_source": r.recorded_at_source,
+                    **recall_metadata_field(r.node_type, r.metadata),
                 }
                 for r in response.results
             ],

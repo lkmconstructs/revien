@@ -107,6 +107,7 @@ from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 from revien.retrieval.engine import RetrievalEngine
 from revien.semantic.index import SemanticIndex
+from revien.extensions import recall_metadata_field
 from revien.validation import (
     TOP_N_MAX,
     TOP_N_MIN,
@@ -507,6 +508,7 @@ class RevienMemoryProvider(MemoryProvider if HERMES_AVAILABLE else _MissingHerme
                     "path": r.path,
                     "recorded_at": r.recorded_at,
                     "recorded_at_source": r.recorded_at_source,
+                    **recall_metadata_field(r.node_type, r.metadata),
                 }
                 for r in response.results
             ],
