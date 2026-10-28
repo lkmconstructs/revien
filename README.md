@@ -313,6 +313,8 @@ recall supports TOON output (`format: "toon"` on `/v1/recall`, `--format toon` o
 
 Every ingestion creates a `context` node holding the verbatim interaction; extracted nodes connect back to it. Any fact or decision traces to its origin.
 
+A package of your own can add node types and edge types without patching Revien: see [docs/EXTENSIONS.md](docs/EXTENSIONS.md).
+
 ---
 
 ## Configuration
@@ -329,6 +331,7 @@ Config lives at `~/.revien/config.json`, created on first run. Retrieval is also
 | `REVIEN_TOUCH_ON_RECALL` | off | On restores retrieval-driven frequency (a popularity loop; off by default) |
 | `REVIEN_RECENCY_WEIGHT` / `_FREQUENCY_WEIGHT` / `_PROXIMITY_WEIGHT` | `0.35 / 0.30 / 0.35` | Three-factor blend |
 | `REVIEN_EXTRACTOR` | `rule` | `ollama` / `openai` / etc. for LLM-based extraction (regex fallback always attached) |
+| `REVIEN_EXTENSIONS` | — | Comma-separated `package.module:function` list that registers extra node and edge types ([docs/EXTENSIONS.md](docs/EXTENSIONS.md)) |
 | `REVIEN_INGEST_DENY` | — | Comma-separated source IDs that are never captured |
 
 ---

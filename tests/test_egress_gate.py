@@ -204,7 +204,75 @@ class TestDynamicImportEvasions:
         "import json\nm = json.__loader__.load_module('http.client')\n",
         "import importlib, operator\n"
         "operator.attrgetter('import_module')(importlib)('socket')\n",
+        "def f(ep):\n    return getattr(ep, 'load')()\n",
+        "import operator\ndef f(ep):\n    return operator.methodcaller('load')(ep)\n",
     ])
     def test_still_uncaught_and_listed(self, gate, src):
         assert gate.network_uses(src) == []
         assert any(src == s for _n, s in gate.EVASIONS)
+
+
+class TestEntryPointLoad:
+    """Loading an entry point imports a module by name. The gate reports it
+    like a dynamic import and allows exactly one site: `_run` in
+    revien/extensions.py, by function and statement, not the whole file."""
+
+    REAL = (REPO / "revien" / "extensions.py").read_text(encoding="utf-8")
+    TAG = "<entry-point-load>"
+
+    @pytest.mark.parametrize("src", [
+        "def f(ep):\n    return ep.load()\n",
+        "import importlib.metadata as md\ndef f(ep):\n    return md.EntryPoint.load(ep)\n",
+        "from importlib.metadata import EntryPoint\nEntryPoint.load(x)\n",
+        "import pkg_resources\nfor ep in pkg_resources.iter_entry_points('g'):\n    ep.load()\n",
+        "import importlib.metadata as md\n"
+        "def f():\n    return [e.load() for e in md.entry_points(group='g')]\n",
+    ])
+    def test_a_load_is_reported(self, gate, src):
+        assert self.TAG in {m for _f, m, _s in gate.network_uses(src)}
+
+    @pytest.mark.parametrize("src", [
+        "import json\njson.load(f)\n",
+        "import importlib.metadata\nimportlib.metadata.entry_points(group='g')\n",
+        "import pickle\npickle.load(f)\n",
+    ])
+    def test_other_loads_and_discovery_alone_are_not(self, gate, src):
+        assert gate.network_uses(src) == []
+
+    def test_a_new_load_in_a_changed_file_fails_the_gate(self, gate):
+        base = "import os\n"
+        head = base + "def f(ep):\n    return ep.load()\n"
+        assert gate.violations_in("revien/cli.py", head, base)
+
+    def test_the_shipped_module_has_exactly_the_one_allowed_load(self, gate):
+        uses = [u for u in gate.network_uses(self.REAL) if u[1] == self.TAG]
+        assert uses == [("_run", self.TAG, "entry_point.load()")]
+        assert gate.violations_in("revien/extensions.py", self.REAL, "") == []
+        assert set(gate.ENTRY_POINT_SITES) == {
+            ("revien/extensions.py", "_run", self.TAG, "entry_point.load()")}
+
+    @pytest.mark.parametrize("rel,src", [
+        ("revien/extensions.py", REAL + "\ndef other(ep):\n    return ep.load()\n"),
+        ("revien/extensions.py", REAL.replace(
+            "    func = entry_point.load()",
+            "    func = entry_point.load()\n    func = entry_point.load()")),
+        ("revien/extensions.py", REAL.replace(
+            "    func = entry_point.load()",
+            "    func = entry_point.load()\n    other = other_point.load()")),
+        ("revien/extensions.py", REAL.replace(
+            "    func = entry_point.load()", "    func = other_point.load()")),
+        ("revien/cli.py", "def _run(spec, entry_point):\n    return entry_point.load()\n"),
+        ("revien/graph/store.py", REAL),
+    ])
+    def test_the_allowance_is_the_one_site_and_not_the_file(self, gate, rel, src):
+        assert src != self.REAL or rel != "revien/extensions.py"
+        assert gate.violations_in(rel, src, "")
+
+    def test_the_file_is_not_pinned(self, gate):
+        assert "revien/extensions.py" not in gate.PINNED
+        edited = self.REAL + "\n# an unrelated edit\n"
+        assert gate.violations_in("revien/extensions.py", edited, "") == []
+
+    def test_the_gates_own_controls_hold(self, gate):
+        for name, src, want in gate.CONTROLS:
+            assert {m for _f, m, _s in gate.network_uses(src)} == want, name

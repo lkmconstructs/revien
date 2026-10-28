@@ -8,6 +8,7 @@ import os
 import re
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
+from revien import extensions
 from revien.graph.schema import Edge, Node, NodeType
 from revien.graph.store import GraphStore
 from revien.graph.normalize import normalize_text
@@ -124,6 +125,12 @@ class Deduplicator:
         # Context nodes are never deduplicated — each session is unique
         owner = (unit_id, 1, 1) if unit_id is not None else None
         if candidate.node_type == NodeType.CONTEXT:
+            stored = self.store.add_node(candidate, owner=owner)
+            return stored, True
+        # An extension type that registered with dedup=False is never merged
+        # either: each candidate is its own node. Every other type, every
+        # built-in and an extension type by default, takes the layers below.
+        if not extensions.node_type_dedups(candidate.node_type):
             stored = self.store.add_node(candidate, owner=owner)
             return stored, True
 
