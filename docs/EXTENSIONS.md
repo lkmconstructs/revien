@@ -97,6 +97,30 @@ Reading the registry:
 | `all_node_type_values()`, `all_edge_type_values()` | every valid value: built-ins, then registered |
 | `loaded_extensions()` | `{spec: where it was configured}` for what has loaded |
 
+## Behaviour sets: leaf, one-way and metadata types
+
+Three more calls choose how a type behaves in recall. Each takes a type that is
+built in or already registered (register it first, in the same function), and
+each set is empty by default, so stock behaviour is unchanged.
+
+| Call | Environment variable | Effect |
+|---|---|---|
+| `register_leaf_node_type(value)` | `REVIEN_LEAF_NODE_TYPES` | recall can return the node, but the graph walk never expands through it |
+| `register_asymmetric_edge_type(value)` | `REVIEN_ASYMMETRIC_EDGE_TYPES` | the edge is followed source to target only; from the target side it is not a neighbour |
+| `register_recall_metadata_node_type(value)` | `REVIEN_RECALL_METADATA_NODE_TYPES` | `/v1/recall` results of this type carry the node's `metadata`; other types keep the stock shape |
+
+The variables are comma lists, read when extensions load (after them, so a
+list may name a type an extension registers); a name that is not a known type
+is an `ExtensionRegistrationError`. The sets only grow, like the registry, and
+are readable as `extensions.LEAF_NODE_TYPES`, `ASYMMETRIC_EDGE_TYPES` and
+`RECALL_METADATA_NODE_TYPES` (sets of type values).
+
+`POST /v1/recall` and `RetrievalEngine.recall()` also take
+`exclude_node_types`, a list of node type values to leave out of the results.
+It is not an extension setting: any caller can send it, and it works for
+built-in types. An unknown value is a 422 on the REST route and a `ValueError`
+in the engine. Omitted or empty: no filtering.
+
 ## How extensions are found and loaded
 
 Revien imports only the modules that two sources name, and reads nothing else:

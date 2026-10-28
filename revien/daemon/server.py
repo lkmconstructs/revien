@@ -95,6 +95,9 @@ class RecallRequest(BaseModel):
     include_invalidated: bool = False
     include_context: bool = False
     include_tensions: bool = False
+    # Node type values to leave out of results. Unknown values are a 422.
+    # None (default): no filtering, response byte-identical.
+    exclude_node_types: Optional[List[str]] = None
     # Bi-temporal query time (B2), ISO-8601: "what was true AT this time?"
     as_of: Optional[str] = None
     # Wire format (LEG P2): "json" (default, unchanged response) or "toon"
@@ -632,6 +635,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             except ValueError:
                 raise HTTPException(400, f"Invalid as_of (ISO-8601 expected): {request.as_of}")
 
+        if request.exclude_node_types:
+            unknown = sorted(set(request.exclude_node_types) - set(extensions.all_node_type_values()))
+            if unknown:
+                raise HTTPException(422, f"Unknown node type in exclude_node_types: {unknown}")
+
         response = engine.recall(
             query=request.query,
             top_n=request.top_n,
@@ -641,6 +649,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             include_tensions=request.include_tensions,
             as_of=as_of,
             source=request.source,
+            exclude_node_types=request.exclude_node_types,
         )
         payload = {
             "query": response.query,
@@ -665,6 +674,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     # Only present when asked for — the flag-off response
                     # shape is byte-identical to pre-B1.
                     **({"tensions": r.tensions} if request.include_tensions else {}),
+                    # Metadata only for node types an extension lists
+                    # (RECALL_METADATA_NODE_TYPES); none by default, so the
+                    # stock wire shape is unchanged.
+                    **({"metadata": r.metadata}
+                       if r.node_type in extensions.RECALL_METADATA_NODE_TYPES else {}),
                 }
                 for r in response.results
             ],

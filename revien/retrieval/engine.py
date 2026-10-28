@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # — bench runs construct hundreds of engines and one warning is the message).
 _SEMANTIC_OFF_WARNED = False
 
+from revien.extensions import all_node_type_values
 from revien.graph.schema import EdgeType, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -139,6 +140,9 @@ class RetrievalResult:
     # for rows ingested before the source was recorded. Renderers show the
     # date (and the "when it was said" note) only for content/capture/import.
     recorded_at_source: Optional[str] = None
+    # The node's own metadata. The daemon puts it on the wire only for node
+    # types an extension lists (RECALL_METADATA_NODE_TYPES); empty otherwise.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -426,9 +430,13 @@ class RetrievalEngine:
         debug: bool = False,
         prefer_types: Optional[List[str]] = None,
         source: Optional[Union[str, List[str]]] = None,
+        exclude_node_types: Optional[List[str]] = None,
     ) -> RetrievalResponse:
         """
         Query the memory graph and return ranked results.
+
+        exclude_node_types: node type values to leave out of the results
+        (None or empty: no filtering). An unknown type raises ValueError.
 
         Args:
             query: Natural language query
@@ -503,6 +511,11 @@ class RetrievalEngine:
         preferred_types = (
             {t.strip().lower() for t in prefer_types} if prefer_types else None
         )
+        excluded_types = set(exclude_node_types or ())
+        unknown_excluded = excluded_types - set(all_node_type_values())
+        if unknown_excluded:
+            raise ValueError(
+                f"Unknown node type in exclude_node_types: {sorted(unknown_excluded)}")
         # Origin Layer (WS0 Leg B) source filter, normalized once (G4):
         # None = unfiltered; any non-None value (including empty) = a
         # filter is present, and empty matches nothing.
@@ -769,6 +782,11 @@ class RetrievalEngine:
                     diag_filtered[node_id] = "missing"
                 continue
 
+            if excluded_types and node.node_type.value in excluded_types:
+                if debug:
+                    diag_filtered[node_id] = "node_type_excluded"
+                continue
+
             # CONTEXT nodes are the verbatim turns — answer-bearing content for
             # conversational memory. Surface them by default; callers wanting only
             # distilled extract nodes can pass include_context=False.
@@ -999,6 +1017,7 @@ class RetrievalEngine:
                 project_key=node.project_key,
                 recorded_at=_iso_utc(node.recorded_at),
                 recorded_at_source=(node.metadata or {}).get("recorded_at_source"),
+                metadata=node.metadata or {},
             ))
 
         # 5. Rank by final score, then (opt-in) cross-encoder rerank of the
