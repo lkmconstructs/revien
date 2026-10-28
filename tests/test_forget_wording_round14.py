@@ -8,7 +8,7 @@ import pytest
 from revien.graph.schema import Edge, EdgeType, Node, NodeType
 from revien.graph.store import GraphStore
 from tests.test_forget_wording import cc, forget_wording
-from tests.test_forget_wording_ash2 import everywhere, fake_key, pieces_reported
+from tests.test_forget_wording_verify2 import everywhere, fake_key, pieces_reported
 
 
 @pytest.fixture

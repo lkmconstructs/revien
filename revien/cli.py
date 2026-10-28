@@ -1059,11 +1059,15 @@ def status(db: Optional[str]):
                 click.echo(f"  {src}: {count}{note}")
 
         click.echo(f"Pairing token: {_pairing_token_status()}")
-        from revien.semantic._ort import ort_telemetry_state
-        click.echo(
-            "ONNX Runtime telemetry: "
-            + ("disabled" if ort_telemetry_state() else "not applicable")
-        )
+        from revien.semantic._ort import ort_telemetry_problem, ort_telemetry_state
+        ort_state = ort_telemetry_state()
+        if ort_state is None:
+            ort_line = "not applicable (onnxruntime not installed)"
+        elif ort_state:
+            ort_line = "disabled"
+        else:
+            ort_line = f"NOT disabled: {ort_telemetry_problem()}"
+        click.echo(f"ONNX Runtime telemetry: {ort_line}")
         store.expire_recall_receipts()
         flags = len(store.list_receipt_flags())
         if flags:

@@ -69,6 +69,17 @@ EVENT_PATTERNS = [
     r"(?:on |last |this )?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|week|month|yesterday),?\s*(?:we )?(.*?)(?:\.|$)",
 ]
 
+# The longest candidate the extractor takes as ONE entity: the 200 characters
+# a node label holds (graph/schema.py). The unquoted patterns below have no
+# bound of their own, so a run of capitalised words ("Attendees: Dana Reyes
+# Marco Bell Priya Shah ...") or a "the <word> tier" phrase built around a
+# pasted token can be any length, and past 200 the node could not be built:
+# ingest and recall crashed. A longer candidate is a list or a title-cased
+# line, not a name. It is not cut down to a shorter name (that would be a
+# different, wrong name): it is not extracted at all, and the rest of the
+# text is extracted as usual. Up to 200, extraction is what it always was.
+MAX_ENTITY_LABEL = 200
+
 # Entity extraction — capitalized multi-word phrases, tech terms, quoted terms.
 # Whitespace inside a candidate is HORIZONTAL only ([ \t]) — \s matched
 # newlines, fusing the last word of one line with the first capitalized word
@@ -264,6 +275,8 @@ class RuleBasedExtractor:
                 label = match.group(1).strip()
                 if len(label) < 2 or label.lower() in STOP_WORDS:
                     continue
+                if len(label) > MAX_ENTITY_LABEL:
+                    continue  # a list or a title-cased line, not a name
                 if label.lower() not in entities:
                     entities[label.lower()] = Node(
                         node_type=NodeType.ENTITY,
@@ -281,6 +294,8 @@ class RuleBasedExtractor:
         )
         for match in tier_pattern.finditer(content):
             label = match.group(1).strip()
+            if len(label) > MAX_ENTITY_LABEL:
+                continue  # built around a pasted token or a run of spaces
             if len(label) > 3 and label.lower() not in entities and label.lower() not in STOP_WORDS:
                 entities[label.lower()] = Node(
                     node_type=NodeType.ENTITY,
@@ -402,7 +417,7 @@ class RuleBasedExtractor:
                 seen.add(bigram)
                 topics.append(Node(
                     node_type=NodeType.TOPIC,
-                    label=bigram,
+                    label=bigram[:200],
                     content=f"Topic: {bigram} (mentioned {freq} times)",
                     source_id=source_id,
                     created_at=now,
@@ -418,7 +433,7 @@ class RuleBasedExtractor:
                     seen.add(word)
                     topics.append(Node(
                         node_type=NodeType.TOPIC,
-                        label=word,
+                        label=word[:200],
                         content=f"Topic: {word} (mentioned {freq} times)",
                         source_id=source_id,
                         created_at=now,

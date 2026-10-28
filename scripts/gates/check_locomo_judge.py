@@ -193,7 +193,7 @@ def main():
     A._http_post_json = fake_post
     try:
         judge = J.build_judge("openai:gpt-4o-mini")
-        verdict = judge.judge("Where does Mara live?", "In the sanctum.", "Unknown.", "location")
+        verdict = judge.judge("Where does Mara live?", "In Lisbon.", "Unknown.", "location")
     finally:
         A._http_post_json = original_post
         if had_key:

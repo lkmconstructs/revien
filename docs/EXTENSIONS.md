@@ -168,8 +168,9 @@ What it means in practice:
 - `x in NodeType` is not a reliable test for an extension value, and it differs
   across Python versions. For the registered member it is `False` on 3.10 and
   3.11 and `True` on 3.12 and later. For the plain string `"recipe"` it raises
-  `TypeError` on 3.10 and 3.11 and is `False` on 3.12 and later (for a built-in
-  string such as `"fact"`: `TypeError`, then `True`). Test membership with
+  `TypeError` on 3.10 and 3.11, and on 3.12 and later the answer depends on the
+  exact release (`False` on 3.12.3, `True` on 3.12.15). For a built-in string
+  such as `"fact"`: `TypeError`, then `True`. Test membership with
   `x in all_node_type_values()` instead.
 - The mechanism was exercised on Python 3.10, 3.11, 3.12 and 3.13, and on
   pydantic 2.0.3 through 2.14.1.

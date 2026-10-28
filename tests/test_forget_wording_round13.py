@@ -14,7 +14,7 @@ from revien.graph.store import GraphStore
 from revien.ingestion.pipeline import IngestionInput, IngestionPipeline
 from revien.watch import snapshot_db
 from tests.test_forget_wording import cc, forget_wording
-from tests.test_forget_wording_ash2 import everywhere, fake_key, pieces_reported, snapshots
+from tests.test_forget_wording_verify2 import everywhere, fake_key, pieces_reported, snapshots
 
 
 @pytest.fixture

@@ -19,7 +19,8 @@ from revien import extensions as _extensions
 from .forget_store import ForgetStoreMixin
 from .origin import derive_origin, derive_recorded_at_source
 from .schema import (
-    Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType, TemporalGranularity,
+    LABEL_CUT_KEY, Edge, EdgeType, Graph, Modality, Node, NodeType, SourceType,
+    TemporalGranularity,
 )
 
 
@@ -1278,7 +1279,7 @@ class GraphStore(ForgetStoreMixin):
     def get_node(self, node_id: str) -> Optional[Node]:
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT * FROM nodes WHERE node_id = ?", (node_id,)
+            f"{self._SELECT_NODES} WHERE node_id = ?", (node_id,)
         ).fetchone()
         if row is None:
             return None
@@ -1303,7 +1304,7 @@ class GraphStore(ForgetStoreMixin):
         if rid is None:
             return None
         op, direction = (">", "ASC") if forward else ("<", "DESC")
-        base = ("SELECT * FROM nodes WHERE session_key = ? AND node_type = ? "
+        base = (f"{self._SELECT_NODES} WHERE session_key = ? AND node_type = ? "
                 "AND node_id != ? AND ")
         order = (f" ORDER BY recorded_at {direction}, created_at {direction}, "
                  f"rowid {direction} LIMIT 1")
@@ -1373,7 +1374,7 @@ class GraphStore(ForgetStoreMixin):
         for i in range(0, len(ids), self._IN_CHUNK):
             chunk = ids[i:i + self._IN_CHUNK]
             rows = conn.execute(
-                f"SELECT * FROM nodes WHERE node_id IN "
+                f"{self._SELECT_NODES} WHERE node_id IN "
                 f"({','.join('?' * len(chunk))})",
                 chunk,
             ).fetchall()
@@ -1980,7 +1981,7 @@ class GraphStore(ForgetStoreMixin):
         # the prefilter matches how the key sits inside the metadata JSON.
         needle = json.dumps(ingest_key)
         rows = conn.execute(
-            "SELECT * FROM nodes WHERE node_type = ? AND metadata LIKE ? "
+            f"{self._SELECT_NODES} WHERE node_type = ? AND metadata LIKE ? "
             "ORDER BY created_at ASC",
             (node_type.value, f"%{needle}%"),
         ).fetchall()
@@ -2261,7 +2262,7 @@ class GraphStore(ForgetStoreMixin):
         conditions = " OR ".join(
             ["instr(lower(label || ' ' || content), ?) > 0"] * len(kws)
         )
-        query = f"SELECT * FROM nodes WHERE ({conditions})"
+        query = f"{self._SELECT_NODES} WHERE ({conditions})"
         params: list = [k.lower() for k in kws]
         if exclude_context:
             query += " AND node_type != 'context'"
@@ -2433,6 +2434,18 @@ class GraphStore(ForgetStoreMixin):
                 if field in kwargs:
                     updates[field] = kwargs[field]
 
+            # The cut-label mark (LABEL_CUT_KEY) says the content is the whole
+            # name the label was cut from. An edit cannot add or change it,
+            # and an edit of the content drops it: the content is no longer
+            # that name.
+            had = (existing.metadata or {}).get(LABEL_CUT_KEY)
+            md = updates.get("metadata", existing.metadata) or {}
+            if isinstance(md, dict) and LABEL_CUT_KEY in md and (
+                    md[LABEL_CUT_KEY] != had
+                    or updates.get("content", existing.content) != existing.content):
+                updates["metadata"] = {
+                    k: v for k, v in md.items() if k != LABEL_CUT_KEY}
+
             if not updates:
                 return existing
 
@@ -2562,7 +2575,7 @@ class GraphStore(ForgetStoreMixin):
         NULL (unknown provenance) never matches either filter — filtered
         recall never silently includes "unknown" as a fourth runtime."""
         conn = self._get_conn()
-        query = "SELECT * FROM nodes WHERE 1=1"
+        query = f"{self._SELECT_NODES} WHERE 1=1"
         params: list = []
         if node_type:
             query += " AND node_type = ?"
@@ -2602,7 +2615,7 @@ class GraphStore(ForgetStoreMixin):
         metadata exactly, a substring hit is never trusted as the whole truth."""
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT * FROM nodes WHERE node_type = ? "
+            f"{self._SELECT_NODES} WHERE node_type = ? "
             "AND metadata LIKE '%\"status\": \"proposed\"%' "
             "AND metadata LIKE '%\"draft\": true%' "
             "ORDER BY created_at DESC, node_id LIMIT ? OFFSET ?",
@@ -2993,7 +3006,7 @@ class GraphStore(ForgetStoreMixin):
     def get_edge(self, edge_id: str) -> Optional[Edge]:
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT * FROM edges WHERE edge_id = ?", (edge_id,)
+            f"{self._SELECT_EDGES} WHERE edge_id = ?", (edge_id,)
         ).fetchone()
         if row is None:
             return None
@@ -3004,7 +3017,7 @@ class GraphStore(ForgetStoreMixin):
         """Get all edges connected to a node (as source or target)."""
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT * FROM edges WHERE source_node_id = ? OR target_node_id = ?",
+            f"{self._SELECT_EDGES} WHERE source_node_id = ? OR target_node_id = ?",
             (node_id, node_id),
         ).fetchall()
         return [self._row_to_edge(r) for r in rows]
@@ -3051,7 +3064,7 @@ class GraphStore(ForgetStoreMixin):
     def export_graph(self) -> Graph:
         nodes = self.list_nodes(limit=999999)
         conn = self._get_conn()
-        edge_rows = conn.execute("SELECT * FROM edges").fetchall()
+        edge_rows = conn.execute(self._SELECT_EDGES).fetchall()
         edges = [self._row_to_edge(r) for r in edge_rows]
         return Graph(nodes=nodes, edges=edges)
 
@@ -3308,6 +3321,30 @@ class GraphStore(ForgetStoreMixin):
         return f"queued ({queued} nodes pending embed)"
 
     # ── Internal Helpers ──────────────────────────────────
+
+    # Readers name their columns rather than SELECT *, so _row_to_node and
+    # _row_to_edge get this order whatever the table's physical order is. An
+    # older DB can hold a column added outside this store (clustering's
+    # community_id) ahead of columns a later migration appended.
+    _NODE_COLUMNS = (
+        "node_id", "node_type", "label", "content", "source_id",
+        "created_at", "last_accessed", "access_count", "metadata",
+        "source_type", "confidence", "pinned", "confidence_set_at",
+        "confidence_set_by", "source_context", "last_referenced",
+        "invalidated_at", "source_modality", "answerable_by_text",
+        "vision_processed", "recorded_at", "event_time_start",
+        "event_time_end", "event_time_granularity", "event_time_confidence",
+        "event_time_text", "valid_from", "valid_until",
+        "origin_runtime", "origin_source", "project_key", "session_key",
+    )
+    _EDGE_COLUMNS = (
+        "edge_id", "edge_type", "source_node_id", "target_node_id",
+        "weight", "created_at", "metadata",
+        "confidence", "confidence_set_at", "confidence_set_by", "source_context",
+        "invalidated_at",
+    )
+    _SELECT_NODES = f"SELECT {', '.join(_NODE_COLUMNS)} FROM nodes"
+    _SELECT_EDGES = f"SELECT {', '.join(_EDGE_COLUMNS)} FROM edges"
 
     def _row_to_node(self, row: tuple) -> Node:
         try:
