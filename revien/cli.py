@@ -482,6 +482,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
            source: tuple, json_output: bool, output_format: str):
     """Query Revien memory from the command line."""
     from datetime import datetime
+    from revien.extensions import recall_metadata_field
     from revien.graph.store import GraphStore
     from revien.retrieval.engine import RetrievalEngine
 
@@ -538,6 +539,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "project_key": r.project_key,
                         "recorded_at": r.recorded_at,
                         "recorded_at_source": r.recorded_at_source,
+                        **recall_metadata_field(r.node_type, r.metadata),
                     }
                     for r in response.results
                 ],
@@ -564,6 +566,7 @@ def recall(query: str, top: int, db: Optional[str], as_of: Optional[str],
                         "project_key": r.project_key,
                         "recorded_at": r.recorded_at,
                         "recorded_at_source": r.recorded_at_source,
+                        **recall_metadata_field(r.node_type, r.metadata),
                     }
                     for r in response.results
                 ],

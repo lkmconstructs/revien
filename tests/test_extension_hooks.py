@@ -269,3 +269,87 @@ def test_engine_exclude_node_types(store):
     assert kinds == {"entity"}
     with pytest.raises(ValueError):
         engine.recall("Quasar", exclude_node_types=["nope"])
+
+
+# ── leaf anchors: community boost and alias expansion ─────
+
+def test_community_boost_ignores_leaf_anchor(tmp_path):
+    """A leaf-type anchor must not lift personal nodes clustered with it."""
+    from revien.graph.clustering import CommunityDetector
+    extensions.register_node_type("reference")
+    extensions.register_leaf_node_type("reference")
+    db = str(tmp_path / "c.db")
+    s = GraphStore(db_path=db)
+    leaf = _node(s, NodeType("reference"), "Baseline Heron")
+    x = _node(s, NodeType.ENTITY, "Secret Xylo")
+    y = _node(s, NodeType.ENTITY, "Yonder")
+    _edge(s, EdgeType.RELATED_TO, leaf, x)
+    _edge(s, EdgeType.RELATED_TO, y, x)
+    for i in range(4):
+        _edge(s, EdgeType.RELATED_TO, y, _node(s, NodeType.ENTITY, f"Yfriend{i}"))
+    cl = CommunityDetector(db_path=db)
+    cl.run()
+    eng = RetrievalEngine(s, clustering=cl)
+    eng._find_anchors = (lambda q, sf=None: [leaf.node_id, y.node_id]
+                         if "Heron" in q else [y.node_id])
+    with_leaf = {r.node_id: r for r in eng.recall("Yonder and Heron", top_n=20).results}
+    without = {r.node_id: r for r in eng.recall("Yonder", top_n=20).results}
+    s.close()
+    assert (with_leaf[x.node_id].score_breakdown["community_boost"]
+            == without[x.node_id].score_breakdown["community_boost"])
+
+
+def test_leaf_anchor_does_not_expand_aliases(store, monkeypatch):
+    monkeypatch.setenv("REVIEN_ALIAS", "1")
+    extensions.register_node_type("reference")
+    extensions.register_leaf_node_type("reference")
+    leaf = _node(store, NodeType("reference"), "Baseline Heron")
+    ent = _node(store, NodeType.ENTITY, "Heron Alias")
+    stock = _node(store, NodeType.ENTITY, "Quasar Station")
+    other = _node(store, NodeType.ENTITY, "Quasar Alias")
+    _edge(store, EdgeType.ALIAS_OF, leaf, ent)
+    _edge(store, EdgeType.ALIAS_OF, stock, other)
+    eng = RetrievalEngine(store)
+    from revien.retrieval import engine as engine_mod
+    assert engine_mod._alias_expansion_enabled_by_env()
+    anchors = eng._find_anchors("Baseline Heron")
+    assert leaf.node_id in anchors and ent.node_id not in anchors
+    # Control: a non-leaf anchor still expands.
+    anchors = eng._find_anchors("Quasar Station")
+    assert other.node_id in anchors
+
+
+# ── MCP / CLI / Hermes parity ─────────────────────────────
+
+def test_recall_metadata_field_helper():
+    extensions.register_node_type("reference")
+    assert extensions.recall_metadata_field("reference", {"a": 1}) == {}
+    extensions.register_recall_metadata_node_type("reference")
+    assert extensions.recall_metadata_field("reference", {"a": 1}) == {"metadata": {"a": 1}}
+    assert extensions.recall_metadata_field("entity", {"a": 1}) == {}
+
+
+def test_mcp_recall_metadata_and_exclude(tmp_path, registered):
+    from revien import mcp_server
+    if not mcp_server.MCP_AVAILABLE:
+        pytest.skip("mcp not installed")
+    extensions.register_recall_metadata_node_type("reference")
+    db = str(tmp_path / "m.db")
+    s = GraphStore(db_path=db)
+    _node(s, NodeType.ENTITY, "Quasar", metadata={"k": "plain"})
+    _node(s, NodeType("reference"), "Quasar reference", metadata={"k": "ref"})
+    s.close()
+    srv = mcp_server.build_mcp_server(db_path=db)
+    try:
+        fn = srv._tool_manager._tools["revien_recall"].fn
+        by = {r["node_type"]: r for r in fn(query="Quasar", top_n=10,
+                                            include_context=True)["results"]}
+        assert by["reference"]["metadata"]["k"] == "ref"
+        assert "metadata" not in by["entity"]
+        out = fn(query="Quasar", top_n=10, include_context=True,
+                 exclude_node_types=["reference"])
+        assert {r["node_type"] for r in out["results"]} == {"entity"}
+        with pytest.raises(ValueError, match="Unknown node type in exclude_node_types"):
+            fn(query="Quasar", exclude_node_types=["nope"])
+    finally:
+        mcp_server.close_mcp_server(srv)

@@ -384,6 +384,15 @@ def register_recall_metadata_node_type(value: str) -> str:
                        all_node_type_values(), value)
 
 
+def recall_metadata_field(node_type: Any, metadata: Any) -> Dict[str, Any]:
+    """The conditional ``metadata`` entry of a recall result: ``{"metadata": ...}``
+    for a node type in RECALL_METADATA_NODE_TYPES, else ``{}`` (stock shape).
+    Every recall face spreads this into its result dict."""
+    if node_type in RECALL_METADATA_NODE_TYPES:
+        return {"metadata": metadata or {}}
+    return {}
+
+
 def _apply_env_sets() -> None:
     """Read the REVIEN_*_TYPES variables (comma lists) into the sets. Called by
     ``load_extensions`` after the extensions ran, so a listed type may be one

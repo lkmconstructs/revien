@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # — bench runs construct hundreds of engines and one warning is the message).
 _SEMANTIC_OFF_WARNED = False
 
-from revien.extensions import all_node_type_values
+from revien.extensions import LEAF_NODE_TYPES, all_node_type_values
 from revien.graph.schema import EdgeType, Node, NodeType, SourceType
 from revien.graph.store import GraphStore
 from revien.graph.operations import GraphOperations
@@ -140,8 +140,9 @@ class RetrievalResult:
     # for rows ingested before the source was recorded. Renderers show the
     # date (and the "when it was said" note) only for content/capture/import.
     recorded_at_source: Optional[str] = None
-    # The node's own metadata. The daemon puts it on the wire only for node
-    # types an extension lists (RECALL_METADATA_NODE_TYPES); empty otherwise.
+    # The node's own metadata, filled for every result. The faces (REST, MCP,
+    # CLI JSON/TOON, Hermes tool) put it on the wire only for node types an
+    # extension lists (RECALL_METADATA_NODE_TYPES); the engine does not filter.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -741,9 +742,13 @@ class RetrievalEngine:
         # 2b. Community-first routing — identify which communities are relevant
         relevant_communities: set = set()
         if base_anchor_ids and self.clustering and self.clustering.is_clustered:
-            relevant_communities = set(
-                self.clustering.get_communities_for_anchors(base_anchor_ids)
-            )
+            # A leaf-type anchor (LEAF_NODE_TYPES) never chooses a community:
+            # it would lift the personal nodes clustered around it.
+            community_anchor_ids = self._non_leaf(base_anchor_ids)
+            if community_anchor_ids:
+                relevant_communities = set(
+                    self.clustering.get_communities_for_anchors(community_anchor_ids)
+                )
 
         # 3. Walk graph from anchors — ONE traversal yields distances, paths,
         # and path strengths (this used to be two full BFS passes per recall).
@@ -1271,7 +1276,8 @@ class RetrievalEngine:
         # carries that node's label as the first hop in `path` — no new
         # response field needed, the existing path already tells the story.
         if _alias_expansion_enabled_by_env():
-            for anchor_id in list(anchor_ids):
+            # A leaf-type anchor does not expand (same rule as the walk).
+            for anchor_id in self._non_leaf(list(anchor_ids)):
                 for alias_id in self._live_alias_neighbors(anchor_id):
                     if alias_id not in anchor_ids:
                         anchor_ids.append(alias_id)
@@ -1285,6 +1291,15 @@ class RetrievalEngine:
     # spammed/misbehaving caller can't turn one anchor into an unbounded
     # anchor-set (and unbounded walk-seed) blowup.
     MAX_ALIAS_NEIGHBORS_PER_ANCHOR = 25
+
+    def _non_leaf(self, node_ids: List[str]) -> List[str]:
+        """node_ids minus nodes whose type is in LEAF_NODE_TYPES (no-op when the
+        set is empty, the default)."""
+        if not node_ids or not LEAF_NODE_TYPES:
+            return list(node_ids)
+        nodes = self.store.get_nodes_bulk(list(node_ids))
+        return [nid for nid in node_ids
+                if nid not in nodes or nodes[nid].node_type.value not in LEAF_NODE_TYPES]
 
     def _live_alias_neighbors(self, node_id: str) -> List[str]:
         """LIVE ALIAS_OF neighbors of one node, both directions, one hop.

@@ -677,8 +677,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     # Metadata only for node types an extension lists
                     # (RECALL_METADATA_NODE_TYPES); none by default, so the
                     # stock wire shape is unchanged.
-                    **({"metadata": r.metadata}
-                       if r.node_type in extensions.RECALL_METADATA_NODE_TYPES else {}),
+                    **extensions.recall_metadata_field(r.node_type, r.metadata),
                 }
                 for r in response.results
             ],
